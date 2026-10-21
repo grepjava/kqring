@@ -417,6 +417,14 @@ enter_from_other_thread(void *arg)
 	return ((void *)(intptr_t)(rc < 0 ? errno : 0));
 }
 
+static void *
+unregister_from_other_thread(void *arg)
+{
+	struct test_ring *r = arg;
+	long rc = kqring_register(r->fd, IORING_UNREGISTER_PBUF_RING, NULL, 0);
+	return ((void *)(intptr_t)(rc < 0 ? errno : 0));
+}
+
 static void
 test_single_issuer(struct test_ring *r)
 {
@@ -425,7 +433,45 @@ test_single_issuer(struct test_ring *r)
 	assert(pthread_create(&t, NULL, enter_from_other_thread, r) == 0);
 	assert(pthread_join(t, &res) == 0);
 	assert((intptr_t)res == EEXIST);
-	printf("[PASS] SINGLE_ISSUER: enter from another thread -> EEXIST\n");
+	assert(pthread_create(&t, NULL, unregister_from_other_thread, r) == 0);
+	assert(pthread_join(t, &res) == 0);
+	assert((intptr_t)res == EEXIST);
+	printf("[PASS] SINGLE_ISSUER: enter/unregister from another thread "
+	    "-> EEXIST\n");
+}
+
+static void
+test_setup_errors(void)
+{
+	struct kqring_setup_arg arg = { .entries = 8 };
+	struct io_uring_params p;
+	int fd = open("/dev/kqring", O_RDWR | O_CLOEXEC);
+	assert(fd >= 0);
+
+	/* SINGLE_ISSUER | DEFER_TASKRUN are required. */
+	memset(&p, 0, sizeof(p));
+	arg.params = &p;
+	assert(ioctl(fd, KQRING_IOC_SETUP, &arg) == -1 && errno == EINVAL);
+
+	/* copyout of the params fails: the rings must be torn down... */
+	long page = sysconf(_SC_PAGESIZE);
+	struct io_uring_params *rop = mmap(NULL, (size_t)page,
+	    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(rop != MAP_FAILED);
+	rop->flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+	assert(mprotect(rop, (size_t)page, PROT_READ) == 0);
+	arg.params = rop;
+	assert(ioctl(fd, KQRING_IOC_SETUP, &arg) == -1 && errno == EFAULT);
+
+	/* ...so that setup can be retried on the same descriptor. */
+	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+	arg.params = &p;
+	assert(ioctl(fd, KQRING_IOC_SETUP, &arg) == 0);
+	assert(ioctl(fd, KQRING_IOC_SETUP, &arg) == -1 && errno == EINVAL);
+
+	munmap(rop, (size_t)page);
+	close(fd);
+	printf("[PASS] SETUP: flags enforced, retry after failed copyout\n");
 }
 
 static void
@@ -541,6 +587,173 @@ test_futex_wait(struct test_ring *r)
 	assert(c.user_data == 4001 && c.res == 0);
 	assert(pthread_join(t, NULL) == 0);
 	printf("[PASS] FUTEX_WAIT: -EAGAIN on mismatch, wakes on change\n");
+
+	/*
+	 * Several waits may be armed at once, and a non-waiting enter
+	 * completes the ones whose word changed.
+	 */
+	static _Atomic uint32_t w1, w2;
+	atomic_store(&w1, 0);
+	atomic_store(&w2, 0);
+	sqe = ring_prep(r, IORING_OP_FUTEX_WAIT,
+	    FUTEX2_SIZE_U32 | FUTEX2_PRIVATE, 4101);
+	sqe->addr = (uint64_t)(uintptr_t)&w1;
+	ring_push_sqe(r);
+	sqe = ring_prep(r, IORING_OP_FUTEX_WAIT,
+	    FUTEX2_SIZE_U32 | FUTEX2_PRIVATE, 4102);
+	sqe->addr = (uint64_t)(uintptr_t)&w2;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+
+	atomic_store(&w2, 1);
+	assert(kqring_enter(r->fd, 0, 0, 0, NULL, 0) == 0);
+	assert(ring_cq_ready(r) == 1);
+	c = ring_pop_cqe(r);
+	assert(c.user_data == 4102 && c.res == 0);
+
+	atomic_store(&w1, 1);
+	assert(kqring_enter(r->fd, 0, 0, 0, NULL, 0) == 0);
+	assert(ring_cq_ready(r) == 1);
+	c = ring_pop_cqe(r);
+	assert(c.user_data == 4101 && c.res == 0);
+	printf("[PASS] FUTEX_WAIT: two armed at once, seen by non-waiting "
+	    "enter\n");
+}
+
+/* A second op on the same socket and direction gets -EBUSY. */
+static void
+test_dup_arm(struct test_ring *r)
+{
+	static char buf[64];
+	int sv[2];
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_RECV, sv[0], 8001);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	ring_push_sqe(r);
+	sqe = ring_prep(r, IORING_OP_POLL_ADD, sv[0], 8002);
+	sqe->poll32_events = POLLIN;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 1);
+	struct io_uring_cqe c = ring_pop_cqe(r);
+	assert(c.user_data == 8002 && c.res == -EBUSY);
+
+	/* The first op is still armed and completes normally. */
+	assert(write(sv[1], "x", 1) == 1);
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = ring_pop_cqe(r);
+	assert(c.user_data == 8001 && c.res == 1);
+	assert(ring_cq_ready(r) == 0);
+
+	close(sv[0]);
+	close(sv[1]);
+	printf("[PASS] second op on same socket+direction -> -EBUSY\n");
+}
+
+/*
+ * An armed op whose fd is closed and reused for another socket must not
+ * operate on the new socket.
+ */
+static void
+test_fd_reuse(struct test_ring *r)
+{
+	static char buf[64];
+	int a[2], b[2];
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, a) == 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, b) == 0);
+	int fd = a[0];
+
+	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_RECV, fd, 8101);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+
+	/* close(fd) fires the upcall; fd then names b[0]'s socket. */
+	assert(dup2(b[0], fd) == fd);
+	assert(write(b[1], "y", 1) == 1);
+	assert(ring_wait(r, 1, 2000) == 0);
+	struct io_uring_cqe c = ring_pop_cqe(r);
+	assert(c.user_data == 8101 && c.res == -EBADF);
+	assert(read(fd, buf, sizeof(buf)) == 1 && buf[0] == 'y');
+
+	close(fd);
+	close(a[1]);
+	close(b[0]);
+	close(b[1]);
+	printf("[PASS] armed RECV after fd reuse -> -EBADF, new socket "
+	    "untouched\n");
+}
+
+/* Timeout or EINTR after submitting still reports the submitted count. */
+static void
+test_enter_returns_submitted(struct test_ring *r)
+{
+	int sv[2];
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_POLL_ADD, sv[0],
+	    8201);
+	sqe->poll32_events = POLLIN;
+	ring_push_sqe(r);
+	struct __kernel_timespec ts = { .tv_nsec = 20000000 };
+	struct io_uring_getevents_arg ga = {
+		.ts = (uint64_t)(uintptr_t)&ts,
+	};
+	assert(kqring_enter(r->fd, 1, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
+	    sizeof(ga)) == 1);
+	assert(ring_pending(r) == 0);
+	assert(ring_cq_ready(r) == 0);
+
+	sqe = ring_prep(r, IORING_OP_ASYNC_CANCEL, -1, 8202);
+	sqe->addr = 8201;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	ring_drain_cqes(r);
+
+	close(sv[0]);
+	close(sv[1]);
+	printf("[PASS] enter with timeout after submit returns submitted "
+	    "count\n");
+}
+
+/* CQEs beyond the CQ ring are held, in order, until there is room. */
+static void
+test_cq_overflow(struct test_ring *r)
+{
+	unsigned cq_entries = r->cq_mask + 1;
+	unsigned total = cq_entries + SQ_ENTRIES;
+
+	for (unsigned i = 0; i < total; i++) {
+		(void)ring_prep(r, IORING_OP_NOP, -1, 10000 + i);
+		ring_push_sqe(r);
+		if (ring_pending(r) == SQ_ENTRIES)
+			ring_submit(r);
+	}
+	if (ring_pending(r) != 0)
+		ring_submit(r);
+	assert(ring_cq_ready(r) == cq_entries);
+	assert((atomic_load(r->sq_kflags) & IORING_SQ_CQ_OVERFLOW) != 0);
+
+	unsigned next = 10000;
+	for (unsigned i = 0; i < cq_entries; i++)
+		assert(ring_pop_cqe(r).user_data == next++);
+
+	/* Any enter flushes the held CQEs into the freed space. */
+	assert(kqring_enter(r->fd, 0, 0, 0, NULL, 0) == 0);
+	assert(ring_cq_ready(r) == total - cq_entries);
+	assert((atomic_load(r->sq_kflags) & IORING_SQ_CQ_OVERFLOW) == 0);
+	while (ring_cq_ready(r) > 0)
+		assert(ring_pop_cqe(r).user_data == next++);
+	assert(next == 10000 + total);
+	printf("[PASS] CQ overflow: %u CQEs held in kernel, delivered in "
+	    "order\n", total - cq_entries);
 }
 
 static void
@@ -588,6 +801,43 @@ test_accept(struct test_ring *r)
 	close(c2);
 	close(lfd);
 	printf("[PASS] ACCEPT: armed on listener + inline, SOCK_CLOEXEC\n");
+
+	/*
+	 * listen(2) on a socket with an op armed on its so_rcv reuses that
+	 * storage for the listen queues; disarming must not write into it.
+	 */
+	struct sockaddr_in sin = {
+		.sin_len = sizeof(sin),
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	socklen_t slen = sizeof(sin);
+	lfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	assert(lfd >= 0);
+	assert(bind(lfd, (struct sockaddr *)&sin, sizeof(sin)) == 0);
+	assert(getsockname(lfd, (struct sockaddr *)&sin, &slen) == 0);
+	sqe = ring_prep(r, IORING_OP_POLL_ADD, lfd, 5101);
+	sqe->poll32_events = POLLIN;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	assert(listen(lfd, 16) == 0);
+	sqe = ring_prep(r, IORING_OP_ASYNC_CANCEL, -1, 5102);
+	sqe->addr = 5101;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	ring_drain_cqes(r);
+
+	/* The listen queue still works. */
+	c1 = tcp_connect(ntohs(sin.sin_port));
+	wait_readable(lfd);
+	a1 = accept(lfd, NULL, NULL);
+	assert(a1 >= 0);
+	close(a1);
+	close(c1);
+	close(lfd);
+	printf("[PASS] op armed before listen(2), cancelled after\n");
 }
 
 /* Arm a SEND on a full socket, drain the peer, expect completion. */
@@ -634,6 +884,25 @@ test_send_armed(struct test_ring *r)
 	assert(fcntl(cfd, F_SETFL, O_NONBLOCK) == 0);
 
 	assert(send_when_writable(r, cfd, sfd, 6001) == 0);
+
+	/*
+	 * POLLIN | POLLOUT on a full socket must wake for either direction
+	 * (both upcalls armed), here for readability.
+	 */
+	fill_socket(cfd);
+	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_POLL_ADD, cfd, 6002);
+	sqe->poll32_events = POLLIN | POLLOUT;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	assert(ring_wait(r, 1, 20) == ETIMEDOUT);
+	assert(write(sfd, "z", 1) == 1);
+	assert(ring_wait(r, 1, 2000) == 0);
+	struct io_uring_cqe c = ring_pop_cqe(r);
+	assert(c.user_data == 6002 && (c.res & POLLIN) != 0);
+	printf("[PASS] POLL_ADD(POLLIN|POLLOUT) on full TCP socket wakes on "
+	    "POLLIN\n");
+
 	close(cfd);
 	close(sfd);
 	close(lfd);
@@ -1001,9 +1270,14 @@ main(int argc, char **argv)
 		test_multishot_and_eof(&r);
 		test_timeout(&r);
 		test_single_issuer(&r);
+		test_setup_errors();
 		test_poll_add(&r);
 		test_cancel(&r);
 		test_futex_wait(&r);
+		test_dup_arm(&r);
+		test_fd_reuse(&r);
+		test_enter_returns_submitted(&r);
+		test_cq_overflow(&r);
 		test_accept(&r);
 		test_send_armed(&r);
 		test_file_rw(&r);
