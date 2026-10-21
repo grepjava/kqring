@@ -73,6 +73,16 @@ MALLOC_DEFINE(M_KQRING, "kqring", "FreeBSD kqring I/O ring state");
 /* CQEs held in the kernel while the CQ ring is full (IORING_FEAT_NODROP). */
 #define KQRING_MAX_OVERFLOW	16384U
 
+/* io_uring_params flags accepted by KQRING_IOC_SETUP. */
+#define	KQRING_SETUP_FLAGS						\
+	(IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP |			\
+	IORING_SETUP_R_DISABLED | IORING_SETUP_SUBMIT_ALL |		\
+	IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG |		\
+	IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)
+
+/* KQRING_IOC_ENTER flags implemented. */
+#define	KQRING_ENTER_FLAGS	(IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG)
+
 /*
  * Layout of the single-mmap SQ+CQ shared memory region (ctx->ring_kva).
  */
@@ -1064,12 +1074,54 @@ retry:
 	mtx_unlock(&ctx->mtx);
 }
 
+/*
+ * Reject SQE flags and ioprio bits kqring does not implement, as io_uring
+ * does, instead of silently ignoring them: IOSQE_FIXED_FILE would turn a
+ * fixed-file index into a raw fd, and links/drain/CQE skipping change
+ * completion semantics.  IOSQE_ASYNC is only a hint and is accepted.
+ */
+static int
+kqring_sqe_check(const struct io_uring_sqe *sqe)
+{
+	if ((sqe->flags & ~(IOSQE_BUFFER_SELECT | IOSQE_ASYNC)) != 0)
+		return (EINVAL);
+
+	switch (sqe->opcode) {
+	case IORING_OP_RECV:
+		if ((sqe->ioprio & ~(IORING_RECVSEND_POLL_FIRST |
+		    IORING_RECV_MULTISHOT)) != 0)
+			return (EINVAL);
+		/* Each multishot completion needs its own buffer. */
+		if ((sqe->ioprio & IORING_RECV_MULTISHOT) != 0 &&
+		    (sqe->flags & IOSQE_BUFFER_SELECT) == 0)
+			return (EINVAL);
+		/* Only buffer group 0 exists. */
+		if ((sqe->flags & IOSQE_BUFFER_SELECT) != 0 &&
+		    sqe->buf_group != 0)
+			return (ENOBUFS);
+		return (0);
+	case IORING_OP_SEND:
+		if ((sqe->ioprio & ~IORING_RECVSEND_POLL_FIRST) != 0)
+			return (EINVAL);
+		break;
+	}
+	if ((sqe->flags & IOSQE_BUFFER_SELECT) != 0)
+		return (EINVAL);
+	return (0);
+}
+
 static void
 kqring_submit_sqe(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
 {
 	struct thread *td = curthread;
 	bool keep_multishot = false;
 	int rc;
+
+	rc = kqring_sqe_check(sqe);
+	if (rc != 0) {
+		kqring_post_cqe(ctx, sqe->user_data, -rc, 0);
+		return;
+	}
 
 	switch (sqe->opcode) {
 	case IORING_OP_NOP:
@@ -1375,28 +1427,46 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	size_t ring_bytes, sqes_bytes, array_off, cqes_off;
 	int error;
 
-	if (uarg->entries == 0 || uarg->entries > KQRING_MAX_SQ_ENTRIES)
-		return (EINVAL);
-
 	error = copyin(uarg->params, &p, sizeof(p));
 	if (error != 0)
 		return (error);
 
 	/*
-	 * Reject IORING_SETUP_SQPOLL: kqring never spawns background kernel
-	 * threads. Require SINGLE_ISSUER | DEFER_TASKRUN, the only semantics
-	 * kqring implements.
+	 * Reject every flag kqring does not implement (SQPOLL: kqring never
+	 * spawns background kernel threads; SQE128/CQE32/NO_SQARRAY would
+	 * change the ring layout userspace uses), as io_uring_setup(2) does,
+	 * so that callers probing for a feature see EINVAL rather than a
+	 * silently different ring.  Require SINGLE_ISSUER | DEFER_TASKRUN,
+	 * the only semantics kqring implements.  COOP_TASKRUN, TASKRUN_FLAG
+	 * and SUBMIT_ALL describe what kqring always does.
 	 */
-	if (p.flags & IORING_SETUP_SQPOLL)
+	if ((p.flags & ~KQRING_SETUP_FLAGS) != 0)
 		return (EINVAL);
 	if ((p.flags & IORING_SETUP_SINGLE_ISSUER) == 0 ||
 	    (p.flags & IORING_SETUP_DEFER_TASKRUN) == 0)
 		return (EINVAL);
+	for (size_t i = 0; i < nitems(p.resv); i++)
+		if (p.resv[i] != 0)
+			return (EINVAL);
 
-	sq_entries = roundup_pow2(uarg->entries);
+	sq_entries = uarg->entries;
+	if (sq_entries == 0)
+		return (EINVAL);
+	if (sq_entries > KQRING_MAX_SQ_ENTRIES) {
+		if ((p.flags & IORING_SETUP_CLAMP) == 0)
+			return (EINVAL);
+		sq_entries = KQRING_MAX_SQ_ENTRIES;
+	}
+	sq_entries = roundup_pow2(sq_entries);
 	if (p.flags & IORING_SETUP_CQSIZE) {
-		if (p.cq_entries < sq_entries ||
-		    p.cq_entries > KQRING_MAX_CQ_ENTRIES)
+		if (p.cq_entries == 0)
+			return (EINVAL);
+		if (p.cq_entries > KQRING_MAX_CQ_ENTRIES) {
+			if ((p.flags & IORING_SETUP_CLAMP) == 0)
+				return (EINVAL);
+			p.cq_entries = KQRING_MAX_CQ_ENTRIES;
+		}
+		if (p.cq_entries < sq_entries)
 			return (EINVAL);
 		cq_entries = roundup_pow2(p.cq_entries);
 	} else {
@@ -1577,7 +1647,7 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
     struct thread *td)
 {
 	struct kqring_shm_header *shm = ctx->shm;
-	uint32_t head, tail, submitted = 0;
+	uint32_t head, tail, consumed = 0, submitted = 0;
 	sbintime_t sbt = 0;
 	bool has_timeout = false;
 	bool wait;
@@ -1588,22 +1658,35 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	if (ctx->owner_td != td)
 		return (EEXIST); /* SINGLE_ISSUER violation */
 
+	/* SQ_WAKEUP/SQ_WAIT need SQPOLL; REGISTERED_RING has no ioctl form. */
+	if ((ea->flags & ~KQRING_ENTER_FLAGS) != 0)
+		return (EINVAL);
+	/* Without EXT_ARG, io_uring_enter(2)'s arg is a sigmask. */
+	if ((ea->flags & IORING_ENTER_EXT_ARG) == 0 && ea->arg != NULL)
+		return (EINVAL);
+
 	wait = (ea->flags & IORING_ENTER_GETEVENTS) != 0 &&
 	    ea->min_complete != 0;
 
 	/*
-	 * 1. Parse the optional IORING_ENTER_EXT_ARG timeout before consuming
+	 * 1. Validate the optional IORING_ENTER_EXT_ARG before consuming
 	 * any SQE, so that a bad argument fails the call without losing
 	 * submissions.
 	 */
-	if (wait && (ea->flags & IORING_ENTER_EXT_ARG) != 0 && ea->arg != NULL) {
+	if ((ea->flags & IORING_ENTER_EXT_ARG) != 0 && ea->arg != NULL) {
 		struct io_uring_getevents_arg ext;
-		if (ea->argsz < sizeof(ext))
+		if (ea->argsz != sizeof(ext))
 			return (EINVAL);
 		error = copyin(ea->arg, &ext, sizeof(ext));
 		if (error != 0)
 			return (error);
-		if (ext.ts != 0) {
+		/*
+		 * Signal masks are not implemented, and pad is min_wait_usec
+		 * on newer Linux: reject both rather than ignore them.
+		 */
+		if (ext.sigmask != 0 || ext.pad != 0)
+			return (EINVAL);
+		if (wait && ext.ts != 0) {
 			struct __kernel_timespec kts;
 			error = copyin((const void *)(uintptr_t)ext.ts, &kts,
 			    sizeof(kts));
@@ -1627,14 +1710,18 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	kqring_flush_overflow(ctx);
 	head = shm->sq_head;
 	tail = atomic_load_acq_32(&shm->sq_tail);
-	while (head != tail && submitted < ea->to_submit) {
+	while (head != tail && consumed < ea->to_submit) {
 		uint32_t sqe_idx = ctx->sq_array[head & ctx->sq_mask];
 		head++;
-		submitted++;
-		if (sqe_idx < ctx->sq_entries) {
-			struct io_uring_sqe sqe = ctx->sqes[sqe_idx];
-			kqring_submit_sqe(ctx, &sqe);
+		consumed++;
+		if (sqe_idx >= ctx->sq_entries) {
+			/* As in io_uring: consumed, counted, not submitted. */
+			atomic_add_32(&shm->sq_dropped, 1);
+			continue;
 		}
+		struct io_uring_sqe sqe = ctx->sqes[sqe_idx];
+		kqring_submit_sqe(ctx, &sqe);
+		submitted++;
 	}
 	atomic_store_rel_32(&shm->sq_head, head);
 	ea->SUBMITTED_out = submitted;
@@ -1763,8 +1850,13 @@ kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
 			IORING_OP_RECV,
 			IORING_OP_FUTEX_WAIT,
 		};
-		uint32_t max_ops = ra->nr_args > 256 ? 256 : ra->nr_args;
-		hdr.last_op = IORING_OP_FUTEX_WAIT;
+		/*
+		 * As in io_uring: last_op is the last opcode this ABI knows
+		 * and ops_len the number of entries filled in, at most
+		 * IORING_OP_LAST (it is a uint8_t, so never 256).
+		 */
+		uint32_t max_ops = MIN(ra->nr_args, (uint32_t)IORING_OP_LAST);
+		hdr.last_op = IORING_OP_LAST - 1;
 		hdr.ops_len = (uint8_t)max_ops;
 		error = copyout(&hdr, ra->arg, sizeof(hdr));
 		if (error != 0)
