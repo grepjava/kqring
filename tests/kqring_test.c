@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -43,7 +44,7 @@ struct test_ring {
 	size_t			ring_map_len;
 	struct io_uring_sqe	*sqes;
 	size_t			sqes_len;
-	_Atomic unsigned	*sq_khead, *sq_ktail, *sq_kflags;
+	_Atomic unsigned	*sq_khead, *sq_ktail, *sq_kflags, *sq_kdropped;
 	_Atomic unsigned	*cq_khead, *cq_ktail;
 	unsigned		*sq_array;
 	unsigned		sq_mask, cq_mask;
@@ -97,6 +98,7 @@ ring_init(struct test_ring *r)
 	r->sq_khead = (_Atomic unsigned *)(base + p.sq_off.head);
 	r->sq_ktail = (_Atomic unsigned *)(base + p.sq_off.tail);
 	r->sq_kflags = (_Atomic unsigned *)(base + p.sq_off.flags);
+	r->sq_kdropped = (_Atomic unsigned *)(base + p.sq_off.dropped);
 	r->sq_mask = *(unsigned *)(base + p.sq_off.ring_mask);
 	r->sq_array = (unsigned *)(base + p.sq_off.array);
 	for (unsigned i = 0; i < p.sq_entries; i++)
@@ -322,6 +324,8 @@ test_probe(struct test_ring *r)
 	struct io_uring_probe *probe = calloc(1, len);
 	assert(probe != NULL);
 	assert(kqring_register(r->fd, IORING_REGISTER_PROBE, probe, 256) == 0);
+	assert(probe->last_op == IORING_OP_LAST - 1);
+	assert(probe->ops_len == IORING_OP_LAST);
 
 	static const int needed[] = {
 		IORING_OP_RECV, IORING_OP_SEND, IORING_OP_ACCEPT,
@@ -453,6 +457,36 @@ test_setup_errors(void)
 	arg.params = &p;
 	assert(ioctl(fd, KQRING_IOC_SETUP, &arg) == -1 && errno == EINVAL);
 
+	/* Unimplemented flags and nonzero reserved fields are rejected. */
+	const uint32_t req = IORING_SETUP_SINGLE_ISSUER |
+	    IORING_SETUP_DEFER_TASKRUN;
+	static const uint32_t bad[] = {
+		IORING_SETUP_SQPOLL, IORING_SETUP_IOPOLL,
+		IORING_SETUP_SQE128, IORING_SETUP_CQE32,
+		IORING_SETUP_ATTACH_WQ, 1U << 16 /* NO_SQARRAY */,
+	};
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		p.flags = req | bad[i];
+		assert(ioctl(fd, KQRING_IOC_SETUP, &arg) == -1 &&
+		    errno == EINVAL);
+	}
+	p.flags = req;
+	p.resv[1] = 1;
+	assert(ioctl(fd, KQRING_IOC_SETUP, &arg) == -1 && errno == EINVAL);
+	p.resv[1] = 0;
+
+	/* Too many entries: EINVAL, unless CLAMP is set. */
+	arg.entries = 1U << 20;
+	assert(ioctl(fd, KQRING_IOC_SETUP, &arg) == -1 && errno == EINVAL);
+	int cfd = open("/dev/kqring", O_RDWR | O_CLOEXEC);
+	assert(cfd >= 0);
+	p.flags = req | IORING_SETUP_CLAMP;
+	assert(ioctl(cfd, KQRING_IOC_SETUP, &arg) == 0);
+	assert(p.sq_entries == 4096 && p.cq_entries == 8192);
+	close(cfd);
+	arg.entries = 8;
+	memset(&p, 0, sizeof(p));
+
 	/* copyout of the params fails: the rings must be torn down... */
 	long page = sysconf(_SC_PAGESIZE);
 	struct io_uring_params *rop = mmap(NULL, (size_t)page,
@@ -471,7 +505,134 @@ test_setup_errors(void)
 
 	munmap(rop, (size_t)page);
 	close(fd);
-	printf("[PASS] SETUP: flags enforced, retry after failed copyout\n");
+	printf("[PASS] SETUP: flags/resv validated, CLAMP, retry after "
+	    "failed copyout\n");
+}
+
+/* Submit one prepared SQE and return its CQE's res. */
+static int32_t
+submit_one(struct test_ring *r)
+{
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 1);
+	return (ring_pop_cqe(r).res);
+}
+
+static void
+test_sqe_validation(struct test_ring *r)
+{
+	static char buf[64];
+	static const uint8_t bad_flags[] = {
+		IOSQE_FIXED_FILE, IOSQE_IO_DRAIN, IOSQE_IO_LINK,
+		IOSQE_IO_HARDLINK, IOSQE_CQE_SKIP_SUCCESS, 1U << 7,
+	};
+	struct io_uring_sqe *sqe;
+	int sv[2];
+
+	for (size_t i = 0; i < sizeof(bad_flags) / sizeof(bad_flags[0]); i++) {
+		sqe = ring_prep(r, IORING_OP_NOP, -1, 11000 + i);
+		sqe->flags = bad_flags[i];
+		ring_push_sqe(r);
+		assert(submit_one(r) == -EINVAL);
+	}
+	/* IOSQE_ASYNC is a hint. */
+	sqe = ring_prep(r, IORING_OP_NOP, -1, 11100);
+	sqe->flags = IOSQE_ASYNC;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	/* Multishot RECV needs IOSQE_BUFFER_SELECT. */
+	sqe = ring_prep(r, IORING_OP_RECV, sv[0], 11101);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->ioprio = IORING_RECV_MULTISHOT;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EINVAL);
+	/* Unknown ioprio bits. */
+	sqe = ring_prep(r, IORING_OP_RECV, sv[0], 11102);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->ioprio = IORING_RECVSEND_FIXED_BUF;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EINVAL);
+	/* Only buffer group 0 exists. */
+	sqe = ring_prep(r, IORING_OP_RECV, sv[0], 11103);
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	sqe->buf_group = 1;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -ENOBUFS);
+	/* Buffer selection is RECV-only. */
+	sqe = ring_prep(r, IORING_OP_SEND, sv[0], 11104);
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EINVAL);
+	close(sv[0]);
+	close(sv[1]);
+
+	/* An out-of-range SQ array index is consumed and counted dropped. */
+	unsigned slot = r->sq_tail & r->sq_mask;
+	unsigned dropped = atomic_load(r->sq_kdropped);
+	r->sq_array[slot] = 0xffff;
+	(void)ring_prep(r, IORING_OP_NOP, -1, 11105);
+	ring_push_sqe(r);
+	assert(kqring_enter(r->fd, 1, 0, 0, NULL, 0) == 0);
+	assert(ring_pending(r) == 0);
+	assert(ring_cq_ready(r) == 0);
+	assert(atomic_load(r->sq_kdropped) == dropped + 1);
+	r->sq_array[slot] = slot;
+
+	printf("[PASS] SQE flags/ioprio/buf_group validated, bad index "
+	    "-> sq_dropped\n");
+}
+
+static void
+test_enter_validation(struct test_ring *r)
+{
+	struct __kernel_timespec ts = { .tv_nsec = 1000000 };
+	struct io_uring_getevents_arg ga = {
+		.ts = (uint64_t)(uintptr_t)&ts,
+	};
+	static const unsigned bad_flags[] = {
+		IORING_ENTER_SQ_WAKEUP, IORING_ENTER_SQ_WAIT,
+		IORING_ENTER_REGISTERED_RING, 1U << 9,
+	};
+
+	/* A rejected enter must not consume the pending SQE. */
+	(void)ring_prep(r, IORING_OP_NOP, -1, 12000);
+	ring_push_sqe(r);
+	for (size_t i = 0; i < sizeof(bad_flags) / sizeof(bad_flags[0]); i++)
+		assert(kqring_enter(r->fd, 1, 0, bad_flags[i], NULL, 0) == -1 &&
+		    errno == EINVAL);
+	/* Without EXT_ARG, arg would be a sigmask. */
+	assert(kqring_enter(r->fd, 1, 1, IORING_ENTER_GETEVENTS, &ga,
+	    sizeof(ga)) == -1 && errno == EINVAL);
+	/* Wrong argsz, a sigmask, or nonzero pad (min_wait_usec). */
+	assert(kqring_enter(r->fd, 1, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
+	    sizeof(ga) - 1) == -1 && errno == EINVAL);
+	sigset_t set;
+	sigemptyset(&set);
+	ga.sigmask = (uint64_t)(uintptr_t)&set;
+	ga.sigmask_sz = sizeof(set);
+	assert(kqring_enter(r->fd, 1, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
+	    sizeof(ga)) == -1 && errno == EINVAL);
+	ga.sigmask = 0;
+	ga.sigmask_sz = 0;
+	ga.pad = 1;
+	assert(kqring_enter(r->fd, 1, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
+	    sizeof(ga)) == -1 && errno == EINVAL);
+	assert(ring_pending(r) == 1);
+	assert(ring_cq_ready(r) == 0);
+
+	ga.pad = 0;
+	assert(kqring_enter(r->fd, 1, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
+	    sizeof(ga)) == 1);
+	assert(ring_pop_cqe(r).user_data == 12000);
+	printf("[PASS] ENTER flags/EXT_ARG validated before consuming SQEs\n");
 }
 
 static void
@@ -1271,6 +1432,8 @@ main(int argc, char **argv)
 		test_timeout(&r);
 		test_single_issuer(&r);
 		test_setup_errors();
+		test_sqe_validation(&r);
+		test_enter_validation(&r);
 		test_poll_add(&r);
 		test_cancel(&r);
 		test_futex_wait(&r);
