@@ -1,0 +1,16 @@
+# FreeBSD kernel module build artifacts
+*.o
+*.ko
+*.kld
+*.full
+*.debug
+.depend*
+@
+machine
+x86
+export_syms
+
+# Test binaries & logs
+tests/kqring_test
+*.log
+vmcore.*
