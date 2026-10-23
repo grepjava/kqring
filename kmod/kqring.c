@@ -118,6 +118,8 @@ MALLOC_DECLARE(M_FADVISE);
  * have not completed; past it submission fails with -ENOMEM.
  */
 #define KQRING_MAX_ARG_BYTES	(32U * 1024 * 1024)
+/* Live requests (armed, ready, deferred, or linked) per ring. */
+#define KQRING_MAX_REQS		32768U
 /* Registered resources, with io_uring's limits. */
 #define KQRING_MAX_FILES	(1U << 20)	/* also RLIMIT_NOFILE */
 #define KQRING_MAX_BUFS		(1U << 14)
@@ -305,6 +307,8 @@ struct kqring_proc_rings {
 
 static LIST_HEAD(kqring_proc_list, kqring_proc_rings)
     kqring_proc_hash[KQRING_PROC_HASH];
+static LIST_HEAD(, kqring_ctx) kqring_ctx_list =
+    LIST_HEAD_INITIALIZER(kqring_ctx_list);
 static struct mtx kqring_proc_mtx;
 static uint32_t kqring_live_workers;
 static eventhandler_tag kqring_exit_tag;
@@ -455,13 +459,16 @@ struct kqring_restrictions {
  * devfs_set_cdevpriv(9).
  */
 struct kqring_ctx {
+	LIST_ENTRY(kqring_ctx)	proc_link;	/* kqring_ctx_list; proc_mtx */
 	struct mtx		mtx;
 	volatile u_int		refs;		/* open fd + running workers */
 	bool			setup_busy;	/* KQRING_IOC_SETUP running */
 	bool			setup_done;
 	bool			enabled;
 	bool			closing;
-	struct thread		*owner_td;	/* SINGLE_ISSUER owner */
+	bool			in_ctx_list;
+	struct proc		*owner_proc;	/* SINGLE_ISSUER process */
+	lwpid_t			owner_tid;	/* SINGLE_ISSUER thread ID */
 
 	uint32_t		flags;
 	uint32_t		sq_entries;
@@ -617,6 +624,27 @@ static bool kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op,
 static void kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
     uint32_t *submitted_out);
 static int  kqring_sqpoll_start(struct kqring_ctx *ctx, struct thread *td);
+
+static inline void
+kqring_set_owner(struct kqring_ctx *ctx, struct thread *td)
+{
+	ctx->owner_proc = td->td_proc;
+	ctx->owner_tid = td->td_tid;
+}
+
+static inline void
+kqring_clear_owner(struct kqring_ctx *ctx)
+{
+	ctx->owner_proc = NULL;
+	ctx->owner_tid = 0;
+}
+
+static inline bool
+kqring_is_owner(const struct kqring_ctx *ctx, const struct thread *td)
+{
+	return (ctx->owner_proc == td->td_proc &&
+	    ctx->owner_tid == td->td_tid);
+}
 
 /* ============================================================================
  * Shared Memory Allocation (Wired VM Objects + Kernel Virtual Address Mapping)
@@ -5879,6 +5907,45 @@ kqring_prep_sockaddr(struct kqring_op *op, uint64_t uaddr, uint64_t len)
 	return (0);
 }
 
+static int
+kqring_check_scm_rights(void *ctl, size_t ctllen)
+{
+	struct thread *td = curthread;
+	uint8_t *p = ctl;
+	size_t rem = ctllen;
+
+	while (rem >= sizeof(struct cmsghdr)) {
+		struct cmsghdr *cm = (void *)p;
+		size_t clen = cm->cmsg_len, alen;
+
+		if (clen < sizeof(struct cmsghdr) || clen > rem)
+			break;
+		if (cm->cmsg_level == SOL_SOCKET &&
+		    cm->cmsg_type == SCM_RIGHTS) {
+			const int *fds = (const int *)CMSG_DATA(cm);
+			size_t nfds = (clen - CMSG_LEN(0)) / sizeof(int);
+
+			for (size_t i = 0; i < nfds; i++) {
+				struct file *fp;
+				bool is_ring;
+
+				if (fget(td, fds[i], &cap_no_rights, &fp) != 0)
+					continue;
+				is_ring = kqring_fp_is_ring(fp);
+				fdrop(fp, td);
+				if (is_ring)
+					return (EINVAL);
+			}
+		}
+		alen = CMSG_ALIGN(clen);
+		if (alen < clen || alen >= rem)
+			break;
+		p += alen;
+		rem -= alen;
+	}
+	return (0);
+}
+
 /*
  * SENDMSG(_ZC) / RECVMSG: copy the msghdr and its iovec, and for a send
  * the name and control data too.  A receive's name and control buffers
@@ -5939,6 +6006,9 @@ kqring_prep_msg(struct kqring_op *op, bool is_send)
 	if (ctllen != 0) {
 		ma->msg.msg_control = (char *)ma->iov + iovsz;
 		error = copyin(msg.msg_control, ma->msg.msg_control, ctllen);
+		if (error != 0)
+			return (error);
+		error = kqring_check_scm_rights(ma->msg.msg_control, ctllen);
 		if (error != 0)
 			return (error);
 	} else {
@@ -6312,6 +6382,8 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 
 	if ((sqe->flags & ~KQRING_SQE_FLAGS) != 0)
 		return (EINVAL);
+	if (ctx->nreqs > KQRING_MAX_REQS)
+		return (EBUSY);
 	if (ctx->restricted && !kqring_restriction_ok(ctx, sqe))
 		return (EACCES);
 	if ((ctx->flags & IORING_SETUP_IOPOLL) != 0 &&
@@ -7953,10 +8025,10 @@ kqring_ctx_rele(struct kqring_ctx *ctx)
 }
 
 static void
-kqring_dtor(void *data)
+kqring_ctx_cancel_all(struct kqring_ctx *ctx)
 {
-	struct kqring_ctx *ctx = data;
 	struct kqring_op *op;
+	struct kqring_wq *wq;
 
 	/* closing stops upcalls, workers and callouts from queueing taskwork. */
 	mtx_lock(&ctx->mtx);
@@ -7974,9 +8046,33 @@ kqring_dtor(void *data)
 			kqring_req_destroy(ctx, op);
 		mtx_lock(&ctx->mtx);
 	}
-	mtx_unlock(&ctx->mtx);
-	kqring_wq_put(ctx->wq);
+	wq = ctx->wq;
 	ctx->wq = NULL;
+	mtx_unlock(&ctx->mtx);
+	kqring_wq_put(wq);
+	while ((op = TAILQ_FIRST(&ctx->ready_q)) != NULL) {
+		TAILQ_REMOVE(&ctx->ready_q, op, q_link);
+		kqring_req_destroy(ctx, op);
+	}
+	while ((op = TAILQ_FIRST(&ctx->defer_q)) != NULL) {
+		TAILQ_REMOVE(&ctx->defer_q, op, q_link);
+		kqring_req_destroy(ctx, op);
+	}
+}
+
+static void
+kqring_dtor(void *data)
+{
+	struct kqring_ctx *ctx = data;
+
+	mtx_lock(&kqring_proc_mtx);
+	if (ctx->in_ctx_list) {
+		LIST_REMOVE(ctx, proc_link);
+		ctx->in_ctx_list = false;
+	}
+	mtx_unlock(&kqring_proc_mtx);
+
+	kqring_ctx_cancel_all(ctx);
 	kqring_ctx_rele(ctx);
 }
 
@@ -8013,8 +8109,13 @@ kqring_open(struct cdev *dev __unused, int oflags __unused, int devtype __unused
 		sx_destroy(&ctx->bg_sx);
 		mtx_destroy(&ctx->mtx);
 		free(ctx, M_KQRING);
+		return (error);
 	}
-	return (error);
+	mtx_lock(&kqring_proc_mtx);
+	ctx->in_ctx_list = true;
+	LIST_INSERT_HEAD(&kqring_ctx_list, ctx, proc_link);
+	mtx_unlock(&kqring_proc_mtx);
+	return (0);
 }
 
 static uint32_t
@@ -8175,7 +8276,7 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	}
 	ctx->enabled = (p.flags & IORING_SETUP_R_DISABLED) == 0;
 	if (ctx->enabled)
-		ctx->owner_td = td;
+		kqring_set_owner(ctx, td);
 
 	ctx->shm->sq_ring_mask = ctx->sq_mask;
 	ctx->shm->sq_ring_entries = sq_entries;
@@ -8226,7 +8327,7 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 		ctx->cqes = NULL;
 		ctx->sqes = NULL;
 		ctx->enabled = false;
-		ctx->owner_td = NULL;
+		kqring_clear_owner(ctx);
 		kqring_wq_put(attach_wq);
 		return (error);
 	}
@@ -8678,9 +8779,9 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	bool wait;
 	int error = 0;
 
-	if (!ctx->setup_done || !ctx->enabled)
+	if (!ctx->setup_done || !ctx->enabled || ctx->closing)
 		return (EBADF);
-	if (ctx->owner_td != td)
+	if (!kqring_is_owner(ctx, td))
 		return (EEXIST); /* SINGLE_ISSUER violation */
 
 	/* SQ_WAKEUP/SQ_WAIT need SQPOLL. */
@@ -9105,7 +9206,27 @@ static void
 kqring_proc_exec(void *arg __unused, struct proc *p,
     struct image_params *imgp __unused)
 {
+	struct kqring_ctx *ctx;
+
 	kqring_proc_clear(p);
+	for (;;) {
+		mtx_lock(&kqring_proc_mtx);
+		LIST_FOREACH(ctx, &kqring_ctx_list, proc_link) {
+			if ((ctx->owner_proc == p ||
+			    (ctx->wq != NULL && ctx->wq->proc == p)) &&
+			    !ctx->closing) {
+				ctx->in_ctx_list = false;
+				LIST_REMOVE(ctx, proc_link);
+				refcount_acquire(&ctx->refs);
+				break;
+			}
+		}
+		mtx_unlock(&kqring_proc_mtx);
+		if (ctx == NULL)
+			break;
+		kqring_ctx_cancel_all(ctx);
+		kqring_ctx_rele(ctx);
+	}
 }
 
 static int
@@ -9291,7 +9412,7 @@ kqring_bufs_clone(struct kqring_ctx *ctx, const struct kqring_register_arg *ra)
 	error = kqring_fp_ctx(fp, &sctx);
 	if (error == 0 && sctx == ctx)
 		error = EINVAL;
-	else if (error == 0 && sctx->owner_td != td)
+	else if (error == 0 && !kqring_is_owner(sctx, td))
 		error = EEXIST;
 	else if (error == 0 && sctx->bufs == NULL)
 		error = ENXIO;
@@ -10007,7 +10128,7 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 			mtx_unlock(&ctx->mtx);
 			return (EINVAL);
 		}
-		ctx->owner_td = td;
+		kqring_set_owner(ctx, td);
 		ctx->enabled = true;
 		ctx->restricted = ctx->rst.registered;
 		mtx_unlock(&ctx->mtx);
@@ -10016,7 +10137,7 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 			if (error != 0) {
 				mtx_lock(&ctx->mtx);
 				ctx->enabled = false;
-				ctx->owner_td = NULL;
+				kqring_clear_owner(ctx);
 				mtx_unlock(&ctx->mtx);
 				return (error);
 			}
@@ -10167,7 +10288,7 @@ kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
 	bool busy = false;
 	int error;
 
-	if (!ctx->setup_done)
+	if (!ctx->setup_done || ctx->closing)
 		return (EBADF);
 	if (ctx->restricted && (ra->opcode >= 256 ||
 	    !kqring_bit_isset(ctx->rst.register_op, ra->opcode)))
@@ -10181,8 +10302,12 @@ kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
 	}
 
 	mtx_lock(&ctx->mtx);
+	if (ctx->closing) {
+		mtx_unlock(&ctx->mtx);
+		return (EBADF);
+	}
 	if (ctx->enabled) {
-		if (ctx->owner_td != td) {
+		if (!kqring_is_owner(ctx, td)) {
 			mtx_unlock(&ctx->mtx);
 			return (EEXIST);	/* SINGLE_ISSUER violation */
 		}

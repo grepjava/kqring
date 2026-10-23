@@ -4,23 +4,28 @@
  * Copyright (c) 2026 The kqring Authors
  *
  * kqring: A memory-mapped Submission/Completion Ring and Provided Buffer Ring
- * (PBUF_RING) driver for FreeBSD, implementing the safe SINGLE_ISSUER |
+ * (PBUF_RING) driver for FreeBSD, implementing the SINGLE_ISSUER |
  * DEFER_TASKRUN subset of the Linux io_uring ABI.
  *
  * Security & Design Invariants:
- *   1. SINGLE_ISSUER identifies the userspace issuer. Without SQPOLL, that
- *      thread submits, drains taskwork, posts CQEs and changes resource
- *      tables. With SQPOLL, an in-process kernel thread also does this work;
- *      sq_sx serializes it with enter and registration.
+ *   1. SINGLE_ISSUER identifies the userspace issuer by kernel thread ID
+ *      (lwpid_t) and process. Without SQPOLL, that thread submits, drains
+ *      taskwork, posts CQEs and changes resource tables. With SQPOLL, an
+ *      in-process kernel thread also does this work; sq_sx serializes it with
+ *      enter and registration.
  *   2. In-process worker kthreads share the process address space and file
  *      descriptor table. Requests retain resource and credential references.
  *      Workers execute I/O and queue results; the serialized issuer posts
  *      CQEs and releases request resources. Cancellation of running I/O is
- *      deferred until worker release; teardown waits for that release.
+ *      deferred until worker release; ring close detaches running workers and
+ *      defers final context/pool deallocation until the last worker returns
+ *      (module unload drains any remaining workers). execve(2) cancels and
+ *      disarms open rings in the calling process.
  *   3. Fixed slots retain file references and Capsicum rights. Rings are
- *      rejected from fixed tables; registered-ring descriptors separately
- *      retain ring file references until unregister, exec or process exit.
- *      Ordinary descriptors are resolved with rights checks when used.
+ *      rejected from fixed tables and SCM_RIGHTS control messages;
+ *      registered-ring descriptors separately retain ring file references
+ *      until unregister, exec or process exit. Ordinary descriptors are
+ *      resolved with rights checks when used.
  *   4. User I/O buffers are not pinned: registered buffers are checked
  *      address ranges, accessed through copyin/copyout or uiomove in process
  *      context. Kernel-allocated ring VM objects are wired and referenced
