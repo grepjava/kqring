@@ -132,9 +132,11 @@ MALLOC_DECLARE(M_FADVISE);
 /* io_uring_params flags accepted by KQRING_IOC_SETUP. */
 #define	KQRING_SETUP_FLAGS						\
 	(IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP |			\
-	IORING_SETUP_R_DISABLED | IORING_SETUP_SUBMIT_ALL |		\
-	IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG |		\
-	IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)
+	IORING_SETUP_ATTACH_WQ | IORING_SETUP_R_DISABLED |		\
+	IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN |		\
+	IORING_SETUP_TASKRUN_FLAG | IORING_SETUP_SQE128 |		\
+	IORING_SETUP_CQE32 | IORING_SETUP_SINGLE_ISSUER |		\
+	IORING_SETUP_DEFER_TASKRUN)
 
 /* KQRING_IOC_ENTER flags implemented. */
 #define	KQRING_ENTER_FLAGS	(IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG)
@@ -246,6 +248,7 @@ struct kqring_op {
 	struct kqring_rsrc	*fbuf;
 	struct ucred		*cred;
 	struct io_uring_sqe	sqe;
+	uint8_t			sqe_extra[64];
 };
 
 TAILQ_HEAD(kqring_op_list, kqring_op);
@@ -281,11 +284,13 @@ static struct mtx kqring_futex_mtx;
  */
 struct kqring_rcqe {
 	STAILQ_ENTRY(kqring_rcqe) link;
-	struct io_uring_cqe	cqe;
 	struct file		*fp;
 	struct filecaps		caps;
 	uint32_t		file_index;
 	bool			skip_cqe;
+	bool			has_extra;
+	struct io_uring_cqe	cqe;
+	uint64_t		extra[2];
 };
 
 /*
@@ -373,6 +378,32 @@ struct kqring_sel {
 struct kqring_ocqe {
 	STAILQ_ENTRY(kqring_ocqe) link;
 	struct io_uring_cqe	cqe;
+	uint64_t		extra[2];
+};
+
+/*
+ * In-process worker thread pool (kthread_add into curproc), refcounted
+ * so rings in the same process can share it via IORING_SETUP_ATTACH_WQ.
+ * Lock order: ctx->mtx -> wq->mtx.
+ */
+struct kqring_wq {
+	struct mtx		mtx;
+	uint32_t		refs;
+	bool			closing;
+	struct proc		*proc;
+	struct {
+		struct kqring_wq *wq;
+		int		type;
+	} arg[KQRING_WQ_TYPES];
+	struct kqring_op_list	ops[KQRING_WQ_TYPES];
+	uint32_t		max[KQRING_WQ_TYPES];
+	uint32_t		total[KQRING_WQ_TYPES];
+	uint32_t		busy[KQRING_WQ_TYPES];
+	uint32_t		pending[KQRING_WQ_TYPES];
+	struct cpuset		*base_cpuset;
+	cpuset_t		cpumask;
+	bool			aff_set;
+	uint32_t		aff_gen;
 };
 
 /* IORING_REGISTER_RESTRICTIONS, in force once the ring is enabled. */
@@ -421,26 +452,8 @@ struct kqring_ctx {
 	uint32_t		nprovided;	/* PROVIDE_BUFFERS buffers held */
 	size_t			ring_mem;	/* IOU_PBUF_RING_MMAP rings */
 
-	/*
-	 * In-process worker thread pool (kthread_add into curproc; under mtx).
-	 * Workers run blocking and IOSQE_ASYNC requests with the owner's
-	 * vmspace and descriptor table, then queue completions on
-	 * taskwork_ops so only the owner touches CQEs and resource tables.
-	 */
-	struct {
-		struct kqring_ctx	*ctx;
-		int			type;
-	} wq_arg[KQRING_WQ_TYPES];
-	struct kqring_op_list	wq_ops[KQRING_WQ_TYPES];
-	uint32_t		wq_max[KQRING_WQ_TYPES];
-	uint32_t		wq_total[KQRING_WQ_TYPES];
-	uint32_t		wq_busy[KQRING_WQ_TYPES];
-	uint32_t		wq_pending[KQRING_WQ_TYPES];
-	uint32_t		wq_inflight;	/* ops queued or running */
-	struct cpuset		*wq_base_cpuset;
-	cpuset_t		wq_cpumask;
-	bool			wq_aff_set;
-	uint32_t		wq_aff_gen;
+	/* In-process worker thread pool (shared with IORING_SETUP_ATTACH_WQ). */
+	struct kqring_wq	*wq;
 
 	/*
 	 * Registered files and buffers (owner thread only).  A NULL slot is
@@ -642,17 +655,30 @@ kqring_free_shm(vm_object_t obj, vm_offset_t kva, size_t alloc_len)
 
 /* Copy one CQE into the CQ ring; false if the ring is full. */
 static bool
-kqring_cq_push(struct kqring_ctx *ctx, const struct io_uring_cqe *src)
+kqring_cq_push(struct kqring_ctx *ctx, const struct io_uring_cqe *src,
+    const uint64_t *extra)
 {
 	struct kqring_shm_header *shm = ctx->shm;
+	struct io_uring_cqe *dst;
 	uint32_t tail, head;
+	size_t shift = (ctx->flags & IORING_SETUP_CQE32) != 0 ? 1 : 0;
 
 	head = atomic_load_acq_32(&shm->cq_head);
 	tail = shm->cq_tail;
 	if (tail - head >= ctx->cq_entries)
 		return (false);
 
-	ctx->cqes[tail & ctx->cq_mask] = *src;
+	dst = &ctx->cqes[(tail & ctx->cq_mask) << shift];
+	*dst = *src;
+	if (shift != 0) {
+		if (extra != NULL) {
+			dst->big_cqe[0] = extra[0];
+			dst->big_cqe[1] = extra[1];
+		} else {
+			dst->big_cqe[0] = 0;
+			dst->big_cqe[1] = 0;
+		}
+	}
 	atomic_store_rel_32(&shm->cq_tail, tail + 1);
 	return (true);
 }
@@ -666,7 +692,7 @@ kqring_flush_overflow(struct kqring_ctx *ctx)
 	if (STAILQ_EMPTY(&ctx->ocq))
 		return;
 	while ((ocqe = STAILQ_FIRST(&ctx->ocq)) != NULL) {
-		if (!kqring_cq_push(ctx, &ocqe->cqe))
+		if (!kqring_cq_push(ctx, &ocqe->cqe, ocqe->extra))
 			return;
 		STAILQ_REMOVE_HEAD(&ctx->ocq, link);
 		ctx->nocq--;
@@ -684,8 +710,8 @@ kqring_flush_overflow(struct kqring_ctx *ctx)
  * advances the sequence that completion-count TIMEOUTs wait on.
  */
 static void
-kqring_post_cqe_uncounted(struct kqring_ctx *ctx, uint64_t user_data,
-    int32_t res, uint32_t flags)
+kqring_post_cqe_extra(struct kqring_ctx *ctx, uint64_t user_data,
+    int32_t res, uint32_t flags, const uint64_t *extra)
 {
 	struct io_uring_cqe cqe = {
 		.user_data = user_data,
@@ -697,18 +723,29 @@ kqring_post_cqe_uncounted(struct kqring_ctx *ctx, uint64_t user_data,
 	/* The eventfd is signalled once per enter; see kqring_evfd_flush(). */
 	if (!ctx->evfd_async || !ctx->submitting)
 		ctx->evfd_cqes++;
-	if (STAILQ_EMPTY(&ctx->ocq) && kqring_cq_push(ctx, &cqe))
+	if (STAILQ_EMPTY(&ctx->ocq) && kqring_cq_push(ctx, &cqe, extra))
 		return;
 
 	if (ctx->nocq >= KQRING_MAX_OVERFLOW) {
 		atomic_add_32(&ctx->shm->cq_overflow, 1);
 		return;
 	}
-	ocqe = malloc(sizeof(*ocqe), M_KQRING, M_WAITOK);
+	ocqe = malloc(sizeof(*ocqe), M_KQRING, M_WAITOK | M_ZERO);
 	ocqe->cqe = cqe;
+	if (extra != NULL) {
+		ocqe->extra[0] = extra[0];
+		ocqe->extra[1] = extra[1];
+	}
 	STAILQ_INSERT_TAIL(&ctx->ocq, ocqe, link);
 	ctx->nocq++;
 	atomic_set_32(&ctx->shm->sq_flags, IORING_SQ_CQ_OVERFLOW);
+}
+
+static void
+kqring_post_cqe_uncounted(struct kqring_ctx *ctx, uint64_t user_data,
+    int32_t res, uint32_t flags)
+{
+	kqring_post_cqe_extra(ctx, user_data, res, flags, NULL);
 }
 
 static void
@@ -1086,6 +1123,7 @@ static void
 kqring_op_disarm_locked(struct kqring_op *op)
 {
 	struct kqring_ctx *ctx = op->ctx;
+	struct kqring_wq *wq = ctx->wq;
 	struct socket *so = op->so;
 
 	mtx_assert(&ctx->mtx, MA_OWNED);
@@ -1093,18 +1131,25 @@ kqring_op_disarm_locked(struct kqring_op *op)
 		op->polled = false;
 		ctx->npolled--;
 	}
-	if (op->wq_queued) {
-		TAILQ_REMOVE(&ctx->wq_ops[op->wq_type], op, wq_link);
-		op->wq_queued = false;
-		ctx->wq_pending[op->wq_type]--;
-		ctx->wq_inflight--;
-	}
-	while (op->wq_running) {
-		op->wq_canceled = true;
-		wakeup(&op->in_taskwork);
-		kqring_wq_abort_td(op->wq_td);
-		msleep_sbt(&op->wq_running, &ctx->mtx, 0, "kqwqcn",
-		    SBT_1MS, 0, 0);
+	if (wq != NULL) {
+		mtx_lock(&wq->mtx);
+		if (op->wq_queued) {
+			TAILQ_REMOVE(&wq->ops[op->wq_type], op, wq_link);
+			op->wq_queued = false;
+			wq->pending[op->wq_type]--;
+		}
+		while (op->wq_running) {
+			op->wq_canceled = true;
+			wakeup(&op->in_taskwork);
+			kqring_wq_abort_td(op->wq_td);
+			mtx_unlock(&ctx->mtx);
+			msleep_sbt(&op->wq_running, &wq->mtx, 0, "kqwqcn",
+			    SBT_1MS, 0, 0);
+			mtx_unlock(&wq->mtx);
+			mtx_lock(&ctx->mtx);
+			mtx_lock(&wq->mtx);
+		}
+		mtx_unlock(&wq->mtx);
 	}
 	op->wq_wait_ready = false;
 	kqring_timer_stop_locked(op);
@@ -5296,6 +5341,10 @@ kqring_msg_ring(struct kqring_ctx *ctx, const struct kqring_op *op)
 		rc->cqe.res = (int32_t)sqe->len;
 		rc->cqe.flags = (sqe->msg_ring_flags &
 		    IORING_MSG_RING_FLAGS_PASS) != 0 ? sqe->file_index : 0;
+		if ((ctx->flags & IORING_SETUP_SQE128) != 0) {
+			memcpy(rc->extra, op->sqe_extra, sizeof(rc->extra));
+			rc->has_extra = true;
+		}
 	}
 	if (error == 0)
 		error = kqring_rcqe_queue(tctx, rc);
@@ -6700,30 +6749,75 @@ kqring_op_is_socket(const struct kqring_op *op)
  * ============================================================================
  */
 
+static struct kqring_wq *
+kqring_wq_alloc(struct thread *td)
+{
+	struct kqring_wq *wq;
+
+	wq = malloc(sizeof(*wq), M_KQRING, M_WAITOK | M_ZERO);
+	mtx_init(&wq->mtx, "kqring wq", NULL, MTX_DEF);
+	wq->refs = 1;
+	wq->proc = td->td_proc;
+	for (int t = 0; t < KQRING_WQ_TYPES; t++) {
+		wq->arg[t].wq = wq;
+		wq->arg[t].type = t;
+		TAILQ_INIT(&wq->ops[t]);
+	}
+	wq->max[IO_WQ_BOUND] = MIN((uint32_t)mp_ncpus * 4,
+	    KQRING_WQ_MAX_WORKERS);
+	wq->max[IO_WQ_UNBOUND] = KQRING_WQ_MAX_WORKERS;
+	wq->base_cpuset = cpuset_ref(td->td_cpuset);
+	return (wq);
+}
+
+static void
+kqring_wq_put(struct kqring_wq *wq)
+{
+	if (wq == NULL)
+		return;
+	mtx_lock(&wq->mtx);
+	KASSERT(wq->refs > 0, ("kqring: wq refcount underflow"));
+	if (--wq->refs != 0) {
+		mtx_unlock(&wq->mtx);
+		return;
+	}
+	wq->closing = true;
+	for (int t = 0; t < KQRING_WQ_TYPES; t++) {
+		wakeup(&wq->ops[t]);
+		while (wq->total[t] > 0)
+			msleep(&wq->total[t], &wq->mtx, 0, "kqwqdr", 0);
+	}
+	mtx_unlock(&wq->mtx);
+	if (wq->base_cpuset != NULL)
+		cpuset_rel(wq->base_cpuset);
+	mtx_destroy(&wq->mtx);
+	free(wq, M_KQRING);
+}
+
 /*
  * Handle process-wide stop/single-threading requests (fork, execve,
  * exit1, SIGSTOP) on an in-process worker kthread.  Called with
- * ctx->mtx held; returns true if the process is exiting or exec'ing
+ * wq->mtx held; returns true if the process is exiting or exec'ing
  * and the caller must kthread_exit().
  */
 static bool
-kqring_wq_check_suspend(struct kqring_ctx *ctx)
+kqring_wq_check_suspend(struct kqring_wq *wq)
 {
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
 
-	mtx_assert(&ctx->mtx, MA_OWNED);
+	mtx_assert(&wq->mtx, MA_OWNED);
 	if (!P_SHOULDSTOP(p) && (p->p_flag2 & P2_WEXIT) == 0 &&
 	    !td_ast_pending(td, TDA_SUSPEND))
 		return (false);
-	mtx_unlock(&ctx->mtx);
+	mtx_unlock(&wq->mtx);
 	PROC_LOCK(p);
 	while (thread_suspend_check_needed() ||
 	    (p->p_flag2 & P2_WEXIT) != 0) {
 		if ((p->p_flag & P_SINGLE_EXIT) != 0 ||
 		    (p->p_flag2 & P2_WEXIT) != 0) {
 			PROC_UNLOCK(p);
-			mtx_lock(&ctx->mtx);
+			mtx_lock(&wq->mtx);
 			return (true);
 		}
 		PROC_SLOCK(p);
@@ -6750,30 +6844,30 @@ kqring_wq_check_suspend(struct kqring_ctx *ctx)
 		PROC_LOCK(p);
 	}
 	PROC_UNLOCK(p);
-	mtx_lock(&ctx->mtx);
+	mtx_lock(&wq->mtx);
 	return (false);
 }
 
 static void
-kqring_wq_apply_affinity(struct kqring_ctx *ctx, uint32_t *genp)
+kqring_wq_apply_affinity(struct kqring_wq *wq, uint32_t *genp)
 {
 	cpuset_t mask;
 	uint32_t gen;
 
-	mtx_lock(&ctx->mtx);
-	gen = ctx->wq_aff_gen;
+	mtx_lock(&wq->mtx);
+	gen = wq->aff_gen;
 	if (gen == *genp && gen != 0) {
-		mtx_unlock(&ctx->mtx);
+		mtx_unlock(&wq->mtx);
 		return;
 	}
-	if (ctx->wq_aff_set)
-		CPU_COPY(&ctx->wq_cpumask, &mask);
-	else if (ctx->wq_base_cpuset != NULL)
-		CPU_COPY(&ctx->wq_base_cpuset->cs_mask, &mask);
+	if (wq->aff_set)
+		CPU_COPY(&wq->cpumask, &mask);
+	else if (wq->base_cpuset != NULL)
+		CPU_COPY(&wq->base_cpuset->cs_mask, &mask);
 	else
 		CPU_COPY(&all_cpus, &mask);
 	*genp = gen;
-	mtx_unlock(&ctx->mtx);
+	mtx_unlock(&wq->mtx);
 	(void)cpuset_setthread(curthread->td_tid, &mask);
 }
 
@@ -6796,13 +6890,14 @@ static void
 kqring_wq_thread(void *arg)
 {
 	struct {
-		struct kqring_ctx	*ctx;
+		struct kqring_wq	*wq;
 		int			type;
 	} *wa = arg;
-	struct kqring_ctx *ctx = wa->ctx;
+	struct kqring_wq *wq = wa->wq;
 	int type = wa->type;
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
+	struct kqring_ctx *ctx;
 	struct kqring_op *op;
 	uint32_t aff_gen = UINT32_MAX;
 	int error;
@@ -6817,77 +6912,79 @@ kqring_wq_thread(void *arg)
 	SIG_CANTMASK(td->td_sigmask);
 	PROC_UNLOCK(p);
 
-	kqring_wq_apply_affinity(ctx, &aff_gen);
+	kqring_wq_apply_affinity(wq, &aff_gen);
 
-	mtx_lock(&ctx->mtx);
+	mtx_lock(&wq->mtx);
 	for (;;) {
-		if (ctx->closing || kqring_wq_check_suspend(ctx))
+		if (wq->closing || kqring_wq_check_suspend(wq))
 			break;
-		if (ctx->wq_total[type] > ctx->wq_max[type])
+		if (wq->total[type] > wq->max[type])
 			break;
-		if (aff_gen != ctx->wq_aff_gen) {
-			mtx_unlock(&ctx->mtx);
-			kqring_wq_apply_affinity(ctx, &aff_gen);
-			mtx_lock(&ctx->mtx);
+		if (aff_gen != wq->aff_gen) {
+			mtx_unlock(&wq->mtx);
+			kqring_wq_apply_affinity(wq, &aff_gen);
+			mtx_lock(&wq->mtx);
 			continue;
 		}
-		op = TAILQ_FIRST(&ctx->wq_ops[type]);
+		op = TAILQ_FIRST(&wq->ops[type]);
 		if (op != NULL) {
-			TAILQ_REMOVE(&ctx->wq_ops[type], op, wq_link);
+			TAILQ_REMOVE(&wq->ops[type], op, wq_link);
 			op->wq_queued = false;
-			ctx->wq_pending[type]--;
-			if (op->cancelled || op->wq_canceled) {
-				ctx->wq_inflight--;
+			wq->pending[type]--;
+			if (op->cancelled || op->wq_canceled)
 				continue;
-			}
+			ctx = op->ctx;
 			op->wq_running = true;
 			op->wq_td = td;
-			ctx->wq_busy[type]++;
-			if (ctx->wq_total[type] <
-			    ctx->wq_pending[type] + ctx->wq_busy[type] &&
-			    ctx->wq_total[type] < ctx->wq_max[type]) {
-				ctx->wq_total[type]++;
-				mtx_unlock(&ctx->mtx);
+			wq->busy[type]++;
+			if (wq->total[type] <
+			    wq->pending[type] + wq->busy[type] &&
+			    wq->total[type] < wq->max[type]) {
+				wq->total[type]++;
+				mtx_unlock(&wq->mtx);
 				if (kthread_add(kqring_wq_thread,
-				    &ctx->wq_arg[type], p, NULL, 0, 0,
+				    &wq->arg[type], p, NULL, 0, 0,
 				    "kqwq%c", type == IO_WQ_BOUND ? 'b' : 'u')
 				    != 0) {
-					mtx_lock(&ctx->mtx);
-					ctx->wq_total[type]--;
-					mtx_unlock(&ctx->mtx);
+					mtx_lock(&wq->mtx);
+					wq->total[type]--;
+					mtx_unlock(&wq->mtx);
 				}
 			} else {
-				mtx_unlock(&ctx->mtx);
+				mtx_unlock(&wq->mtx);
 			}
 
 			kqring_wq_exec_op(ctx, op);
 
 			mtx_lock(&ctx->mtx);
+			mtx_lock(&wq->mtx);
 			op->wq_running = false;
 			op->wq_td = NULL;
 			if (!op->wq_wait_ready)
 				op->wq_done = true;
-			ctx->wq_busy[type]--;
-			ctx->wq_inflight--;
+			wq->busy[type]--;
 			wakeup(&op->wq_running);
+			mtx_unlock(&wq->mtx);
 			if (!op->cancelled && !ctx->closing &&
 			    (op->wq_blocking || op->wq_wait_ready))
 				kqring_taskwork_add_locked(ctx, op);
 			if (ctx->sleeping)
 				wakeup(&ctx->wakeup_chan);
+			mtx_unlock(&ctx->mtx);
+			mtx_lock(&wq->mtx);
 			continue;
 		}
 
-		error = msleep_sbt(&ctx->wq_ops[type], &ctx->mtx, PCATCH,
+		error = msleep_sbt(&wq->ops[type], &wq->mtx, PCATCH,
 		    "kqwqid", KQRING_WQ_IDLE_SBT, 0, 0);
 		if (error == EWOULDBLOCK &&
-		    TAILQ_EMPTY(&ctx->wq_ops[type]))
+		    TAILQ_EMPTY(&wq->ops[type]))
 			break;
 	}
-	ctx->wq_total[type]--;
-	if (ctx->wq_total[type] == 0)
-		wakeup(&ctx->wq_total[type]);
-	mtx_unlock(&ctx->mtx);
+	wq->total[type]--;
+	if (wq->total[type] == 0)
+		wakeup(&wq->total[type]);
+	mtx_unlock(&wq->mtx);
 	kthread_exit();
 }
 
@@ -6980,10 +7077,16 @@ kqring_op_wq_type(const struct kqring_op *op)
 static bool
 kqring_wq_can_wait_op_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 {
+	struct kqring_wq *wq = ctx->wq;
+	bool can_wait = false;
+
 	mtx_assert(&ctx->mtx, MA_OWNED);
-	if (op->cancelled || op->wq_done || op->wq_blocking || ctx->closing)
+	if (op->cancelled || op->wq_done || op->wq_blocking || ctx->closing ||
+	    wq == NULL)
 		return (false);
+	mtx_lock(&wq->mtx);
 	if (op->wq_running) {
+		can_wait = true;
 		if (op->wq_td != NULL) {
 			bool abortable;
 
@@ -6992,23 +7095,25 @@ kqring_wq_can_wait_op_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 			thread_unlock(op->wq_td);
 			if (abortable) {
 				op->wq_blocking = true;
-				return (false);
+				can_wait = false;
 			}
 		}
-		return (true);
+	} else if (op->wq_queued &&
+	    wq->pending[op->wq_type] + wq->busy[op->wq_type] <=
+	    wq->total[op->wq_type]) {
+		can_wait = true;
+	} else if (!op->wq_done) {
+		op->wq_blocking = true;
 	}
-	if (op->wq_queued &&
-	    ctx->wq_pending[op->wq_type] + ctx->wq_busy[op->wq_type] <=
-	    ctx->wq_total[op->wq_type])
-		return (true);
-	op->wq_blocking = true;
-	return (false);
+	mtx_unlock(&wq->mtx);
+	return (can_wait);
 }
 
 static bool
 kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 {
 	struct thread *td = curthread;
+	struct kqring_wq *wq = ctx->wq;
 	bool need_spawn = false;
 
 	if (op->cred == NULL)
@@ -7017,30 +7122,31 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 	op->wq_blocking = kqring_op_will_block(op);
 
 	mtx_lock(&ctx->mtx);
+	mtx_lock(&wq->mtx);
 	op->cancelled = false;
 	op->wq_canceled = false;
 	op->wq_done = false;
 	op->wq_queued = true;
 	kqring_op_arm_locked(ctx, op);
-	TAILQ_INSERT_TAIL(&ctx->wq_ops[type], op, wq_link);
-	ctx->wq_pending[type]++;
-	ctx->wq_inflight++;
-	if (ctx->wq_total[type] < ctx->wq_pending[type] + ctx->wq_busy[type] &&
-	    ctx->wq_total[type] < ctx->wq_max[type]) {
-		ctx->wq_total[type]++;
+	TAILQ_INSERT_TAIL(&wq->ops[type], op, wq_link);
+	wq->pending[type]++;
+	if (wq->total[type] < wq->pending[type] + wq->busy[type] &&
+	    wq->total[type] < wq->max[type]) {
+		wq->total[type]++;
 		need_spawn = true;
 	}
-	wakeup_one(&ctx->wq_ops[type]);
+	wakeup_one(&wq->ops[type]);
+	mtx_unlock(&wq->mtx);
 	if (need_spawn) {
 		mtx_unlock(&ctx->mtx);
-		if (kthread_add(kqring_wq_thread, &ctx->wq_arg[type],
-		    td->td_proc, NULL, 0, 0, "kqwq%c",
+		if (kthread_add(kqring_wq_thread, &wq->arg[type],
+		    wq->proc, NULL, 0, 0, "kqwq%c",
 		    type == IO_WQ_BOUND ? 'b' : 'u') != 0) {
-			mtx_lock(&ctx->mtx);
-			ctx->wq_total[type]--;
-		} else {
-			mtx_lock(&ctx->mtx);
+			mtx_lock(&wq->mtx);
+			wq->total[type]--;
+			mtx_unlock(&wq->mtx);
 		}
+		mtx_lock(&ctx->mtx);
 	}
 	while (kqring_wq_can_wait_op_locked(ctx, op)) {
 		int error;
@@ -7152,16 +7258,18 @@ kqring_arm_nonsock_op(struct kqring_ctx *ctx, struct kqring_op *op)
 static void
 kqring_wq_rearm_ready(struct kqring_ctx *ctx, struct kqring_op *op)
 {
-	struct thread *td = curthread;
+	struct kqring_wq *wq = ctx->wq;
 	bool need_spawn = false;
 
 	mtx_lock(&ctx->mtx);
-	if (op->cancelled || ctx->closing) {
+	if (op->cancelled || ctx->closing || wq == NULL) {
 		mtx_unlock(&ctx->mtx);
 		return;
 	}
+	mtx_lock(&wq->mtx);
 	if (op->wq_running || op->wq_queued) {
 		wakeup(&op->in_taskwork);
+		mtx_unlock(&wq->mtx);
 		mtx_unlock(&ctx->mtx);
 		return;
 	}
@@ -7170,24 +7278,24 @@ kqring_wq_rearm_ready(struct kqring_ctx *ctx, struct kqring_op *op)
 	op->wq_canceled = false;
 	op->wq_done = false;
 	op->wq_queued = true;
-	TAILQ_INSERT_TAIL(&ctx->wq_ops[IO_WQ_UNBOUND], op, wq_link);
-	ctx->wq_pending[IO_WQ_UNBOUND]++;
-	ctx->wq_inflight++;
-	if (ctx->wq_total[IO_WQ_UNBOUND] <
-	    ctx->wq_pending[IO_WQ_UNBOUND] + ctx->wq_busy[IO_WQ_UNBOUND] &&
-	    ctx->wq_total[IO_WQ_UNBOUND] < ctx->wq_max[IO_WQ_UNBOUND]) {
-		ctx->wq_total[IO_WQ_UNBOUND]++;
+	TAILQ_INSERT_TAIL(&wq->ops[IO_WQ_UNBOUND], op, wq_link);
+	wq->pending[IO_WQ_UNBOUND]++;
+	if (wq->total[IO_WQ_UNBOUND] <
+	    wq->pending[IO_WQ_UNBOUND] + wq->busy[IO_WQ_UNBOUND] &&
+	    wq->total[IO_WQ_UNBOUND] < wq->max[IO_WQ_UNBOUND]) {
+		wq->total[IO_WQ_UNBOUND]++;
 		need_spawn = true;
 	}
-	wakeup_one(&ctx->wq_ops[IO_WQ_UNBOUND]);
+	wakeup_one(&wq->ops[IO_WQ_UNBOUND]);
+	mtx_unlock(&wq->mtx);
 	mtx_unlock(&ctx->mtx);
 	if (need_spawn) {
 		if (kthread_add(kqring_wq_thread,
-		    &ctx->wq_arg[IO_WQ_UNBOUND], td->td_proc, NULL, 0, 0,
+		    &wq->arg[IO_WQ_UNBOUND], wq->proc, NULL, 0, 0,
 		    "kqwqu") != 0) {
-			mtx_lock(&ctx->mtx);
-			ctx->wq_total[IO_WQ_UNBOUND]--;
-			mtx_unlock(&ctx->mtx);
+			mtx_lock(&wq->mtx);
+			wq->total[IO_WQ_UNBOUND]--;
+			mtx_unlock(&wq->mtx);
 		}
 	}
 }
@@ -7482,9 +7590,12 @@ kqring_post_remote_locked(struct kqring_ctx *ctx)
 			    &rc->caps, rc->file_index);
 			rc->fp = NULL;
 		}
-		if (!rc->skip_cqe)
-			kqring_post_cqe(ctx, rc->cqe.user_data, rc->cqe.res,
-			    rc->cqe.flags);
+		if (!rc->skip_cqe) {
+			ctx->cq_seq++;
+			kqring_post_cqe_extra(ctx, rc->cqe.user_data,
+			    rc->cqe.res, rc->cqe.flags,
+			    rc->has_extra ? rc->extra : NULL);
+		}
 		kqring_rcqe_free(rc);
 	}
 	mtx_lock(&ctx->mtx);
@@ -7558,12 +7669,9 @@ kqring_dtor(void *data)
 		kqring_req_destroy(ctx, op);
 		mtx_lock(&ctx->mtx);
 	}
-	for (int t = 0; t < KQRING_WQ_TYPES; t++) {
-		wakeup(&ctx->wq_ops[t]);
-		while (ctx->wq_total[t] > 0)
-			msleep(&ctx->wq_total[t], &ctx->mtx, 0, "kqwqdr", 0);
-	}
 	mtx_unlock(&ctx->mtx);
+	kqring_wq_put(ctx->wq);
+	ctx->wq = NULL;
 	while ((op = TAILQ_FIRST(&ctx->ready_q)) != NULL) {
 		TAILQ_REMOVE(&ctx->ready_q, op, q_link);
 		kqring_req_destroy(ctx, op);
@@ -7608,8 +7716,6 @@ kqring_dtor(void *data)
 
 	kqring_free_shm(ctx->ring_obj, ctx->ring_kva, ctx->ring_alloc_len);
 	kqring_free_shm(ctx->sqes_obj, ctx->sqes_kva, ctx->sqes_alloc_len);
-	if (ctx->wq_base_cpuset != NULL)
-		cpuset_rel(ctx->wq_base_cpuset);
 	sx_destroy(&ctx->bg_sx);
 	mtx_destroy(&ctx->mtx);
 	free(ctx, M_KQRING);
@@ -7625,15 +7731,7 @@ kqring_open(struct cdev *dev __unused, int oflags __unused, int devtype __unused
 	ctx = malloc(sizeof(*ctx), M_KQRING, M_WAITOK | M_ZERO);
 	mtx_init(&ctx->mtx, "kqring", NULL, MTX_DEF);
 	sx_init(&ctx->bg_sx, "kqring bg");
-	for (int t = 0; t < KQRING_WQ_TYPES; t++) {
-		ctx->wq_arg[t].ctx = ctx;
-		ctx->wq_arg[t].type = t;
-		TAILQ_INIT(&ctx->wq_ops[t]);
-	}
-	ctx->wq_max[IO_WQ_BOUND] = MIN((uint32_t)mp_ncpus * 4,
-	    KQRING_WQ_MAX_WORKERS);
-	ctx->wq_max[IO_WQ_UNBOUND] = KQRING_WQ_MAX_WORKERS;
-	ctx->wq_base_cpuset = cpuset_ref(td->td_cpuset);
+	ctx->wq = kqring_wq_alloc(td);
 	TAILQ_INIT(&ctx->active_ops);
 	TAILQ_INIT(&ctx->taskwork_ops);
 	TAILQ_INIT(&ctx->free_ops);
@@ -7648,8 +7746,7 @@ kqring_open(struct cdev *dev __unused, int oflags __unused, int devtype __unused
 
 	error = devfs_set_cdevpriv(ctx, kqring_dtor);
 	if (error != 0) {
-		if (ctx->wq_base_cpuset != NULL)
-			cpuset_rel(ctx->wq_base_cpuset);
+		kqring_wq_put(ctx->wq);
 		sx_destroy(&ctx->bg_sx);
 		mtx_destroy(&ctx->mtx);
 		free(ctx, M_KQRING);
@@ -7674,8 +7771,10 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
     struct thread *td)
 {
 	struct io_uring_params p;
+	struct kqring_wq *attach_wq = NULL;
 	uint32_t sq_entries, cq_entries;
 	size_t ring_bytes, sqes_bytes, array_off, cqes_off;
+	size_t cqe_shift, sqe_shift;
 	int error;
 
 	error = copyin(uarg->params, &p, sizeof(p));
@@ -7683,10 +7782,8 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 		return (error);
 
 	/*
-	 * Reject every flag kqring does not implement (SQPOLL: kqring never
-	 * spawns background kernel threads; SQE128/CQE32/NO_SQARRAY would
-	 * change the ring layout userspace uses), as io_uring_setup(2) does,
-	 * so that callers probing for a feature see EINVAL rather than a
+	 * Reject every flag kqring does not implement, as io_uring_setup(2)
+	 * does, so that callers probing for a feature see EINVAL rather than a
 	 * silently different ring.  Require SINGLE_ISSUER | DEFER_TASKRUN,
 	 * the only semantics kqring implements.  COOP_TASKRUN, TASKRUN_FLAG
 	 * and SUBMIT_ALL describe what kqring always does.
@@ -7724,15 +7821,54 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 		cq_entries = sq_entries * 2;
 	}
 
+	if ((p.flags & IORING_SETUP_ATTACH_WQ) != 0) {
+		struct kqring_ctx *wctx;
+		struct file *wfp;
+		cap_rights_t rights;
+
+		if (fget(td, (int)p.wq_fd,
+		    cap_rights_init_one(&rights, CAP_IOCTL), &wfp) != 0)
+			return (EINVAL);
+		if (kqring_fp_ctx(wfp, &wctx) != 0 || wctx == ctx) {
+			fdrop(wfp, td);
+			return (EINVAL);
+		}
+		mtx_lock(&wctx->mtx);
+		if (!wctx->setup_done || wctx->closing || wctx->wq == NULL ||
+		    wctx->wq->proc != td->td_proc) {
+			mtx_unlock(&wctx->mtx);
+			fdrop(wfp, td);
+			return (EINVAL);
+		}
+		attach_wq = wctx->wq;
+		mtx_lock(&attach_wq->mtx);
+		if (attach_wq->closing) {
+			mtx_unlock(&attach_wq->mtx);
+			mtx_unlock(&wctx->mtx);
+			fdrop(wfp, td);
+			return (EINVAL);
+		}
+		attach_wq->refs++;
+		mtx_unlock(&attach_wq->mtx);
+		mtx_unlock(&wctx->mtx);
+		fdrop(wfp, td);
+	}
+
+	cqe_shift = (p.flags & IORING_SETUP_CQE32) != 0 ? 1 : 0;
+	sqe_shift = (p.flags & IORING_SETUP_SQE128) != 0 ? 1 : 0;
 	array_off = sizeof(struct kqring_shm_header);
 	cqes_off = array_off + sq_entries * sizeof(uint32_t);
-	ring_bytes = cqes_off + cq_entries * sizeof(struct io_uring_cqe);
-	sqes_bytes = sq_entries * sizeof(struct io_uring_sqe);
+	ring_bytes = cqes_off +
+	    ((size_t)cq_entries * sizeof(struct io_uring_cqe) << cqe_shift);
+	sqes_bytes = (size_t)sq_entries * sizeof(struct io_uring_sqe) <<
+	    sqe_shift;
 
 	error = kqring_alloc_shm(ring_bytes, &ctx->ring_obj, &ctx->ring_kva,
 	    &ctx->ring_alloc_len);
-	if (error != 0)
+	if (error != 0) {
+		kqring_wq_put(attach_wq);
 		return (error);
+	}
 
 	error = kqring_alloc_shm(sqes_bytes, &ctx->sqes_obj, &ctx->sqes_kva,
 	    &ctx->sqes_alloc_len);
@@ -7740,6 +7876,7 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 		kqring_free_shm(ctx->ring_obj, ctx->ring_kva,
 		    ctx->ring_alloc_len);
 		ctx->ring_obj = NULL;
+		kqring_wq_put(attach_wq);
 		return (error);
 	}
 
@@ -7803,7 +7940,14 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 		ctx->sqes = NULL;
 		ctx->enabled = false;
 		ctx->owner_td = NULL;
+		kqring_wq_put(attach_wq);
 		return (error);
+	}
+	if (attach_wq != NULL) {
+		struct kqring_wq *old_wq = ctx->wq;
+
+		ctx->wq = attach_wq;
+		kqring_wq_put(old_wq);
 	}
 	return (0);
 }
@@ -8014,7 +8158,16 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 			continue;
 		}
 		struct kqring_op *op = kqring_op_alloc(ctx);
-		op->sqe = ctx->sqes[sqe_idx];
+		if ((ctx->flags & IORING_SETUP_SQE128) != 0) {
+			const uint8_t *raw = (const uint8_t *)ctx->sqes +
+			    (size_t)sqe_idx * 128;
+
+			memcpy(&op->sqe, raw, sizeof(op->sqe));
+			memcpy(op->sqe_extra, raw + sizeof(op->sqe),
+			    sizeof(op->sqe_extra));
+		} else {
+			op->sqe = ctx->sqes[sqe_idx];
+		}
 		op->prep_err = kqring_req_prep(op, chain_tail);
 		if (chain_head == NULL) {
 			chain_head = op;
@@ -8834,20 +8987,23 @@ static int
 kqring_iowq_aff(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
     bool set)
 {
+	struct kqring_wq *wq = ctx->wq;
 	cpuset_t mask;
 	size_t len;
 	int error;
 
+	if (wq == NULL)
+		return (EINVAL);
 	if (!set) {
 		if (ra->arg != NULL || ra->nr_args != 0)
 			return (EINVAL);
-		mtx_lock(&ctx->mtx);
-		ctx->wq_aff_set = false;
-		CPU_ZERO(&ctx->wq_cpumask);
-		ctx->wq_aff_gen++;
-		wakeup(&ctx->wq_ops[IO_WQ_BOUND]);
-		wakeup(&ctx->wq_ops[IO_WQ_UNBOUND]);
-		mtx_unlock(&ctx->mtx);
+		mtx_lock(&wq->mtx);
+		wq->aff_set = false;
+		CPU_ZERO(&wq->cpumask);
+		wq->aff_gen++;
+		wakeup(&wq->ops[IO_WQ_BOUND]);
+		wakeup(&wq->ops[IO_WQ_UNBOUND]);
+		mtx_unlock(&wq->mtx);
 		return (0);
 	}
 	if (ra->nr_args == 0 || ra->nr_args > PAGE_SIZE)
@@ -8859,19 +9015,19 @@ kqring_iowq_aff(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 	error = copyin(ra->arg, &mask, len);
 	if (error != 0)
 		return (error);
-	if (ctx->wq_base_cpuset != NULL)
-		CPU_AND(&mask, &mask, &ctx->wq_base_cpuset->cs_mask);
+	if (wq->base_cpuset != NULL)
+		CPU_AND(&mask, &mask, &wq->base_cpuset->cs_mask);
 	else
 		CPU_AND(&mask, &mask, &all_cpus);
 	if (CPU_EMPTY(&mask))
 		return (EINVAL);
-	mtx_lock(&ctx->mtx);
-	CPU_COPY(&mask, &ctx->wq_cpumask);
-	ctx->wq_aff_set = true;
-	ctx->wq_aff_gen++;
-	wakeup(&ctx->wq_ops[IO_WQ_BOUND]);
-	wakeup(&ctx->wq_ops[IO_WQ_UNBOUND]);
-	mtx_unlock(&ctx->mtx);
+	mtx_lock(&wq->mtx);
+	CPU_COPY(&mask, &wq->cpumask);
+	wq->aff_set = true;
+	wq->aff_gen++;
+	wakeup(&wq->ops[IO_WQ_BOUND]);
+	wakeup(&wq->ops[IO_WQ_UNBOUND]);
+	mtx_unlock(&wq->mtx);
 	return (0);
 }
 
@@ -8885,10 +9041,11 @@ static int
 kqring_iowq_max_workers(struct kqring_ctx *ctx,
     const struct kqring_register_arg *ra)
 {
+	struct kqring_wq *wq = ctx->wq;
 	uint32_t vals[KQRING_WQ_TYPES];
 	int error;
 
-	if (ra->nr_args != KQRING_WQ_TYPES)
+	if (wq == NULL || ra->nr_args != KQRING_WQ_TYPES)
 		return (EINVAL);
 	if (ra->arg == NULL)
 		return (EFAULT);
@@ -8897,16 +9054,16 @@ kqring_iowq_max_workers(struct kqring_ctx *ctx,
 		return (error);
 	if (vals[IO_WQ_BOUND] > INT32_MAX || vals[IO_WQ_UNBOUND] > INT32_MAX)
 		return (EINVAL);
-	mtx_lock(&ctx->mtx);
+	mtx_lock(&wq->mtx);
 	for (int t = 0; t < KQRING_WQ_TYPES; t++) {
 		if (vals[t] != 0) {
-			ctx->wq_max[t] = MIN(vals[t], KQRING_WQ_MAX_WORKERS);
-			if (ctx->wq_total[t] > ctx->wq_max[t])
-				wakeup(&ctx->wq_ops[t]);
+			wq->max[t] = MIN(vals[t], KQRING_WQ_MAX_WORKERS);
+			if (wq->total[t] > wq->max[t])
+				wakeup(&wq->ops[t]);
 		}
-		vals[t] = ctx->wq_max[t];
+		vals[t] = wq->max[t];
 	}
-	mtx_unlock(&ctx->mtx);
+	mtx_unlock(&wq->mtx);
 	return (copyout(vals, ra->arg, sizeof(vals)));
 }
 
