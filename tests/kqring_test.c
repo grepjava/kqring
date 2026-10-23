@@ -9,7 +9,9 @@
  */
 
 #include <sys/types.h>
+#include <sys/capsicum.h>
 #include <sys/event.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -49,7 +51,7 @@ struct test_ring {
 	struct io_uring_sqe	*sqes;
 	size_t			sqes_len;
 	_Atomic unsigned	*sq_khead, *sq_ktail, *sq_kflags, *sq_kdropped;
-	_Atomic unsigned	*cq_khead, *cq_ktail;
+	_Atomic unsigned	*cq_khead, *cq_ktail, *cq_kflags;
 	unsigned		*sq_array;
 	unsigned		sq_mask, cq_mask;
 	unsigned		sq_tail;
@@ -67,8 +69,9 @@ now_ns(void)
 	return ((uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec);
 }
 
+/* Set up and map a ring, still disabled (IORING_SETUP_R_DISABLED). */
 static void
-ring_init(struct test_ring *r)
+ring_setup(struct test_ring *r)
 {
 	struct io_uring_params p;
 	memset(&p, 0, sizeof(p));
@@ -110,8 +113,16 @@ ring_init(struct test_ring *r)
 
 	r->cq_khead = (_Atomic unsigned *)(base + p.cq_off.head);
 	r->cq_ktail = (_Atomic unsigned *)(base + p.cq_off.tail);
+	r->cq_kflags = (_Atomic unsigned *)(base + p.cq_off.flags);
 	r->cq_mask = *(unsigned *)(base + p.cq_off.ring_mask);
 	r->cqes = (struct io_uring_cqe *)(base + p.cq_off.cqes);
+}
+
+/* A ring enabled in this thread, with buffer ring group 0. */
+static void
+ring_init(struct test_ring *r)
+{
+	ring_setup(r);
 
 	/* Enable ring on owning thread */
 	assert(kqring_register(r->fd, IORING_REGISTER_ENABLE_RINGS, NULL, 0) == 0);
@@ -517,8 +528,14 @@ test_setup_errors(void)
 static int32_t
 submit_one(struct test_ring *r)
 {
+	uint64_t ud = r->sqes[(r->sq_tail - 1) & r->sq_mask].user_data;
+
 	ring_submit(r);
-	assert(ring_cq_ready(r) == 1);
+	if (ring_cq_ready(r) != 1) {
+		fprintf(stderr, "submit_one: %u CQEs for user_data %llu\n",
+		    ring_cq_ready(r), (unsigned long long)ud);
+		abort();
+	}
 	return (ring_pop_cqe(r).res);
 }
 
@@ -559,15 +576,22 @@ test_sqe_validation(struct test_ring *r)
 	sqe->ioprio = IORING_RECVSEND_FIXED_BUF;
 	ring_push_sqe(r);
 	assert(submit_one(r) == -EINVAL);
-	/* Only buffer group 0 exists. */
+	/* A buffer group that does not exist has no buffers. */
+	assert(write(sv[1], "x", 1) == 1);
 	sqe = ring_prep(r, IORING_OP_RECV, sv[0], 11103);
 	sqe->flags = IOSQE_BUFFER_SELECT;
 	sqe->buf_group = 1;
 	ring_push_sqe(r);
 	assert(submit_one(r) == -ENOBUFS);
-	/* Buffer selection is for receives only. */
 	sqe = ring_prep(r, IORING_OP_SEND, sv[0], 11104);
 	sqe->flags = IOSQE_BUFFER_SELECT;
+	sqe->buf_group = 7;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -ENOBUFS);
+	/* Buffer selection is for transfers only. */
+	sqe = ring_prep(r, IORING_OP_POLL_ADD, sv[0], 11106);
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	sqe->poll32_events = POLLIN;
 	ring_push_sqe(r);
 	assert(submit_one(r) == -EINVAL);
 	close(sv[0]);
@@ -2934,7 +2958,7 @@ test_msg_ring(struct test_ring *r)
 	expect_cqe(r, 32003, 0);
 	expect_cqe(r, 0xabe, 9);
 
-	/* Not a ring; SEND_FD needs fixed files. */
+	/* Not a ring. */
 	assert(pipe(pfd) == 0);
 	sqe = ring_prep(r, IORING_OP_MSG_RING, pfd[0], 32004);
 	ring_push_sqe(r);
@@ -2942,7 +2966,7 @@ test_msg_ring(struct test_ring *r)
 	sqe = ring_prep(r, IORING_OP_MSG_RING, pfd[0], 32005);
 	sqe->addr = IORING_MSG_SEND_FD;
 	ring_push_sqe(r);
-	assert(submit_one(r) == -EOPNOTSUPP);
+	assert(submit_one(r) == -EBADF);
 	close(pfd[0]);
 	close(pfd[1]);
 
@@ -3132,7 +3156,7 @@ test_phase2_validation(struct test_ring *r)
 	assert(submit_one(r) == -EINVAL);
 	static const uint8_t later[] = {
 		IORING_OP_EPOLL_CTL, IORING_OP_SPLICE, IORING_OP_TEE,
-		IORING_OP_READ_FIXED, IORING_OP_PROVIDE_BUFFERS,
+		IORING_OP_RECV_ZC, IORING_OP_EPOLL_WAIT,
 	};
 	for (size_t i = 0; i < sizeof(later); i++) {
 		ring_prep(r, later[i], -1, 36003);
@@ -3155,6 +3179,1265 @@ test_phase2_validation(struct test_ring *r)
 	close(nfd);
 	printf("[PASS] Phase 2 validation: rw_flags, personality, unsupported "
 	    "ops, ioctl return\n");
+}
+
+/* ============================================================================
+ * Phase 3: registered resources
+ * ============================================================================
+ */
+
+/* io_uring_register(2)'s result: >= 0, or a negative errno. */
+static int
+reg(struct test_ring *r, unsigned op, void *arg, unsigned nr)
+{
+	long rc = kqring_register(r->fd, op, arg, nr);
+	return (rc < 0 ? -errno : (int)rc);
+}
+
+/* A READ / WRITE of `len` bytes at `buf` through fixed slot `slot`. */
+static int32_t
+fixed_rw(struct test_ring *r, uint8_t opcode, int slot, void *buf,
+    unsigned len, uint64_t ud)
+{
+	struct io_uring_sqe *sqe = ring_prep(r, opcode, slot, ud);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = len;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(r);
+	return (submit_one(r));
+}
+
+static void
+test_fixed_files(void)
+{
+	struct test_ring t;
+	struct io_uring_files_update up;
+	struct io_uring_sqe *sqe;
+	int pfd[2], sv[2];
+	char buf[16];
+
+	ring_init(&t);
+	assert(pipe(pfd) == 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+	/* No table yet. */
+	assert(reg(&t, IORING_UNREGISTER_FILES, NULL, 0) == -ENXIO);
+	assert(fixed_rw(&t, IORING_OP_READ, 0, buf, 1, 40001) == -EBADF);
+	/* FIXED_FILE only applies to ops that take a file. */
+	sqe = ring_prep(&t, IORING_OP_OPENAT, AT_FDCWD, 40002);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)"/dev/null";
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+
+	int fds[4] = { pfd[0], pfd[1], sv[0], -1 };
+	assert(reg(&t, IORING_REGISTER_FILES, fds, 0) == -EINVAL);
+	assert(reg(&t, IORING_REGISTER_FILES, fds, 4) == 0);
+	assert(reg(&t, IORING_REGISTER_FILES, fds, 4) == -EBUSY);
+	/* The table holds the files: their descriptors can go. */
+	close(pfd[1]);
+	close(sv[0]);
+	assert(fixed_rw(&t, IORING_OP_WRITE, 1, "hello", 5, 40003) == 5);
+	assert(fixed_rw(&t, IORING_OP_READ, 0, buf, sizeof(buf), 40004) == 5);
+	assert(memcmp(buf, "hello", 5) == 0);
+
+	/* A fixed socket: an armed RECV, then SEND. */
+	sqe = ring_prep(&t, IORING_OP_RECV, 2, 40005);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+	assert(write(sv[1], "abc", 3) == 3);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 40005, 3);
+	sqe = ring_prep(&t, IORING_OP_SEND, 2, 40006);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)"xy";
+	sqe->len = 2;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 2);
+	assert(read(sv[1], buf, sizeof(buf)) == 2);
+
+	/* Empty and out-of-range slots. */
+	assert(fixed_rw(&t, IORING_OP_READ, 3, buf, 1, 40007) == -EBADF);
+	assert(fixed_rw(&t, IORING_OP_READ, 9, buf, 1, 40008) == -EBADF);
+
+	/* A ring cannot go in a table. */
+	int one[1] = { t.fd };
+	up = (struct io_uring_files_update){ .offset = 3,
+	    .fds = (uint64_t)(uintptr_t)one };
+	assert(reg(&t, IORING_REGISTER_FILES_UPDATE, &up, 1) == -EBADF);
+	/* Update: empty slot 0, leave slot 1, put sv[1] in slot 3. */
+	int ufds[4] = { -1, IORING_REGISTER_FILES_SKIP,
+	    IORING_REGISTER_FILES_SKIP, sv[1] };
+	up = (struct io_uring_files_update){ .offset = 0,
+	    .fds = (uint64_t)(uintptr_t)ufds };
+	assert(reg(&t, IORING_REGISTER_FILES_UPDATE, &up, 4) == 4);
+	assert(fixed_rw(&t, IORING_OP_READ, 0, buf, 1, 40009) == -EBADF);
+	assert(fixed_rw(&t, IORING_OP_WRITE, 1, "z", 1, 40010) == 1);
+	assert(fixed_rw(&t, IORING_OP_WRITE, 3, "w", 1, 40011) == 1);
+	assert(fixed_rw(&t, IORING_OP_READ, 2, buf, sizeof(buf), 40012) == 1);
+	assert(buf[0] == 'w');
+	up.offset = 3;
+	assert(reg(&t, IORING_REGISTER_FILES_UPDATE, &up, 2) == -EINVAL);
+
+	/* The FILES_UPDATE op, and its IORING_FILE_INDEX_ALLOC form. */
+	int ofd[1] = { pfd[0] };
+	sqe = ring_prep(&t, IORING_OP_FILES_UPDATE, -1, 40013);
+	sqe->addr = (uint64_t)(uintptr_t)ofd;
+	sqe->len = 1;
+	sqe->off = 0;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 1);
+	assert(fixed_rw(&t, IORING_OP_READ, 0, buf, sizeof(buf), 40014) == 1);
+	assert(buf[0] == 'z');
+	/* Empty slot 3: ALLOC fills it, then finds no free slot. */
+	int afd[2] = { sv[1], sv[1] };
+	up = (struct io_uring_files_update){ .offset = 3,
+	    .fds = (uint64_t)(uintptr_t)ufds };
+	ufds[0] = -1;
+	assert(reg(&t, IORING_REGISTER_FILES_UPDATE, &up, 1) == 1);
+	sqe = ring_prep(&t, IORING_OP_FILES_UPDATE, -1, 40015);
+	sqe->addr = (uint64_t)(uintptr_t)afd;
+	sqe->len = 2;
+	sqe->off = IORING_FILE_INDEX_ALLOC;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 1);
+	assert(afd[0] == 3);
+	sqe = ring_prep(&t, IORING_OP_FILES_UPDATE, -1, 40016);
+	sqe->addr = (uint64_t)(uintptr_t)afd;
+	sqe->len = 1;
+	sqe->off = IORING_FILE_INDEX_ALLOC;
+	afd[0] = sv[1];
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -ENFILE);
+
+	assert(reg(&t, IORING_UNREGISTER_FILES, NULL, 0) == 0);
+	assert(fixed_rw(&t, IORING_OP_WRITE, 1, "z", 1, 40017) == -EBADF);
+	close(pfd[0]);
+	close(sv[1]);
+	close(t.fd);
+	printf("[PASS] Fixed files: register, FIXED_FILE ops (incl. armed), "
+	    "update, alloc, no rings\n");
+}
+
+static void
+test_direct_descriptors(void)
+{
+	struct io_uring_rsrc_register rr = {
+		.nr = 8,
+		.flags = IORING_RSRC_REGISTER_SPARSE,
+	};
+	struct io_uring_file_index_range range;
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	char dir[64], path[96], buf[16];
+	int fd, s, slot;
+	uint16_t port;
+
+	ring_init(&t);
+	assert(reg(&t, IORING_REGISTER_FILES2, &rr, sizeof(rr)) == 0);
+	make_tmpdir(dir, sizeof(dir));
+	snprintf(path, sizeof(path), "%s/f", dir);
+	fd = open(path, O_RDWR | O_CREAT, 0600);
+	assert(fd >= 0 && write(fd, "direct!", 7) == 7);
+	close(fd);
+
+	/* OPENAT into slot 2, and into a free slot (0). */
+	sqe = ring_prep(&t, IORING_OP_OPENAT, AT_FDCWD, 41001);
+	sqe->addr = (uint64_t)(uintptr_t)path;
+	sqe->open_flags = O_RDONLY;
+	sqe->file_index = 3;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	sqe = ring_prep(&t, IORING_OP_OPENAT, AT_FDCWD, 41002);
+	sqe->addr = (uint64_t)(uintptr_t)path;
+	sqe->open_flags = O_RDONLY;
+	sqe->file_index = IORING_FILE_INDEX_ALLOC;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	memset(buf, 0, sizeof(buf));
+	sqe = ring_prep(&t, IORING_OP_READ, 2, 41003);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 7 && memcmp(buf, "direct!", 7) == 0);
+	assert(fixed_rw(&t, IORING_OP_READ, 0, buf, sizeof(buf), 41004) == 7);
+	/* No close-on-exec without a descriptor. */
+	sqe = ring_prep(&t, IORING_OP_OPENAT, AT_FDCWD, 41005);
+	sqe->addr = (uint64_t)(uintptr_t)path;
+	sqe->open_flags = O_RDONLY | O_CLOEXEC;
+	sqe->file_index = 4;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+
+	/* FIXED_FD_INSTALL: a descriptor, close-on-exec unless asked not. */
+	sqe = ring_prep(&t, IORING_OP_FIXED_FD_INSTALL, 2, 41006);
+	sqe->flags = IOSQE_FIXED_FILE;
+	ring_push_sqe(&t);
+	fd = submit_one(&t);
+	assert(fd >= 0 && (fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0);
+	assert(pread(fd, buf, sizeof(buf), 0) == 7);
+	close(fd);
+	sqe = ring_prep(&t, IORING_OP_FIXED_FD_INSTALL, 2, 41007);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->install_fd_flags = IORING_FIXED_FD_NO_CLOEXEC;
+	ring_push_sqe(&t);
+	fd = submit_one(&t);
+	assert(fd >= 0 && (fcntl(fd, F_GETFD) & FD_CLOEXEC) == 0);
+	close(fd);
+	sqe = ring_prep(&t, IORING_OP_FIXED_FD_INSTALL, 2, 41008);
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EBADF);
+
+	/* CLOSE a fixed slot. */
+	sqe = ring_prep(&t, IORING_OP_CLOSE, 0, 41009);
+	sqe->file_index = 3;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	assert(fixed_rw(&t, IORING_OP_READ, 2, buf, 1, 41010) == -EBADF);
+	sqe = ring_prep(&t, IORING_OP_CLOSE, 0, 41011);
+	sqe->file_index = 3;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EBADF);
+
+	/* SOCKET, BIND, LISTEN and ACCEPT, all on direct descriptors. */
+	sqe = ring_prep(&t, IORING_OP_SOCKET, AF_INET, 41012);
+	sqe->off = SOCK_STREAM;
+	sqe->file_index = IORING_FILE_INDEX_ALLOC;
+	ring_push_sqe(&t);
+	s = submit_one(&t);
+	assert(s == 1);
+	struct sockaddr_in sin = {
+		.sin_len = sizeof(sin),
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	sqe = ring_prep(&t, IORING_OP_BIND, s, 41013);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)&sin;
+	sqe->addr2 = sizeof(sin);
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	sqe = ring_prep(&t, IORING_OP_LISTEN, s, 41014);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->len = 8;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	sqe = ring_prep(&t, IORING_OP_FIXED_FD_INSTALL, s, 41015);
+	sqe->flags = IOSQE_FIXED_FILE;
+	ring_push_sqe(&t);
+	fd = submit_one(&t);
+	socklen_t slen = sizeof(sin);
+	assert(fd >= 0 && getsockname(fd, (struct sockaddr *)&sin, &slen) == 0);
+	close(fd);
+	port = ntohs(sin.sin_port);
+
+	int c1 = tcp_connect(port);
+	sqe = ring_prep(&t, IORING_OP_ACCEPT, s, 41016);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->file_index = IORING_FILE_INDEX_ALLOC;
+	ring_push_sqe(&t);
+	/* The connection may not be queued yet: then it waits. */
+	assert(ring_wait(&t, 1, 2000) == 0);
+	slot = ring_pop_cqe(&t).res;
+	assert(slot == 2);
+	sqe = ring_prep(&t, IORING_OP_SEND, slot, 41017);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)"acc";
+	sqe->len = 3;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 3);
+	assert(read(c1, buf, sizeof(buf)) == 3 && memcmp(buf, "acc", 3) == 0);
+	/* Multishot: each connection in a new slot. */
+	sqe = ring_prep(&t, IORING_OP_ACCEPT, s, 41018);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->ioprio = IORING_ACCEPT_MULTISHOT;
+	sqe->file_index = 2;	/* must allocate */
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+	sqe = ring_prep(&t, IORING_OP_ACCEPT, s, 41019);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->ioprio = IORING_ACCEPT_MULTISHOT;
+	sqe->file_index = IORING_FILE_INDEX_ALLOC;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	int c2 = tcp_connect(port), c3 = tcp_connect(port);
+	assert(ring_wait(&t, 2, 2000) == 0);
+	struct io_uring_cqe a1 = ring_pop_cqe(&t), a2 = ring_pop_cqe(&t);
+	assert(a1.user_data == 41019 && (a1.flags & IORING_CQE_F_MORE) != 0);
+	assert(a2.user_data == 41019 && a1.res != a2.res);
+	assert(a1.res >= 3 && a2.res >= 3);
+	sqe = ring_prep(&t, IORING_OP_ASYNC_CANCEL, -1, 41020);
+	sqe->addr = 41019;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	expect_cqe(&t, 41019, -ECANCELED);
+	expect_cqe(&t, 41020, 0);
+
+	/* PIPE: descriptors, or two fixed slots. */
+	int pfds[2] = { -1, -1 };
+	sqe = ring_prep(&t, IORING_OP_PIPE, 0, 41021);
+	sqe->addr = (uint64_t)(uintptr_t)pfds;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	assert(write(pfds[1], "p", 1) == 1 && read(pfds[0], buf, 1) == 1);
+	close(pfds[0]);
+	close(pfds[1]);
+	/* Slots 6 and 7 (file_index 7), written back to pfds. */
+	sqe = ring_prep(&t, IORING_OP_PIPE, 0, 41022);
+	sqe->addr = (uint64_t)(uintptr_t)pfds;
+	sqe->file_index = 7;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	assert(pfds[0] == 6 && pfds[1] == 7);
+	assert(fixed_rw(&t, IORING_OP_WRITE, 7, "PQ", 2, 41023) == 2);
+	assert(fixed_rw(&t, IORING_OP_READ, 6, buf, sizeof(buf), 41024) == 2);
+	assert(memcmp(buf, "PQ", 2) == 0);
+
+	/* FILE_ALLOC_RANGE: ALLOC only uses [5, 6), now empty, then full. */
+	range = (struct io_uring_file_index_range){ .off = 5, .len = 1 };
+	assert(reg(&t, IORING_REGISTER_FILE_ALLOC_RANGE, &range, 0) == 0);
+	sqe = ring_prep(&t, IORING_OP_OPENAT, AT_FDCWD, 41025);
+	sqe->addr = (uint64_t)(uintptr_t)path;
+	sqe->open_flags = O_RDONLY;
+	sqe->file_index = IORING_FILE_INDEX_ALLOC;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 5);
+	sqe = ring_prep(&t, IORING_OP_OPENAT, AT_FDCWD, 41026);
+	sqe->addr = (uint64_t)(uintptr_t)path;
+	sqe->open_flags = O_RDONLY;
+	sqe->file_index = IORING_FILE_INDEX_ALLOC;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -ENFILE);
+	range = (struct io_uring_file_index_range){ .off = 7, .len = 2 };
+	assert(reg(&t, IORING_REGISTER_FILE_ALLOC_RANGE, &range, 0) ==
+	    -EINVAL);
+
+	close(c1);
+	close(c2);
+	close(c3);
+	close(t.fd);
+	unlink(path);
+	rmdir(dir);
+	printf("[PASS] Direct descriptors: OPENAT/SOCKET/ACCEPT/PIPE file_index, "
+	    "CLOSE, FIXED_FD_INSTALL, alloc range\n");
+}
+
+static void
+test_rsrc_tags(void)
+{
+	struct io_uring_rsrc_update2 up2;
+	struct io_uring_files_update up;
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	int sv[2];
+	char buf[8];
+
+	ring_init(&t);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	int fds[2] = { sv[0], -1 };
+	uint64_t tags[2] = { 0x7a6, 0 };
+	struct io_uring_rsrc_register rr = {
+		.nr = 2,
+		.data = (uint64_t)(uintptr_t)fds,
+		.tags = (uint64_t)(uintptr_t)tags,
+	};
+	assert(reg(&t, IORING_REGISTER_FILES2, &rr, sizeof(rr)) == 0);
+
+	/* An armed RECV keeps using slot 0 after it is emptied... */
+	sqe = ring_prep(&t, IORING_OP_RECV, 0, 42001);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	int none[1] = { -1 };
+	up = (struct io_uring_files_update){ .offset = 0,
+	    .fds = (uint64_t)(uintptr_t)none };
+	assert(reg(&t, IORING_REGISTER_FILES_UPDATE, &up, 1) == 1);
+	assert(ring_cq_ready(&t) == 0);
+	/* ...and the tag CQE comes once it is done with it. */
+	assert(write(sv[1], "q", 1) == 1);
+	assert(ring_wait(&t, 2, 2000) == 0);
+	expect_cqe(&t, 42001, 1);
+	struct io_uring_cqe c = expect_cqe(&t, 0x7a6, 0);
+	assert(c.flags == 0);
+
+	/* A tag only goes with a file. */
+	uint64_t tag = 5;
+	up2 = (struct io_uring_rsrc_update2){ .offset = 1,
+	    .data = (uint64_t)(uintptr_t)none,
+	    .tags = (uint64_t)(uintptr_t)&tag, .nr = 1 };
+	assert(reg(&t, IORING_REGISTER_FILES_UPDATE2, &up2, sizeof(up2)) ==
+	    -EINVAL);
+	/* Unregistering releases the slots that are left. */
+	int one[1] = { sv[1] };
+	tag = 0x7a7;
+	up2.data = (uint64_t)(uintptr_t)one;
+	assert(reg(&t, IORING_REGISTER_FILES_UPDATE2, &up2, sizeof(up2)) == 1);
+	assert(reg(&t, IORING_UNREGISTER_FILES, NULL, 0) == 0);
+	expect_cqe(&t, 0x7a7, 0);
+	assert(ring_cq_ready(&t) == 0);
+	assert(reg(&t, IORING_REGISTER_FILES2, &rr, sizeof(rr) - 1) ==
+	    -EINVAL);
+
+	close(sv[0]);
+	close(sv[1]);
+	close(t.fd);
+	printf("[PASS] Resource tags: posted once the last user is done, "
+	    "on update and unregister\n");
+}
+
+static void
+test_registered_buffers(void)
+{
+	long page = sysconf(_SC_PAGESIZE);
+	struct io_uring_rsrc_update2 up2;
+	struct io_uring_clone_buffers cb;
+	struct io_uring_sqe *sqe;
+	struct test_ring t, t2;
+	char dir[64], path[96];
+	int fd, sv[2];
+
+	ring_init(&t);
+	char *m = mmap(NULL, (size_t)page * 4, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(m != MAP_FAILED);
+	struct iovec iov[3] = {
+		{ m, (size_t)page },
+		{ NULL, 0 },
+		{ m + 2 * page, 2 * (size_t)page },
+	};
+	assert(reg(&t, IORING_REGISTER_BUFFERS, NULL, 3) == -EFAULT);
+	assert(reg(&t, IORING_REGISTER_BUFFERS, iov, 3) == 0);
+	assert(reg(&t, IORING_REGISTER_BUFFERS, iov, 3) == -EBUSY);
+
+	make_tmpdir(dir, sizeof(dir));
+	snprintf(path, sizeof(path), "%s/b", dir);
+	fd = open(path, O_RDWR | O_CREAT, 0600);
+	assert(fd >= 0);
+	memcpy(m, "fixed-buffer", 12);
+	sqe = ring_prep(&t, IORING_OP_WRITE_FIXED, fd, 43001);
+	sqe->addr = (uint64_t)(uintptr_t)m;
+	sqe->len = 12;
+	sqe->buf_index = 0;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 12);
+	char *dst = m + 2 * page + 100;
+	sqe = ring_prep(&t, IORING_OP_READ_FIXED, fd, 43002);
+	sqe->addr = (uint64_t)(uintptr_t)dst;
+	sqe->len = 12;
+	sqe->buf_index = 2;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 12 && memcmp(dst, "fixed-buffer", 12) == 0);
+
+	/* Outside its buffer, an empty slot, a missing slot. */
+	static const struct { uint16_t idx; long off; unsigned len; } bad[] = {
+		{ 0, 0, 0 }, { 1, 0, 1 }, { 9, 0, 1 },
+	};
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		sqe = ring_prep(&t, IORING_OP_READ_FIXED, fd, 43003);
+		sqe->addr = (uint64_t)(uintptr_t)(m + page - 8);
+		sqe->len = i == 0 ? 16 : bad[i].len;
+		sqe->buf_index = bad[i].idx;
+		ring_push_sqe(&t);
+		assert(submit_one(&t) == -EFAULT);
+	}
+
+	/* READV_FIXED: every iovec must be inside the buffer. */
+	struct iovec rv[2] = {
+		{ m + 2 * page, 6 },
+		{ m + 3 * page, 6 },
+	};
+	sqe = ring_prep(&t, IORING_OP_READV_FIXED, fd, 43004);
+	sqe->addr = (uint64_t)(uintptr_t)rv;
+	sqe->len = 2;
+	sqe->buf_index = 2;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 12);
+	assert(memcmp(m + 2 * page, "fixed-", 6) == 0);
+	assert(memcmp(m + 3 * page, "buffer", 6) == 0);
+	rv[1].iov_base = m;
+	sqe = ring_prep(&t, IORING_OP_READV_FIXED, fd, 43005);
+	sqe->addr = (uint64_t)(uintptr_t)rv;
+	sqe->len = 2;
+	sqe->buf_index = 2;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EFAULT);
+
+	/* SEND_ZC from a registered buffer; READ_FIXED on a socket waits. */
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	sqe = ring_prep(&t, IORING_OP_SEND_ZC, sv[0], 43006);
+	sqe->addr = (uint64_t)(uintptr_t)m;
+	sqe->len = 5;
+	sqe->ioprio = IORING_RECVSEND_FIXED_BUF;
+	sqe->buf_index = 0;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 2);
+	struct io_uring_cqe c = expect_cqe(&t, 43006, 5);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	c = expect_cqe(&t, 43006, 0);
+	assert((c.flags & IORING_CQE_F_NOTIF) != 0);
+	char rb[16];
+	assert(read(sv[1], rb, sizeof(rb)) == 5 && memcmp(rb, "fixed", 5) == 0);
+	sqe = ring_prep(&t, IORING_OP_READ_FIXED, sv[0], 43007);
+	sqe->addr = (uint64_t)(uintptr_t)(m + 64);
+	sqe->len = 16;
+	sqe->buf_index = 0;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+	assert(write(sv[1], "sockfx", 6) == 6);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 43007, 6);
+	assert(memcmp(m + 64, "sockfx", 6) == 0);
+
+	/* Registration checks the memory: unmapped, read-only, too big. */
+	char *ro = mmap(NULL, (size_t)page, PROT_READ, MAP_PRIVATE | MAP_ANON,
+	    -1, 0);
+	char *gone = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(ro != MAP_FAILED && gone != MAP_FAILED);
+	munmap(gone, (size_t)page);
+	struct iovec bi[3] = {
+		{ gone, (size_t)page },
+		{ ro, (size_t)page },
+		{ m, (size_t)2 << 30 },
+	};
+	for (int i = 0; i < 3; i++) {
+		up2 = (struct io_uring_rsrc_update2){ .offset = 1,
+		    .data = (uint64_t)(uintptr_t)&bi[i], .nr = 1 };
+		assert(reg(&t, IORING_REGISTER_BUFFERS_UPDATE, &up2,
+		    sizeof(up2)) == -EFAULT);
+	}
+	struct iovec ok = { m + page, (size_t)page };
+	up2 = (struct io_uring_rsrc_update2){ .offset = 1,
+	    .data = (uint64_t)(uintptr_t)&ok, .nr = 1 };
+	assert(reg(&t, IORING_REGISTER_BUFFERS_UPDATE, &up2, sizeof(up2)) == 1);
+	sqe = ring_prep(&t, IORING_OP_READ_FIXED, fd, 43008);
+	sqe->addr = (uint64_t)(uintptr_t)(m + page);
+	sqe->len = 12;
+	sqe->buf_index = 1;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 12);
+
+	/* CLONE_BUFFERS to another ring this thread owns. */
+	ring_init(&t2);
+	cb = (struct io_uring_clone_buffers){ .src_fd = (uint32_t)t.fd };
+	assert(reg(&t2, IORING_REGISTER_CLONE_BUFFERS, &cb, 1) == 0);
+	assert(reg(&t2, IORING_REGISTER_CLONE_BUFFERS, &cb, 1) == -EBUSY);
+	cb = (struct io_uring_clone_buffers){ .src_fd = (uint32_t)t.fd,
+	    .flags = IORING_REGISTER_DST_REPLACE, .src_off = 0, .dst_off = 3,
+	    .nr = 1 };
+	assert(reg(&t2, IORING_REGISTER_CLONE_BUFFERS, &cb, 1) == 0);
+	sqe = ring_prep(&t2, IORING_OP_READ_FIXED, fd, 43009);
+	sqe->addr = (uint64_t)(uintptr_t)(m + 8);
+	sqe->len = 4;
+	sqe->buf_index = 3;
+	ring_push_sqe(&t2);
+	assert(submit_one(&t2) == 4);
+	cb = (struct io_uring_clone_buffers){ .src_fd = (uint32_t)t2.fd,
+	    .flags = IORING_REGISTER_DST_REPLACE };
+	assert(reg(&t2, IORING_REGISTER_CLONE_BUFFERS, &cb, 1) == -EINVAL);
+	close(t2.fd);
+
+	assert(reg(&t, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+	assert(reg(&t, IORING_UNREGISTER_BUFFERS, NULL, 0) == -ENXIO);
+	sqe = ring_prep(&t, IORING_OP_READ_FIXED, fd, 43010);
+	sqe->addr = (uint64_t)(uintptr_t)m;
+	sqe->len = 4;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EFAULT);
+
+	munmap(ro, (size_t)page);
+	munmap(m, (size_t)page * 4);
+	close(sv[0]);
+	close(sv[1]);
+	close(fd);
+	close(t.fd);
+	unlink(path);
+	rmdir(dir);
+	printf("[PASS] Registered buffers: READ/WRITE(V)_FIXED bounds, SEND_ZC "
+	    "FIXED_BUF, update checks, CLONE_BUFFERS\n");
+}
+
+/* A RECV of up to `len` bytes from a provided buffer of group bgid. */
+static struct io_uring_cqe
+recv_select(struct test_ring *r, int fd, uint16_t bgid, unsigned len,
+    uint16_t ioprio, uint64_t ud)
+{
+	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_RECV, fd, ud);
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	sqe->buf_group = bgid;
+	sqe->len = len;
+	sqe->ioprio = ioprio;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 1);
+	struct io_uring_cqe c = ring_pop_cqe(r);
+	assert(c.user_data == ud);
+	return (c);
+}
+
+static uint16_t
+pbuf_head(struct test_ring *r, uint16_t bgid)
+{
+	struct io_uring_buf_status st = { .buf_group = bgid };
+	assert(reg(r, IORING_REGISTER_PBUF_STATUS, &st, 1) == 0);
+	return ((uint16_t)st.head);
+}
+
+static void
+test_buffer_groups(void)
+{
+	long page = sysconf(_SC_PAGESIZE);
+	struct io_uring_buf_reg br;
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	struct test_ring t;
+	int sv[2];
+	char rb[16];
+
+	ring_init(&t);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	char *pb = mmap(NULL, (size_t)page * 2, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(pb != MAP_FAILED);
+
+	/* PROVIDE_BUFFERS: 4 x 256 bytes, IDs 10..13, into group 5. */
+	sqe = ring_prep(&t, IORING_OP_PROVIDE_BUFFERS, 4, 44001);
+	sqe->addr = (uint64_t)(uintptr_t)pb;
+	sqe->len = 256;
+	sqe->off = 10;
+	sqe->buf_group = 5;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	assert(write(sv[1], "abc", 3) == 3);
+	c = recv_select(&t, sv[0], 5, 0, 0, 44002);
+	assert(c.res == 3 && (c.flags & IORING_CQE_F_BUFFER) != 0);
+	assert((c.flags >> IORING_CQE_BUFFER_SHIFT) == 10);
+	assert(memcmp(pb, "abc", 3) == 0);
+	/* Not into a ring group; removal counts. */
+	sqe = ring_prep(&t, IORING_OP_PROVIDE_BUFFERS, 1, 44003);
+	sqe->addr = (uint64_t)(uintptr_t)pb;
+	sqe->len = 16;
+	sqe->buf_group = 0;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+	static const struct { int nbufs; uint16_t bgid; int32_t res; } rm[] = {
+		{ 8, 5, 3 }, { 8, 5, 0 }, { 1, 9, -ENOENT }, { 1, 0, -EINVAL },
+	};
+	for (size_t i = 0; i < sizeof(rm) / sizeof(rm[0]); i++) {
+		sqe = ring_prep(&t, IORING_OP_REMOVE_BUFFERS, rm[i].nbufs, 44004);
+		sqe->buf_group = rm[i].bgid;
+		ring_push_sqe(&t);
+		assert(submit_one(&t) == rm[i].res);
+	}
+	/* PROVIDE_BUFFERS limits (as in io_uring). */
+	static const struct { int nbufs; unsigned len; uint64_t off;
+	    int32_t res; } lim[] = {
+		{ 0, 16, 0, -E2BIG }, { 65537, 16, 0, -E2BIG },
+		{ 2, 16, 65535, -EINVAL }, { 1, 0, 0, -EINVAL },
+		{ 1, 16, 65536, -E2BIG },
+	};
+	for (size_t i = 0; i < sizeof(lim) / sizeof(lim[0]); i++) {
+		sqe = ring_prep(&t, IORING_OP_PROVIDE_BUFFERS, lim[i].nbufs,
+		    44005);
+		sqe->addr = (uint64_t)(uintptr_t)pb;
+		sqe->len = lim[i].len;
+		sqe->off = lim[i].off;
+		sqe->buf_group = 5;
+		ring_push_sqe(&t);
+		assert(submit_one(&t) == lim[i].res);
+	}
+
+	/* A kernel-allocated ring (IOU_PBUF_RING_MMAP) userspace maps. */
+	br = (struct io_uring_buf_reg){ .ring_entries = 8, .bgid = 3,
+	    .flags = IOU_PBUF_RING_MMAP };
+	assert(reg(&t, IORING_REGISTER_PBUF_RING, &br, 1) == 0);
+	assert(reg(&t, IORING_REGISTER_PBUF_RING, &br, 1) == -EEXIST);
+	off_t moff = (off_t)(IORING_OFF_PBUF_RING |
+	    (3ULL << IORING_OFF_PBUF_SHIFT));
+	struct io_uring_buf_ring *kr = mmap(NULL, (size_t)page,
+	    PROT_READ | PROT_WRITE, MAP_SHARED, t.fd, moff);
+	assert(kr != MAP_FAILED);
+	struct io_uring_buf *kb = (struct io_uring_buf *)kr;
+	kb[0] = (struct io_uring_buf){ (uint64_t)(uintptr_t)(pb + 1024), 128,
+	    7, 0 };
+	atomic_store_explicit((_Atomic uint16_t *)&kr->tail, 1,
+	    memory_order_release);
+	assert(write(sv[1], "mmap!", 5) == 5);
+	c = recv_select(&t, sv[0], 3, 0, 0, 44006);
+	assert(c.res == 5 && (c.flags >> IORING_CQE_BUFFER_SHIFT) == 7);
+	assert(memcmp(pb + 1024, "mmap!", 5) == 0);
+	assert(pbuf_head(&t, 3) == 1);
+	/* Empty now: data waits, and the RECV fails rather than waits. */
+	assert(write(sv[1], "x", 1) == 1);
+	c = recv_select(&t, sv[0], 3, 0, 0, 44007);
+	assert(c.res == -ENOBUFS);
+	assert(read(sv[0], rb, sizeof(rb)) == 1);
+
+	/* A bundle (IORING_RECVSEND_BUNDLE) spans buffers. */
+	struct io_uring_buf *ub = mmap(NULL, (size_t)page,
+	    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(ub != MAP_FAILED);
+	br = (struct io_uring_buf_reg){ .ring_addr = (uint64_t)(uintptr_t)ub,
+	    .ring_entries = 4, .bgid = 4 };
+	assert(reg(&t, IORING_REGISTER_PBUF_RING, &br, 1) == 0);
+	for (int i = 0; i < 4; i++)
+		ub[i] = (struct io_uring_buf){
+		    (uint64_t)(uintptr_t)(pb + 2048 + i * 4), 4,
+		    (uint16_t)(20 + i), 0 };
+	atomic_store_explicit((_Atomic uint16_t *)
+	    &((struct io_uring_buf_ring *)ub)->tail, 4, memory_order_release);
+	assert(write(sv[1], "0123456789", 10) == 10);
+	c = recv_select(&t, sv[0], 4, 0, IORING_RECVSEND_BUNDLE, 44008);
+	assert(c.res == 10 && (c.flags >> IORING_CQE_BUFFER_SHIFT) == 20);
+	assert(memcmp(pb + 2048, "0123456789", 10) == 0);
+	assert(pbuf_head(&t, 4) == 3);
+	/* A bundle needs provided buffers. */
+	sqe = ring_prep(&t, IORING_OP_RECV, sv[0], 44009);
+	sqe->ioprio = IORING_RECVSEND_BUNDLE;
+	sqe->addr = (uint64_t)(uintptr_t)rb;
+	sqe->len = sizeof(rb);
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+
+	/* IOU_PBUF_RING_INC: a buffer used in parts. */
+	struct io_uring_buf *ib = mmap(NULL, (size_t)page,
+	    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(ib != MAP_FAILED);
+	br = (struct io_uring_buf_reg){ .ring_addr = (uint64_t)(uintptr_t)ib,
+	    .ring_entries = 2, .bgid = 6, .flags = IOU_PBUF_RING_INC };
+	assert(reg(&t, IORING_REGISTER_PBUF_RING, &br, 1) == 0);
+	char *inc = pb + 3072;
+	ib[0] = (struct io_uring_buf){ (uint64_t)(uintptr_t)inc, 100, 30, 0 };
+	atomic_store_explicit((_Atomic uint16_t *)
+	    &((struct io_uring_buf_ring *)ib)->tail, 1, memory_order_release);
+	char data[60];
+	memset(data, 'i', sizeof(data));
+	assert(write(sv[1], data, 40) == 40);
+	c = recv_select(&t, sv[0], 6, 0, 0, 44010);
+	assert(c.res == 40 && (c.flags >> IORING_CQE_BUFFER_SHIFT) == 30);
+	assert((c.flags & IORING_CQE_F_BUF_MORE) != 0);
+	assert(ib[0].addr == (uint64_t)(uintptr_t)(inc + 40) &&
+	    ib[0].len == 60);
+	assert(pbuf_head(&t, 6) == 0);
+	memset(data, 'j', sizeof(data));
+	assert(write(sv[1], data, 60) == 60);
+	c = recv_select(&t, sv[0], 6, 0, 0, 44011);
+	assert(c.res == 60 && (c.flags & IORING_CQE_F_BUF_MORE) == 0);
+	assert(inc[39] == 'i' && inc[40] == 'j' && inc[99] == 'j');
+	assert(pbuf_head(&t, 6) == 1);
+
+	/* SEND from provided buffers. */
+	memcpy(pb + 4000, "sendme", 6);
+	sqe = ring_prep(&t, IORING_OP_PROVIDE_BUFFERS, 1, 44012);
+	sqe->addr = (uint64_t)(uintptr_t)(pb + 4000);
+	sqe->len = 6;
+	sqe->off = 40;
+	sqe->buf_group = 8;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	sqe = ring_prep(&t, IORING_OP_SEND, sv[0], 44013);
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	sqe->buf_group = 8;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	c = expect_cqe(&t, 44013, 6);
+	assert((c.flags >> IORING_CQE_BUFFER_SHIFT) == 40);
+	assert(read(sv[1], rb, sizeof(rb)) == 6 && memcmp(rb, "sendme", 6) == 0);
+
+	/* Register / unregister / status rules. */
+	br = (struct io_uring_buf_reg){ .ring_addr =
+	    (uint64_t)(uintptr_t)ub + 16, .ring_entries = 4, .bgid = 11 };
+	assert(reg(&t, IORING_REGISTER_PBUF_RING, &br, 1) == -EINVAL);
+	br = (struct io_uring_buf_reg){ .ring_addr = (uint64_t)(uintptr_t)ub,
+	    .ring_entries = 4, .bgid = 11, .flags = IOU_PBUF_RING_MMAP };
+	assert(reg(&t, IORING_REGISTER_PBUF_RING, &br, 1) == -EINVAL);
+	br = (struct io_uring_buf_reg){ .ring_addr = (uint64_t)(uintptr_t)ub,
+	    .ring_entries = 3, .bgid = 11 };
+	assert(reg(&t, IORING_REGISTER_PBUF_RING, &br, 1) == -EINVAL);
+	br = (struct io_uring_buf_reg){ .bgid = 5 };
+	assert(reg(&t, IORING_UNREGISTER_PBUF_RING, &br, 1) == -EINVAL);
+	br.bgid = 99;
+	assert(reg(&t, IORING_UNREGISTER_PBUF_RING, &br, 1) == -ENOENT);
+	struct io_uring_buf_status st = { .buf_group = 5 };
+	assert(reg(&t, IORING_REGISTER_PBUF_STATUS, &st, 1) == -EINVAL);
+
+	/* Unregistering a mapped ring leaves the mapping plain memory. */
+	br = (struct io_uring_buf_reg){ .bgid = 3 };
+	assert(reg(&t, IORING_UNREGISTER_PBUF_RING, &br, 1) == 0);
+	kb[1].len = 1234;
+	assert(kb[1].len == 1234 && kb[0].bid == 7);
+	munmap(kr, (size_t)page);
+	assert(mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_SHARED,
+	    t.fd, moff) == MAP_FAILED);
+
+	munmap(ub, (size_t)page);
+	munmap(ib, (size_t)page);
+	munmap(pb, (size_t)page * 2);
+	close(sv[0]);
+	close(sv[1]);
+	close(t.fd);
+	printf("[PASS] Buffer groups: PROVIDE/REMOVE_BUFFERS, MMAP rings, "
+	    "bundles, INC, SEND select, status\n");
+}
+
+static void
+test_eventfd(void)
+{
+	struct test_ring t;
+	eventfd_t v;
+	int efd, sv[2], pfd[2];
+	char buf[8];
+
+	ring_init(&t);
+	efd = eventfd(0, EFD_NONBLOCK);
+	assert(efd >= 0);
+	assert(pipe(pfd) == 0);
+	assert(reg(&t, IORING_REGISTER_EVENTFD, &pfd[0], 1) == -EINVAL);
+	assert(reg(&t, IORING_REGISTER_EVENTFD, &efd, 2) == -EINVAL);
+	assert(reg(&t, IORING_REGISTER_EVENTFD, &efd, 1) == 0);
+	assert(reg(&t, IORING_REGISTER_EVENTFD, &efd, 1) == -EBUSY);
+
+	prep_nop(&t, 45001, 0);
+	ring_submit(&t);
+	expect_cqe(&t, 45001, 0);
+	assert(eventfd_read(efd, &v) == 0 && v >= 1);
+	/* IORING_CQ_EVENTFD_DISABLED silences it. */
+	atomic_fetch_or(t.cq_kflags, IORING_CQ_EVENTFD_DISABLED);
+	prep_nop(&t, 45002, 0);
+	ring_submit(&t);
+	expect_cqe(&t, 45002, 0);
+	assert(eventfd_read(efd, &v) == -1 && errno == EAGAIN);
+	atomic_fetch_and(t.cq_kflags, ~IORING_CQ_EVENTFD_DISABLED);
+	assert(reg(&t, IORING_UNREGISTER_EVENTFD, NULL, 0) == 0);
+	assert(reg(&t, IORING_UNREGISTER_EVENTFD, NULL, 0) == -ENXIO);
+
+	/* EVENTFD_ASYNC: not for inline completions, but for waiting ones. */
+	assert(reg(&t, IORING_REGISTER_EVENTFD_ASYNC, &efd, 1) == 0);
+	prep_nop(&t, 45003, 0);
+	ring_submit(&t);
+	expect_cqe(&t, 45003, 0);
+	assert(eventfd_read(efd, &v) == -1 && errno == EAGAIN);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	prep_recv(&t, sv[0], 45004, buf, sizeof(buf), 0);
+	ring_submit(&t);
+	assert(eventfd_read(efd, &v) == -1 && errno == EAGAIN);
+	/* The upcall itself signals: no enter needed to learn of work. */
+	assert(write(sv[1], "e", 1) == 1);
+	struct pollfd pf = { .fd = efd, .events = POLLIN };
+	assert(poll(&pf, 1, 2000) == 1);
+	assert(eventfd_read(efd, &v) == 0);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 45004, 1);
+	assert(eventfd_read(efd, &v) == 0 && v >= 1);
+
+	close(sv[0]);
+	close(sv[1]);
+	close(pfd[0]);
+	close(pfd[1]);
+	close(t.fd);
+	/* The ring held its own reference to the eventfd. */
+	assert(eventfd_write(efd, 1) == 0);
+	close(efd);
+	printf("[PASS] Eventfd: signalled per enter and on taskwork, "
+	    "CQ_EVENTFD_DISABLED, EVENTFD_ASYNC\n");
+}
+
+static void
+test_personality(void)
+{
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	int id, id2, fd;
+
+	ring_init(&t);
+	assert(reg(&t, IORING_REGISTER_PERSONALITY, &t, 0) == -EINVAL);
+	id = reg(&t, IORING_REGISTER_PERSONALITY, NULL, 0);
+	id2 = reg(&t, IORING_REGISTER_PERSONALITY, NULL, 0);
+	assert(id >= 1 && id2 >= 1 && id != id2);
+	sqe = ring_prep(&t, IORING_OP_NOP, -1, 46001);
+	sqe->personality = (uint16_t)id;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	/* Work done under it: an open, a socket receive. */
+	sqe = ring_prep(&t, IORING_OP_OPENAT, AT_FDCWD, 46002);
+	sqe->addr = (uint64_t)(uintptr_t)"/dev/null";
+	sqe->open_flags = O_RDONLY;
+	sqe->personality = (uint16_t)id2;
+	ring_push_sqe(&t);
+	fd = submit_one(&t);
+	assert(fd >= 0);
+	close(fd);
+	assert(reg(&t, IORING_UNREGISTER_PERSONALITY, NULL, (unsigned)id) == 0);
+	assert(reg(&t, IORING_UNREGISTER_PERSONALITY, NULL, (unsigned)id) ==
+	    -EINVAL);
+	sqe = ring_prep(&t, IORING_OP_NOP, -1, 46003);
+	sqe->personality = (uint16_t)id;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+	close(t.fd);
+
+	/*
+	 * Credentials registered before cap_enter(2) cannot be used to get
+	 * out of capability mode (in a child: it cannot be left).
+	 */
+	pid_t pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		struct test_ring c;
+		int pid_id;
+
+		ring_init(&c);
+		pid_id = reg(&c, IORING_REGISTER_PERSONALITY, NULL, 0);
+		if (pid_id < 1 || cap_enter() != 0)
+			_exit(2);
+		sqe = ring_prep(&c, IORING_OP_OPENAT, AT_FDCWD, 46004);
+		sqe->addr = (uint64_t)(uintptr_t)"/dev/null";
+		sqe->open_flags = O_RDONLY;
+		sqe->personality = (uint16_t)pid_id;
+		ring_push_sqe(&c);
+		_exit(submit_one(&c) == -ECAPMODE ? 0 : 1);
+	}
+	int status;
+	assert(waitpid(pid, &status, 0) == pid);
+	assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	printf("[PASS] Personalities: register ids, use, unregister, no "
+	    "capability-mode escape\n");
+}
+
+static void
+test_restrictions(struct test_ring *r)
+{
+	struct io_uring_restriction res[] = {
+		{ .opcode = IORING_RESTRICTION_SQE_OP,
+		    .sqe_op = IORING_OP_NOP },
+		{ .opcode = IORING_RESTRICTION_SQE_FLAGS_ALLOWED,
+		    .sqe_flags = IOSQE_IO_LINK },
+		{ .opcode = IORING_RESTRICTION_REGISTER_OP,
+		    .register_op = IORING_REGISTER_PROBE },
+	};
+	struct io_uring_restriction badres = { .opcode = 9 };
+	struct test_ring t;
+	char probe[sizeof(struct io_uring_probe) +
+	    4 * sizeof(struct io_uring_probe_op)];
+
+	/* Only on a ring that is still disabled. */
+	assert(reg(r, IORING_REGISTER_RESTRICTIONS, res, 1) == -EBADF);
+	ring_setup(&t);
+	assert(reg(&t, IORING_REGISTER_RESTRICTIONS, &badres, 1) == -EINVAL);
+	assert(reg(&t, IORING_REGISTER_RESTRICTIONS, res, 3) == 0);
+	assert(reg(&t, IORING_REGISTER_RESTRICTIONS, res, 3) == -EBUSY);
+	assert(kqring_enter(t.fd, 0, 0, 0, NULL, 0) == -1 && errno == EBADF);
+	assert(reg(&t, IORING_REGISTER_ENABLE_RINGS, NULL, 0) == 0);
+
+	prep_nop(&t, 47001, IOSQE_IO_LINK);
+	prep_nop(&t, 47002, 0);
+	ring_submit(&t);
+	expect_cqe(&t, 47001, 0);
+	expect_cqe(&t, 47002, 0);
+	prep_nop(&t, 47003, IOSQE_IO_DRAIN);
+	ring_submit(&t);
+	expect_cqe(&t, 47003, -EACCES);
+	(void)ring_prep(&t, IORING_OP_READ, 0, 47004);
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EACCES);
+	memset(probe, 0, sizeof(probe));
+	assert(reg(&t, IORING_REGISTER_PROBE, probe, 4) == 0);
+	assert(reg(&t, IORING_REGISTER_PERSONALITY, NULL, 0) == -EACCES);
+	close(t.fd);
+
+	/* Required flags. */
+	struct io_uring_restriction req[] = {
+		{ .opcode = IORING_RESTRICTION_SQE_OP,
+		    .sqe_op = IORING_OP_NOP },
+		{ .opcode = IORING_RESTRICTION_SQE_FLAGS_REQUIRED,
+		    .sqe_flags = IOSQE_ASYNC },
+	};
+	ring_setup(&t);
+	assert(reg(&t, IORING_REGISTER_RESTRICTIONS, req, 2) == 0);
+	assert(reg(&t, IORING_REGISTER_ENABLE_RINGS, NULL, 0) == 0);
+	prep_nop(&t, 47005, 0);
+	ring_submit(&t);
+	expect_cqe(&t, 47005, -EACCES);
+	prep_nop(&t, 47006, IOSQE_ASYNC);
+	ring_submit(&t);
+	expect_cqe(&t, 47006, 0);
+	close(t.fd);
+	printf("[PASS] Restrictions: SQE ops/flags and register ops, only "
+	    "before enable\n");
+}
+
+static void
+test_send_fd(void)
+{
+	struct io_uring_rsrc_register rr = {
+		.nr = 4,
+		.flags = IORING_RSRC_REGISTER_SPARSE,
+	};
+	struct test_ring a, b, c;
+	struct io_uring_sqe *sqe;
+	int pfd[2];
+	char buf[8];
+
+	ring_init(&a);
+	ring_init(&b);
+	ring_init(&c);
+	assert(pipe(pfd) == 0);
+	assert(reg(&a, IORING_REGISTER_FILES, &pfd[1], 1) == 0);
+	assert(reg(&b, IORING_REGISTER_FILES2, &rr, sizeof(rr)) == 0);
+	close(pfd[1]);
+
+	/* To a free slot of b: b's CQE carries the slot. */
+	sqe = ring_prep(&a, IORING_OP_MSG_RING, b.fd, 48001);
+	sqe->addr = IORING_MSG_SEND_FD;
+	sqe->addr3 = 0;
+	sqe->file_index = IORING_FILE_INDEX_ALLOC;
+	sqe->off = 0x5e4d;
+	ring_push_sqe(&a);
+	assert(submit_one(&a) == 0);
+	assert(kqring_enter(b.fd, 0, 0, 0, NULL, 0) == 0);
+	expect_cqe(&b, 0x5e4d, 0);
+	assert(fixed_rw(&b, IORING_OP_WRITE, 0, "fd!", 3, 48002) == 3);
+	assert(read(pfd[0], buf, sizeof(buf)) == 3 && memcmp(buf, "fd!", 3) == 0);
+	/* To slot 2, and to slot 1 without a CQE (CQE_SKIP). */
+	sqe = ring_prep(&a, IORING_OP_MSG_RING, b.fd, 48003);
+	sqe->addr = IORING_MSG_SEND_FD;
+	sqe->file_index = 3;
+	sqe->off = 0x5e4e;
+	ring_push_sqe(&a);
+	assert(submit_one(&a) == 0);
+	sqe = ring_prep(&a, IORING_OP_MSG_RING, b.fd, 48004);
+	sqe->addr = IORING_MSG_SEND_FD;
+	sqe->file_index = 2;
+	sqe->msg_ring_flags = IORING_MSG_RING_CQE_SKIP;
+	ring_push_sqe(&a);
+	assert(submit_one(&a) == 0);
+	assert(kqring_enter(b.fd, 0, 0, 0, NULL, 0) == 0);
+	expect_cqe(&b, 0x5e4e, 0);
+	assert(ring_cq_ready(&b) == 0);
+	assert(fixed_rw(&b, IORING_OP_WRITE, 1, "1", 1, 48005) == 1);
+	assert(fixed_rw(&b, IORING_OP_WRITE, 2, "2", 1, 48006) == 1);
+	assert(read(pfd[0], buf, sizeof(buf)) == 2);
+
+	/* Errors the target reports: no table, slot out of range. */
+	sqe = ring_prep(&a, IORING_OP_MSG_RING, c.fd, 48007);
+	sqe->addr = IORING_MSG_SEND_FD;
+	sqe->file_index = IORING_FILE_INDEX_ALLOC;
+	sqe->off = 0x5e4f;
+	ring_push_sqe(&a);
+	assert(submit_one(&a) == 0);
+	assert(kqring_enter(c.fd, 0, 0, 0, NULL, 0) == 0);
+	expect_cqe(&c, 0x5e4f, -ENXIO);
+	sqe = ring_prep(&a, IORING_OP_MSG_RING, b.fd, 48008);
+	sqe->addr = IORING_MSG_SEND_FD;
+	sqe->file_index = 9;
+	sqe->off = 0x5e50;
+	ring_push_sqe(&a);
+	assert(submit_one(&a) == 0);
+	assert(kqring_enter(b.fd, 0, 0, 0, NULL, 0) == 0);
+	expect_cqe(&b, 0x5e50, -EINVAL);
+	/* Errors the sender sees: itself, an empty source slot. */
+	sqe = ring_prep(&a, IORING_OP_MSG_RING, a.fd, 48009);
+	sqe->addr = IORING_MSG_SEND_FD;
+	sqe->file_index = 1;
+	ring_push_sqe(&a);
+	assert(submit_one(&a) == -EINVAL);
+	sqe = ring_prep(&a, IORING_OP_MSG_RING, b.fd, 48010);
+	sqe->addr = IORING_MSG_SEND_FD;
+	sqe->addr3 = 5;
+	sqe->file_index = 1;
+	ring_push_sqe(&a);
+	assert(submit_one(&a) == -EBADF);
+
+	/* IORING_REGISTER_SEND_MSG_RING: MSG_RING without an SQE. */
+	struct io_uring_sqe msg = {
+		.opcode = IORING_OP_MSG_RING,
+		.fd = c.fd,
+		.addr = IORING_MSG_DATA,
+		.len = 44,
+		.off = 0xbeef,
+	};
+	assert(reg(&a, IORING_REGISTER_SEND_MSG_RING, &msg, 1) == 0);
+	assert(kqring_enter(c.fd, 0, 0, 0, NULL, 0) == 0);
+	expect_cqe(&c, 0xbeef, 44);
+	msg.addr = IORING_MSG_SEND_FD;
+	assert(reg(&a, IORING_REGISTER_SEND_MSG_RING, &msg, 1) == -EINVAL);
+
+	close(pfd[0]);
+	close(a.fd);
+	close(b.fd);
+	close(c.fd);
+	printf("[PASS] MSG_RING SEND_FD: alloc/explicit slot, CQE_SKIP, target "
+	    "errors; REGISTER_SEND_MSG_RING\n");
+}
+
+static void
+test_fixed_cancel(void)
+{
+	struct io_uring_sync_cancel_reg sc;
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	int sv[2];
+	char buf[8];
+
+	ring_init(&t);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	assert(reg(&t, IORING_REGISTER_FILES, &sv[0], 1) == 0);
+	sqe = ring_prep(&t, IORING_OP_RECV, 0, 49001);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	/* Slot 0 is not descriptor 0. */
+	sqe = ring_prep(&t, IORING_OP_ASYNC_CANCEL, 0, 49002);
+	sqe->cancel_flags = IORING_ASYNC_CANCEL_FD;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -ENOENT);
+	sqe = ring_prep(&t, IORING_OP_ASYNC_CANCEL, 0, 49003);
+	sqe->cancel_flags = IORING_ASYNC_CANCEL_FD_FIXED;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+	sqe = ring_prep(&t, IORING_OP_ASYNC_CANCEL, 3, 49004);
+	sqe->cancel_flags = IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_FD_FIXED;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EBADF);
+	sqe = ring_prep(&t, IORING_OP_ASYNC_CANCEL, 0, 49005);
+	sqe->cancel_flags = IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_FD_FIXED;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	expect_cqe(&t, 49001, -ECANCELED);
+	expect_cqe(&t, 49005, 0);
+
+	/* IORING_REGISTER_SYNC_CANCEL. */
+	prep_recv(&t, sv[0], 49006, buf, sizeof(buf), 0);
+	ring_submit(&t);
+	sc = (struct io_uring_sync_cancel_reg){ .addr = 49006 };
+	assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == 0);
+	expect_cqe(&t, 49006, -ECANCELED);
+	assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == -ENOENT);
+	sc.pad[0] = 1;
+	assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == -EINVAL);
+	prep_recv(&t, sv[0], 49007, buf, sizeof(buf), 0);
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, sv[1], 49008);
+	sqe->poll32_events = POLLIN;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	sc = (struct io_uring_sync_cancel_reg){
+		.flags = IORING_ASYNC_CANCEL_ANY };
+	assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == 2);
+	assert(ring_cq_ready(&t) == 2);
+	ring_drain_cqes(&t);
+
+	close(sv[0]);
+	close(sv[1]);
+	close(t.fd);
+	printf("[PASS] Cancel: CANCEL_FD_FIXED matches slots only, "
+	    "REGISTER_SYNC_CANCEL\n");
+}
+
+static void
+test_fixed_file_ops(void)
+{
+	struct io_uring_clock_register clk = { .clockid = CLOCK_MONOTONIC };
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	struct stat sb;
+	char dir[64], path[96];
+	int fds[3], fd, rofd, pfd[2];
+
+	ring_init(&t);
+	make_tmpdir(dir, sizeof(dir));
+	snprintf(path, sizeof(path), "%s/o", dir);
+	fd = open(path, O_RDWR | O_CREAT, 0600);
+	assert(fd >= 0 && write(fd, "0123456789", 10) == 10);
+	rofd = open(path, O_RDONLY);
+	assert(rofd >= 0 && pipe(pfd) == 0);
+	fds[0] = fd;
+	fds[1] = pfd[0];
+	fds[2] = rofd;
+	assert(reg(&t, IORING_REGISTER_FILES, fds, 3) == 0);
+
+	static const uint8_t ok_ops[] = {
+		IORING_OP_FSYNC, IORING_OP_SYNC_FILE_RANGE, IORING_OP_FTRUNCATE,
+		IORING_OP_FADVISE,
+	};
+	for (size_t i = 0; i < sizeof(ok_ops); i++) {
+		sqe = ring_prep(&t, ok_ops[i], 0, 50001 + i);
+		sqe->flags = IOSQE_FIXED_FILE;
+		switch (ok_ops[i]) {
+		case IORING_OP_SYNC_FILE_RANGE:
+			sqe->sync_range_flags = SYNC_FILE_RANGE_WRITE;
+			break;
+		case IORING_OP_FTRUNCATE:
+			sqe->off = 4;
+			break;
+		case IORING_OP_FADVISE:
+			sqe->fadvise_advice = POSIX_FADV_SEQUENTIAL;
+			break;
+		}
+		ring_push_sqe(&t);
+		assert(submit_one(&t) == 0);
+	}
+	assert(fstat(fd, &sb) == 0 && sb.st_size == 4);
+	/* Some file systems (ZFS) cannot preallocate. */
+	sqe = ring_prep(&t, IORING_OP_FALLOCATE, 0, 50009);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = 4096;	/* length */
+	ring_push_sqe(&t);
+	int32_t res = submit_one(&t);
+	assert(res == 0 || res == -EOPNOTSUPP || res == -EINVAL);
+	if (res == 0)
+		assert(fstat(fd, &sb) == 0 && sb.st_size == 4096);
+	/* The pipe in slot 1: no advice, no truncation, not seekable. */
+	sqe = ring_prep(&t, IORING_OP_FADVISE, 1, 50010);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->fadvise_advice = POSIX_FADV_NORMAL;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -ESPIPE);
+	sqe = ring_prep(&t, IORING_OP_FTRUNCATE, 1, 50011);
+	sqe->flags = IOSQE_FIXED_FILE;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+	sqe = ring_prep(&t, IORING_OP_READ, 1, 50012);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)dir;
+	sqe->len = 1;
+	sqe->off = 0;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -ESPIPE);
+	/* A file opened read-only cannot be written. */
+	sqe = ring_prep(&t, IORING_OP_WRITE, 2, 50013);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)"x";
+	sqe->len = 1;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EBADF);
+
+	/* IORING_REGISTER_CLOCK. */
+	assert(reg(&t, IORING_REGISTER_CLOCK, &clk, 0) == 0);
+	clk.clockid = CLOCK_REALTIME;
+	assert(reg(&t, IORING_REGISTER_CLOCK, &clk, 0) == -EINVAL);
+
+	close(fd);
+	close(rofd);
+	close(pfd[0]);
+	close(pfd[1]);
+	close(t.fd);
+	unlink(path);
+	rmdir(dir);
+	printf("[PASS] Fixed-file sync ops: FSYNC/FTRUNCATE/FADVISE/FALLOCATE, "
+	    "mode and seek checks, REGISTER_CLOCK\n");
 }
 
 int
@@ -3208,6 +4491,17 @@ main(int argc, char **argv)
 		test_uring_cmd(&r);
 		test_read_multishot(&r);
 		test_phase2_validation(&r);
+		test_fixed_files();
+		test_direct_descriptors();
+		test_rsrc_tags();
+		test_registered_buffers();
+		test_buffer_groups();
+		test_eventfd();
+		test_personality();
+		test_restrictions(&r);
+		test_send_fd();
+		test_fixed_cancel();
+		test_fixed_file_ops();
 		printf("%s: %d failure(s)\n", failures ? "[FAIL]" : "[OK]",
 		    failures);
 	}
