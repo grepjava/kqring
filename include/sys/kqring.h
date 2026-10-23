@@ -638,6 +638,12 @@ struct io_uring_clock_register {
 	__u32	__resv[3];
 };
 
+/* IORING_REGISTER_IOWQ_MAX_WORKERS (uint32_t max[2]: bound, unbound) */
+enum io_wq_type {
+	IO_WQ_BOUND,
+	IO_WQ_UNBOUND,
+};
+
 /* IORING_REGISTER_CLONE_BUFFERS */
 #define IORING_REGISTER_SRC_REGISTERED	(1U << 0)
 #define IORING_REGISTER_DST_REPLACE	(1U << 1)

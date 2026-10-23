@@ -15,7 +15,7 @@
 
 | Linux `io_uring` CVE Class | `kqring.ko` Guarantee |
 |---|---|
-| **`io-wq` async worker UAFs** | No kernel worker threads exist. All SQE submissions and deferred socket re-arms run strictly in the owning thread's `sys_ioctl(KQRING_IOC_ENTER)` syscall context (`curthread->td_tid == ring->owner_tid`). |
+| **`io-wq` async worker UAFs** | In-process worker `kthread`s (`IORING_FEAT_NATIVE_WORKERS`) run inside `curproc` and never touch the CQ ring or the owner's fixed-file / registered-buffer tables (`ctx->files`, `ctx->bufs`). Every request acquires reference-counted resource and credential handles on the owner thread at issue time, and workers only queue completed `kqring_op`s onto `ctx->taskwork_ops` for the owner thread to drain inside `sys_ioctl(KQRING_IOC_ENTER)`. |
 | **`IOSQE_FIXED_FILE` reference cycles** | A ring can never be put in a fixed-file table (register, update, direct descriptors, `MSG_RING` `SEND_FD`), so rings cannot keep each other alive. Each slot holds a file reference and the file's Capsicum rights, which every request on it is checked against. Descriptors are re-resolved with rights checks on every attempt, and armed sockets hold `soref()`. |
 | **Fixed-file / registered-buffer node use-after-free on update** | Slots are reference-counted nodes. A request takes a reference when it is issued and drops it when freed, so replacing or unregistering a slot never affects a request still using it. The tag CQE is posted once the last reference is gone. All tables are changed only by the ring's owner thread. |
 | **Pinned user-buffer page lifetime bugs** | Nothing is pinned. Registered buffers are checked to be mapped and writable when they are registered, then kept as plain address ranges. `READ_FIXED` and friends must stay inside their range, and the data is copied with `uiomove()` as for any request. User-memory buffer rings are read with `copyin()`. |
@@ -30,11 +30,11 @@
 
 ## Supported Operations
 
-All I/O runs in the ring owner's thread inside `KQRING_IOC_ENTER`. Socket operations try the transfer inline first, and then wait on a socket upcall. Futexes, `WAITID` and timers are re-checked from the same thread.
+Socket operations try the transfer inline first in `KQRING_IOC_ENTER` (unless `IOSQE_ASYNC` is set) and then wait on a socket upcall. Blocking file, pipe, VFS, `WAITID` and `IOSQE_ASYNC` requests run on per-ring in-process kernel worker threads (`IO_WQ_BOUND` and `IO_WQ_UNBOUND`, `IORING_FEAT_NATIVE_WORKERS`) that share the process's address space and descriptor table and queue completions as deferred taskwork for the ring owner. Futexes and timers are driven from the owner thread.
 
 - **I/O:** `READ`, `WRITE`, `READV`, `WRITEV`, `READ_FIXED`, `WRITE_FIXED`, `READV_FIXED`, `WRITEV_FIXED`, `FSYNC`, `SYNC_FILE_RANGE`, `FALLOCATE`, `FTRUNCATE`, `FADVISE`, `MADVISE`.
   - `READ` and `READV` (with one iovec) take a provided buffer.
-  - On a socket, the read and write operations wait like `RECV` and `SEND` instead of blocking.
+  - On a socket, the read and write operations wait like `RECV` and `SEND` instead of blocking; on files, pipes and devices, they run on the in-process worker pool.
 - **Sockets:** `RECV`, `SEND`, `RECVMSG`, `SENDMSG`, `SEND_ZC`, `SENDMSG_ZC`, `ACCEPT`, `CONNECT`, `SOCKET`, `BIND`, `LISTEN`, `SHUTDOWN`, `READ_MULTISHOT`, `URING_CMD`.
   - Multishot is supported for `RECV`, `RECVMSG`, `ACCEPT` and `READ_MULTISHOT`.
   - `MSG_WAITALL` works on stream sockets, and `SEND` can take a destination address.
@@ -46,17 +46,18 @@ All I/O runs in the ring owner's thread inside `KQRING_IOC_ENTER`. Socket operat
   - `OPENAT`, `OPENAT2`, `ACCEPT` (including multishot), `SOCKET` and `PIPE` can create direct descriptors (`file_index`), and `CLOSE` can close them.
 - **Synchronisation:** `FUTEX_WAIT`, `FUTEX_WAITV`, `FUTEX_WAKE`, `WAITID`, `MSG_RING` (`IORING_MSG_DATA` and `IORING_MSG_SEND_FD`).
 - **Control:** `NOP`, `POLL_ADD` (including multishot), `POLL_REMOVE`, `TIMEOUT`, `TIMEOUT_REMOVE`, `LINK_TIMEOUT`, `ASYNC_CANCEL` (including `IORING_ASYNC_CANCEL_FD_FIXED`).
-- **SQE flags:** `IOSQE_FIXED_FILE`, `IOSQE_IO_LINK`, `IOSQE_IO_HARDLINK`, `IOSQE_IO_DRAIN`, `IOSQE_CQE_SKIP_SUCCESS` and `IOSQE_BUFFER_SELECT` (any group), plus `sqe->personality`.
+- **SQE flags:** `IOSQE_FIXED_FILE`, `IOSQE_IO_LINK`, `IOSQE_IO_HARDLINK`, `IOSQE_IO_DRAIN`, `IOSQE_ASYNC`, `IOSQE_CQE_SKIP_SUCCESS` and `IOSQE_BUFFER_SELECT` (any group), plus `sqe->personality`.
 - **Registration:**
   - Files: `FILES`, `FILES2`, `FILES_UPDATE`, `FILES_UPDATE2`, `UNREGISTER_FILES` and `FILE_ALLOC_RANGE`, with sparse tables and tags.
   - Buffers: `BUFFERS`, `BUFFERS2`, `BUFFERS_UPDATE`, `UNREGISTER_BUFFERS` and `CLONE_BUFFERS`.
   - Buffer rings: `PBUF_RING` (including `IOU_PBUF_RING_MMAP` and `IOU_PBUF_RING_INC`), `UNREGISTER_PBUF_RING` and `PBUF_STATUS`.
+  - Workers: `IOWQ_AFF`, `UNREGISTER_IOWQ_AFF` and `IOWQ_MAX_WORKERS`.
   - Other: `EVENTFD`, `EVENTFD_ASYNC`, `UNREGISTER_EVENTFD`, `PERSONALITY`, `UNREGISTER_PERSONALITY`, `RESTRICTIONS`, `ENABLE_RINGS`, `PROBE`, `SYNC_CANCEL`, `SEND_MSG_RING` and `CLOCK`.
 
 These operations and options are rejected for now, with `-EOPNOTSUPP` or `-EINVAL`:
 
 - **Pipe and other non-socket readiness:** `SPLICE`, `TEE`, and `READ_MULTISHOT` on anything other than a socket.
-- **Worker threads and polling:** `IORING_SETUP_SQPOLL`, `IORING_SETUP_IOPOLL`, `IORING_SETUP_SQE128`, `IORING_SETUP_CQE32`, and the `IOWQ_AFF` and `IOWQ_MAX_WORKERS` registrations.
+- **Polling and extended ring layouts:** `IORING_SETUP_SQPOLL`, `IORING_SETUP_IOPOLL`, `IORING_SETUP_SQE128`, `IORING_SETUP_CQE32`, and `IORING_SETUP_ATTACH_WQ`.
 - **No `io_uring_enter(2)` to use them:** `REGISTER_RING_FDS` and `IORING_ENTER_REGISTERED_RING`.
 - **No FreeBSD equivalent:** `EPOLL_CTL`, `EPOLL_WAIT`, `RECV_ZC`, and NAPI.
 
