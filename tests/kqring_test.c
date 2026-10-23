@@ -10,6 +10,7 @@
 
 #include <sys/types.h>
 #include <sys/capsicum.h>
+#include <sys/cpuset.h>
 #include <sys/event.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
@@ -89,6 +90,7 @@ ring_setup(struct test_ring *r)
 	assert((p.features & IORING_FEAT_SINGLE_MMAP) != 0);
 	assert((p.features & IORING_FEAT_NODROP) != 0);
 	assert((p.features & IORING_FEAT_EXT_ARG) != 0);
+	assert((p.features & IORING_FEAT_NATIVE_WORKERS) != 0);
 
 	r->ring_map_len = p.cq_off.cqes +
 	    p.cq_entries * sizeof(struct io_uring_cqe);
@@ -4440,6 +4442,429 @@ test_fixed_file_ops(void)
 	    "mode and seek checks, REGISTER_CLOCK\n");
 }
 
+static void
+test_iowq_register(void)
+{
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	cpuset_t mask, empty;
+	uint32_t maxw[2], defw[2];
+
+	ring_init(&t);
+
+	/* IORING_REGISTER_IOWQ_MAX_WORKERS validation and query/update. */
+	assert(reg(&t, IORING_REGISTER_IOWQ_MAX_WORKERS, maxw, 0) == -EINVAL);
+	assert(reg(&t, IORING_REGISTER_IOWQ_MAX_WORKERS, maxw, 1) == -EINVAL);
+	assert(reg(&t, IORING_REGISTER_IOWQ_MAX_WORKERS, maxw, 3) == -EINVAL);
+	assert(reg(&t, IORING_REGISTER_IOWQ_MAX_WORKERS, NULL, 2) == -EFAULT);
+	maxw[IO_WQ_BOUND] = 0x80000000U;
+	maxw[IO_WQ_UNBOUND] = 0;
+	assert(reg(&t, IORING_REGISTER_IOWQ_MAX_WORKERS, maxw, 2) == -EINVAL);
+
+	defw[IO_WQ_BOUND] = 0;
+	defw[IO_WQ_UNBOUND] = 0;
+	assert(reg(&t, IORING_REGISTER_IOWQ_MAX_WORKERS, defw, 2) == 0);
+	assert(defw[IO_WQ_BOUND] >= 1 && defw[IO_WQ_UNBOUND] >= 1);
+
+	maxw[IO_WQ_BOUND] = 2;
+	maxw[IO_WQ_UNBOUND] = 0;
+	assert(reg(&t, IORING_REGISTER_IOWQ_MAX_WORKERS, maxw, 2) == 0);
+	assert(maxw[IO_WQ_BOUND] == 2);
+	assert(maxw[IO_WQ_UNBOUND] == defw[IO_WQ_UNBOUND]);
+
+	maxw[IO_WQ_BOUND] = 0;
+	maxw[IO_WQ_UNBOUND] = 4;
+	assert(reg(&t, IORING_REGISTER_IOWQ_MAX_WORKERS, maxw, 2) == 0);
+	assert(maxw[IO_WQ_BOUND] == 2 && maxw[IO_WQ_UNBOUND] == 4);
+
+	maxw[IO_WQ_BOUND] = 100000;
+	maxw[IO_WQ_UNBOUND] = 100000;
+	assert(reg(&t, IORING_REGISTER_IOWQ_MAX_WORKERS, maxw, 2) == 0);
+	assert(maxw[IO_WQ_BOUND] == 256 && maxw[IO_WQ_UNBOUND] == 256);
+
+	/* IORING_REGISTER_IOWQ_AFF / IORING_UNREGISTER_IOWQ_AFF. */
+	CPU_ZERO(&empty);
+	assert(reg(&t, IORING_REGISTER_IOWQ_AFF, &empty, 0) == -EINVAL);
+	assert(reg(&t, IORING_REGISTER_IOWQ_AFF, &empty, 65536) == -EINVAL);
+	assert(reg(&t, IORING_REGISTER_IOWQ_AFF, NULL, sizeof(empty)) ==
+	    -EFAULT);
+	assert(reg(&t, IORING_REGISTER_IOWQ_AFF, &empty, sizeof(empty)) ==
+	    -EINVAL);
+	assert(reg(&t, IORING_UNREGISTER_IOWQ_AFF, &empty, 0) == -EINVAL);
+	assert(reg(&t, IORING_UNREGISTER_IOWQ_AFF, NULL, 1) == -EINVAL);
+
+	assert(cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1,
+	    sizeof(mask), &mask) == 0);
+	cpuset_t one;
+	CPU_ZERO(&one);
+	for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+		if (CPU_ISSET(cpu, &mask)) {
+			CPU_SET(cpu, &one);
+			break;
+		}
+	}
+	assert(!CPU_EMPTY(&one));
+	assert(reg(&t, IORING_REGISTER_IOWQ_AFF, &one, sizeof(one)) == 0);
+
+	/* Run an IOSQE_ASYNC request under the pinned affinity, then clear. */
+	sqe = ring_prep(&t, IORING_OP_NOP, -1, 60001);
+	sqe->flags = IOSQE_ASYNC;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+
+	assert(reg(&t, IORING_UNREGISTER_IOWQ_AFF, NULL, 0) == 0);
+	sqe = ring_prep(&t, IORING_OP_NOP, -1, 60002);
+	sqe->flags = IOSQE_ASYNC;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+
+	close(t.fd);
+	printf("[PASS] IOWQ registration: IOWQ_MAX_WORKERS, IOWQ_AFF / "
+	    "UNREGISTER_IOWQ_AFF\n");
+}
+
+static void
+test_worker_nonblocking_pipe(void)
+{
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	struct test_ring t;
+	char buf[64], fill[4096];
+	int pfd[2], fl;
+
+	ring_init(&t);
+	assert(pipe(pfd) == 0);
+
+	/*
+	 * A blocking READ on an empty pipe runs on an in-process worker
+	 * thread, so ring_submit() returns immediately without blocking the
+	 * ring owner, and an inline NOP still completes while the pipe read
+	 * is waiting.
+	 */
+	memset(buf, 0, sizeof(buf));
+	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 61001);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 5;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+
+	prep_nop(&t, 61002, 0);
+	ring_submit(&t);
+	expect_cqe(&t, 61002, 0);
+	assert(ring_cq_ready(&t) == 0);
+
+	assert(write(pfd[1], "async", 5) == 5);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 61001, 5);
+	assert(memcmp(buf, "async", 5) == 0);
+
+	/*
+	 * IOSQE_BUFFER_SELECT on a blocking pipe read waits for readability
+	 * before picking a buffer from group 0, so another read with buffer
+	 * selection is not starved while the first pipe is empty.
+	 */
+	int pfd2[2];
+	assert(pipe(pfd2) == 0);
+	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 61003);
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	sqe->len = 16;
+	sqe->off = (uint64_t)-1;
+	sqe->buf_group = 0;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+
+	assert(write(pfd2[1], "first!", 6) == 6);
+	sqe = ring_prep(&t, IORING_OP_READ, pfd2[0], 61004);
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	sqe->len = 16;
+	sqe->off = (uint64_t)-1;
+	sqe->buf_group = 0;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 61004 && c.res == 6);
+	assert((c.flags & IORING_CQE_F_BUFFER) != 0);
+	uint16_t bid1 = c.flags >> IORING_CQE_BUFFER_SHIFT;
+	assert(memcmp(t.bufs + (size_t)bid1 * BUF_SIZE, "first!", 6) == 0);
+	ring_offer_buf(&t, bid1);
+
+	assert(write(pfd[1], "second!", 7) == 7);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 61003 && c.res == 7);
+	assert((c.flags & IORING_CQE_F_BUFFER) != 0);
+	uint16_t bid2 = c.flags >> IORING_CQE_BUFFER_SHIFT;
+	assert(memcmp(t.bufs + (size_t)bid2 * BUF_SIZE, "second!", 7) == 0);
+	ring_offer_buf(&t, bid2);
+	close(pfd2[0]);
+	close(pfd2[1]);
+
+	/*
+	 * A blocking WRITE on a full pipe also runs on a worker without
+	 * blocking the ring owner thread.
+	 */
+	memset(fill, 'W', sizeof(fill));
+	fl = fcntl(pfd[1], F_GETFL, 0);
+	assert(fl != -1 && fcntl(pfd[1], F_SETFL, fl | O_NONBLOCK) == 0);
+	size_t filled = 0;
+	while (write(pfd[1], fill, sizeof(fill)) > 0)
+		filled += sizeof(fill);
+	assert(errno == EAGAIN);
+	assert(fcntl(pfd[1], F_SETFL, fl) == 0);
+
+	sqe = ring_prep(&t, IORING_OP_WRITE, pfd[1], 61005);
+	sqe->addr = (uint64_t)(uintptr_t)"tail";
+	sqe->len = 4;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+
+	while (filled > 0) {
+		ssize_t n = read(pfd[0], fill, sizeof(fill));
+		assert(n > 0);
+		filled -= (size_t)n;
+	}
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 61005, 4);
+	assert(read(pfd[0], buf, 4) == 4 && memcmp(buf, "tail", 4) == 0);
+
+	close(pfd[0]);
+	close(pfd[1]);
+	close(t.fd);
+	printf("[PASS] Worker threads: non-blocking pipe READ/WRITE and "
+	    "deferred BUFFER_SELECT\n");
+}
+
+static void
+test_worker_cancel_and_timeout(void)
+{
+	struct io_uring_sync_cancel_reg sc;
+	struct __kernel_timespec ts = { .tv_nsec = 20000000 }; /* 20 ms */
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	char buf[16];
+	int pfd[2];
+
+	ring_init(&t);
+	assert(pipe(pfd) == 0);
+
+	/* 1. Cancel a sleeping worker pipe READ via IORING_OP_ASYNC_CANCEL. */
+	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 62001);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+
+	sqe = ring_prep(&t, IORING_OP_ASYNC_CANCEL, -1, 62002);
+	sqe->addr = 62001;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	expect_cqe(&t, 62001, -ECANCELED);
+	expect_cqe(&t, 62002, 0);
+
+	/* 2. Cancel a sleeping worker pipe READ via SYNC_CANCEL. */
+	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 62003);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+
+	memset(&sc, 0, sizeof(sc));
+	sc.addr = 62003;
+	assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == 0);
+	expect_cqe(&t, 62003, -ECANCELED);
+
+	/* 3. Cancel a sleeping worker pipe READ via LINK_TIMEOUT. */
+	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 62004);
+	sqe->flags = IOSQE_IO_LINK;
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	sqe = ring_prep(&t, IORING_OP_LINK_TIMEOUT, -1, 62005);
+	sqe->addr = (uint64_t)(uintptr_t)&ts;
+	sqe->len = 1;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_wait(&t, 2, 2000) == 0);
+	expect_cqe(&t, 62005, -ETIME);
+	expect_cqe(&t, 62004, -ECANCELED);
+
+	/*
+	 * 4. Verify the pipe is still usable after worker cancellations and
+	 * no stale worker consumed data.
+	 */
+	assert(write(pfd[1], "ok!", 3) == 3);
+	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 62006);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 3;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 3);
+	assert(memcmp(buf, "ok!", 3) == 0);
+
+	close(pfd[0]);
+	close(pfd[1]);
+	close(t.fd);
+	printf("[PASS] Worker cancellation: ASYNC_CANCEL, SYNC_CANCEL, "
+	    "LINK_TIMEOUT\n");
+}
+
+static void
+test_worker_max_workers(void)
+{
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	uint32_t maxw[2] = { 1, 1 };
+	char dir[64], path[96], fbuf[8], pbuf[3][8];
+	int pfd[3][2], fd;
+
+	ring_init(&t);
+	assert(reg(&t, IORING_REGISTER_IOWQ_MAX_WORKERS, maxw, 2) == 0);
+	assert(maxw[IO_WQ_BOUND] == 1 && maxw[IO_WQ_UNBOUND] == 1);
+
+	for (int i = 0; i < 3; i++)
+		assert(pipe(pfd[i]) == 0);
+	make_tmpdir(dir, sizeof(dir));
+	snprintf(path, sizeof(path), "%s/w", dir);
+	fd = open(path, O_RDWR | O_CREAT, 0600);
+	assert(fd >= 0 && write(fd, "bounded", 7) == 7);
+
+	/*
+	 * Queue 3 blocking pipe reads on IO_WQ_UNBOUND (limit 1): the first
+	 * occupies the single unbound worker and the other two wait in the
+	 * queue.
+	 */
+	for (int i = 0; i < 3; i++) {
+		sqe = ring_prep(&t, IORING_OP_READ, pfd[i][0], 63001 + i);
+		sqe->addr = (uint64_t)(uintptr_t)pbuf[i];
+		sqe->len = 2;
+		sqe->off = (uint64_t)-1;
+		ring_push_sqe(&t);
+	}
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+
+	/*
+	 * Regular file I/O uses IO_WQ_BOUND, so it completes even while
+	 * IO_WQ_UNBOUND's single worker is blocked on pfd[0].
+	 */
+	memset(fbuf, 0, sizeof(fbuf));
+	sqe = ring_prep(&t, IORING_OP_READ, fd, 63010);
+	sqe->addr = (uint64_t)(uintptr_t)fbuf;
+	sqe->len = 7;
+	sqe->off = 0;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 7);
+	assert(memcmp(fbuf, "bounded", 7) == 0);
+
+	/*
+	 * Writing to pfd[1] while pfd[0] is still blocking the single
+	 * unbound worker cannot complete pfd[1]'s read until pfd[0] is
+	 * unblocked.
+	 */
+	assert(write(pfd[1][1], "p1", 2) == 2);
+	assert(write(pfd[2][1], "p2", 2) == 2);
+	assert(ring_wait(&t, 1, 20) == ETIMEDOUT);
+	assert(ring_cq_ready(&t) == 0);
+
+	/* Unblocking pfd[0] lets the single unbound worker drain all three. */
+	assert(write(pfd[0][1], "p0", 2) == 2);
+	assert(ring_wait(&t, 3, 2000) == 0);
+	expect_cqe(&t, 63001, 2);
+	expect_cqe(&t, 63002, 2);
+	expect_cqe(&t, 63003, 2);
+	assert(memcmp(pbuf[0], "p0", 2) == 0);
+	assert(memcmp(pbuf[1], "p1", 2) == 0);
+	assert(memcmp(pbuf[2], "p2", 2) == 0);
+
+	for (int i = 0; i < 3; i++) {
+		close(pfd[i][0]);
+		close(pfd[i][1]);
+	}
+	close(fd);
+	close(t.fd);
+	unlink(path);
+	rmdir(dir);
+	printf("[PASS] Worker pools: IO_WQ_BOUND vs IO_WQ_UNBOUND isolation "
+	    "and IOWQ_MAX_WORKERS cap\n");
+}
+
+static void
+test_worker_process_lifecycle(void)
+{
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	char buf[8];
+	int pfd[2], status;
+	pid_t pid;
+
+	ring_init(&t);
+	assert(pipe(pfd) == 0);
+
+	/* Spawn a blocked worker on pfd[0] and an idle bounded worker. */
+	sqe = ring_prep(&t, IORING_OP_NOP, -1, 64001);
+	sqe->flags = IOSQE_ASYNC;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+
+	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 64002);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 4;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+
+	/*
+	 * fork(2) uses thread_single(SINGLE_BOUNDARY); in-process worker
+	 * kthreads must suspend at the boundary and resume in the parent.
+	 */
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		struct test_ring ct;
+		int cpfd[2];
+
+		close(t.fd);
+		close(pfd[0]);
+		close(pfd[1]);
+		ring_init(&ct);
+		assert(pipe(cpfd) == 0);
+		sqe = ring_prep(&ct, IORING_OP_READ, cpfd[0], 64010);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = 4;
+		sqe->off = (uint64_t)-1;
+		ring_push_sqe(&ct);
+		ring_submit(&ct);
+		/* Exit with a blocked worker still running: SINGLE_EXIT. */
+		_exit(0);
+	}
+	assert(waitpid(pid, &status, 0) == pid);
+	assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	/* Parent's blocked worker is still alive after fork(2) and completes. */
+	assert(write(pfd[1], "fork", 4) == 4);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 64002, 4);
+	assert(memcmp(buf, "fork", 4) == 0);
+
+	close(pfd[0]);
+	close(pfd[1]);
+	close(t.fd);
+	printf("[PASS] Worker process lifecycle: fork(2) SINGLE_BOUNDARY and "
+	    "_exit(2) SINGLE_EXIT with active workers\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -4502,6 +4927,11 @@ main(int argc, char **argv)
 		test_send_fd();
 		test_fixed_cancel();
 		test_fixed_file_ops();
+		test_iowq_register();
+		test_worker_nonblocking_pipe();
+		test_worker_cancel_and_timeout();
+		test_worker_max_workers();
+		test_worker_process_lifecycle();
 		printf("%s: %d failure(s)\n", failures ? "[FAIL]" : "[OK]",
 		    failures);
 	}
