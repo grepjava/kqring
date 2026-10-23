@@ -466,6 +466,7 @@ struct kqring_ctx {
 	bool			setup_done;
 	bool			enabled;
 	bool			closing;
+	bool			cancelled;
 	bool			in_ctx_list;
 	struct proc		*owner_proc;	/* SINGLE_ISSUER process */
 	lwpid_t			owner_tid;	/* SINGLE_ISSUER thread ID */
@@ -6340,8 +6341,6 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 
 	if ((sqe->flags & ~KQRING_SQE_FLAGS) != 0)
 		return (EINVAL);
-	if (ctx->nreqs > KQRING_MAX_REQS)
-		return (EBUSY);
 	if (ctx->restricted && !kqring_restriction_ok(ctx, sqe))
 		return (EACCES);
 	if ((ctx->flags & IORING_SETUP_IOPOLL) != 0 &&
@@ -7988,7 +7987,11 @@ kqring_ctx_cancel_all(struct kqring_ctx *ctx)
 	struct kqring_op *op;
 	struct kqring_wq *wq;
 
-	/* closing stops upcalls, workers and callouts from queueing taskwork. */
+	/*
+	 * Signal closing and wait for the SQPOLL kthread to exit before
+	 * taking sq_sx (since kqring_sqpoll_thread() acquires sq_sx in its
+	 * main loop).
+	 */
 	mtx_lock(&ctx->mtx);
 	ctx->closing = true;
 	if (ctx->sleeping)
@@ -7997,6 +8000,21 @@ kqring_ctx_cancel_all(struct kqring_ctx *ctx)
 		wakeup(&ctx->sqpoll_wait_chan);
 	while (ctx->sqpoll_running)
 		msleep(&ctx->sqpoll_running, &ctx->mtx, 0, "kqsqdt", 0);
+	mtx_unlock(&ctx->mtx);
+
+	/*
+	 * Serialize teardown with any in-flight issuer path and ensure the
+	 * body of kqring_ctx_cancel_all() runs exclusively once (even if
+	 * kqring_proc_rings_teardown() and kqring_dtor() race).
+	 */
+	sx_xlock(&ctx->sq_sx);
+	if (ctx->cancelled) {
+		sx_xunlock(&ctx->sq_sx);
+		return;
+	}
+	ctx->cancelled = true;
+
+	mtx_lock(&ctx->mtx);
 	while ((op = TAILQ_FIRST(&ctx->active_ops)) != NULL) {
 		kqring_op_unarm_locked(ctx, op);
 		mtx_unlock(&ctx->mtx);
@@ -8008,6 +8026,7 @@ kqring_ctx_cancel_all(struct kqring_ctx *ctx)
 	ctx->wq = NULL;
 	mtx_unlock(&ctx->mtx);
 	kqring_wq_put(wq);
+
 	while ((op = TAILQ_FIRST(&ctx->ready_q)) != NULL) {
 		TAILQ_REMOVE(&ctx->ready_q, op, q_link);
 		kqring_req_destroy(ctx, op);
@@ -8023,6 +8042,7 @@ kqring_ctx_cancel_all(struct kqring_ctx *ctx)
 	 */
 	kqring_files_free(ctx);
 	kqring_bufs_free(ctx);
+	sx_xunlock(&ctx->sq_sx);
 }
 
 static void
@@ -8436,22 +8456,53 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
     uint32_t *submitted_out)
 {
 	struct kqring_shm_header *shm = ctx->shm;
-	uint32_t head, tail, consumed = 0, submitted = 0;
+	uint32_t head, tail, avail, consumed = 0, submitted = 0;
 	struct kqring_op *chain_head = NULL, *chain_tail = NULL;
-	bool chain_failed = false;
+	bool chain_failed = false, chain_drop = false;
 
 	kqring_flush_overflow(ctx);
 	head = shm->sq_head;
 	tail = atomic_load_acq_32(&shm->sq_tail);
+	avail = MIN(tail - head, ctx->sq_entries);
+	max_submit = MIN(max_submit, avail);
 	/* CQEs posted inline here are not "async" (EVENTFD_ASYNC). */
 	ctx->submitting = true;
-	while (head != tail && consumed < max_submit) {
+	while (consumed < max_submit) {
 		uint32_t sqe_idx = ctx->sq_array[head & ctx->sq_mask];
 		head++;
 		consumed++;
 		if (sqe_idx >= ctx->sq_entries) {
 			/* As in io_uring: consumed, counted, not submitted. */
 			atomic_add_32(&shm->sq_dropped, 1);
+			continue;
+		}
+		if (chain_drop || ctx->nreqs >= KQRING_MAX_REQS) {
+			struct io_uring_sqe sqe;
+			int32_t err = chain_drop ? -ECANCELED : -EBUSY;
+
+			if ((ctx->flags & IORING_SETUP_SQE128) != 0) {
+				const uint8_t *raw =
+				    (const uint8_t *)ctx->sqes +
+				    (size_t)sqe_idx * 128;
+
+				memcpy(&sqe, raw, sizeof(sqe));
+			} else {
+				sqe = ctx->sqes[sqe_idx];
+			}
+			if (chain_head != NULL) {
+				kqring_chain_fail(ctx, chain_head);
+				chain_head = chain_tail = NULL;
+				chain_failed = false;
+			}
+			kqring_post_cqe(ctx, sqe.user_data, err, 0);
+			if ((sqe.flags &
+			    (IOSQE_IO_LINK | IOSQE_IO_HARDLINK)) != 0) {
+				chain_drop = true;
+			} else {
+				chain_drop = false;
+				atomic_store_rel_32(&shm->sq_head, head);
+			}
+			submitted++;
 			continue;
 		}
 		struct kqring_op *op = kqring_op_alloc(ctx);
@@ -8836,12 +8887,18 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	/*
 	 * 2. Drain and submit queued SQEs.
 	 */
+	sx_xlock(&ctx->sq_sx);
+	if (ctx->closing) {
+		sx_xunlock(&ctx->sq_sx);
+		return (EBADF);
+	}
 	kqring_submit_sqes(ctx, ea->to_submit, &submitted);
 	ea->SUBMITTED_out = submitted;
 
 	/* 3. Run pending DEFER_TASKRUN completions, futex and timeout checks */
 	kqring_run_taskwork(ctx);
 	kqring_run_checks(ctx);
+	sx_xunlock(&ctx->sq_sx);
 
 	if (!wait) {
 		kqring_evfd_flush(ctx);
@@ -8875,9 +8932,15 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 	int error;
 
 	for (;;) {
+		sx_xlock(&ctx->sq_sx);
+		if (ctx->closing) {
+			sx_xunlock(&ctx->sq_sx);
+			return (EBADF);
+		}
 		kqring_run_taskwork(ctx);
 		kqring_run_checks(ctx);
 		kqring_flush_overflow(ctx);
+		sx_xunlock(&ctx->sq_sx);
 
 		uint32_t cq_count = atomic_load_acq_32(&shm->cq_tail) -
 		    atomic_load_acq_32(&shm->cq_head);
@@ -9389,6 +9452,8 @@ kqring_bufs_clone(struct kqring_ctx *ctx, const struct kqring_register_arg *ra)
 		error = EINVAL;
 	else if (error == 0 && !kqring_is_owner(sctx, td))
 		error = EEXIST;
+	else if (error == 0 && sctx->closing)
+		error = EBADF;
 	else if (error == 0 && sctx->bufs == NULL)
 		error = ENXIO;
 	if (error != 0)
@@ -10295,11 +10360,14 @@ kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
 	}
 	mtx_unlock(&ctx->mtx);
 
-	if ((ctx->flags & IORING_SETUP_SQPOLL) != 0)
-		sx_xlock(&ctx->sq_sx);
-	error = kqring_register_op(ctx, ra, td, resp);
-	if ((ctx->flags & IORING_SETUP_SQPOLL) != 0)
+	sx_xlock(&ctx->sq_sx);
+	if (ctx->closing) {
 		sx_xunlock(&ctx->sq_sx);
+		error = EBADF;
+	} else {
+		error = kqring_register_op(ctx, ra, td, resp);
+		sx_xunlock(&ctx->sq_sx);
+	}
 
 	if (busy) {
 		mtx_lock(&ctx->mtx);

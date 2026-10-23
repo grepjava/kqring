@@ -5791,8 +5791,35 @@ test_phase5_security_audit(void)
 	assert(waitpid(pid, &status, 0) == pid);
 	assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 
+	/*
+	 * 3. Forged sq_tail (tail - head > sq_entries) with linked SQEs is
+	 * bounded to sq_entries per batch and cannot bypass KQRING_MAX_REQS.
+	 */
+	struct test_ring ft;
+	ring_setup(&ft);
+	assert(kqring_register(ft.fd, IORING_REGISTER_ENABLE_RINGS,
+	    NULL, 0) == 0);
+	for (unsigned i = 0; i < SQ_ENTRIES; i++) {
+		memset(&ft.sqes[i], 0, sizeof(ft.sqes[i]));
+		ft.sqes[i].opcode = IORING_OP_NOP;
+		ft.sqes[i].flags = IOSQE_IO_LINK;
+		ft.sqes[i].user_data = 80000 + i;
+		ft.sq_array[i] = i;
+	}
+	atomic_store_explicit(ft.sq_ktail, 100000U, memory_order_release);
+	int nsub = kqring_enter(ft.fd, 100000U, 0, 0, NULL, 0);
+	assert(nsub == SQ_ENTRIES);
+	assert(atomic_load_explicit(ft.sq_khead, memory_order_acquire) ==
+	    SQ_ENTRIES);
+	assert(atomic_load_explicit(ft.cq_ktail, memory_order_acquire) -
+	    atomic_load_explicit(ft.cq_khead, memory_order_acquire) ==
+	    SQ_ENTRIES);
+	munmap(ft.sqes, ft.sqes_len);
+	munmap(ft.ring_map, ft.ring_map_len);
+	close(ft.fd);
+
 	printf("[PASS] Phase 5 security: AF_UNIX SCM_RIGHTS cycle broken on "
-	    "exit, execve(2) ring teardown, owner tid+proc check\n");
+	    "exit, execve(2) ring teardown, forged sq_tail bound, owner check\n");
 }
 
 int
