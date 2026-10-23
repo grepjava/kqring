@@ -157,6 +157,7 @@ struct io_uring_cqe {
 	__u64	user_data;
 	__s32	res;
 	__u32	flags;
+	__u64	big_cqe[0];
 };
 
 _Static_assert(sizeof(struct io_uring_cqe) == 16, "io_uring_cqe must be 16 bytes");
@@ -478,6 +479,7 @@ _Static_assert(sizeof(struct statx) == 256, "struct statx must be 256 bytes");
 #define IORING_CQE_F_SOCK_NONEMPTY	(1U << 2)
 #define IORING_CQE_F_NOTIF		(1U << 3)
 #define IORING_CQE_F_BUF_MORE		(1U << 4)	/* IOU_PBUF_RING_INC */
+#define IORING_CQE_F_32			(1U << 5)	/* 32-byte CQE */
 
 #define IORING_CQE_BUFFER_SHIFT		16
 

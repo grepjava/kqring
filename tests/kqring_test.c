@@ -479,7 +479,6 @@ test_setup_errors(void)
 	    IORING_SETUP_DEFER_TASKRUN;
 	static const uint32_t bad[] = {
 		IORING_SETUP_SQPOLL, IORING_SETUP_IOPOLL,
-		IORING_SETUP_SQE128, IORING_SETUP_CQE32,
 		IORING_SETUP_ATTACH_WQ, 1U << 16 /* NO_SQARRAY */,
 	};
 	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
@@ -5161,6 +5160,167 @@ test_nonsock_poll(void)
 	    "FIXED_FILE, POLL_REMOVE, POLLHUP\n");
 }
 
+static void
+test_sqe128_cqe32_attach_wq(void)
+{
+	struct io_uring_params p1, p2, pbad;
+	int fd1, badfd, pfd[2];
+	char buf[16];
+
+	/* 1. SQE128 + CQE32 ring layout and MSG_RING extra CQE payload. */
+	memset(&p1, 0, sizeof(p1));
+	p1.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+	    IORING_SETUP_SQE128 | IORING_SETUP_CQE32;
+	fd1 = (int)kqring_setup(4, &p1);
+	assert(fd1 >= 0);
+	assert(p1.sq_entries == 4 && p1.cq_entries == 8);
+
+	size_t ring_len = p1.cq_off.cqes +
+	    (size_t)p1.cq_entries * sizeof(struct io_uring_cqe) * 2;
+	char *ring_base = mmap(NULL, ring_len, PROT_READ | PROT_WRITE,
+	    MAP_SHARED, fd1, IORING_OFF_SQ_RING);
+	assert(ring_base != MAP_FAILED);
+
+	size_t sqes_len = (size_t)p1.sq_entries * sizeof(struct io_uring_sqe) * 2;
+	uint8_t *sqes_raw = mmap(NULL, sqes_len, PROT_READ | PROT_WRITE,
+	    MAP_SHARED, fd1, IORING_OFF_SQES);
+	assert(sqes_raw != MAP_FAILED);
+
+	_Atomic unsigned *sq_ktail = (_Atomic unsigned *)(ring_base +
+	    p1.sq_off.tail);
+	unsigned *sq_array = (unsigned *)(ring_base + p1.sq_off.array);
+	_Atomic unsigned *cq_khead = (_Atomic unsigned *)(ring_base +
+	    p1.cq_off.head);
+	_Atomic unsigned *cq_ktail = (_Atomic unsigned *)(ring_base +
+	    p1.cq_off.tail);
+	struct io_uring_cqe *cqes = (struct io_uring_cqe *)(ring_base +
+	    p1.cq_off.cqes);
+
+	for (unsigned i = 0; i < p1.sq_entries; i++)
+		sq_array[i] = i;
+
+	/* Submit two 128-byte SQEs: NOP at index 0, MSG_RING at index 1. */
+	memset(sqes_raw, 0, sqes_len);
+	struct io_uring_sqe *sqe0 = (struct io_uring_sqe *)(sqes_raw + 0 * 128);
+	sqe0->opcode = IORING_OP_NOP;
+	sqe0->fd = -1;
+	sqe0->user_data = 72001;
+
+	struct io_uring_sqe *sqe1 = (struct io_uring_sqe *)(sqes_raw + 1 * 128);
+	sqe1->opcode = IORING_OP_MSG_RING;
+	sqe1->fd = fd1;
+	sqe1->addr = IORING_MSG_DATA;
+	sqe1->len = 42;
+	sqe1->off = 72002;
+	sqe1->user_data = 72003;
+	uint64_t extra_in[2] = { 0x1122334455667788ULL, 0x99aabbccddeeff00ULL };
+	memcpy((uint8_t *)sqe1 + 64, extra_in, sizeof(extra_in));
+
+	/* Pre-fill big_cqe slots with non-zero to verify NOP zeroes them. */
+	cqes[0].big_cqe[0] = ~0ULL;
+	cqes[0].big_cqe[1] = ~0ULL;
+
+	atomic_store_explicit(sq_ktail, 2, memory_order_release);
+	assert(kqring_enter(fd1, 2, 3, IORING_ENTER_GETEVENTS, NULL, 0) == 2);
+	assert(atomic_load_explicit(cq_ktail, memory_order_acquire) -
+	    atomic_load_explicit(cq_khead, memory_order_relaxed) == 3);
+
+	/* Slot 0 (offset 0 * 32): NOP completion, big_cqe zeroed. */
+	struct io_uring_cqe *c0 = &cqes[0 * 2];
+	assert(c0->user_data == 72001 && c0->res == 0);
+	assert(c0->big_cqe[0] == 0 && c0->big_cqe[1] == 0);
+
+	/* Slot 1 (offset 1 * 32): MSG_RING sender completion. */
+	struct io_uring_cqe *c1 = &cqes[1 * 2];
+	assert(c1->user_data == 72003 && c1->res == 0);
+	assert(c1->big_cqe[0] == 0 && c1->big_cqe[1] == 0);
+
+	/* Slot 2 (offset 2 * 32): MSG_RING target completion with big_cqe. */
+	struct io_uring_cqe *c2 = &cqes[2 * 2];
+	assert(c2->user_data == 72002 && c2->res == 42);
+	assert(c2->big_cqe[0] == extra_in[0] && c2->big_cqe[1] == extra_in[1]);
+	atomic_store_explicit(cq_khead, 3, memory_order_release);
+
+	/* 2. ATTACH_WQ validation and shared worker pool behavior. */
+	memset(&pbad, 0, sizeof(pbad));
+	pbad.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+	    IORING_SETUP_ATTACH_WQ;
+	pbad.wq_fd = 999999;
+	assert(kqring_setup(4, &pbad) == -1 && errno == EINVAL);
+
+	badfd = open("/dev/kqring", O_RDWR | O_CLOEXEC);
+	assert(badfd >= 0);
+	pbad.wq_fd = (uint32_t)badfd; /* not yet setup */
+	assert(kqring_setup(4, &pbad) == -1 && errno == EINVAL);
+	close(badfd);
+
+	/* Attach a second ring (fd2) to fd1's worker pool. */
+	struct test_ring r2;
+	memset(&p2, 0, sizeof(p2));
+	p2.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+	    IORING_SETUP_ATTACH_WQ;
+	p2.wq_fd = (uint32_t)fd1;
+	memset(&r2, 0, sizeof(r2));
+	r2.fd = (int)kqring_setup(8, &p2);
+	assert(r2.fd >= 0);
+	r2.ring_map_len = p2.cq_off.cqes +
+	    p2.cq_entries * sizeof(struct io_uring_cqe);
+	r2.ring_map = mmap(NULL, r2.ring_map_len, PROT_READ | PROT_WRITE,
+	    MAP_SHARED, r2.fd, IORING_OFF_SQ_RING);
+	assert(r2.ring_map != MAP_FAILED);
+	r2.sqes_len = p2.sq_entries * sizeof(struct io_uring_sqe);
+	r2.sqes = mmap(NULL, r2.sqes_len, PROT_READ | PROT_WRITE,
+	    MAP_SHARED, r2.fd, IORING_OFF_SQES);
+	assert(r2.sqes != MAP_FAILED);
+	char *base2 = (char *)r2.ring_map;
+	r2.sq_khead = (_Atomic unsigned *)(base2 + p2.sq_off.head);
+	r2.sq_ktail = (_Atomic unsigned *)(base2 + p2.sq_off.tail);
+	r2.sq_kflags = (_Atomic unsigned *)(base2 + p2.sq_off.flags);
+	r2.sq_kdropped = (_Atomic unsigned *)(base2 + p2.sq_off.dropped);
+	r2.sq_mask = *(unsigned *)(base2 + p2.sq_off.ring_mask);
+	r2.sq_array = (unsigned *)(base2 + p2.sq_off.array);
+	for (unsigned i = 0; i < p2.sq_entries; i++)
+		r2.sq_array[i] = i;
+	r2.cq_khead = (_Atomic unsigned *)(base2 + p2.cq_off.head);
+	r2.cq_ktail = (_Atomic unsigned *)(base2 + p2.cq_off.tail);
+	r2.cq_kflags = (_Atomic unsigned *)(base2 + p2.cq_off.flags);
+	r2.cq_mask = *(unsigned *)(base2 + p2.cq_off.ring_mask);
+	r2.cqes = (struct io_uring_cqe *)(base2 + p2.cq_off.cqes);
+
+	/* Setting IOWQ_MAX_WORKERS on fd1 is reflected when queried on r2. */
+	uint32_t maxw[2] = { 2, 3 };
+	assert(kqring_register(fd1, IORING_REGISTER_IOWQ_MAX_WORKERS,
+	    maxw, 2) == 0);
+	uint32_t qmax[2] = { 0, 0 };
+	assert(kqring_register(r2.fd, IORING_REGISTER_IOWQ_MAX_WORKERS,
+	    qmax, 2) == 0);
+	assert(qmax[0] == 2 && qmax[1] == 3);
+
+	/* Close fd1 first; r2's attached worker pool must remain functional. */
+	munmap(sqes_raw, sqes_len);
+	munmap(ring_base, ring_len);
+	close(fd1);
+
+	assert(pipe(pfd) == 0);
+	assert(write(pfd[1], "wqok", 4) == 4);
+	struct io_uring_sqe *sqe = ring_prep(&r2, IORING_OP_READ, pfd[0],
+	    72010);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 4;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&r2);
+	assert(submit_one(&r2) == 4);
+	assert(memcmp(buf, "wqok", 4) == 0);
+
+	close(pfd[0]);
+	close(pfd[1]);
+	munmap(r2.sqes, r2.sqes_len);
+	munmap(r2.ring_map, r2.ring_map_len);
+	close(r2.fd);
+	printf("[PASS] SQE128, CQE32, and ATTACH_WQ: 128B SQEs, 32B CQEs, "
+	    "MSG_RING big_cqe, shared WQ\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -5230,6 +5390,7 @@ main(int argc, char **argv)
 		test_worker_process_lifecycle();
 		test_splice_and_tee();
 		test_nonsock_poll();
+		test_sqe128_cqe32_attach_wq();
 		printf("%s: %d failure(s)\n", failures ? "[FAIL]" : "[OK]",
 		    failures);
 	}
