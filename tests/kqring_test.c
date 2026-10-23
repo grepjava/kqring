@@ -478,7 +478,7 @@ test_setup_errors(void)
 	const uint32_t req = IORING_SETUP_SINGLE_ISSUER |
 	    IORING_SETUP_DEFER_TASKRUN;
 	static const uint32_t bad[] = {
-		IORING_SETUP_SQPOLL, IORING_SETUP_IOPOLL,
+		IORING_SETUP_SQ_AFF,
 		IORING_SETUP_ATTACH_WQ, 1U << 16 /* NO_SQARRAY */,
 	};
 	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
@@ -5438,6 +5438,199 @@ test_registered_rings(void)
 	    "USE_REGISTERED_RING, SRC_REGISTERED\n");
 }
 
+static void
+test_sqpoll_and_iopoll(void)
+{
+	struct io_uring_params p;
+	struct test_ring sr, ir;
+	char dir[64], path[128], buf[32];
+	int pfd[2], ffd;
+
+	/* 1. SQ_AFF validation: invalid CPU rejected with EINVAL. */
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+	    IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF;
+	p.sq_thread_cpu = 9999;
+	assert(kqring_setup(8, &p) == -1 && errno == EINVAL);
+
+	/* 2. SQPOLL + SQ_AFF (CPU 0) with 30 ms idle timeout. */
+	memset(&sr, 0, sizeof(sr));
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+	    IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF;
+	p.sq_thread_cpu = 0;
+	p.sq_thread_idle = 30;
+	sr.fd = (int)kqring_setup(16, &p);
+	assert(sr.fd >= 0);
+	assert((p.features & IORING_FEAT_SQPOLL_NONFIXED) != 0);
+
+	sr.ring_map_len = p.cq_off.cqes +
+	    p.cq_entries * sizeof(struct io_uring_cqe);
+	sr.ring_map = mmap(NULL, sr.ring_map_len, PROT_READ | PROT_WRITE,
+	    MAP_SHARED, sr.fd, IORING_OFF_SQ_RING);
+	assert(sr.ring_map != MAP_FAILED);
+	sr.sqes_len = p.sq_entries * sizeof(struct io_uring_sqe);
+	sr.sqes = mmap(NULL, sr.sqes_len, PROT_READ | PROT_WRITE,
+	    MAP_SHARED, sr.fd, IORING_OFF_SQES);
+	assert(sr.sqes != MAP_FAILED);
+
+	uint8_t *base = sr.ring_map;
+	sr.sq_khead = (_Atomic uint32_t *)(base + p.sq_off.head);
+	sr.sq_ktail = (_Atomic uint32_t *)(base + p.sq_off.tail);
+	sr.sq_kflags = (_Atomic uint32_t *)(base + p.sq_off.flags);
+	sr.sq_kdropped = (_Atomic uint32_t *)(base + p.sq_off.dropped);
+	sr.sq_mask = *(uint32_t *)(base + p.sq_off.ring_mask);
+	sr.sq_array = (uint32_t *)(base + p.sq_off.array);
+	sr.cq_khead = (_Atomic uint32_t *)(base + p.cq_off.head);
+	sr.cq_ktail = (_Atomic uint32_t *)(base + p.cq_off.tail);
+	sr.cq_kflags = (_Atomic uint32_t *)(base + p.cq_off.flags);
+	sr.cq_mask = *(uint32_t *)(base + p.cq_off.ring_mask);
+	sr.cqes = (struct io_uring_cqe *)(base + p.cq_off.cqes);
+	for (uint32_t i = 0; i < p.sq_entries; i++)
+		sr.sq_array[i] = i;
+
+	/* Submit NOP + non-fixed PIPE READ/WRITE without calling kqring_enter. */
+	assert(pipe(pfd) == 0);
+	struct io_uring_sqe *sqe = ring_prep(&sr, IORING_OP_NOP, -1, 74001);
+	ring_push_sqe(&sr);
+	sqe = ring_prep(&sr, IORING_OP_WRITE, pfd[1], 74002);
+	sqe->addr = (uint64_t)(uintptr_t)"sqpoll!";
+	sqe->len = 7;
+	sqe->off = (uint64_t)-1;
+	sqe->flags = IOSQE_IO_LINK;
+	ring_push_sqe(&sr);
+	memset(buf, 0, sizeof(buf));
+	sqe = ring_prep(&sr, IORING_OP_READ, pfd[0], 74003);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 7;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&sr);
+
+	/* Spin-wait for all 3 CQEs with zero syscalls. */
+	uint64_t deadline = now_ns() + 2000000000ULL;
+	while (ring_cq_ready(&sr) < 3) {
+		assert(now_ns() < deadline);
+		usleep(50);
+	}
+	bool saw[3] = { false, false, false };
+	for (int i = 0; i < 3; i++) {
+		struct io_uring_cqe c = ring_pop_cqe(&sr);
+		if (c.user_data == 74001) {
+			assert(c.res == 0);
+			saw[0] = true;
+		} else if (c.user_data == 74002) {
+			assert(c.res == 7);
+			saw[1] = true;
+		} else if (c.user_data == 74003) {
+			assert(c.res == 7);
+			saw[2] = true;
+		}
+	}
+	assert(saw[0] && saw[1] && saw[2]);
+	assert(memcmp(buf, "sqpoll!", 7) == 0);
+
+	/* 3. Wait for sq_thread_idle (30 ms) to set IORING_SQ_NEED_WAKEUP. */
+	deadline = now_ns() + 2000000000ULL;
+	while ((atomic_load_explicit(sr.sq_kflags, memory_order_acquire) &
+	    IORING_SQ_NEED_WAKEUP) == 0) {
+		assert(now_ns() < deadline);
+		usleep(1000);
+	}
+	/* Enqueue NOP and wake via IORING_ENTER_SQ_WAKEUP | IORING_ENTER_GETEVENTS. */
+	sqe = ring_prep(&sr, IORING_OP_NOP, -1, 74004);
+	ring_push_sqe(&sr);
+	assert(kqring_enter(sr.fd, 0, 1,
+	    IORING_ENTER_SQ_WAKEUP | IORING_ENTER_GETEVENTS, NULL, 0) == 0);
+	struct io_uring_cqe c = ring_pop_cqe(&sr);
+	assert(c.user_data == 74004 && c.res == 0);
+
+	/* IORING_ENTER_SQ_WAIT succeeds on SQPOLL ring. */
+	assert(kqring_enter(sr.fd, 0, 0, IORING_ENTER_SQ_WAIT, NULL, 0) == 0);
+
+	close(pfd[0]);
+	close(pfd[1]);
+	munmap(sr.sqes, sr.sqes_len);
+	munmap(sr.ring_map, sr.ring_map_len);
+	close(sr.fd);
+
+	/* 4. IORING_SETUP_IOPOLL: file READ/WRITE/READV/WRITEV + opcode validation. */
+	memset(&ir, 0, sizeof(ir));
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+	    IORING_SETUP_IOPOLL;
+	ir.fd = (int)kqring_setup(16, &p);
+	assert(ir.fd >= 0);
+	ir.ring_map_len = p.cq_off.cqes +
+	    p.cq_entries * sizeof(struct io_uring_cqe);
+	ir.ring_map = mmap(NULL, ir.ring_map_len, PROT_READ | PROT_WRITE,
+	    MAP_SHARED, ir.fd, IORING_OFF_SQ_RING);
+	assert(ir.ring_map != MAP_FAILED);
+	ir.sqes_len = p.sq_entries * sizeof(struct io_uring_sqe);
+	ir.sqes = mmap(NULL, ir.sqes_len, PROT_READ | PROT_WRITE,
+	    MAP_SHARED, ir.fd, IORING_OFF_SQES);
+	assert(ir.sqes != MAP_FAILED);
+	base = ir.ring_map;
+	ir.sq_khead = (_Atomic uint32_t *)(base + p.sq_off.head);
+	ir.sq_ktail = (_Atomic uint32_t *)(base + p.sq_off.tail);
+	ir.sq_kflags = (_Atomic uint32_t *)(base + p.sq_off.flags);
+	ir.sq_kdropped = (_Atomic uint32_t *)(base + p.sq_off.dropped);
+	ir.sq_mask = *(uint32_t *)(base + p.sq_off.ring_mask);
+	ir.sq_array = (uint32_t *)(base + p.sq_off.array);
+	ir.cq_khead = (_Atomic uint32_t *)(base + p.cq_off.head);
+	ir.cq_ktail = (_Atomic uint32_t *)(base + p.cq_off.tail);
+	ir.cq_kflags = (_Atomic uint32_t *)(base + p.cq_off.flags);
+	ir.cq_mask = *(uint32_t *)(base + p.cq_off.ring_mask);
+	ir.cqes = (struct io_uring_cqe *)(base + p.cq_off.cqes);
+	for (uint32_t i = 0; i < p.sq_entries; i++)
+		ir.sq_array[i] = i;
+
+	make_tmpdir(dir, sizeof(dir));
+	snprintf(path, sizeof(path), "%s/iopoll", dir);
+	ffd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0600);
+	assert(ffd >= 0);
+
+	sqe = ring_prep(&ir, IORING_OP_WRITE, ffd, 74010);
+	sqe->addr = (uint64_t)(uintptr_t)"iopoll_ok";
+	sqe->len = 9;
+	sqe->off = 0;
+	ring_push_sqe(&ir);
+	assert(submit_one(&ir) == 9);
+
+	memset(buf, 0, sizeof(buf));
+	sqe = ring_prep(&ir, IORING_OP_READ, ffd, 74011);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 9;
+	sqe->off = 0;
+	ring_push_sqe(&ir);
+	assert(submit_one(&ir) == 9);
+	assert(memcmp(buf, "iopoll_ok", 9) == 0);
+
+	/* Non-IOPOLL opcodes (POLL_ADD) and non-vnode fds (pipe) are rejected. */
+	assert(pipe(pfd) == 0);
+	sqe = ring_prep(&ir, IORING_OP_POLL_ADD, pfd[0], 74012);
+	sqe->poll32_events = POLLIN;
+	ring_push_sqe(&ir);
+	assert(submit_one(&ir) == -EINVAL);
+
+	sqe = ring_prep(&ir, IORING_OP_READ, pfd[0], 74013);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 4;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&ir);
+	assert(submit_one(&ir) == -EOPNOTSUPP);
+
+	close(pfd[0]);
+	close(pfd[1]);
+	close(ffd);
+	unlink(path);
+	rmdir(dir);
+	munmap(ir.sqes, ir.sqes_len);
+	munmap(ir.ring_map, ir.ring_map_len);
+	close(ir.fd);
+	printf("[PASS] SQPOLL and IOPOLL: syscall-free SQPOLL, SQ_AFF, "
+	    "NEED_WAKEUP, SQ_WAKEUP, SQ_WAIT, IOPOLL file I/O\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -5509,6 +5702,7 @@ main(int argc, char **argv)
 		test_nonsock_poll();
 		test_sqe128_cqe32_attach_wq();
 		test_registered_rings();
+		test_sqpoll_and_iopoll();
 		printf("%s: %d failure(s)\n", failures ? "[FAIL]" : "[OK]",
 		    failures);
 	}
