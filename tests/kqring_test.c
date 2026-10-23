@@ -5755,6 +5755,17 @@ test_phase5_security_audit(void)
 		sqe->addr = (uint64_t)(uintptr_t)&msg;
 		ring_push_sqe(&ct);
 		assert(submit_one(&ct) == 1);
+		/*
+		 * Also arm a blocking worker op (POLL_ADD on fixed slot 0)
+		 * and close ct.fd before _exit(0) so the only struct file
+		 * reference to ct.fd is in sv[1]'s SCM_RIGHTS buffer.
+		 */
+		sqe = ring_prep(&ct, IORING_OP_POLL_ADD, 0, 75002);
+		sqe->flags = IOSQE_FIXED_FILE | IOSQE_ASYNC;
+		sqe->poll32_events = POLLIN;
+		ring_push_sqe(&ct);
+		ring_submit(&ct);
+		close(ct.fd);
 		_exit(0);
 	}
 	int status = 0;
@@ -5817,6 +5828,53 @@ test_phase5_security_audit(void)
 	munmap(ft.sqes, ft.sqes_len);
 	munmap(ft.ring_map, ft.ring_map_len);
 	close(ft.fd);
+
+	/*
+	 * 4. Retired worker finishing into taskwork_ops before ring close,
+	 * and SPLICE offset overflow check.
+	 */
+	struct test_ring rt;
+	int rpfd[2];
+	char rbuf[8];
+	char tmppath[] = "/tmp/kqring_splice_ovf.XXXXXX";
+	int tmpfd = mkstemp(tmppath);
+	assert(tmpfd >= 0);
+	unlink(tmppath);
+	ring_init(&rt);
+	assert(pipe(rpfd) == 0);
+	assert(write(rpfd[1], "x", 1) == 1);
+	struct io_uring_sqe *rsqe = ring_prep(&rt, IORING_OP_SPLICE, tmpfd,
+	    81003);
+	rsqe->splice_fd_in = rpfd[0];
+	rsqe->splice_off_in = (uint64_t)-1;
+	rsqe->off = (uint64_t)INT64_MAX;
+	rsqe->len = 1;
+	ring_push_sqe(&rt);
+	assert(submit_one(&rt) == -EINVAL);
+	assert(read(rpfd[0], rbuf, 1) == 1);
+	close(tmpfd);
+
+	rsqe = ring_prep(&rt, IORING_OP_READ, rpfd[0], 81001);
+	rsqe->addr = (uint64_t)(uintptr_t)rbuf;
+	rsqe->len = sizeof(rbuf);
+	rsqe->off = (uint64_t)-1;
+	ring_push_sqe(&rt);
+	ring_submit(&rt);
+
+	rsqe = ring_prep(&rt, IORING_OP_ASYNC_CANCEL, 0, 81002);
+	rsqe->addr = 81001;
+	ring_push_sqe(&rt);
+	ring_submit(&rt);
+	/* Unblock the retired worker so it queues onto taskwork_ops, then close. */
+	assert(write(rpfd[1], "x", 1) == 1);
+	usleep(5000);
+	close(rpfd[0]);
+	close(rpfd[1]);
+	munmap(rt.br, sysconf(_SC_PAGESIZE));
+	munmap(rt.bufs, NBUFS * BUF_SIZE);
+	munmap(rt.sqes, rt.sqes_len);
+	munmap(rt.ring_map, rt.ring_map_len);
+	close(rt.fd);
 
 	printf("[PASS] Phase 5 security: AF_UNIX SCM_RIGHTS cycle broken on "
 	    "exit, execve(2) ring teardown, forged sq_tail bound, owner check\n");
