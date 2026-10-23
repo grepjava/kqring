@@ -50,6 +50,7 @@
 #include <sys/capsicum.h>
 #include <sys/event.h>
 #include <sys/eventfd.h>
+#include <sys/eventhandler.h>
 #include <sys/fcntl.h>
 #include <sys/extattr.h>
 #include <sys/limits.h>
@@ -139,7 +140,12 @@ MALLOC_DECLARE(M_FADVISE);
 	IORING_SETUP_DEFER_TASKRUN)
 
 /* KQRING_IOC_ENTER flags implemented. */
-#define	KQRING_ENTER_FLAGS	(IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG)
+#define	KQRING_ENTER_FLAGS						\
+	(IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG |		\
+	IORING_ENTER_REGISTERED_RING)
+
+#define	KQRING_MAX_REG_RINGS	16U
+#define	KQRING_PROC_HASH	64
 
 /*
  * Layout of the single-mmap SQ+CQ shared memory region (ctx->ring_kva).
@@ -276,6 +282,19 @@ struct kqring_fwait {
 static LIST_HEAD(kqring_fwait_list, kqring_fwait)
     kqring_futex_hash[KQRING_FUTEX_HASH];
 static struct mtx kqring_futex_mtx;
+
+struct kqring_proc_rings {
+	LIST_ENTRY(kqring_proc_rings) link;
+	struct proc		*proc;
+	struct file		*rings[KQRING_MAX_REG_RINGS];
+	uint32_t		nrings;
+};
+
+static LIST_HEAD(kqring_proc_list, kqring_proc_rings)
+    kqring_proc_hash[KQRING_PROC_HASH];
+static struct mtx kqring_proc_mtx;
+static eventhandler_tag kqring_exit_tag;
+static eventhandler_tag kqring_exec_tag;
 
 /*
  * A MSG_RING CQE queued for the target ring's owner to post.  For
@@ -7906,7 +7925,8 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	    IORING_FEAT_EXT_ARG | IORING_FEAT_FAST_POLL |
 	    IORING_FEAT_POLL_32BITS | IORING_FEAT_CQE_SKIP |
 	    IORING_FEAT_LINKED_FILE | IORING_FEAT_NATIVE_WORKERS |
-	    IORING_FEAT_CUR_PERSONALITY | IORING_FEAT_RSRC_TAGS;
+	    IORING_FEAT_CUR_PERSONALITY | IORING_FEAT_RSRC_TAGS |
+	    IORING_FEAT_REG_REG_RING;
 
 	p.sq_off.head = offsetof(struct kqring_shm_header, sq_head);
 	p.sq_off.tail = offsetof(struct kqring_shm_header, sq_tail);
@@ -8447,6 +8467,225 @@ kqring_bufs_update(struct kqring_ctx *ctx, uint32_t off, uint64_t uiov,
 	return (i != 0 ? (int32_t)i : -error);
 }
 
+static inline struct kqring_proc_list *
+kqring_proc_bucket(const struct proc *p)
+{
+	return (&kqring_proc_hash[((uintptr_t)p >> 4) % KQRING_PROC_HASH]);
+}
+
+static struct kqring_proc_rings *
+kqring_proc_find_locked(const struct proc *p)
+{
+	struct kqring_proc_rings *pr;
+
+	mtx_assert(&kqring_proc_mtx, MA_OWNED);
+	LIST_FOREACH(pr, kqring_proc_bucket(p), link) {
+		if (pr->proc == p)
+			return (pr);
+	}
+	return (NULL);
+}
+
+static int
+kqring_reg_ring_fget(struct thread *td, uint32_t slot, bool is_enter,
+    struct file **fpp)
+{
+	struct kqring_proc_rings *pr;
+	struct file *fp;
+
+	if (slot >= KQRING_MAX_REG_RINGS)
+		return (EINVAL);
+	mtx_lock(&kqring_proc_mtx);
+	pr = kqring_proc_find_locked(td->td_proc);
+	if (pr == NULL) {
+		mtx_unlock(&kqring_proc_mtx);
+		return (is_enter ? EINVAL : EBADF);
+	}
+	fp = pr->rings[slot];
+	if (fp == NULL || !fhold(fp)) {
+		mtx_unlock(&kqring_proc_mtx);
+		return (EBADF);
+	}
+	mtx_unlock(&kqring_proc_mtx);
+	*fpp = fp;
+	return (0);
+}
+
+static void
+kqring_proc_clear(struct proc *p)
+{
+	struct kqring_proc_rings *pr;
+
+	mtx_lock(&kqring_proc_mtx);
+	pr = kqring_proc_find_locked(p);
+	if (pr != NULL)
+		LIST_REMOVE(pr, link);
+	mtx_unlock(&kqring_proc_mtx);
+	if (pr == NULL)
+		return;
+	for (uint32_t i = 0; i < KQRING_MAX_REG_RINGS; i++) {
+		if (pr->rings[i] != NULL)
+			fdrop(pr->rings[i], curthread);
+	}
+	free(pr, M_KQRING);
+}
+
+static void
+kqring_proc_exit(void *arg __unused, struct proc *p)
+{
+	kqring_proc_clear(p);
+}
+
+static void
+kqring_proc_exec(void *arg __unused, struct proc *p,
+    struct image_params *imgp __unused)
+{
+	kqring_proc_clear(p);
+}
+
+static int
+kqring_ring_fds_register(struct thread *td,
+    const struct kqring_register_arg *ra, int *resp)
+{
+	struct io_uring_rsrc_update up;
+	struct kqring_proc_rings *pr, *alloc_pr;
+	struct kqring_ctx *rctx;
+	struct file *fp;
+	cap_rights_t rights;
+	uint32_t i, slot;
+	int error = 0;
+
+	if (ra->arg == NULL || ra->nr_args == 0)
+		return (EINVAL);
+	if (ra->nr_args > KQRING_MAX_REG_RINGS)
+		return (EMFILE);
+
+	alloc_pr = malloc(sizeof(*alloc_pr), M_KQRING, M_WAITOK | M_ZERO);
+	alloc_pr->proc = td->td_proc;
+	mtx_lock(&kqring_proc_mtx);
+	pr = kqring_proc_find_locked(td->td_proc);
+	if (pr == NULL) {
+		pr = alloc_pr;
+		alloc_pr = NULL;
+		LIST_INSERT_HEAD(kqring_proc_bucket(td->td_proc), pr, link);
+	}
+	mtx_unlock(&kqring_proc_mtx);
+	free(alloc_pr, M_KQRING);
+
+	for (i = 0; i < ra->nr_args; i++) {
+		uint8_t *uptr = (uint8_t *)ra->arg + i * sizeof(up);
+
+		error = copyin(uptr, &up, sizeof(up));
+		if (error != 0)
+			break;
+		if (up.resv != 0) {
+			error = EINVAL;
+			break;
+		}
+		if (up.offset != IORING_FILE_INDEX_ALLOC &&
+		    up.offset >= KQRING_MAX_REG_RINGS) {
+			error = EINVAL;
+			break;
+		}
+		error = fget(td, (int)up.data,
+		    cap_rights_init_one(&rights, CAP_IOCTL), &fp);
+		if (error != 0)
+			break;
+		error = kqring_fp_ctx(fp, &rctx);
+		if (error == 0 && (!rctx->setup_done || rctx->closing))
+			error = EBADF;
+		if (error != 0) {
+			fdrop(fp, td);
+			break;
+		}
+		mtx_lock(&kqring_proc_mtx);
+		slot = up.offset;
+		if (slot == IORING_FILE_INDEX_ALLOC) {
+			for (slot = 0; slot < KQRING_MAX_REG_RINGS; slot++) {
+				if (pr->rings[slot] == NULL)
+					break;
+			}
+			if (slot == KQRING_MAX_REG_RINGS)
+				error = ENFILE;
+		} else if (pr->rings[slot] != NULL) {
+			error = EBUSY;
+		}
+		if (error == 0) {
+			pr->rings[slot] = fp;
+			pr->nrings++;
+		}
+		mtx_unlock(&kqring_proc_mtx);
+		if (error != 0) {
+			fdrop(fp, td);
+			break;
+		}
+		if (up.offset == IORING_FILE_INDEX_ALLOC) {
+			up.offset = slot;
+			error = copyout(&up.offset, uptr, sizeof(up.offset));
+			if (error != 0) {
+				mtx_lock(&kqring_proc_mtx);
+				if (pr->rings[slot] == fp) {
+					pr->rings[slot] = NULL;
+					pr->nrings--;
+				} else {
+					fp = NULL;
+				}
+				mtx_unlock(&kqring_proc_mtx);
+				if (fp != NULL)
+					fdrop(fp, td);
+				break;
+			}
+		}
+	}
+	if (i == 0)
+		return (error);
+	*resp = (int)i;
+	return (0);
+}
+
+static int
+kqring_ring_fds_unregister(struct thread *td,
+    const struct kqring_register_arg *ra, int *resp)
+{
+	struct io_uring_rsrc_update up;
+	struct kqring_proc_rings *pr;
+	struct file *fp;
+	uint32_t i;
+	int error = 0;
+
+	if (ra->arg == NULL || ra->nr_args == 0 ||
+	    ra->nr_args > KQRING_MAX_REG_RINGS)
+		return (EINVAL);
+
+	for (i = 0; i < ra->nr_args; i++) {
+		error = copyin((const uint8_t *)ra->arg + i * sizeof(up),
+		    &up, sizeof(up));
+		if (error != 0)
+			break;
+		if (up.resv != 0 || up.offset >= KQRING_MAX_REG_RINGS) {
+			error = EINVAL;
+			break;
+		}
+		mtx_lock(&kqring_proc_mtx);
+		pr = kqring_proc_find_locked(td->td_proc);
+		fp = pr != NULL ? pr->rings[up.offset] : NULL;
+		if (fp != NULL) {
+			pr->rings[up.offset] = NULL;
+			pr->nrings--;
+		}
+		mtx_unlock(&kqring_proc_mtx);
+		if (fp == NULL) {
+			error = EBADF;
+			break;
+		}
+		fdrop(fp, td);
+	}
+	if (i == 0)
+		return (error);
+	*resp = (int)i;
+	return (0);
+}
+
 /*
  * IORING_REGISTER_CLONE_BUFFERS: copy registered buffers [src_off,
  * src_off + nr) of another ring to [dst_off, ...) of this one.  The source
@@ -8470,15 +8709,18 @@ kqring_bufs_clone(struct kqring_ctx *ctx, const struct kqring_register_arg *ra)
 	error = copyin(ra->arg, &cb, sizeof(cb));
 	if (error != 0)
 		return (error);
-	/* There are no registered ring descriptors (SRC_REGISTERED). */
-	if ((cb.flags & ~IORING_REGISTER_DST_REPLACE) != 0 ||
+	if ((cb.flags & ~(IORING_REGISTER_SRC_REGISTERED |
+	    IORING_REGISTER_DST_REPLACE)) != 0 ||
 	    cb.pad[0] != 0 || cb.pad[1] != 0 || cb.pad[2] != 0)
 		return (EINVAL);
 	if (ctx->bufs != NULL &&
 	    (cb.flags & IORING_REGISTER_DST_REPLACE) == 0)
 		return (EBUSY);
-	error = fget(td, (int)cb.src_fd, cap_rights_init_one(&rights,
-	    CAP_IOCTL), &fp);
+	if ((cb.flags & IORING_REGISTER_SRC_REGISTERED) != 0)
+		error = kqring_reg_ring_fget(td, cb.src_fd, false, &fp);
+	else
+		error = fget(td, (int)cb.src_fd, cap_rights_init_one(&rights,
+		    CAP_IOCTL), &fp);
 	if (error != 0)
 		return (error);
 	error = kqring_fp_ctx(fp, &sctx);
@@ -9316,11 +9558,13 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 	case IORING_REGISTER_IOWQ_MAX_WORKERS:
 		return (kqring_iowq_max_workers(ctx, ra));
 
+	case IORING_REGISTER_RING_FDS:
+		return (kqring_ring_fds_register(td, ra, resp));
+	case IORING_UNREGISTER_RING_FDS:
+		return (kqring_ring_fds_unregister(td, ra, resp));
+
 	default:
-		/*
-		 * RING_FDS (no io_uring_enter(2) to take a registered ring),
-		 * NAPI.
-		 */
+		/* NAPI. */
 		return (EOPNOTSUPP);
 	}
 	if (res < 0)
@@ -9387,6 +9631,7 @@ kqring_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
     int fflag __unused, struct thread *td)
 {
 	struct kqring_ctx *ctx;
+	struct file *rfp = NULL;
 	int error, res = 0;
 
 	error = devfs_get_cdevpriv((void **)&ctx);
@@ -9398,17 +9643,41 @@ kqring_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 		error = kqring_ioc_setup(ctx, (struct kqring_setup_arg *)data,
 		    td);
 		break;
-	case KQRING_IOC_ENTER:
-		error = kqring_ioc_enter(ctx, (struct kqring_enter_arg *)data,
-		    td);
+	case KQRING_IOC_ENTER: {
+		struct kqring_enter_arg *ea = (struct kqring_enter_arg *)data;
+
+		if ((ea->flags & IORING_ENTER_REGISTERED_RING) != 0) {
+			error = kqring_reg_ring_fget(td, (uint32_t)ea->ring_fd,
+			    true, &rfp);
+			if (error == 0)
+				error = kqring_fp_ctx(rfp, &ctx);
+			if (error != 0)
+				break;
+		}
+		error = kqring_ioc_enter(ctx, ea, td);
 		break;
-	case KQRING_IOC_REGISTER:
-		error = kqring_ioc_register(ctx,
-		    (struct kqring_register_arg *)data, td, &res);
+	}
+	case KQRING_IOC_REGISTER: {
+		struct kqring_register_arg *ra =
+		    (struct kqring_register_arg *)data;
+
+		if ((ra->opcode & IORING_REGISTER_USE_REGISTERED_RING) != 0) {
+			ra->opcode &= ~IORING_REGISTER_USE_REGISTERED_RING;
+			error = kqring_reg_ring_fget(td, (uint32_t)ra->ring_fd,
+			    false, &rfp);
+			if (error == 0)
+				error = kqring_fp_ctx(rfp, &ctx);
+			if (error != 0)
+				break;
+		}
+		error = kqring_ioc_register(ctx, ra, td, &res);
 		break;
+	}
 	default:
 		return (ENOTTY);
 	}
+	if (rfp != NULL)
+		fdrop(rfp, td);
 	/*
 	 * kern_*() calls made for SQEs (openat, accept, socket...) leave
 	 * their result in td_retval[0], which is ioctl(2)'s return value:
@@ -9482,11 +9751,21 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 	switch (type) {
 	case MOD_LOAD:
 		mtx_init(&kqring_futex_mtx, "kqring futex", NULL, MTX_DEF);
+		mtx_init(&kqring_proc_mtx, "kqring proc", NULL, MTX_DEF);
 		for (int i = 0; i < KQRING_FUTEX_HASH; i++)
 			LIST_INIT(&kqring_futex_hash[i]);
+		for (int i = 0; i < KQRING_PROC_HASH; i++)
+			LIST_INIT(&kqring_proc_hash[i]);
+		kqring_exit_tag = EVENTHANDLER_REGISTER(process_exit,
+		    kqring_proc_exit, NULL, EVENTHANDLER_PRI_ANY);
+		kqring_exec_tag = EVENTHANDLER_REGISTER(process_exec,
+		    kqring_proc_exec, NULL, EVENTHANDLER_PRI_ANY);
 		kqring_cdev = make_dev(&kqring_cdevsw, 0, UID_ROOT, GID_WHEEL,
 		    0666, "kqring");
 		if (kqring_cdev == NULL) {
+			EVENTHANDLER_DEREGISTER(process_exec, kqring_exec_tag);
+			EVENTHANDLER_DEREGISTER(process_exit, kqring_exit_tag);
+			mtx_destroy(&kqring_proc_mtx);
 			mtx_destroy(&kqring_futex_mtx);
 			return (ENOMEM);
 		}
@@ -9494,12 +9773,29 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 		return (0);
 
 	case MOD_UNLOAD:
+		EVENTHANDLER_DEREGISTER(process_exec, kqring_exec_tag);
+		EVENTHANDLER_DEREGISTER(process_exit, kqring_exit_tag);
+		for (int i = 0; i < KQRING_PROC_HASH; i++) {
+			struct kqring_proc_rings *pr;
+
+			while ((pr = LIST_FIRST(&kqring_proc_hash[i])) !=
+			    NULL) {
+				LIST_REMOVE(pr, link);
+				for (uint32_t s = 0; s < KQRING_MAX_REG_RINGS;
+				    s++) {
+					if (pr->rings[s] != NULL)
+						fdrop(pr->rings[s], curthread);
+				}
+				free(pr, M_KQRING);
+			}
+		}
 		/*
 		 * destroy_dev() runs the destructor of every ring still open,
 		 * so no futex is hashed after it.
 		 */
 		if (kqring_cdev != NULL)
 			destroy_dev(kqring_cdev);
+		mtx_destroy(&kqring_proc_mtx);
 		mtx_destroy(&kqring_futex_mtx);
 		printf("kqring: unloaded\n");
 		return (0);

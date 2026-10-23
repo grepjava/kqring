@@ -571,6 +571,8 @@ enum {
 	IORING_REGISTER_LAST
 };
 
+#define IORING_REGISTER_USE_REGISTERED_RING	(1U << 31)
+
 /*
  * IORING_REGISTER_FILES / _FILES_UPDATE: an fd of -1 is an empty slot, and
  * in an update IORING_REGISTER_FILES_SKIP leaves the slot as it is.
@@ -582,6 +584,13 @@ struct io_uring_files_update {
 	__u32	offset;
 	__u32	resv;
 	__u64	fds;		/* __s32 * */
+};
+
+/* IORING_REGISTER_RING_FDS / IORING_UNREGISTER_RING_FDS */
+struct io_uring_rsrc_update {
+	__u32	offset;
+	__u32	resv;
+	__u64	data;
 };
 
 /* IORING_REGISTER_FILES2 / _BUFFERS2 (nr_args = sizeof) */
@@ -841,12 +850,16 @@ struct kqring_enter_arg {
 	__u32	 SUBMITTED_out;
 	void	*arg;
 	size_t	argsz;
+	__s32	ring_fd;
+	__u32	pad;
 };
 
 struct kqring_register_arg {
 	__u32	opcode;
 	__u32	nr_args;
 	void	*arg;
+	__s32	ring_fd;
+	__u32	pad;
 };
 
 #define KQRING_IOC_MAGIC	'U'
@@ -857,7 +870,27 @@ struct kqring_register_arg {
 #ifndef _KERNEL
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <unistd.h>
+
+static inline int
+kqring_ctl_fd(void)
+{
+	static int ctl_fd = -1;
+	int fd = __atomic_load_n(&ctl_fd, __ATOMIC_ACQUIRE);
+	if (fd >= 0)
+		return (fd);
+	fd = open("/dev/kqring", O_RDWR | O_CLOEXEC);
+	if (fd < 0)
+		return (-1);
+	int expected = -1;
+	if (!__atomic_compare_exchange_n(&ctl_fd, &expected, fd, false,
+	    __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+		close(fd);
+		return (expected);
+	}
+	return (fd);
+}
 
 /*
  * Drop-in userspace wrappers matching cvega.c's uring_setup / uring_enter /
@@ -894,8 +927,16 @@ kqring_enter(int fd, unsigned submit, unsigned wait, unsigned flags,
 		.SUBMITTED_out = 0,
 		.arg = arg,
 		.argsz = argsz,
+		.ring_fd = fd,
+		.pad = 0,
 	};
-	if (ioctl(fd, KQRING_IOC_ENTER, &ea) < 0)
+	int ioctl_fd = fd;
+	if ((flags & IORING_ENTER_REGISTERED_RING) != 0) {
+		ioctl_fd = kqring_ctl_fd();
+		if (ioctl_fd < 0)
+			return (-1);
+	}
+	if (ioctl(ioctl_fd, KQRING_IOC_ENTER, &ea) < 0)
 		return (-1);
 	return ((long)ea.SUBMITTED_out);
 }
@@ -907,8 +948,19 @@ kqring_register(int fd, unsigned op, void *arg, unsigned n)
 		.opcode = op,
 		.nr_args = n,
 		.arg = arg,
+		.ring_fd = fd,
+		.pad = 0,
 	};
-	return (ioctl(fd, KQRING_IOC_REGISTER, &ra));
+	int ioctl_fd = fd;
+	if ((op & ~IORING_REGISTER_USE_REGISTERED_RING) ==
+	    IORING_REGISTER_RING_FDS)
+		(void)kqring_ctl_fd();
+	if ((op & IORING_REGISTER_USE_REGISTERED_RING) != 0) {
+		ioctl_fd = kqring_ctl_fd();
+		if (ioctl_fd < 0)
+			return (-1);
+	}
+	return (ioctl(ioctl_fd, KQRING_IOC_REGISTER, &ra));
 }
 #endif /* !_KERNEL */
 
