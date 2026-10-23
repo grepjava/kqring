@@ -335,6 +335,15 @@ struct io_uring_recvmsg_out {
 #define XATTR_CREATE			0x1
 #define XATTR_REPLACE			0x2
 #endif
+#ifndef SPLICE_F_MOVE
+#define SPLICE_F_MOVE			0x01U
+#define SPLICE_F_NONBLOCK		0x02U
+#define SPLICE_F_MORE			0x04U
+#define SPLICE_F_GIFT			0x08U
+#endif
+#ifndef SPLICE_F_FD_IN_FIXED
+#define SPLICE_F_FD_IN_FIXED		(1U << 31)
+#endif
 #define KQRING_XATTR_NAME_MAX		255
 #define KQRING_XATTR_SIZE_MAX		65536
 
