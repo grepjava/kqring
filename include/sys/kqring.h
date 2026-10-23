@@ -8,22 +8,25 @@
  * DEFER_TASKRUN subset of the Linux io_uring ABI.
  *
  * Security & Design Invariants:
- *   1. SINGLE_ISSUER + DEFER_TASKRUN only: All actual I/O data transfers
- *      (soreceive, sosend, accept, fo_read/fo_write, uiomove) execute
- *      synchronously in the owning thread's context inside KQRING_IOC_ENTER,
- *      and only that thread changes the ring's tables (fixed files,
- *      registered buffers, buffer groups, personalities).
- *   2. Zero background kernel threads (no io-wq): The kernel never borrows
- *      curproc->p_fd, vmspace, or ucred asynchronously.
- *   3. struct file references are held only by fixed-file slots (with the
- *      descriptor's Capsicum rights) and by the requests using them, never
- *      to a ring.  Descriptors are looked up with Capsicum rights on every
- *      attempt.
- *   4. Zero kernel page-pinning (vm_page_wire) of user I/O buffers:
- *      registered buffers are checked address ranges, and buffer rings and
- *      user buffers are read/written via copyin/uiomove in curthread
- *      context.  Kernel-allocated buffer rings are VM objects that each
- *      mapping references.
+ *   1. SINGLE_ISSUER identifies the userspace issuer. Without SQPOLL, that
+ *      thread submits, drains taskwork, posts CQEs and changes resource
+ *      tables. With SQPOLL, an in-process kernel thread also does this work;
+ *      sq_sx serializes it with enter and registration.
+ *   2. In-process worker kthreads share the process address space and file
+ *      descriptor table. Requests retain resource and credential references.
+ *      Workers execute I/O and queue results; the serialized issuer posts
+ *      CQEs and releases request resources. Cancellation of running I/O is
+ *      deferred until worker release; teardown waits for that release.
+ *   3. Fixed slots retain file references and Capsicum rights. Rings are
+ *      rejected from fixed tables; registered-ring descriptors separately
+ *      retain ring file references until unregister, exec or process exit.
+ *      Ordinary descriptors are resolved with rights checks when used.
+ *   4. User I/O buffers are not pinned: registered buffers are checked
+ *      address ranges, accessed through copyin/copyout or uiomove in process
+ *      context. Kernel-allocated ring VM objects are wired and referenced
+ *      independently by mappings. A worker reserves a provided group's head
+ *      without holding the group lock across blocking I/O; conflicting
+ *      selections fail ENOBUFS and removal/unregister fails EBUSY.
  */
 
 #ifndef _SYS_KQRING_H_
@@ -177,7 +180,7 @@ _Static_assert(sizeof(struct io_uring_cqe) == 16, "io_uring_cqe must be 16 bytes
  * io_uring_setup() flags (params->flags)
  */
 #define IORING_SETUP_IOPOLL		(1U << 0)
-#define IORING_SETUP_SQPOLL		(1U << 1)	/* rejected: no kernel threads */
+#define IORING_SETUP_SQPOLL		(1U << 1)	/* in-process submission thread */
 #define IORING_SETUP_SQ_AFF		(1U << 2)
 #define IORING_SETUP_CQSIZE		(1U << 3)
 #define IORING_SETUP_CLAMP		(1U << 4)
