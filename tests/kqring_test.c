@@ -4659,6 +4659,82 @@ test_worker_nonblocking_pipe(void)
 	    "deferred BUFFER_SELECT\n");
 }
 
+/* Cancellation acknowledgement may precede worker release. */
+static void
+expect_cancel_pair(struct test_ring *r, uint64_t target, uint64_t cancel)
+{
+	struct io_uring_cqe a, b;
+
+	assert(ring_wait(r, 2, 2000) == 0);
+	a = ring_pop_cqe(r);
+	b = ring_pop_cqe(r);
+	assert((a.user_data == target && a.res == -ECANCELED &&
+	    b.user_data == cancel && b.res == 0) ||
+	    (b.user_data == target && b.res == -ECANCELED &&
+	    a.user_data == cancel && a.res == 0));
+}
+
+/* A FIFO blocks in fo_read after selection, unlike the pipe pre-wait. */
+static void
+test_worker_buffer_reservation(void)
+{
+	struct test_ring t;
+	struct io_uring_sqe *sqe;
+	char dir[] = "/tmp/kqring-reserve.XXXXXX", path[128], buf[16];
+	int fd, flags;
+
+	assert(mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/fifo", dir);
+	assert(mkfifo(path, 0600) == 0);
+	fd = open(path, O_RDWR | O_NONBLOCK);
+	assert(fd >= 0);
+	flags = fcntl(fd, F_GETFL);
+	assert(flags >= 0 && fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == 0);
+	ring_init(&t);
+	sqe = ring_prep(&t, IORING_OP_PROVIDE_BUFFERS, 1, 61900);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->buf_group = 90;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	sqe = ring_prep(&t, IORING_OP_READ, fd, 61901);
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	sqe->buf_group = 90;
+	sqe->len = sizeof(buf);
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	usleep(50000);
+
+	/* Same-group removal fails promptly; unrelated groups still work. */
+	sqe = ring_prep(&t, IORING_OP_REMOVE_BUFFERS, 1, 61902);
+	sqe->buf_group = 90;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EBUSY);
+	sqe = ring_prep(&t, IORING_OP_PROVIDE_BUFFERS, 1, 61903);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->buf_group = 91;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	sqe = ring_prep(&t, IORING_OP_ASYNC_CANCEL, -1, 61904);
+	sqe->addr = 61901;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	expect_cancel_pair(&t, 61901, 61904);
+
+	/* An interrupted empty read leaves the reserved buffer available. */
+	sqe = ring_prep(&t, IORING_OP_REMOVE_BUFFERS, 1, 61905);
+	sqe->buf_group = 90;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 1);
+	close(t.fd);
+	close(fd);
+	unlink(path);
+	rmdir(dir);
+	printf("[PASS] Blocking FIFO buffer reservation and deferred cancel\n");
+}
+
 static void
 test_worker_cancel_and_timeout(void)
 {
@@ -4685,8 +4761,7 @@ test_worker_cancel_and_timeout(void)
 	sqe->addr = 62001;
 	ring_push_sqe(&t);
 	ring_submit(&t);
-	expect_cqe(&t, 62001, -ECANCELED);
-	expect_cqe(&t, 62002, 0);
+	expect_cancel_pair(&t, 62001, 62002);
 
 	/* 2. Cancel a sleeping worker pipe READ via SYNC_CANCEL. */
 	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 62003);
@@ -4700,6 +4775,7 @@ test_worker_cancel_and_timeout(void)
 	memset(&sc, 0, sizeof(sc));
 	sc.addr = 62003;
 	assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == 0);
+	assert(ring_wait(&t, 1, 2000) == 0);
 	expect_cqe(&t, 62003, -ECANCELED);
 
 	/* 3. Cancel a sleeping worker pipe READ via LINK_TIMEOUT. */
@@ -5695,6 +5771,7 @@ main(int argc, char **argv)
 		test_fixed_file_ops();
 		test_iowq_register();
 		test_worker_nonblocking_pipe();
+		test_worker_buffer_reservation();
 		test_worker_cancel_and_timeout();
 		test_worker_max_workers();
 		test_worker_process_lifecycle();
