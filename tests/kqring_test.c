@@ -5190,8 +5190,7 @@ test_nonsock_poll(void)
 	ring_prep(&t, IORING_OP_POLL_REMOVE, -1, 71004)->addr = 71003;
 	ring_push_sqe(&t);
 	ring_submit(&t);
-	expect_cqe(&t, 71003, -ECANCELED);
-	expect_cqe(&t, 71004, 0);
+	expect_cancel_pair(&t, 71003, 71004);
 
 	/* 3. Multishot POLL_ADD on an eventfd (via IOSQE_FIXED_FILE). */
 	int fds[2] = { efd, pfd[0] };
@@ -5214,8 +5213,7 @@ test_nonsock_poll(void)
 	ring_prep(&t, IORING_OP_POLL_REMOVE, -1, 71006)->addr = 71005;
 	ring_push_sqe(&t);
 	ring_submit(&t);
-	expect_cqe(&t, 71005, -ECANCELED);
-	expect_cqe(&t, 71006, 0);
+	expect_cancel_pair(&t, 71005, 71006);
 
 	/* 4. Peer close wakes armed pipe POLL_ADD with POLLHUP. */
 	sqe = ring_prep(&t, IORING_OP_POLL_ADD, 1, 71007);
