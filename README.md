@@ -1,4 +1,4 @@
-# `kqring` — CVE-Free `io_uring` (`SINGLE_ISSUER | DEFER_TASKRUN` + `PBUF_RING`) for FreeBSD
+# `kqring` — `io_uring` (`SINGLE_ISSUER | DEFER_TASKRUN` + `PBUF_RING`) for FreeBSD
 
 `kqring.ko` is a loadable FreeBSD kernel module implementing a subset of the Linux `io_uring` ABI, engineered specifically for modern per-worker thread-per-core runtimes like **Vega** (`SINGLE_ISSUER | DEFER_TASKRUN` + `PBUF_RING` + `RECV_MULTISHOT`).
 
@@ -18,7 +18,7 @@ These are implementation constraints, not a claim of immunity to known CVE class
 | Linux `io_uring` CVE Class | `kqring.ko` behavior |
 |---|---|
 | **`io-wq` async worker UAFs** | In-process worker `kthread`s (`IORING_FEAT_NATIVE_WORKERS`) run inside `curproc` and never touch the CQ ring or the owner's fixed-file / registered-buffer tables (`ctx->files`, `ctx->bufs`). Requests retain resource and credential references. Workers execute I/O and queue results for the serialized issuer to complete. Without `SQPOLL`, the userspace owner drains taskwork in `KQRING_IOC_ENTER`; with `SQPOLL`, the in-process submission thread also drains it under `sq_sx`. |
-| **`IOSQE_FIXED_FILE` reference cycles** | A ring can never be put in a fixed-file table (register, update, direct descriptors, `MSG_RING` `SEND_FD`), so rings cannot keep each other alive. Each slot holds a file reference and the file's Capsicum rights, which every request on it is checked against. Descriptors are re-resolved with rights checks on every attempt, and armed sockets hold `soref()`. |
+| **`IOSQE_FIXED_FILE` reference cycles** | A ring can never be put in a fixed-file table (register, update, direct descriptors, `MSG_RING` `SEND_FD`) or sent over `AF_UNIX` `SCM_RIGHTS` in `SENDMSG` / `SENDMSG_ZC`, so rings cannot keep each other alive. Each slot holds a file reference and the file's Capsicum rights, which every request on it is checked against. Descriptors are re-resolved with rights checks on every attempt, and armed sockets hold `soref()`. |
 | **Fixed-file / registered-buffer node use-after-free on update** | Slots are reference-counted nodes. A request takes a reference when it is issued and drops it when freed, so replacing or unregistering a slot never affects a request still using it. The tag CQE is posted once the last reference is gone. Table changes are serialized on the issuer path, including the `SQPOLL` thread when enabled. |
 | **Pinned user-buffer page lifetime bugs** | Nothing is pinned. Registered buffers are checked to be mapped and writable when they are registered, then kept as plain address ranges. `READ_FIXED` and friends must stay inside their range, and the data is copied with `uiomove()` as for any request. User-memory buffer rings are read with `copyin()`. |
 | **Mapped buffer ring use-after-free (CVE-2024-0582)** | `IOU_PBUF_RING_MMAP` rings are VM objects, and each mapping holds its own reference. Unregistering a ring that is still mapped leaves the process with ordinary memory, never freed pages. The wired memory these rings use is capped per ring. |
@@ -26,7 +26,7 @@ These are implementation constraints, not a claim of immunity to known CVE class
 | **`eventfd` use-after-free** | The ring holds an `eventfd_get()` reference. Upcalls signal it under the ring lock, which unregistering also takes. |
 | **EOF buffer-ID leak on `IOSQE_BUFFER_SELECT`** | Unlike Linux `io_uring` (which consumes a `PBUF_RING` buffer ID even when `recv` returns `0` at EOF), `kqring_pbuf_commit()` only advances the kernel ring head when `transferred > 0`. |
 | **`MSG_RING` cross-ring CQ races** | CQ writes run on the serialized issuer path (owner or `SQPOLL` thread). `MSG_RING` queues the CQE on the target ring under its lock and wakes the owner, which posts it from taskwork. |
-| **SQE argument TOCTOU / stale user pointers** | Everything an SQE points to (paths, iovecs, `msghdr`s, socket addresses, `open_how`, xattr names and values, futex vectors, timespecs) is copied in at submission (`IORING_FEAT_SUBMIT_STABLE`), charged to a per-ring budget. Only output buffers are touched later. |
+| **SQE argument TOCTOU / stale user pointers** | Everything an SQE points to (paths, iovecs, `msghdr`s, socket addresses, `open_how`, xattr names and values, futex vectors, timespecs) is copied in at submission (`IORING_FEAT_SUBMIT_STABLE`), charged to a per-ring budget, and live in-flight requests per ring are capped at `KQRING_MAX_REQS`. Only output buffers are touched later. |
 
 ---
 
@@ -66,7 +66,7 @@ These Linux-only operations are rejected with `-EOPNOTSUPP` or `-EINVAL`:
 **Differences from Linux:**
 
 - **Provided-buffer reservations.** Blocking worker I/O reserves a group's head without holding the ring-wide buffer-group lock. Other selections from that group fail with `-ENOBUFS`; removal or unregister fails with `EBUSY` until the transfer returns. Other groups and registration remain usable. EOF consumes no buffer.
-- **Worker cancellation.** Cancel and link timeouts request an interrupt without waiting for running I/O. The target's completion and resource release wait until its worker returns; a cancellation CQE does not promise that the I/O had no side effects. Ring close detaches running workers without waiting and defers final context/pool deallocation until the last worker returns (module unload drains any remaining workers). `SYNC_CANCEL` accepts the cancellation but does not wait for the target CQE.
+- **Worker cancellation and CQE ordering.** Cancel (`ASYNC_CANCEL`, `POLL_REMOVE`) and `LINK_TIMEOUT` request an interrupt without waiting for running worker I/O. Because the cancel/remove/timeout SQE completes immediately while the target request's `-ECANCELED` CQE and resource release wait until its worker returns via taskwork, the cancel/remove/timeout CQE can arrive **before** the target's `-ECANCELED` CQE (whereas Linux posts the cancelled target's CQE first), and a cancellation CQE does not promise that the I/O had no side effects. Callers must wait for the target request's own CQE before freeing its buffers or state. Ring close detaches running workers without waiting and defers final context/pool deallocation until the last worker returns (module unload drains any remaining workers). `SYNC_CANCEL` accepts the cancellation but does not wait for the target CQE.
 
 - **Native values.** Flags and constants use their FreeBSD values: `O_*`, `AT_*`, `MSG_*`, `SOCK_*`, `POSIX_FADV_*`, `MADV_*`, `idtype_t` and `W*`. CQE errors are negated FreeBSD errnos.
 - **Timeouts.** These complete with `-ETIME`, which the header defines as `ETIMEDOUT`.
