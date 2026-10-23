@@ -5321,6 +5321,123 @@ test_sqe128_cqe32_attach_wq(void)
 	    "MSG_RING big_cqe, shared WQ\n");
 }
 
+static void
+test_registered_rings(void)
+{
+	struct io_uring_rsrc_update up[2];
+	struct io_uring_clone_buffers cb;
+	struct io_uring_params p;
+	struct test_ring t1, t2;
+	long page = sysconf(_SC_PAGESIZE);
+	int pfd[2];
+	char buf[16];
+
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+	int fd = (int)kqring_setup(4, &p);
+	assert(fd >= 0);
+	assert((p.features & IORING_FEAT_REG_REG_RING) != 0);
+	close(fd);
+
+	ring_init(&t1);
+	ring_init(&t2);
+	assert(pipe(pfd) == 0);
+
+	/* 1. Validation before registering: non-ring fd, out-of-range slot. */
+	up[0] = (struct io_uring_rsrc_update){ .offset = 0,
+	    .data = (uint64_t)pfd[0] };
+	assert(reg(&t1, IORING_REGISTER_RING_FDS, &up[0], 1) == -EBADF);
+	up[0] = (struct io_uring_rsrc_update){ .offset = 16,
+	    .data = (uint64_t)t1.fd };
+	assert(reg(&t1, IORING_REGISTER_RING_FDS, &up[0], 1) == -EINVAL);
+
+	/* 2. Register t1 at explicit slot 2 and t2 via ALLOC (-1). */
+	up[0] = (struct io_uring_rsrc_update){ .offset = 2,
+	    .data = (uint64_t)t1.fd };
+	up[1] = (struct io_uring_rsrc_update){ .offset = IORING_FILE_INDEX_ALLOC,
+	    .data = (uint64_t)t2.fd };
+	assert(reg(&t1, IORING_REGISTER_RING_FDS, up, 2) == 2);
+	assert(up[0].offset == 2 && up[1].offset == 0);
+
+	/* Duplicate registration into occupied slot 2 fails with EBUSY. */
+	assert(reg(&t1, IORING_REGISTER_RING_FDS, &up[0], 1) == -EBUSY);
+
+	/* 3. Close t1.fd and use slot 2 via IORING_ENTER_REGISTERED_RING
+	 * and IORING_REGISTER_USE_REGISTERED_RING.
+	 */
+	close(t1.fd);
+	t1.fd = -1;
+
+	assert(kqring_register(2,
+	    IORING_REGISTER_FILES | IORING_REGISTER_USE_REGISTERED_RING,
+	    &pfd[0], 1) == 0);
+	assert(write(pfd[1], "reg!", 4) == 4);
+	struct io_uring_sqe *sqe = ring_prep(&t1, IORING_OP_READ, 0, 73001);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 4;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t1);
+	assert(kqring_enter(2, 1, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_REGISTERED_RING,
+	    NULL, 0) == 1);
+	struct io_uring_cqe c = ring_pop_cqe(&t1);
+	assert(c.user_data == 73001 && c.res == 4);
+	assert(memcmp(buf, "reg!", 4) == 0);
+
+	/* 4. CLONE_BUFFERS with IORING_REGISTER_SRC_REGISTERED from slot 2. */
+	char *m = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(m != MAP_FAILED);
+	struct iovec iov = { m, (size_t)page };
+	assert(kqring_register(2,
+	    IORING_REGISTER_BUFFERS | IORING_REGISTER_USE_REGISTERED_RING,
+	    &iov, 1) == 0);
+
+	cb = (struct io_uring_clone_buffers){
+		.src_fd = 2,
+		.flags = IORING_REGISTER_SRC_REGISTERED,
+	};
+	assert(kqring_register(0,
+	    IORING_REGISTER_CLONE_BUFFERS | IORING_REGISTER_USE_REGISTERED_RING,
+	    &cb, 1) == 0);
+	assert(write(pfd[1], "clon", 4) == 4);
+	sqe = ring_prep(&t2, IORING_OP_READ_FIXED, pfd[0], 73002);
+	sqe->addr = (uint64_t)(uintptr_t)m;
+	sqe->len = 4;
+	sqe->off = (uint64_t)-1;
+	sqe->buf_index = 0;
+	ring_push_sqe(&t2);
+	assert(kqring_enter(0, 1, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_REGISTERED_RING,
+	    NULL, 0) == 1);
+	c = ring_pop_cqe(&t2);
+	assert(c.user_data == 73002 && c.res == 4);
+	assert(memcmp(m, "clon", 4) == 0);
+
+	/* 5. Unregister slot 2 via IORING_REGISTER_USE_REGISTERED_RING
+	 * (IORING_FEAT_REG_REG_RING) and slot 0, then verify EBADF.
+	 */
+	assert(kqring_register(2,
+	    IORING_UNREGISTER_RING_FDS | IORING_REGISTER_USE_REGISTERED_RING,
+	    &up[0], 1) == 1);
+	assert(kqring_enter(2, 0, 0, IORING_ENTER_REGISTERED_RING,
+	    NULL, 0) == -1 && errno == EBADF);
+	assert(kqring_register(0,
+	    IORING_UNREGISTER_RING_FDS | IORING_REGISTER_USE_REGISTERED_RING,
+	    &up[1], 1) == 1);
+	assert(kqring_register(0,
+	    IORING_UNREGISTER_RING_FDS | IORING_REGISTER_USE_REGISTERED_RING,
+	    &up[1], 1) == -1 && errno == EBADF);
+
+	munmap(m, (size_t)page);
+	close(pfd[0]);
+	close(pfd[1]);
+	close(t2.fd);
+	printf("[PASS] Registered ring fds: RING_FDS, ENTER_REGISTERED_RING, "
+	    "USE_REGISTERED_RING, SRC_REGISTERED\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -5391,6 +5508,7 @@ main(int argc, char **argv)
 		test_splice_and_tee();
 		test_nonsock_poll();
 		test_sqe128_cqe32_attach_wq();
+		test_registered_rings();
 		printf("%s: %d failure(s)\n", failures ? "[FAIL]" : "[OK]",
 		    failures);
 	}
