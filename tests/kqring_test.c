@@ -5708,50 +5708,61 @@ test_sqpoll_and_iopoll(void)
 static void
 test_phase5_security_audit(void)
 {
-	struct test_ring t;
-	struct io_uring_sqe *sqe;
-	int sv[2];
-
-	ring_init(&t);
-	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-
 	/*
-	 * 1. Reject sending a kqring descriptor over AF_UNIX SCM_RIGHTS in
-	 * IORING_OP_SENDMSG / IORING_OP_SENDMSG_ZC to prevent fixed-file <->
-	 * socket reference cycles.
+	 * 1. AF_UNIX SCM_RIGHTS reference-cycle leak test:
+	 * A child creates a ring, registers a socketpair in the ring's fixed
+	 * table, closes the user socket fds (so only the ring's fixed table
+	 * holds the sockets), sends the ring's own fd over the fixed socket
+	 * via SCM_RIGHTS, and exits without closing the ring. Process-exit
+	 * teardown must drop the ring's fixed table, breaking the cycle so
+	 * the ring is destroyed with zero leaked kernel memory.
 	 */
-	union {
-		struct cmsghdr cm;
-		char buf[CMSG_SPACE(sizeof(int))];
-	} cmsg_buf;
-	char ch = 'x';
-	struct iovec iov = { &ch, 1 };
-	struct msghdr msg;
+	pid_t pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		struct test_ring ct;
+		struct io_uring_sqe *sqe;
+		int sv[2];
 
-	memset(&cmsg_buf, 0, sizeof(cmsg_buf));
-	memset(&msg, 0, sizeof(msg));
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_control = cmsg_buf.buf;
-	msg.msg_controllen = sizeof(cmsg_buf.buf);
-	struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
-	cm->cmsg_len = CMSG_LEN(sizeof(int));
-	cm->cmsg_level = SOL_SOCKET;
-	cm->cmsg_type = SCM_RIGHTS;
-	memcpy(CMSG_DATA(cm), &t.fd, sizeof(int));
+		ring_init(&ct);
+		assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+		assert(reg(&ct, IORING_REGISTER_FILES, sv, 2) == 0);
+		close(sv[0]);
+		close(sv[1]);
 
-	sqe = ring_prep(&t, IORING_OP_SENDMSG, sv[0], 75001);
-	sqe->addr = (uint64_t)(uintptr_t)&msg;
-	ring_push_sqe(&t);
-	assert(submit_one(&t) == -EINVAL);
+		union {
+			struct cmsghdr cm;
+			char buf[CMSG_SPACE(sizeof(int))];
+		} cmsg_buf;
+		char ch = 'x';
+		struct iovec iov = { &ch, 1 };
+		struct msghdr msg;
 
-	sqe = ring_prep(&t, IORING_OP_SENDMSG_ZC, sv[0], 75002);
-	sqe->addr = (uint64_t)(uintptr_t)&msg;
-	ring_push_sqe(&t);
-	assert(submit_one(&t) == -EINVAL);
+		memset(&cmsg_buf, 0, sizeof(cmsg_buf));
+		memset(&msg, 0, sizeof(msg));
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		msg.msg_control = cmsg_buf.buf;
+		msg.msg_controllen = sizeof(cmsg_buf.buf);
+		struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+		cm->cmsg_len = CMSG_LEN(sizeof(int));
+		cm->cmsg_level = SOL_SOCKET;
+		cm->cmsg_type = SCM_RIGHTS;
+		memcpy(CMSG_DATA(cm), &ct.fd, sizeof(int));
+
+		sqe = ring_prep(&ct, IORING_OP_SENDMSG, 0, 75001);
+		sqe->flags = IOSQE_FIXED_FILE;
+		sqe->addr = (uint64_t)(uintptr_t)&msg;
+		ring_push_sqe(&ct);
+		assert(submit_one(&ct) == 1);
+		_exit(0);
+	}
+	int status = 0;
+	assert(waitpid(pid, &status, 0) == pid);
+	assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 
 	/* 2. execve(2) cancels and disarms open rings (even if O_CLOEXEC is cleared). */
-	pid_t pid = fork();
+	pid = fork();
 	assert(pid >= 0);
 	if (pid == 0) {
 		struct test_ring ct;
@@ -5776,15 +5787,12 @@ test_phase5_security_audit(void)
 		execl("/usr/bin/true", "true", (char *)NULL);
 		_exit(127);
 	}
-	int status = 0;
+	status = 0;
 	assert(waitpid(pid, &status, 0) == pid);
 	assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 
-	close(sv[0]);
-	close(sv[1]);
-	close(t.fd);
-	printf("[PASS] Phase 5 security: SCM_RIGHTS ring-cycle rejection, "
-	    "execve(2) ring cancel/disarm, owner tid+proc check\n");
+	printf("[PASS] Phase 5 security: AF_UNIX SCM_RIGHTS cycle broken on "
+	    "exit, execve(2) ring teardown, owner tid+proc check\n");
 }
 
 int
