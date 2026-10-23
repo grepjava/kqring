@@ -523,8 +523,7 @@ test_sqe_validation(struct test_ring *r)
 {
 	static char buf[64];
 	static const uint8_t bad_flags[] = {
-		IOSQE_FIXED_FILE, IOSQE_IO_DRAIN, IOSQE_IO_LINK,
-		IOSQE_IO_HARDLINK, IOSQE_CQE_SKIP_SUCCESS, 1U << 7,
+		IOSQE_FIXED_FILE, 1U << 7,
 	};
 	struct io_uring_sqe *sqe;
 	int sv[2];
@@ -1164,6 +1163,521 @@ test_file_rw(struct test_ring *r)
 
 static _Atomic uint32_t futex_word2;
 
+/* Pop one CQE and check it. */
+static struct io_uring_cqe
+expect_cqe(struct test_ring *r, uint64_t ud, int32_t res)
+{
+	assert(ring_cq_ready(r) > 0);
+	struct io_uring_cqe c = ring_pop_cqe(r);
+	if (c.user_data != ud || c.res != res) {
+		fprintf(stderr, "expected cqe ud=%llu res=%d, got ud=%llu "
+		    "res=%d flags=%#x\n", (unsigned long long)ud, res,
+		    (unsigned long long)c.user_data, c.res, c.flags);
+		abort();
+	}
+	return (c);
+}
+
+static void
+prep_recv(struct test_ring *r, int fd, uint64_t ud, void *buf, unsigned len,
+    uint8_t flags)
+{
+	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_RECV, fd, ud);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = len;
+	sqe->flags = flags;
+	ring_push_sqe(r);
+}
+
+static void
+prep_timeout(struct test_ring *r, uint8_t opcode, uint64_t ud,
+    struct __kernel_timespec *ts, uint64_t off, uint32_t tflags,
+    uint8_t flags)
+{
+	struct io_uring_sqe *sqe = ring_prep(r, opcode, -1, ud);
+	sqe->addr = (uint64_t)(uintptr_t)ts;
+	sqe->len = 1;
+	sqe->off = off;
+	sqe->timeout_flags = tflags;
+	sqe->flags = flags;
+	ring_push_sqe(r);
+}
+
+static void
+prep_nop(struct test_ring *r, uint64_t ud, uint8_t flags)
+{
+	ring_prep(r, IORING_OP_NOP, -1, ud)->flags = flags;
+	ring_push_sqe(r);
+}
+
+static void
+test_links(struct test_ring *r)
+{
+	static char buf[64];
+	int sv[2];
+
+	/* A chain of NOPs completes in order. */
+	prep_nop(r, 20001, IOSQE_IO_LINK);
+	prep_nop(r, 20002, IOSQE_IO_LINK);
+	prep_nop(r, 20003, 0);
+	ring_submit(r);
+	expect_cqe(r, 20001, 0);
+	expect_cqe(r, 20002, 0);
+	expect_cqe(r, 20003, 0);
+
+	/* A failure cancels the rest of the chain... */
+	ring_prep(r, IORING_OP_READ, -1, 20011)->flags = IOSQE_IO_LINK;
+	ring_push_sqe(r);
+	prep_nop(r, 20012, IOSQE_IO_LINK);
+	prep_nop(r, 20013, 0);
+	prep_nop(r, 20014, 0);		/* not part of the chain */
+	ring_submit(r);
+	expect_cqe(r, 20011, -EBADF);
+	expect_cqe(r, 20012, -ECANCELED);
+	expect_cqe(r, 20013, -ECANCELED);
+	expect_cqe(r, 20014, 0);
+
+	/* ...unless it is a hard link. */
+	ring_prep(r, IORING_OP_READ, -1, 20021)->flags = IOSQE_IO_HARDLINK;
+	ring_push_sqe(r);
+	prep_nop(r, 20022, 0);
+	ring_submit(r);
+	expect_cqe(r, 20021, -EBADF);
+	expect_cqe(r, 20022, 0);
+
+	/* A bad SQE fails its whole chain at submission. */
+	prep_nop(r, 20031, IOSQE_IO_LINK);
+	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_POLL_ADD, 0, 20032);
+	sqe->addr = 1;			/* must be 0 */
+	sqe->flags = IOSQE_IO_LINK;
+	ring_push_sqe(r);
+	prep_nop(r, 20033, 0);
+	ring_submit(r);
+	expect_cqe(r, 20031, -ECANCELED);
+	expect_cqe(r, 20032, -EINVAL);
+	expect_cqe(r, 20033, -ECANCELED);
+
+	/* A link flag on the last SQE of a batch just ends the chain. */
+	prep_nop(r, 20041, IOSQE_IO_LINK);
+	ring_submit(r);
+	expect_cqe(r, 20041, 0);
+
+	/* A successor waits for an armed (async) predecessor. */
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	prep_recv(r, sv[0], 20051, buf, sizeof(buf), IOSQE_IO_LINK);
+	prep_nop(r, 20052, 0);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	assert(write(sv[1], "abc", 3) == 3);
+	assert(ring_wait(r, 2, 2000) == 0);
+	expect_cqe(r, 20051, 3);
+	expect_cqe(r, 20052, 0);
+
+	/* An armed predecessor that is cancelled breaks the chain. */
+	prep_recv(r, sv[0], 20061, buf, sizeof(buf), IOSQE_IO_LINK);
+	prep_nop(r, 20062, 0);
+	ring_prep(r, IORING_OP_ASYNC_CANCEL, -1, 20063)->addr = 20061;
+	ring_push_sqe(r);
+	ring_submit(r);
+	expect_cqe(r, 20061, -ECANCELED);
+	expect_cqe(r, 20062, -ECANCELED);
+	expect_cqe(r, 20063, 0);
+
+	/* A long chain is issued iteratively (no kernel stack growth). */
+	for (unsigned i = 0; i < SQ_ENTRIES; i++)
+		prep_nop(r, 21000 + i, i + 1 < SQ_ENTRIES ? IOSQE_IO_LINK : 0);
+	ring_submit(r);
+	for (unsigned i = 0; i < SQ_ENTRIES; i++)
+		expect_cqe(r, 21000 + i, 0);
+
+	close(sv[0]);
+	close(sv[1]);
+	printf("[PASS] IO_LINK / IO_HARDLINK chains (inline, async, failed, "
+	    "cancelled, %u long)\n", SQ_ENTRIES);
+}
+
+static void
+test_cqe_skip(struct test_ring *r)
+{
+	prep_nop(r, 22001, IOSQE_CQE_SKIP_SUCCESS);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+
+	/* Errors are always posted. */
+	ring_prep(r, IORING_OP_READ, -1, 22002)->flags =
+	    IOSQE_CQE_SKIP_SUCCESS;
+	ring_push_sqe(r);
+	ring_submit(r);
+	expect_cqe(r, 22002, -EBADF);
+
+	prep_nop(r, 22003, IOSQE_CQE_SKIP_SUCCESS | IOSQE_IO_LINK);
+	prep_nop(r, 22004, 0);
+	ring_submit(r);
+	expect_cqe(r, 22004, 0);
+	assert(ring_cq_ready(r) == 0);
+	printf("[PASS] IOSQE_CQE_SKIP_SUCCESS\n");
+}
+
+static void
+test_drain(struct test_ring *r)
+{
+	static char buf[64];
+	int sv[2];
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+	/* The drained NOP, and everything after it, waits for the RECV. */
+	prep_recv(r, sv[0], 23001, buf, sizeof(buf), 0);
+	prep_nop(r, 23002, IOSQE_IO_DRAIN);
+	prep_nop(r, 23003, 0);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	assert(write(sv[1], "x", 1) == 1);
+	assert(ring_wait(r, 3, 2000) == 0);
+	expect_cqe(r, 23001, 1);
+	expect_cqe(r, 23002, 0);
+	expect_cqe(r, 23003, 0);
+
+	/* With nothing in flight, a drained request runs at once. */
+	prep_nop(r, 23011, IOSQE_IO_DRAIN);
+	ring_submit(r);
+	expect_cqe(r, 23011, 0);
+
+	close(sv[0]);
+	close(sv[1]);
+	printf("[PASS] IOSQE_IO_DRAIN orders against in-flight requests\n");
+}
+
+static void
+test_timeouts(struct test_ring *r)
+{
+	struct __kernel_timespec t20 = { .tv_nsec = 20000000 };
+	struct __kernel_timespec t10 = { .tv_nsec = 10000000 };
+	struct __kernel_timespec t5s = { .tv_sec = 5 };
+	struct io_uring_sqe *sqe;
+	uint64_t t0;
+
+	/* Relative timeout. */
+	t0 = now_ns();
+	prep_timeout(r, IORING_OP_TIMEOUT, 24001, &t20, 0, 0, 0);
+	assert(ring_wait(r, 1, 2000) == 0);
+	expect_cqe(r, 24001, -ETIME);
+	uint64_t ms = (now_ns() - t0) / 1000000ULL;
+	assert(ms >= 15 && ms < 1000);
+
+	/* Absolute CLOCK_MONOTONIC timeout. */
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	struct __kernel_timespec abs = {
+		.tv_sec = now.tv_sec,
+		.tv_nsec = now.tv_nsec + 20000000LL,
+	};
+	if (abs.tv_nsec >= 1000000000LL) {
+		abs.tv_sec++;
+		abs.tv_nsec -= 1000000000LL;
+	}
+	t0 = now_ns();
+	prep_timeout(r, IORING_OP_TIMEOUT, 24002, &abs, 0,
+	    IORING_TIMEOUT_ABS, 0);
+	assert(ring_wait(r, 1, 2000) == 0);
+	expect_cqe(r, 24002, -ETIME);
+	assert((now_ns() - t0) / 1000000ULL >= 10);
+
+	/* Completion count: done (res 0) after 2 other CQEs. */
+	prep_timeout(r, IORING_OP_TIMEOUT, 24003, &t5s, 2, 0, 0);
+	prep_nop(r, 24004, 0);
+	prep_nop(r, 24005, 0);
+	ring_submit(r);
+	expect_cqe(r, 24004, 0);
+	expect_cqe(r, 24005, 0);
+	expect_cqe(r, 24003, 0);
+
+	/* TIMEOUT_REMOVE cancels; a second remove finds nothing. */
+	prep_timeout(r, IORING_OP_TIMEOUT, 24011, &t5s, 0, 0, 0);
+	ring_prep(r, IORING_OP_TIMEOUT_REMOVE, -1, 24012)->addr = 24011;
+	ring_push_sqe(r);
+	ring_prep(r, IORING_OP_TIMEOUT_REMOVE, -1, 24013)->addr = 24011;
+	ring_push_sqe(r);
+	ring_submit(r);
+	expect_cqe(r, 24011, -ECANCELED);
+	expect_cqe(r, 24012, 0);
+	expect_cqe(r, 24013, -ENOENT);
+
+	/* TIMEOUT_UPDATE re-arms a 5 s timeout to 10 ms. */
+	t0 = now_ns();
+	prep_timeout(r, IORING_OP_TIMEOUT, 24021, &t5s, 0, 0, 0);
+	sqe = ring_prep(r, IORING_OP_TIMEOUT_REMOVE, -1, 24022);
+	sqe->addr = 24021;
+	sqe->addr2 = (uint64_t)(uintptr_t)&t10;
+	sqe->timeout_flags = IORING_TIMEOUT_UPDATE;
+	ring_push_sqe(r);
+	ring_submit(r);
+	expect_cqe(r, 24022, 0);
+	assert(ring_wait(r, 1, 2000) == 0);
+	expect_cqe(r, 24021, -ETIME);
+	assert((now_ns() - t0) / 1000000ULL < 1000);
+
+	/* Multishot: 3 expirations, the last without F_MORE. */
+	prep_timeout(r, IORING_OP_TIMEOUT, 24031, &t10, 3,
+	    IORING_TIMEOUT_MULTISHOT, 0);
+	for (int i = 0; i < 3; i++) {
+		assert(ring_wait(r, 1, 2000) == 0);
+		struct io_uring_cqe c = expect_cqe(r, 24031, -ETIME);
+		assert(((c.flags & IORING_CQE_F_MORE) != 0) == (i < 2));
+	}
+
+	/* ETIME_SUCCESS does not break a link. */
+	prep_timeout(r, IORING_OP_TIMEOUT, 24041, &t10, 0,
+	    IORING_TIMEOUT_ETIME_SUCCESS, IOSQE_IO_LINK);
+	prep_nop(r, 24042, 0);
+	assert(ring_wait(r, 2, 2000) == 0);
+	expect_cqe(r, 24041, -ETIME);
+	expect_cqe(r, 24042, 0);
+
+	/* Validation: len must be 1, both clocks is invalid. */
+	prep_timeout(r, IORING_OP_TIMEOUT, 24051, &t10, 0, 0, 0);
+	r->sqes[(r->sq_tail - 1) & r->sq_mask].len = 2;
+	prep_timeout(r, IORING_OP_TIMEOUT, 24052, &t10, 0,
+	    IORING_TIMEOUT_BOOTTIME | IORING_TIMEOUT_REALTIME, 0);
+	prep_timeout(r, IORING_OP_TIMEOUT, 24053, NULL, 0, 0, 0);
+	ring_submit(r);
+	expect_cqe(r, 24051, -EINVAL);
+	expect_cqe(r, 24052, -EINVAL);
+	expect_cqe(r, 24053, -EFAULT);
+
+	printf("[PASS] TIMEOUT (relative, ABS, count, remove, update, "
+	    "multishot, ETIME_SUCCESS)\n");
+}
+
+static void
+test_link_timeout(struct test_ring *r)
+{
+	struct __kernel_timespec t20 = { .tv_nsec = 20000000 };
+	struct __kernel_timespec t5s = { .tv_sec = 5 };
+	static char buf[64];
+	int sv[2];
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+	/* Fires: the guarded RECV is cancelled, and so is its successor. */
+	prep_recv(r, sv[0], 25001, buf, sizeof(buf), IOSQE_IO_LINK);
+	prep_timeout(r, IORING_OP_LINK_TIMEOUT, 25002, &t20, 0, 0,
+	    IOSQE_IO_LINK);
+	prep_nop(r, 25003, 0);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	assert(ring_wait(r, 3, 2000) == 0);
+	expect_cqe(r, 25002, -ETIME);
+	expect_cqe(r, 25001, -ECANCELED);
+	expect_cqe(r, 25003, -ECANCELED);
+
+	/* The RECV wins: the timeout is cancelled, the chain goes on. */
+	prep_recv(r, sv[0], 25011, buf, sizeof(buf), IOSQE_IO_LINK);
+	prep_timeout(r, IORING_OP_LINK_TIMEOUT, 25012, &t5s, 0, 0,
+	    IOSQE_IO_LINK);
+	prep_nop(r, 25013, 0);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	assert(write(sv[1], "hi", 2) == 2);
+	assert(ring_wait(r, 3, 2000) == 0);
+	expect_cqe(r, 25011, 2);
+	expect_cqe(r, 25012, -ECANCELED);
+	expect_cqe(r, 25013, 0);
+
+	/* Guarding a request that completes inline. */
+	prep_nop(r, 25021, IOSQE_IO_LINK);
+	prep_timeout(r, IORING_OP_LINK_TIMEOUT, 25022, &t5s, 0, 0, 0);
+	ring_submit(r);
+	expect_cqe(r, 25021, 0);
+	expect_cqe(r, 25022, -ECANCELED);
+
+	/* LINK_TIMEOUT_UPDATE shortens an armed link timeout. */
+	prep_recv(r, sv[0], 25031, buf, sizeof(buf), IOSQE_IO_LINK);
+	prep_timeout(r, IORING_OP_LINK_TIMEOUT, 25032, &t5s, 0, 0, 0);
+	ring_submit(r);
+	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_TIMEOUT_REMOVE, -1,
+	    25033);
+	sqe->addr = 25032;
+	sqe->addr2 = (uint64_t)(uintptr_t)&t20;
+	sqe->timeout_flags = IORING_LINK_TIMEOUT_UPDATE;
+	ring_push_sqe(r);
+	ring_submit(r);
+	expect_cqe(r, 25033, 0);
+	assert(ring_wait(r, 2, 2000) == 0);
+	expect_cqe(r, 25032, -ETIME);
+	expect_cqe(r, 25031, -ECANCELED);
+
+	/* Must follow a linked request. */
+	prep_timeout(r, IORING_OP_LINK_TIMEOUT, 25041, &t20, 0, 0, 0);
+	ring_submit(r);
+	expect_cqe(r, 25041, -EINVAL);
+
+	close(sv[0]);
+	close(sv[1]);
+	printf("[PASS] LINK_TIMEOUT (fires, cancelled, inline, update)\n");
+}
+
+static void
+test_poll_remove(struct test_ring *r)
+{
+	struct io_uring_sqe *sqe;
+	char c;
+	int sv[2];
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+	/* Remove an armed poll. */
+	sqe = ring_prep(r, IORING_OP_POLL_ADD, sv[0], 26001);
+	sqe->poll32_events = POLLIN;
+	ring_push_sqe(r);
+	ring_prep(r, IORING_OP_POLL_REMOVE, -1, 26002)->addr = 26001;
+	ring_push_sqe(r);
+	ring_submit(r);
+	expect_cqe(r, 26001, -ECANCELED);
+	expect_cqe(r, 26002, 0);
+	ring_prep(r, IORING_OP_POLL_REMOVE, -1, 26003)->addr = 26001;
+	ring_push_sqe(r);
+	ring_submit(r);
+	expect_cqe(r, 26003, -ENOENT);
+
+	/* Multishot poll: one CQE per readiness edge, with F_MORE. */
+	sqe = ring_prep(r, IORING_OP_POLL_ADD, sv[0], 26011);
+	sqe->poll32_events = POLLIN;
+	sqe->len = IORING_POLL_ADD_MULTI;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	for (int i = 0; i < 3; i++) {
+		assert(write(sv[1], "x", 1) == 1);
+		assert(ring_wait(r, 1, 2000) == 0);
+		struct io_uring_cqe cq = expect_cqe(r, 26011, POLLIN);
+		assert((cq.flags & IORING_CQE_F_MORE) != 0);
+		assert(read(sv[0], &c, 1) == 1);
+	}
+	ring_prep(r, IORING_OP_POLL_REMOVE, -1, 26012)->addr = 26011;
+	ring_push_sqe(r);
+	ring_submit(r);
+	struct io_uring_cqe last = expect_cqe(r, 26011, -ECANCELED);
+	assert((last.flags & IORING_CQE_F_MORE) == 0);
+	expect_cqe(r, 26012, 0);
+
+	/* Update user_data of an armed poll. */
+	sqe = ring_prep(r, IORING_OP_POLL_ADD, sv[0], 26021);
+	sqe->poll32_events = POLLIN;
+	ring_push_sqe(r);
+	sqe = ring_prep(r, IORING_OP_POLL_REMOVE, -1, 26022);
+	sqe->addr = 26021;
+	sqe->off = 26023;
+	sqe->len = IORING_POLL_UPDATE_USER_DATA;
+	ring_push_sqe(r);
+	ring_submit(r);
+	expect_cqe(r, 26022, 0);
+	assert(write(sv[1], "x", 1) == 1);
+	assert(ring_wait(r, 1, 2000) == 0);
+	expect_cqe(r, 26023, POLLIN);
+	assert(read(sv[0], &c, 1) == 1);
+
+	close(sv[0]);
+	close(sv[1]);
+	printf("[PASS] POLL_REMOVE (remove, multishot, update user_data)\n");
+}
+
+static void
+test_cancel_flags(struct test_ring *r)
+{
+	static char buf[64];
+	struct io_uring_sqe *sqe;
+	int a[2], b[2];
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, a) == 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, b) == 0);
+
+	/* CANCEL_ALL by user_data. */
+	prep_recv(r, a[0], 27001, buf, sizeof(buf), 0);
+	prep_recv(r, b[0], 27001, buf, sizeof(buf), 0);
+	sqe = ring_prep(r, IORING_OP_ASYNC_CANCEL, -1, 27002);
+	sqe->addr = 27001;
+	sqe->cancel_flags = IORING_ASYNC_CANCEL_ALL;
+	ring_push_sqe(r);
+	ring_submit(r);
+	expect_cqe(r, 27001, -ECANCELED);
+	expect_cqe(r, 27001, -ECANCELED);
+	expect_cqe(r, 27002, 2);
+
+	/* CANCEL_FD. */
+	prep_recv(r, a[0], 27011, buf, sizeof(buf), 0);
+	prep_recv(r, b[0], 27012, buf, sizeof(buf), 0);
+	sqe = ring_prep(r, IORING_OP_ASYNC_CANCEL, b[0], 27013);
+	sqe->cancel_flags = IORING_ASYNC_CANCEL_FD;
+	ring_push_sqe(r);
+	ring_submit(r);
+	expect_cqe(r, 27012, -ECANCELED);
+	expect_cqe(r, 27013, 0);
+
+	/* CANCEL_OP | CANCEL_ALL: every armed RECV (27011 on a[0]). */
+	sqe = ring_prep(r, IORING_OP_POLL_ADD, b[0], 27021);
+	sqe->poll32_events = POLLIN;
+	ring_push_sqe(r);
+	sqe = ring_prep(r, IORING_OP_ASYNC_CANCEL, -1, 27022);
+	sqe->len = IORING_OP_RECV;
+	sqe->cancel_flags = IORING_ASYNC_CANCEL_OP | IORING_ASYNC_CANCEL_ALL;
+	ring_push_sqe(r);
+	ring_submit(r);
+	expect_cqe(r, 27011, -ECANCELED);
+	expect_cqe(r, 27022, 1);
+
+	/* CANCEL_ANY takes the rest (the poll); then nothing is left. */
+	sqe = ring_prep(r, IORING_OP_ASYNC_CANCEL, -1, 27031);
+	sqe->cancel_flags = IORING_ASYNC_CANCEL_ANY;
+	ring_push_sqe(r);
+	sqe = ring_prep(r, IORING_OP_ASYNC_CANCEL, -1, 27032);
+	sqe->cancel_flags = IORING_ASYNC_CANCEL_ANY;
+	ring_push_sqe(r);
+	sqe = ring_prep(r, IORING_OP_ASYNC_CANCEL, -1, 27033);
+	sqe->cancel_flags = IORING_ASYNC_CANCEL_FD_FIXED;
+	ring_push_sqe(r);
+	ring_submit(r);
+	expect_cqe(r, 27021, -ECANCELED);
+	expect_cqe(r, 27031, 1);
+	expect_cqe(r, 27032, -ENOENT);
+	expect_cqe(r, 27033, -EINVAL);
+
+	close(a[0]);
+	close(a[1]);
+	close(b[0]);
+	close(b[1]);
+	printf("[PASS] ASYNC_CANCEL ALL / FD / OP / ANY\n");
+}
+
+/*
+ * Close a ring holding timers, link timeouts, link chains and drained
+ * requests; the callouts then expire against a destroyed ring.
+ */
+static void
+test_close_with_timers(void)
+{
+	struct __kernel_timespec t10 = { .tv_nsec = 10000000 };
+	static char buf[64];
+	struct test_ring r2;
+	int sv[2];
+
+	ring_init(&r2);
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	prep_timeout(&r2, IORING_OP_TIMEOUT, 1, &t10, 0, 0, 0);
+	prep_timeout(&r2, IORING_OP_TIMEOUT, 2, &t10, 0,
+	    IORING_TIMEOUT_MULTISHOT, 0);
+	prep_recv(&r2, sv[0], 3, buf, sizeof(buf), IOSQE_IO_LINK);
+	prep_timeout(&r2, IORING_OP_LINK_TIMEOUT, 4, &t10, 0, 0,
+	    IOSQE_IO_LINK);
+	prep_nop(&r2, 5, 0);
+	prep_nop(&r2, 6, IOSQE_IO_DRAIN | IOSQE_IO_LINK);
+	prep_nop(&r2, 7, 0);
+	ring_submit(&r2);
+	assert(ring_cq_ready(&r2) == 0);
+	assert(close(r2.fd) == 0);
+	usleep(50000);
+	assert(write(sv[1], "x", 1) == 1);
+	close(sv[0]);
+	close(sv[1]);
+	printf("[PASS] close() with timers, link timeouts, chains, drains\n");
+}
+
 /*
  * Close a ring while ops of every kind are armed, then poke all of them.
  * If teardown leaves any upcall installed, this panics the kernel (UAF).
@@ -1445,6 +1959,14 @@ main(int argc, char **argv)
 		test_send_armed(&r);
 		test_file_rw(&r);
 		test_close_with_pending();
+		test_links(&r);
+		test_cqe_skip(&r);
+		test_drain(&r);
+		test_timeouts(&r);
+		test_link_timeout(&r);
+		test_poll_remove(&r);
+		test_cancel_flags(&r);
+		test_close_with_timers();
 		printf("%s: %d failure(s)\n", failures ? "[FAIL]" : "[OK]",
 		    failures);
 	}

@@ -30,8 +30,17 @@
 #else
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stddef.h>
+#endif
+
+/*
+ * CQE results are negated FreeBSD errno values.  FreeBSD has no ETIME,
+ * which io_uring timeouts complete with; it is reported as ETIMEDOUT.
+ */
+#ifndef ETIME
+#define ETIME	ETIMEDOUT
 #endif
 
 #ifdef __cplusplus
@@ -139,7 +148,7 @@ _Static_assert(sizeof(struct io_uring_cqe) == 16, "io_uring_cqe must be 16 bytes
 /*
  * SQE flags (sqe->flags)
  */
-#define IOSQE_FIXED_FILE	(1U << 0)	/* unsupported by design (CVE safety) */
+#define IOSQE_FIXED_FILE	(1U << 0)
 #define IOSQE_IO_DRAIN		(1U << 1)
 #define IOSQE_IO_LINK		(1U << 2)
 #define IOSQE_IO_HARDLINK	(1U << 3)
@@ -241,6 +250,39 @@ enum io_uring_op {
  * sqe->fsync_flags
  */
 #define IORING_FSYNC_DATASYNC		(1U << 0)
+
+/*
+ * sqe->timeout_flags
+ */
+#define IORING_TIMEOUT_ABS		(1U << 0)
+#define IORING_TIMEOUT_UPDATE		(1U << 1)
+#define IORING_TIMEOUT_BOOTTIME		(1U << 2)
+#define IORING_TIMEOUT_REALTIME		(1U << 3)
+#define IORING_LINK_TIMEOUT_UPDATE	(1U << 4)
+#define IORING_TIMEOUT_ETIME_SUCCESS	(1U << 5)
+#define IORING_TIMEOUT_MULTISHOT	(1U << 6)
+#define IORING_TIMEOUT_CLOCK_MASK					\
+	(IORING_TIMEOUT_BOOTTIME | IORING_TIMEOUT_REALTIME)
+#define IORING_TIMEOUT_UPDATE_MASK					\
+	(IORING_TIMEOUT_UPDATE | IORING_LINK_TIMEOUT_UPDATE)
+
+/*
+ * POLL_ADD / POLL_REMOVE flags, stored in sqe->len
+ */
+#define IORING_POLL_ADD_MULTI		(1U << 0)
+#define IORING_POLL_UPDATE_EVENTS	(1U << 1)
+#define IORING_POLL_UPDATE_USER_DATA	(1U << 2)
+#define IORING_POLL_ADD_LEVEL		(1U << 3)
+
+/*
+ * ASYNC_CANCEL flags (sqe->cancel_flags)
+ */
+#define IORING_ASYNC_CANCEL_ALL		(1U << 0)
+#define IORING_ASYNC_CANCEL_FD		(1U << 1)
+#define IORING_ASYNC_CANCEL_ANY		(1U << 2)
+#define IORING_ASYNC_CANCEL_FD_FIXED	(1U << 3)
+#define IORING_ASYNC_CANCEL_USERDATA	(1U << 4)
+#define IORING_ASYNC_CANCEL_OP		(1U << 5)
 
 /*
  * CQE flags (cqe->flags)
