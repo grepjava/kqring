@@ -9,16 +9,21 @@
  *
  * Security & Design Invariants:
  *   1. SINGLE_ISSUER + DEFER_TASKRUN only: All actual I/O data transfers
- *      (kern_recvit, kern_sendit, kern_accept4, uiomove) execute synchronously
- *      in the owning thread's context inside KQRING_IOC_ENTER.
+ *      (soreceive, sosend, accept, fo_read/fo_write, uiomove) execute
+ *      synchronously in the owning thread's context inside KQRING_IOC_ENTER,
+ *      and only that thread changes the ring's tables (fixed files,
+ *      registered buffers, buffer groups, personalities).
  *   2. Zero background kernel threads (no io-wq): The kernel never borrows
  *      curproc->p_fd, vmspace, or ucred asynchronously.
- *   3. Zero persistent struct file* references across syscalls: File
- *      descriptors are looked up with Capsicum rights (fget_read / fget_write)
- *      only for the duration of the synchronous transfer inside KQRING_IOC_ENTER.
- *   4. Zero kernel page-pinning (vm_page_wire) of user I/O buffers: Provided
- *      buffer rings (PBUF_RING) and user buffers are read/written via standard
- *      copyin/uiomove in curthread context.
+ *   3. struct file references are held only by fixed-file slots (with the
+ *      descriptor's Capsicum rights) and by the requests using them, never
+ *      to a ring.  Descriptors are looked up with Capsicum rights on every
+ *      attempt.
+ *   4. Zero kernel page-pinning (vm_page_wire) of user I/O buffers:
+ *      registered buffers are checked address ranges, and buffer rings and
+ *      user buffers are read/written via copyin/uiomove in curthread
+ *      context.  Kernel-allocated buffer rings are VM objects that each
+ *      mapping references.
  */
 
 #ifndef _SYS_KQRING_H_
@@ -114,6 +119,9 @@ struct io_uring_sqe {
 		__u32	uring_cmd_flags;
 		__u32	waitid_flags;
 		__u32	futex_flags;
+		__u32	install_fd_flags;
+		__u32	nop_flags;
+		__u32	pipe_flags;
 	};
 	__u64	user_data;	/* echoed back in CQE */
 	union {
@@ -244,8 +252,24 @@ enum io_uring_op {
 	IORING_OP_FTRUNCATE = 55,
 	IORING_OP_BIND = 56,
 	IORING_OP_LISTEN = 57,
+	IORING_OP_RECV_ZC = 58,
+	IORING_OP_EPOLL_WAIT = 59,
+	IORING_OP_READV_FIXED = 60,
+	IORING_OP_WRITEV_FIXED = 61,
+	IORING_OP_PIPE = 62,
 	IORING_OP_LAST
 };
+
+/*
+ * sqe->file_index for ops that can create a direct descriptor (OPENAT,
+ * OPENAT2, ACCEPT, SOCKET, PIPE): 0 installs a normal descriptor, n puts
+ * the file in fixed slot n - 1, and IORING_FILE_INDEX_ALLOC in a free slot
+ * (returned as the result).
+ */
+#define IORING_FILE_INDEX_ALLOC		(~0U)
+
+/* FIXED_FD_INSTALL flags (sqe->install_fd_flags) */
+#define IORING_FIXED_FD_NO_CLOEXEC	(1U << 0)
 
 /*
  * sqe->ioprio flags for SEND/RECV
@@ -444,8 +468,14 @@ _Static_assert(sizeof(struct statx) == 256, "struct statx must be 256 bytes");
 #define IORING_CQE_F_MORE		(1U << 1)
 #define IORING_CQE_F_SOCK_NONEMPTY	(1U << 2)
 #define IORING_CQE_F_NOTIF		(1U << 3)
+#define IORING_CQE_F_BUF_MORE		(1U << 4)	/* IOU_PBUF_RING_INC */
 
 #define IORING_CQE_BUFFER_SHIFT		16
+
+/*
+ * CQ ring flags (*cq_flags), set by userspace
+ */
+#define IORING_CQ_EVENTFD_DISABLED	(1U << 0)
 
 /*
  * Magic mmap offsets for ring fd
@@ -454,6 +484,8 @@ _Static_assert(sizeof(struct statx) == 256, "struct statx must be 256 bytes");
 #define IORING_OFF_CQ_RING		0x8000000ULL
 #define IORING_OFF_SQES			0x10000000ULL
 #define IORING_OFF_PBUF_RING		0x80000000ULL
+#define IORING_OFF_PBUF_SHIFT		16	/* bgid << shift, for IOU_PBUF_RING_MMAP */
+#define IORING_OFF_MMAP_MASK		0xf8000000ULL
 
 /*
  * SQ ring kflags (*sq_kflags)
@@ -506,8 +538,117 @@ enum {
 	IORING_UNREGISTER_PERSONALITY		= 10,
 	IORING_REGISTER_RESTRICTIONS		= 11,
 	IORING_REGISTER_ENABLE_RINGS		= 12,
+	IORING_REGISTER_FILES2			= 13,
+	IORING_REGISTER_FILES_UPDATE2		= 14,
+	IORING_REGISTER_BUFFERS2		= 15,
+	IORING_REGISTER_BUFFERS_UPDATE		= 16,
+	IORING_REGISTER_IOWQ_AFF		= 17,
+	IORING_UNREGISTER_IOWQ_AFF		= 18,
+	IORING_REGISTER_IOWQ_MAX_WORKERS	= 19,
+	IORING_REGISTER_RING_FDS		= 20,
+	IORING_UNREGISTER_RING_FDS		= 21,
 	IORING_REGISTER_PBUF_RING		= 22,
 	IORING_UNREGISTER_PBUF_RING		= 23,
+	IORING_REGISTER_SYNC_CANCEL		= 24,
+	IORING_REGISTER_FILE_ALLOC_RANGE	= 25,
+	IORING_REGISTER_PBUF_STATUS		= 26,
+	IORING_REGISTER_NAPI			= 27,
+	IORING_UNREGISTER_NAPI			= 28,
+	IORING_REGISTER_CLOCK			= 29,
+	IORING_REGISTER_CLONE_BUFFERS		= 30,
+	IORING_REGISTER_SEND_MSG_RING		= 31,
+	IORING_REGISTER_LAST
+};
+
+/*
+ * IORING_REGISTER_FILES / _FILES_UPDATE: an fd of -1 is an empty slot, and
+ * in an update IORING_REGISTER_FILES_SKIP leaves the slot as it is.
+ */
+#define IORING_REGISTER_FILES_SKIP	(-2)
+
+/* IORING_REGISTER_FILES_UPDATE (nr_args = number of fds) */
+struct io_uring_files_update {
+	__u32	offset;
+	__u32	resv;
+	__u64	fds;		/* __s32 * */
+};
+
+/* IORING_REGISTER_FILES2 / _BUFFERS2 (nr_args = sizeof) */
+#define IORING_RSRC_REGISTER_SPARSE	(1U << 0)
+
+struct io_uring_rsrc_register {
+	__u32	nr;
+	__u32	flags;
+	__u64	resv2;
+	__u64	data;		/* __s32 fds[nr] or struct iovec[nr] */
+	__u64	tags;		/* __u64 tags[nr], or 0 */
+};
+
+/* IORING_REGISTER_FILES_UPDATE2 / _BUFFERS_UPDATE (nr_args = sizeof) */
+struct io_uring_rsrc_update2 {
+	__u32	offset;
+	__u32	resv;
+	__u64	data;
+	__u64	tags;
+	__u32	nr;
+	__u32	resv2;
+};
+
+/* IORING_REGISTER_FILE_ALLOC_RANGE: slots IORING_FILE_INDEX_ALLOC uses */
+struct io_uring_file_index_range {
+	__u32	off;
+	__u32	len;
+	__u64	resv;
+};
+
+/* IORING_REGISTER_RESTRICTIONS (on an IORING_SETUP_R_DISABLED ring) */
+enum {
+	IORING_RESTRICTION_REGISTER_OP		= 0,
+	IORING_RESTRICTION_SQE_OP		= 1,
+	IORING_RESTRICTION_SQE_FLAGS_ALLOWED	= 2,
+	IORING_RESTRICTION_SQE_FLAGS_REQUIRED	= 3,
+	IORING_RESTRICTION_LAST
+};
+
+struct io_uring_restriction {
+	__u16	opcode;
+	union {
+		__u8	register_op;
+		__u8	sqe_op;
+		__u8	sqe_flags;
+	};
+	__u8	resv;
+	__u32	resv2[3];
+};
+
+/* IORING_REGISTER_SYNC_CANCEL */
+struct io_uring_sync_cancel_reg {
+	__u64	addr;
+	__s32	fd;
+	__u32	flags;
+	struct __kernel_timespec timeout;
+	__u8	opcode;
+	__u8	pad[7];
+	__u64	pad2[3];
+};
+
+/* IORING_REGISTER_CLOCK */
+struct io_uring_clock_register {
+	__u32	clockid;
+	__u32	__resv[3];
+};
+
+/* IORING_REGISTER_CLONE_BUFFERS */
+#define IORING_REGISTER_SRC_REGISTERED	(1U << 0)
+#define IORING_REGISTER_DST_REPLACE	(1U << 1)
+
+struct io_uring_clone_buffers {
+	__u32	src_fd;
+	__u32	flags;
+	__u32	src_off;
+	__u32	dst_off;
+	__u32	nr;
+	__u32	pad[3];
 };
 
 /*
@@ -580,6 +721,23 @@ struct io_uring_buf_reg {
 	__u16	bgid;
 	__u16	flags;
 	__u64	resv[3];
+};
+
+/*
+ * io_uring_buf_reg flags.  IOU_PBUF_RING_MMAP: the kernel allocates the
+ * ring, which userspace maps at IORING_OFF_PBUF_RING |
+ * (bgid << IORING_OFF_PBUF_SHIFT).  IOU_PBUF_RING_INC: a buffer may be
+ * consumed in parts; the kernel advances its addr/len in the ring and sets
+ * IORING_CQE_F_BUF_MORE while some of it is left.
+ */
+#define IOU_PBUF_RING_MMAP		(1U << 0)
+#define IOU_PBUF_RING_INC		(1U << 1)
+
+/* IORING_REGISTER_PBUF_STATUS */
+struct io_uring_buf_status {
+	__u32	buf_group;	/* in */
+	__u32	head;		/* out */
+	__u32	resv[8];
 };
 
 /*

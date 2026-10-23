@@ -16,8 +16,12 @@
 | Linux `io_uring` CVE Class | `kqring.ko` Guarantee |
 |---|---|
 | **`io-wq` async worker UAFs** | No kernel worker threads exist. All SQE submissions and deferred socket re-arms run strictly in the owning thread's `sys_ioctl(KQRING_IOC_ENTER)` syscall context (`curthread->td_tid == ring->owner_tid`). |
-| **`IOSQE_FIXED_FILE` reference cycles** | No fixed-file table or `unix_gc` bypass. Every SQE resolves standard file descriptors with Capsicum rights checks (`fget_read` / `fget_write`) and holds explicit `soref()` / `sorele()` references on armed sockets. |
-| **Pinned user-buffer page lifetime bugs** | `PBUF_RING` descriptor pages (`struct io_uring_buf`) are wired kernel/user shared memory, while data buffers remain ordinary userspace virtual addresses copied via standard `uiomove()` inside `soreceive()` in `curthread` context. |
+| **`IOSQE_FIXED_FILE` reference cycles** | A ring can never be put in a fixed-file table (register, update, direct descriptors, `MSG_RING` `SEND_FD`), so rings cannot keep each other alive. Each slot holds a file reference and the file's Capsicum rights, which every request on it is checked against. Descriptors are re-resolved with rights checks on every attempt, and armed sockets hold `soref()`. |
+| **Fixed-file / registered-buffer node use-after-free on update** | Slots are reference-counted nodes. A request takes a reference when it is issued and drops it when freed, so replacing or unregistering a slot never affects a request still using it. The tag CQE is posted once the last reference is gone. All tables are changed only by the ring's owner thread. |
+| **Pinned user-buffer page lifetime bugs** | Nothing is pinned. Registered buffers are checked to be mapped and writable when they are registered, then kept as plain address ranges. `READ_FIXED` and friends must stay inside their range, and the data is copied with `uiomove()` as for any request. User-memory buffer rings are read with `copyin()`. |
+| **Mapped buffer ring use-after-free (CVE-2024-0582)** | `IOU_PBUF_RING_MMAP` rings are VM objects, and each mapping holds its own reference. Unregistering a ring that is still mapped leaves the process with ordinary memory, never freed pages. The wired memory these rings use is capped per ring. |
+| **Credentials outliving their context** | Personalities hold `crhold()` references, and so does each request using one. Credentials are switched only on the owner thread, only for that request's own work. A personality registered before `cap_enter(2)` is refused once the process is in capability mode, so it cannot be used to leave the sandbox. |
+| **`eventfd` use-after-free** | The ring holds an `eventfd_get()` reference. Upcalls signal it under the ring lock, which unregistering also takes. |
 | **EOF buffer-ID leak on `IOSQE_BUFFER_SELECT`** | Unlike Linux `io_uring` (which consumes a `PBUF_RING` buffer ID even when `recv` returns `0` at EOF), `kqring_pbuf_commit()` only advances the kernel ring head when `transferred > 0`. |
 | **`MSG_RING` cross-ring CQ races** | A ring's CQ is only ever written by its owner thread. `MSG_RING` queues the CQE on the target ring under its lock and wakes the owner, which posts it from its own taskwork. |
 | **SQE argument TOCTOU / stale user pointers** | Everything an SQE points to (paths, iovecs, `msghdr`s, socket addresses, `open_how`, xattr names and values, futex vectors, timespecs) is copied in at submission (`IORING_FEAT_SUBMIT_STABLE`), charged to a per-ring budget. Only output buffers are touched later. |
@@ -28,23 +32,33 @@
 
 All I/O runs in the ring owner's thread inside `KQRING_IOC_ENTER`. Socket operations try the transfer inline first, and then wait on a socket upcall. Futexes, `WAITID` and timers are re-checked from the same thread.
 
-- **I/O:** `READ`, `WRITE`, `READV`, `WRITEV`, `FSYNC`, `SYNC_FILE_RANGE`, `FALLOCATE`, `FTRUNCATE`, `FADVISE`, `MADVISE`.
-  - `READ` takes a provided buffer.
+- **I/O:** `READ`, `WRITE`, `READV`, `WRITEV`, `READ_FIXED`, `WRITE_FIXED`, `READV_FIXED`, `WRITEV_FIXED`, `FSYNC`, `SYNC_FILE_RANGE`, `FALLOCATE`, `FTRUNCATE`, `FADVISE`, `MADVISE`.
+  - `READ` and `READV` (with one iovec) take a provided buffer.
   - On a socket, the read and write operations wait like `RECV` and `SEND` instead of blocking.
 - **Sockets:** `RECV`, `SEND`, `RECVMSG`, `SENDMSG`, `SEND_ZC`, `SENDMSG_ZC`, `ACCEPT`, `CONNECT`, `SOCKET`, `BIND`, `LISTEN`, `SHUTDOWN`, `READ_MULTISHOT`, `URING_CMD`.
   - Multishot is supported for `RECV`, `RECVMSG`, `ACCEPT` and `READ_MULTISHOT`.
   - `MSG_WAITALL` works on stream sockets, and `SEND` can take a destination address.
+  - `SEND` can send from provided buffers, and `RECV` and `SEND` take bundles (`IORING_RECVSEND_BUNDLE`, up to 32 buffers).
+  - `SEND_ZC` can send from a registered buffer (`IORING_RECVSEND_FIXED_BUF`).
   - `URING_CMD` supports `SIOCINQ`, `SIOCOUTQ`, `GETSOCKOPT` and `SETSOCKOPT`.
-- **Files and paths:** `OPENAT`, `OPENAT2`, `CLOSE`, `STATX`, `RENAMEAT`, `UNLINKAT`, `MKDIRAT`, `SYMLINKAT`, `LINKAT`, `GETXATTR`, `SETXATTR`, `FGETXATTR`, `FSETXATTR`.
-- **Synchronisation:** `FUTEX_WAIT`, `FUTEX_WAITV`, `FUTEX_WAKE`, `WAITID`, `MSG_RING` (`IORING_MSG_DATA`).
-- **Control:** `NOP`, `POLL_ADD` (including multishot), `POLL_REMOVE`, `TIMEOUT`, `TIMEOUT_REMOVE`, `LINK_TIMEOUT`, `ASYNC_CANCEL`.
-- **SQE flags:** `IOSQE_IO_LINK`, `IOSQE_IO_HARDLINK`, `IOSQE_IO_DRAIN`, `IOSQE_CQE_SKIP_SUCCESS` and `IOSQE_BUFFER_SELECT` (buffer group 0).
+- **Files and paths:** `OPENAT`, `OPENAT2`, `CLOSE`, `PIPE`, `STATX`, `RENAMEAT`, `UNLINKAT`, `MKDIRAT`, `SYMLINKAT`, `LINKAT`, `GETXATTR`, `SETXATTR`, `FGETXATTR`, `FSETXATTR`.
+- **Fixed files and buffers:** `FILES_UPDATE` (including `IORING_FILE_INDEX_ALLOC`), `FIXED_FD_INSTALL`, `PROVIDE_BUFFERS`, `REMOVE_BUFFERS`.
+  - `OPENAT`, `OPENAT2`, `ACCEPT` (including multishot), `SOCKET` and `PIPE` can create direct descriptors (`file_index`), and `CLOSE` can close them.
+- **Synchronisation:** `FUTEX_WAIT`, `FUTEX_WAITV`, `FUTEX_WAKE`, `WAITID`, `MSG_RING` (`IORING_MSG_DATA` and `IORING_MSG_SEND_FD`).
+- **Control:** `NOP`, `POLL_ADD` (including multishot), `POLL_REMOVE`, `TIMEOUT`, `TIMEOUT_REMOVE`, `LINK_TIMEOUT`, `ASYNC_CANCEL` (including `IORING_ASYNC_CANCEL_FD_FIXED`).
+- **SQE flags:** `IOSQE_FIXED_FILE`, `IOSQE_IO_LINK`, `IOSQE_IO_HARDLINK`, `IOSQE_IO_DRAIN`, `IOSQE_CQE_SKIP_SUCCESS` and `IOSQE_BUFFER_SELECT` (any group), plus `sqe->personality`.
+- **Registration:**
+  - Files: `FILES`, `FILES2`, `FILES_UPDATE`, `FILES_UPDATE2`, `UNREGISTER_FILES` and `FILE_ALLOC_RANGE`, with sparse tables and tags.
+  - Buffers: `BUFFERS`, `BUFFERS2`, `BUFFERS_UPDATE`, `UNREGISTER_BUFFERS` and `CLONE_BUFFERS`.
+  - Buffer rings: `PBUF_RING` (including `IOU_PBUF_RING_MMAP` and `IOU_PBUF_RING_INC`), `UNREGISTER_PBUF_RING` and `PBUF_STATUS`.
+  - Other: `EVENTFD`, `EVENTFD_ASYNC`, `UNREGISTER_EVENTFD`, `PERSONALITY`, `UNREGISTER_PERSONALITY`, `RESTRICTIONS`, `ENABLE_RINGS`, `PROBE`, `SYNC_CANCEL`, `SEND_MSG_RING` and `CLOCK`.
 
-These operations and flags are rejected for now, with `-EOPNOTSUPP` or `-EINVAL`:
+These operations and options are rejected for now, with `-EOPNOTSUPP` or `-EINVAL`:
 
-- **Fixed files and registered buffers:** `READ_FIXED`, `WRITE_FIXED`, `FILES_UPDATE`, `FIXED_FD_INSTALL`, `PROVIDE_BUFFERS`, `REMOVE_BUFFERS`, `IORING_MSG_SEND_FD`, `IOSQE_FIXED_FILE`, and `file_index` (direct descriptors).
 - **Pipe and other non-socket readiness:** `SPLICE`, `TEE`, and `READ_MULTISHOT` on anything other than a socket.
-- **No FreeBSD equivalent:** `EPOLL_CTL`.
+- **Worker threads and polling:** `IORING_SETUP_SQPOLL`, `IORING_SETUP_IOPOLL`, `IORING_SETUP_SQE128`, `IORING_SETUP_CQE32`, and the `IOWQ_AFF` and `IOWQ_MAX_WORKERS` registrations.
+- **No `io_uring_enter(2)` to use them:** `REGISTER_RING_FDS` and `IORING_ENTER_REGISTERED_RING`.
+- **No FreeBSD equivalent:** `EPOLL_CTL`, `EPOLL_WAIT`, `RECV_ZC`, and NAPI.
 
 **Differences from Linux:**
 
@@ -55,6 +69,16 @@ These operations and flags are rejected for now, with `-EOPNOTSUPP` or `-EINVAL`
 - **Xattrs.** Names are mapped to `extattr` namespaces: `user.` to user, and `system.` and `trusted.` to system.
 - **`SYNC_FILE_RANGE`.** It syncs the whole file's data.
 - **`SIGPIPE`.** It is never raised.
+- **Registration is owner-only.** Once the ring is enabled, register calls that change it must come from the owner thread (`EEXIST` otherwise), as with enter. Before `IORING_REGISTER_ENABLE_RINGS`, one thread at a time may register. `PROBE` and `SEND_MSG_RING` work from any thread.
+- **Fixed files keep Capsicum rights.** A slot carries the rights its descriptor had, and `FIXED_FD_INSTALL` gives them back. A direct descriptor opened relative to a directory with limited rights gets that directory's rights, as `openat(2)` would.
+- **Registered buffers are not pinned.** Unmapping one after registering it makes I/O on it fail with `-EFAULT`, rather than going to pages that are no longer mapped.
+- **`IORING_MSG_SEND_FD` errors.** If the target cannot install the file (no table, bad slot, no free slot), the error is reported in the target's CQE. Linux reports it to the sender. Only the target's owner ever writes to its table.
+- **`CLONE_BUFFERS`.** Both rings must have the same owner thread.
+- **Personalities and capability mode.** Personalities cannot be used to leave capability mode.
+- **Eventfd.** It is signalled once per enter that posted CQEs, and when work is queued for an idle ring.
+- **Direct `PIPE`.** The new pipe briefly has descriptors in the process before moving to its fixed slots, because FreeBSD has no way to create a pipe without them.
+- **`SYNC_CANCEL` and `CLOCK`.** `SYNC_CANCEL`'s timeout is ignored, since cancellation is immediate. `CLOCK` is recorded, but timeouts are relative, so it has no effect.
+- **Limits.** `PROVIDE_BUFFERS` holds at most 2^18 buffers per ring, and mapped buffer rings at most 16 MiB per ring. On Linux, both are left to memory accounting.
 
 ---
 

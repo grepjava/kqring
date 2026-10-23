@@ -18,7 +18,7 @@
  *         the shared SQ flags word, and wake the sleeping ring owner.
  *       * When the owning thread enters KQRING_IOC_ENTER, it drains the
  *         taskwork list in its own process context (curthread): selecting a
- *         buffer from PBUF_RING, calling soreceive()/kern_accept4() with
+ *         buffer from PBUF_RING, calling soreceive()/solisten_dequeue() with
  *         UIO_USERSPACE, and posting CQEs to the shared CQ ring.
  *       * On EOF (bytes == 0), any selected PBUF_RING buffer is NOT consumed,
  *         so cqe->res == 0 with no leaked buffer ID.
@@ -41,8 +41,11 @@
 #include <sys/filedesc.h>
 #include <sys/filio.h>
 #include <sys/capsicum.h>
+#include <sys/event.h>
+#include <sys/eventfd.h>
 #include <sys/fcntl.h>
 #include <sys/extattr.h>
+#include <sys/limits.h>
 #include <sys/mbuf.h>
 #include <sys/mount.h>
 #include <sys/namei.h>
@@ -52,6 +55,7 @@
 #include <sys/protosw.h>
 #include <sys/uio.h>
 #include <sys/poll.h>
+#include <sys/resourcevar.h>
 #include <sys/signal.h>
 #include <sys/stat.h>
 #include <sys/syscallsubr.h>
@@ -72,13 +76,17 @@
 #include <vm/vm_param.h>
 #include <vm/vm_extern.h>
 #include <vm/vm_kern.h>
+#include <vm/vm_map.h>
 #include <vm/vm_object.h>
 #include <vm/vm_page.h>
 #include <vm/vm_pager.h>
+#include <vm/vnode_pager.h>
 
 #include <sys/kqring.h>
 
 MALLOC_DEFINE(M_KQRING, "kqring", "FreeBSD kqring I/O ring state");
+/* posix_fadvise(2) state hung off struct file (freed by the kernel). */
+MALLOC_DECLARE(M_FADVISE);
 
 #define KQRING_MAX_SQ_ENTRIES	4096U
 #define KQRING_MAX_CQ_ENTRIES	16384U
@@ -93,6 +101,20 @@ MALLOC_DEFINE(M_KQRING, "kqring", "FreeBSD kqring I/O ring state");
  * have not completed; past it submission fails with -ENOMEM.
  */
 #define KQRING_MAX_ARG_BYTES	(32U * 1024 * 1024)
+/* Registered resources, with io_uring's limits. */
+#define KQRING_MAX_FILES	(1U << 20)	/* also RLIMIT_NOFILE */
+#define KQRING_MAX_BUFS		(1U << 14)
+#define KQRING_MAX_BUF_LEN	(1ULL << 30)
+#define KQRING_MAX_PERSONALITIES 1024U
+/* Buffers handed over with PROVIDE_BUFFERS and not yet used, per group. */
+#define KQRING_MAX_GROUP_BUFS	65536U
+/* ... and per ring, which io_uring leaves to memory accounting. */
+#define KQRING_MAX_PROVIDED	(1U << 18)
+/* Wired memory of IOU_PBUF_RING_MMAP rings, per ring. */
+#define KQRING_MAX_RING_MEM	(16U * 1024 * 1024)
+/* Provided buffers one bundle (IORING_RECVSEND_BUNDLE) transfer may use. */
+#define KQRING_MAX_BUNDLE	32
+#define KQRING_BGROUP_HASH	64
 
 /* io_uring_params flags accepted by KQRING_IOC_SETUP. */
 #define	KQRING_SETUP_FLAGS						\
@@ -187,6 +209,15 @@ struct kqring_op {
 	bool			connecting;	/* CONNECT: soconnect() issued */
 	bool			futex_woken;	/* FUTEX_WAKE hit; res in ->res */
 	uint32_t		nfwait;		/* FUTEX_WAIT(V) nodes in args */
+	/*
+	 * Held from issue until the request is freed, so that replacing or
+	 * unregistering a slot never pulls a file or buffer out from under
+	 * a request using it: the IOSQE_FIXED_FILE slot, the registered
+	 * buffer (READ_FIXED, ...), and sqe->personality's credentials.
+	 */
+	struct kqring_rsrc	*ffile;
+	struct kqring_rsrc	*fbuf;
+	struct ucred		*cred;
 	struct io_uring_sqe	sqe;
 };
 
@@ -216,10 +247,96 @@ static LIST_HEAD(kqring_fwait_list, kqring_fwait)
     kqring_futex_hash[KQRING_FUTEX_HASH];
 static struct mtx kqring_futex_mtx;
 
-/* A MSG_RING CQE queued for the target ring's owner to post. */
+/*
+ * A MSG_RING CQE queued for the target ring's owner to post.  For
+ * IORING_MSG_SEND_FD it carries a file (referenced) that the owner first
+ * installs in its fixed table, at file_index.
+ */
 struct kqring_rcqe {
 	STAILQ_ENTRY(kqring_rcqe) link;
 	struct io_uring_cqe	cqe;
+	struct file		*fp;
+	struct filecaps		caps;
+	uint32_t		file_index;
+	bool			skip_cqe;
+};
+
+/*
+ * A registered file or buffer: one slot of the fixed file table
+ * (IORING_REGISTER_FILES, direct descriptors) or of the registered buffer
+ * table.  The table holds one reference and each request using the slot
+ * another, so replacing or unregistering a slot does not affect requests
+ * already using it; once the last reference is gone the slot's tag CQE is
+ * posted (IORING_FEAT_RSRC_TAGS), as in io_uring.  Owner thread only.
+ *
+ * Registered buffers are not pinned: kqring keeps the range, checks that
+ * READ_FIXED and friends stay inside it, and copies to and from user
+ * memory as for any other request.
+ */
+struct kqring_rsrc {
+	uint32_t		refs;
+	uint64_t		tag;
+	struct file		*fp;		/* file slot */
+	struct filecaps		caps;		/* its Capsicum rights */
+	uint64_t		addr;		/* buffer slot */
+	uint64_t		len;
+};
+
+/* A buffer handed over with PROVIDE_BUFFERS. */
+struct kqring_kbuf {
+	STAILQ_ENTRY(kqring_kbuf) link;
+	uint64_t		addr;
+	uint32_t		len;
+	uint16_t		bid;
+};
+
+/*
+ * A provided buffer group: a buffer ring in user memory
+ * (IORING_REGISTER_PBUF_RING) or in kernel memory userspace maps
+ * (IOU_PBUF_RING_MMAP), or a list of buffers given with PROVIDE_BUFFERS.
+ * Only the owner thread uses and changes groups; the hash table is also
+ * changed under ctx->mtx, because mmap(2) of a ring looks it up from any
+ * thread.
+ */
+struct kqring_bgroup {
+	LIST_ENTRY(kqring_bgroup) link;
+	uint16_t		bgid;
+	bool			is_ring;
+	uint16_t		ring_flags;	/* IOU_PBUF_RING_* */
+	uint64_t		ring_uaddr;	/* user memory ring */
+	struct io_uring_buf_ring *ring_kva;	/* IOU_PBUF_RING_MMAP ring */
+	vm_object_t		ring_obj;
+	vm_offset_t		ring_kva_base;
+	size_t			ring_alloc_len;
+	uint32_t		ring_entries;
+	uint32_t		ring_mask;
+	uint16_t		head;		/* kernel consumer index */
+	STAILQ_HEAD(, kqring_kbuf) bufs;	/* PROVIDE_BUFFERS */
+	uint32_t		nbufs;
+};
+
+LIST_HEAD(kqring_bgroup_list, kqring_bgroup);
+
+/* Credentials registered with IORING_REGISTER_PERSONALITY. */
+struct kqring_cred {
+	LIST_ENTRY(kqring_cred)	link;
+	uint16_t		id;
+	struct ucred		*cred;
+};
+
+/*
+ * A buffer (or, for a bundle, buffers) picked from a provided buffer group
+ * for one transfer, consumed by kqring_buf_commit() once bytes moved.  It
+ * keeps its own copy of what was picked: the transfer's uiomove() advances
+ * the iovecs it was given.
+ */
+struct kqring_sel {
+	struct kqring_bgroup	*bg;
+	u_int			nbufs;
+	uint16_t		bid;		/* first buffer */
+	uint64_t		addr0;		/* its address */
+	uint32_t		len0;		/* and full length */
+	uint32_t		lens[KQRING_MAX_BUNDLE]; /* lengths used */
 };
 
 #define	KQ_DIR_RCV	0x1
@@ -231,15 +348,13 @@ struct kqring_ocqe {
 	struct io_uring_cqe	cqe;
 };
 
-/*
- * Provided Buffer Ring (group 0) registered via IORING_REGISTER_PBUF_RING.
- */
-struct kqring_pbuf_group {
+/* IORING_REGISTER_RESTRICTIONS, in force once the ring is enabled. */
+struct kqring_restrictions {
+	uint64_t	register_op[4];		/* bitmaps over 0..255 */
+	uint64_t	sqe_op[4];
+	uint8_t		sqe_flags_allowed;
+	uint8_t		sqe_flags_required;
 	bool		registered;
-	uint64_t	user_ring_addr;
-	uint32_t	ring_entries;
-	uint32_t	ring_mask;
-	uint16_t	head;		/* kernel consumer index */
 };
 
 /*
@@ -273,8 +388,45 @@ struct kqring_ctx {
 	size_t			sqes_alloc_len;
 	struct io_uring_sqe	*sqes;
 
-	/* Provided buffer group 0 */
-	struct kqring_pbuf_group pbuf;
+	/* Provided buffer groups by bgid; see struct kqring_bgroup. */
+	struct kqring_bgroup_list bgroups[KQRING_BGROUP_HASH];
+	uint32_t		nprovided;	/* PROVIDE_BUFFERS buffers held */
+	size_t			ring_mem;	/* IOU_PBUF_RING_MMAP rings */
+
+	/*
+	 * Registered files and buffers (owner thread only).  A NULL slot is
+	 * empty.  IORING_FILE_INDEX_ALLOC picks slots in
+	 * [file_alloc_off, file_alloc_end), starting at file_alloc_hint.
+	 */
+	struct kqring_rsrc	**files;
+	uint32_t		nfiles;
+	uint32_t		file_alloc_off;
+	uint32_t		file_alloc_end;
+	uint32_t		file_alloc_hint;
+	struct kqring_rsrc	**bufs;
+	uint32_t		nbufs;
+
+	/* IORING_REGISTER_PERSONALITY (owner thread only) */
+	LIST_HEAD(, kqring_cred) creds;
+	uint32_t		ncreds;
+	uint16_t		cred_next;	/* next id to try */
+
+	/*
+	 * IORING_REGISTER_EVENTFD.  Changed under mtx, and signalled under
+	 * mtx from upcalls; the owner reads it without.  evfd_cqes counts
+	 * CQEs posted since the last signal (only asynchronous ones with
+	 * IORING_REGISTER_EVENTFD_ASYNC); submitting is set while SQEs are
+	 * being issued inline.
+	 */
+	struct eventfd		*evfd;
+	bool			evfd_async;
+	bool			submitting;
+	uint32_t		evfd_cqes;
+
+	struct kqring_restrictions rst;
+	bool			restricted;	/* rst in force */
+	uint32_t		clockid;	/* IORING_REGISTER_CLOCK */
+	bool			reg_busy;	/* register on a disabled ring */
 
 	/* Armed operations and deferred taskwork queue */
 	struct kqring_op_list	active_ops;
@@ -344,6 +496,13 @@ static int  kqring_soupcall(struct socket *so, void *arg, int waitflag);
 static void kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op,
     int32_t res, uint32_t cflags);
 static void kqring_req_issue(struct kqring_ctx *ctx, struct kqring_op *op);
+static bool kqring_fp_is_ring(const struct file *fp);
+static int  kqring_fixed_remove(struct kqring_ctx *ctx, uint32_t slot);
+static void kqring_files_free(struct kqring_ctx *ctx);
+static void kqring_bufs_free(struct kqring_ctx *ctx);
+static void kqring_bgroup_free(struct kqring_ctx *ctx,
+    struct kqring_bgroup *bg);
+static void kqring_evfd_flush(struct kqring_ctx *ctx);
 
 /* ============================================================================
  * Shared Memory Allocation (Wired VM Objects + Kernel Virtual Address Mapping)
@@ -484,6 +643,9 @@ kqring_post_cqe_uncounted(struct kqring_ctx *ctx, uint64_t user_data,
 	};
 	struct kqring_ocqe *ocqe;
 
+	/* The eventfd is signalled once per enter; see kqring_evfd_flush(). */
+	if (!ctx->evfd_async || !ctx->submitting)
+		ctx->evfd_cqes++;
 	if (STAILQ_EMPTY(&ctx->ocq) && kqring_cq_push(ctx, &cqe))
 		return;
 
@@ -506,52 +668,214 @@ kqring_post_cqe(struct kqring_ctx *ctx, uint64_t user_data, int32_t res,
 	kqring_post_cqe_uncounted(ctx, user_data, res, flags);
 }
 
-/*
- * Peek at the next available buffer in group 0's PBUF_RING without advancing
- * head yet. Only called in curthread context during KQRING_IOC_ENTER.
- * If the receive succeeds with > 0 bytes, kqring_pbuf_commit() consumes it.
- * If the receive hits EOF (0 bytes) or fails (< 0), head is NOT advanced,
- * preventing the EOF buffer-leak bug!
- */
-static int
-kqring_pbuf_peek(struct kqring_ctx *ctx, struct io_uring_buf *buf_out)
+static inline bool
+kqring_op_readv(uint8_t opcode)
 {
-	struct kqring_pbuf_group *pb = &ctx->pbuf;
-	uint16_t user_tail;
-	uintptr_t tail_uaddr, entry_uaddr;
-	uint32_t idx;
-	int32_t tailv;
-	int error;
+	return (opcode == IORING_OP_READV || opcode == IORING_OP_READV_FIXED);
+}
 
-	if (!pb->registered)
-		return (ENOBUFS);
+static inline bool
+kqring_op_writev(uint8_t opcode)
+{
+	return (opcode == IORING_OP_WRITEV || opcode == IORING_OP_WRITEV_FIXED);
+}
 
-	/* tail lives at byte offset 14 of struct io_uring_buf_ring */
-	tail_uaddr = (uintptr_t)pb->user_ring_addr +
-	    offsetof(struct io_uring_buf_ring, tail);
+/* ============================================================================
+ * Provided Buffer Groups (PBUF_RING, PROVIDE_BUFFERS)
+ * ============================================================================
+ *
+ * Buffers are picked by kqring_buf_select() right before a transfer and
+ * consumed by kqring_buf_commit() only once bytes moved, in the owner
+ * thread.  A transfer that hits EOF (0 bytes) or fails leaves the group as
+ * it was, so no buffer ID leaks.  Requests look their group up again on
+ * every attempt, so unregistering a group under an armed request just makes
+ * it fail with ENOBUFS.
+ */
+
+static inline struct kqring_bgroup_list *
+kqring_bgroup_bucket(struct kqring_ctx *ctx, uint16_t bgid)
+{
+	return (&ctx->bgroups[bgid % KQRING_BGROUP_HASH]);
+}
+
+static struct kqring_bgroup *
+kqring_bgroup_find(struct kqring_ctx *ctx, uint16_t bgid)
+{
+	struct kqring_bgroup *bg;
+
+	LIST_FOREACH(bg, kqring_bgroup_bucket(ctx, bgid), link) {
+		if (bg->bgid == bgid)
+			return (bg);
+	}
+	return (NULL);
+}
+
+/* A ring's tail, which userspace publishes after filling entries. */
+static int
+kqring_bring_tail(const struct kqring_bgroup *bg, uint16_t *tail)
+{
+	int32_t v;
+
+	if (bg->ring_kva != NULL) {
+		*tail = atomic_load_acq_16(&bg->ring_kva->tail);
+		return (0);
+	}
 	/* fuword16() is cheaper than copyin() for 2 bytes; -1 means fault. */
-	tailv = fuword16((const void *)tail_uaddr);
-	if (tailv == -1)
+	v = fuword16((const void *)(uintptr_t)(bg->ring_uaddr +
+	    offsetof(struct io_uring_buf_ring, tail)));
+	if (v == -1)
 		return (EFAULT);
-	user_tail = (uint16_t)tailv;
-
-	if (pb->head == user_tail)
-		return (ENOBUFS);
-
-	idx = pb->head & pb->ring_mask;
-	entry_uaddr = (uintptr_t)pb->user_ring_addr +
-	    idx * sizeof(struct io_uring_buf);
-	error = copyin((const void *)entry_uaddr, buf_out, sizeof(*buf_out));
-	if (error != 0)
-		return (error);
-
+	*tail = (uint16_t)v;
 	return (0);
 }
 
-static inline void
-kqring_pbuf_commit(struct kqring_ctx *ctx)
+static int
+kqring_bring_get(const struct kqring_bgroup *bg, uint16_t idx,
+    struct io_uring_buf *b)
 {
-	ctx->pbuf.head++;
+	idx &= bg->ring_mask;
+	if (bg->ring_kva != NULL) {
+		/* Userspace may be writing it: a torn entry only faults. */
+		*b = ((volatile struct io_uring_buf *)bg->ring_kva)[idx];
+		return (0);
+	}
+	return (copyin((const void *)(uintptr_t)(bg->ring_uaddr +
+	    idx * sizeof(*b)), b, sizeof(*b)));
+}
+
+/* IOU_PBUF_RING_INC: store what is left of entry idx (addr, len). */
+static int
+kqring_bring_put(const struct kqring_bgroup *bg, uint16_t idx,
+    const struct io_uring_buf *b)
+{
+	volatile struct io_uring_buf *e;
+
+	idx &= bg->ring_mask;
+	if (bg->ring_kva != NULL) {
+		e = &((volatile struct io_uring_buf *)bg->ring_kva)[idx];
+		e->addr = b->addr;
+		e->len = b->len;
+		return (0);
+	}
+	CTASSERT(offsetof(struct io_uring_buf, len) == sizeof(uint64_t));
+	return (copyout(b, (void *)(uintptr_t)(bg->ring_uaddr +
+	    idx * sizeof(*b)), offsetof(struct io_uring_buf, bid)));
+}
+
+/*
+ * Pick buffers from group bgid for a transfer of at most `max` bytes (0:
+ * no limit): one buffer, or for a bundle up to `nmax` consecutive ones,
+ * described in iov[] (the last one trimmed to `max`).  ENOBUFS if the
+ * group has none.  Nothing is consumed yet.
+ */
+static int
+kqring_buf_select(struct kqring_ctx *ctx, uint16_t bgid, size_t max,
+    struct iovec *iov, u_int nmax, struct kqring_sel *sel)
+{
+	struct kqring_bgroup *bg;
+	struct kqring_kbuf *kb;
+	struct io_uring_buf b;
+	uint16_t tail;
+	size_t total = 0;
+	u_int n = 0;
+	int error;
+
+	bg = kqring_bgroup_find(ctx, bgid);
+	if (bg == NULL)
+		return (ENOBUFS);
+	sel->bg = bg;
+	nmax = MIN(nmax, KQRING_MAX_BUNDLE);
+	if (bg->is_ring) {
+		error = kqring_bring_tail(bg, &tail);
+		if (error != 0)
+			return (error);
+		/* A buffer consumed in parts is used one at a time. */
+		if ((bg->ring_flags & IOU_PBUF_RING_INC) != 0)
+			nmax = 1;
+		for (uint16_t h = bg->head; h != tail && n < nmax; h++) {
+			error = kqring_bring_get(bg, h, &b);
+			if (error != 0)
+				return (error);
+			if (n == 0) {
+				sel->bid = b.bid;
+				sel->addr0 = b.addr;
+				sel->len0 = b.len;
+			}
+			iov[n].iov_base = (void *)(uintptr_t)b.addr;
+			iov[n].iov_len = b.len;
+			total += iov[n++].iov_len;
+			if (max != 0 && total >= max)
+				break;
+		}
+	} else {
+		STAILQ_FOREACH(kb, &bg->bufs, link) {
+			if (n == nmax)
+				break;
+			if (n == 0) {
+				sel->bid = kb->bid;
+				sel->addr0 = kb->addr;
+				sel->len0 = kb->len;
+			}
+			iov[n].iov_base = (void *)(uintptr_t)kb->addr;
+			iov[n].iov_len = kb->len;
+			total += iov[n++].iov_len;
+			if (max != 0 && total >= max)
+				break;
+		}
+	}
+	if (n == 0)
+		return (ENOBUFS);
+	if (max != 0 && total > max)
+		iov[n - 1].iov_len -= total - max;
+	for (u_int i = 0; i < n; i++)
+		sel->lens[i] = (uint32_t)iov[i].iov_len;
+	sel->nbufs = n;
+	return (0);
+}
+
+/*
+ * Consume the selected buffers that n > 0 bytes went into, and return the
+ * CQE flags reporting them (the first buffer's ID).  With
+ * IOU_PBUF_RING_INC, a buffer only partly used stays at the head with
+ * what is left of it, and IORING_CQE_F_BUF_MORE says so.
+ */
+static uint32_t
+kqring_buf_commit(struct kqring_ctx *ctx, const struct kqring_sel *sel,
+    size_t n)
+{
+	struct kqring_bgroup *bg = sel->bg;
+	struct kqring_kbuf *kb;
+	uint32_t cflags;
+	size_t left = n;
+	u_int used;
+
+	KASSERT(n > 0, ("kqring: committing an empty transfer"));
+	cflags = IORING_CQE_F_BUFFER |
+	    ((uint32_t)sel->bid << IORING_CQE_BUFFER_SHIFT);
+	for (used = 0; used < sel->nbufs && left > 0; used++)
+		left -= MIN(left, sel->lens[used]);
+	if (!bg->is_ring) {
+		while (used-- > 0) {
+			kb = STAILQ_FIRST(&bg->bufs);
+			STAILQ_REMOVE_HEAD(&bg->bufs, link);
+			bg->nbufs--;
+			ctx->nprovided--;
+			free(kb, M_KQRING);
+		}
+		return (cflags);
+	}
+	if ((bg->ring_flags & IOU_PBUF_RING_INC) != 0 && n < sel->len0) {
+		struct io_uring_buf b = {
+			.addr = sel->addr0 + n,
+			.len = sel->len0 - (uint32_t)n,
+		};
+
+		/* If the ring cannot be updated, use the buffer up. */
+		if (kqring_bring_put(bg, bg->head, &b) == 0)
+			return (cflags | IORING_CQE_F_BUF_MORE);
+	}
+	bg->head += used;
+	return (cflags);
 }
 
 /* ============================================================================
@@ -564,6 +888,20 @@ kqring_pbuf_commit(struct kqring_ctx *ctx)
  * Never touches user memory: simply moves `op` onto ctx->taskwork_ops, sets
  * IORING_SQ_TASKRUN in shm->sq_flags, and wakes the owner if sleeping.
  */
+/*
+ * Signal the registered eventfd, unless userspace set
+ * IORING_CQ_EVENTFD_DISABLED.  ctx->mtx keeps the eventfd registered.
+ */
+static void
+kqring_evfd_signal_locked(struct kqring_ctx *ctx)
+{
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	if (ctx->evfd != NULL && ctx->shm != NULL &&
+	    (atomic_load_32(&ctx->shm->cq_flags) &
+	    IORING_CQ_EVENTFD_DISABLED) == 0)
+		eventfd_signal(ctx->evfd);
+}
+
 static void
 kqring_taskwork_add_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 {
@@ -571,6 +909,12 @@ kqring_taskwork_add_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 	if (op->cancelled || ctx->closing || op->in_taskwork)
 		return;
 	op->in_taskwork = true;
+	/*
+	 * As io_uring does for DEFER_TASKRUN, tell an eventfd watcher that
+	 * the ring has work to run (once, until the owner runs it).
+	 */
+	if (TAILQ_EMPTY(&ctx->taskwork_ops))
+		kqring_evfd_signal_locked(ctx);
 	TAILQ_INSERT_TAIL(&ctx->taskwork_ops, op, taskwork_link);
 	if (ctx->shm != NULL)
 		atomic_set_32(&ctx->shm->sq_flags, IORING_SQ_TASKRUN);
@@ -741,6 +1085,422 @@ kqring_op_arm_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 	TAILQ_INSERT_TAIL(&ctx->active_ops, op, active_link);
 }
 
+/*
+ * Drop a reference to a registered file or buffer; the last one posts its
+ * tag CQE (not while the ring is being torn down) and releases the file.
+ * Owner thread (or kqring_dtor()), ctx->mtx not held: fdrop() may close.
+ */
+static void
+kqring_rsrc_put(struct kqring_ctx *ctx, struct kqring_rsrc *r)
+{
+	KASSERT(r->refs > 0, ("kqring: rsrc refcount underflow"));
+	if (--r->refs != 0)
+		return;
+	if (r->tag != 0 && !ctx->closing)
+		kqring_post_cqe(ctx, r->tag, 0, 0);
+	if (r->fp != NULL) {
+		filecaps_free(&r->caps);
+		fdrop(r->fp, curthread);
+	}
+	free(r, M_KQRING);
+}
+
+/* Give every Capsicum right, as a descriptor kqring itself created has. */
+static void
+kqring_caps_all(struct filecaps *caps)
+{
+	filecaps_init(caps);
+	CAP_ALL(&caps->fc_rights);
+	caps->fc_fcntls = CAP_FCNTL_ALL;
+}
+
+/*
+ * A new fixed-file slot holding `fp` (whose reference passes to it) with
+ * the rights in `caps` (moved into it).
+ */
+static struct kqring_rsrc *
+kqring_rsrc_file(struct file *fp, struct filecaps *caps, uint64_t tag)
+{
+	struct kqring_rsrc *r;
+
+	r = malloc(sizeof(*r), M_KQRING, M_WAITOK | M_ZERO);
+	r->refs = 1;
+	r->tag = tag;
+	r->fp = fp;
+	filecaps_move(caps, &r->caps);
+	return (r);
+}
+
+/* ============================================================================
+ * Fixed Files (IORING_REGISTER_FILES, direct descriptors)
+ * ============================================================================
+ */
+
+/* Take a reference to fixed slot `slot` for a request. */
+static int
+kqring_fixed_get(struct kqring_ctx *ctx, uint32_t slot,
+    struct kqring_rsrc **rp)
+{
+	struct kqring_rsrc *r;
+
+	if (ctx->files == NULL || slot >= ctx->nfiles ||
+	    (r = ctx->files[slot]) == NULL)
+		return (EBADF);
+	r->refs++;
+	*rp = r;
+	return (0);
+}
+
+/* A free slot for IORING_FILE_INDEX_ALLOC, searched from the hint. */
+static int
+kqring_fixed_alloc(struct kqring_ctx *ctx, uint32_t *slotp)
+{
+	uint32_t n = ctx->file_alloc_end - ctx->file_alloc_off;
+	uint32_t s = ctx->file_alloc_hint;
+
+	for (uint32_t i = 0; i < n; i++, s++) {
+		if (s < ctx->file_alloc_off || s >= ctx->file_alloc_end)
+			s = ctx->file_alloc_off;
+		if (ctx->files[s] == NULL) {
+			ctx->file_alloc_hint = s + 1;
+			*slotp = s;
+			return (0);
+		}
+	}
+	return (ENFILE);
+}
+
+/*
+ * Put `fp` in the fixed table, passing on its reference and `caps`: in
+ * slot file_index - 1, replacing what was there, or for
+ * IORING_FILE_INDEX_ALLOC in a free slot.  Returns the slot for ALLOC,
+ * else 0, or a negative errno (and drops fp).
+ */
+static int32_t
+kqring_fixed_install(struct kqring_ctx *ctx, struct file *fp,
+    struct filecaps *caps, uint32_t file_index)
+{
+	struct kqring_rsrc *old;
+	uint32_t slot;
+	int32_t res = 0;
+	int error;
+
+	if (ctx->files == NULL) {
+		res = -ENXIO;
+		goto fail;
+	}
+	/*
+	 * A ring held in a ring's table (its own, or in a cycle) would never
+	 * be closed, as io_uring found; nothing is gained by allowing it.
+	 */
+	if (kqring_fp_is_ring(fp)) {
+		res = -EBADF;
+		goto fail;
+	}
+	if (file_index == IORING_FILE_INDEX_ALLOC) {
+		error = kqring_fixed_alloc(ctx, &slot);
+		if (error != 0) {
+			res = -error;
+			goto fail;
+		}
+		res = (int32_t)slot;
+	} else {
+		slot = file_index - 1;
+		if (slot >= ctx->nfiles) {
+			res = -EINVAL;
+			goto fail;
+		}
+	}
+	old = ctx->files[slot];
+	ctx->files[slot] = kqring_rsrc_file(fp, caps, 0);
+	if (old != NULL)
+		kqring_rsrc_put(ctx, old);
+	return (res);
+fail:
+	filecaps_free(caps);
+	fdrop(fp, curthread);
+	return (res);
+}
+
+/*
+ * Set fixed slot `slot` to descriptor fd's file, with its Capsicum rights,
+ * or empty it (fd -1).  A tag only goes with a file.
+ */
+static int
+kqring_files_set(struct kqring_ctx *ctx, uint32_t slot, int fd,
+    uint64_t tag)
+{
+	struct thread *td = curthread;
+	struct kqring_rsrc *old, *r = NULL;
+	struct filecaps caps;
+	struct file *fp;
+
+	if (fd == -1) {
+		if (tag != 0)
+			return (EINVAL);
+	} else {
+		if (fget_cap(td, fd, &cap_no_rights, NULL, &fp, &caps) != 0)
+			return (EBADF);
+		if (kqring_fp_is_ring(fp)) {
+			filecaps_free(&caps);
+			fdrop(fp, td);
+			return (EBADF);
+		}
+		r = kqring_rsrc_file(fp, &caps, tag);
+	}
+	old = ctx->files[slot];
+	ctx->files[slot] = r;
+	if (old != NULL)
+		kqring_rsrc_put(ctx, old);
+	return (0);
+}
+
+/*
+ * FILES_UPDATE (op and register): slots [off, off + nr) from the user's
+ * fds (IORING_REGISTER_FILES_SKIP leaves a slot alone) and optional tags.
+ * Returns how many were processed, or a negative errno if none was.
+ */
+static int32_t
+kqring_files_update(struct kqring_ctx *ctx, uint32_t off, uint64_t ufds,
+    uint64_t utags, uint32_t nr)
+{
+	uint64_t tag = 0;
+	uint32_t i;
+	int32_t fd;
+	int error = 0;
+
+	if (ctx->files == NULL)
+		return (-ENXIO);
+	if (off > ctx->nfiles || nr > ctx->nfiles - off)
+		return (-EINVAL);
+	for (i = 0; i < nr; i++) {
+		error = copyin((const void *)(uintptr_t)(ufds + i * sizeof(fd)),
+		    &fd, sizeof(fd));
+		if (error == 0 && utags != 0)
+			error = copyin((const void *)(uintptr_t)(utags +
+			    i * sizeof(tag)), &tag, sizeof(tag));
+		if (error != 0)
+			break;
+		if (fd == IORING_REGISTER_FILES_SKIP) {
+			if (tag != 0) {
+				error = EINVAL;
+				break;
+			}
+			continue;
+		}
+		error = kqring_files_set(ctx, off + i, fd, tag);
+		if (error != 0)
+			break;
+	}
+	return (i != 0 ? (int32_t)i : -error);
+}
+
+/*
+ * FILES_UPDATE with offset IORING_FILE_INDEX_ALLOC: each fd goes to a free
+ * slot, whose index is written back over it.
+ */
+static int32_t
+kqring_files_update_alloc(struct kqring_ctx *ctx, uint64_t ufds,
+    uint32_t nr)
+{
+	struct thread *td = curthread;
+	struct filecaps caps;
+	struct file *fp;
+	uint32_t i;
+	int32_t fd, slot = 0;
+	int error = 0;
+
+	if (ctx->files == NULL)
+		return (-ENXIO);
+	for (i = 0; i < nr; i++) {
+		void *ufd = (void *)(uintptr_t)(ufds + i * sizeof(fd));
+
+		error = copyin(ufd, &fd, sizeof(fd));
+		if (error != 0)
+			break;
+		error = fget_cap(td, fd, &cap_no_rights, NULL, &fp, &caps);
+		if (error != 0)
+			break;
+		slot = kqring_fixed_install(ctx, fp, &caps,
+		    IORING_FILE_INDEX_ALLOC);
+		if (slot < 0) {
+			error = -slot;
+			break;
+		}
+		error = copyout(&slot, ufd, sizeof(slot));
+		if (error != 0) {
+			(void)kqring_fixed_remove(ctx, (uint32_t)slot);
+			break;
+		}
+	}
+	return (i != 0 ? (int32_t)i : -error);
+}
+
+/*
+ * A buffer for IORING_REGISTER_BUFFERS: up to 1 GiB of mapped, writable
+ * user memory (as io_uring's pinning requires), or the empty slot
+ * {NULL, 0}.  It is not pinned: see struct kqring_rsrc.
+ */
+static int
+kqring_buf_validate(struct thread *td, const struct iovec *iov)
+{
+	vm_map_t map = &td->td_proc->p_vmspace->vm_map;
+	vm_offset_t start = (vm_offset_t)iov->iov_base;
+	vm_offset_t end = start + iov->iov_len;
+	boolean_t ok;
+
+	if (iov->iov_base == NULL)
+		return (iov->iov_len != 0 ? EFAULT : 0);
+	if (iov->iov_len == 0 || iov->iov_len > KQRING_MAX_BUF_LEN)
+		return (EFAULT);
+	if (end < start)
+		return (EOVERFLOW);
+	if (end > vm_map_max(map))
+		return (EFAULT);
+	vm_map_lock_read(map);
+	ok = vm_map_check_protection(map, trunc_page(start), round_page(end),
+	    VM_PROT_READ | VM_PROT_WRITE);
+	vm_map_unlock_read(map);
+	return (ok ? 0 : EFAULT);
+}
+
+/* Set registered buffer slot `slot`; a tag only goes with a buffer. */
+static int
+kqring_bufs_set(struct kqring_ctx *ctx, uint32_t slot,
+    const struct iovec *iov, uint64_t tag)
+{
+	struct kqring_rsrc *old, *r = NULL;
+	int error;
+
+	error = kqring_buf_validate(curthread, iov);
+	if (error != 0)
+		return (error);
+	if (iov->iov_base == NULL) {
+		if (tag != 0)
+			return (EINVAL);
+	} else {
+		r = malloc(sizeof(*r), M_KQRING, M_WAITOK | M_ZERO);
+		r->refs = 1;
+		r->tag = tag;
+		r->addr = (uintptr_t)iov->iov_base;
+		r->len = iov->iov_len;
+	}
+	old = ctx->bufs[slot];
+	ctx->bufs[slot] = r;
+	if (old != NULL)
+		kqring_rsrc_put(ctx, old);
+	return (0);
+}
+
+/* Whether [addr, addr + len) lies inside registered buffer r. */
+static inline bool
+kqring_buf_within(const struct kqring_rsrc *r, uint64_t addr, uint64_t len)
+{
+	return (addr >= r->addr && len <= r->len &&
+	    addr - r->addr <= r->len - len);
+}
+
+/*
+ * Take the fixed file and registered buffer a request names.  As in
+ * io_uring this happens at issue, so that a linked request sees slots its
+ * predecessors filled, and READ_FIXED and friends must stay inside their
+ * registered buffer.
+ */
+static int
+kqring_req_resources(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	const struct iovec *iov = op->args;
+	struct kqring_rsrc *r;
+	uint32_t idx = sqe->buf_index;
+	int error;
+
+	if ((sqe->flags & IOSQE_FIXED_FILE) != 0 && op->ffile == NULL) {
+		error = kqring_fixed_get(ctx, (uint32_t)sqe->fd, &op->ffile);
+		if (error != 0)
+			return (error);
+	}
+	switch (sqe->opcode) {
+	case IORING_OP_READ_FIXED:
+	case IORING_OP_WRITE_FIXED:
+	case IORING_OP_READV_FIXED:
+	case IORING_OP_WRITEV_FIXED:
+		break;
+	case IORING_OP_SEND_ZC:
+		if ((sqe->ioprio & IORING_RECVSEND_FIXED_BUF) != 0)
+			break;
+		return (0);
+	default:
+		return (0);
+	}
+	if (op->fbuf == NULL) {
+		if (ctx->bufs == NULL || idx >= ctx->nbufs ||
+		    (r = ctx->bufs[idx]) == NULL)
+			return (EFAULT);
+		r->refs++;
+		op->fbuf = r;
+	}
+	if (kqring_op_readv(sqe->opcode) || kqring_op_writev(sqe->opcode)) {
+		for (uint32_t i = 0; i < sqe->len; i++) {
+			if (!kqring_buf_within(op->fbuf,
+			    (uintptr_t)iov[i].iov_base, iov[i].iov_len))
+				return (EFAULT);
+		}
+		return (0);
+	}
+	return (kqring_buf_within(op->fbuf, sqe->addr, sqe->len) ? 0 :
+	    EFAULT);
+}
+
+/*
+ * Run a request's own work with the credentials sqe->personality names
+ * (IORING_REGISTER_PERSONALITY).  Only this thread's td_ucred changes,
+ * and only until kqring_cred_exit(); the swap holds its own reference,
+ * as the request may be freed in between.
+ */
+static struct ucred *
+kqring_cred_enter(const struct kqring_op *op)
+{
+	struct thread *td = curthread;
+	struct ucred *saved;
+
+	if (op->cred == NULL)
+		return (NULL);
+	saved = td->td_ucred;
+	td->td_ucred = crhold(op->cred);
+	return (saved);
+}
+
+static void
+kqring_cred_exit(struct ucred *saved)
+{
+	struct thread *td = curthread;
+	struct ucred *cr;
+
+	if (saved == NULL)
+		return;
+	cr = td->td_ucred;
+	td->td_ucred = saved;
+	crfree(cr);
+}
+
+/* Empty fixed slot `slot` (CLOSE with file_index, FILES_UPDATE). */
+static int
+kqring_fixed_remove(struct kqring_ctx *ctx, uint32_t slot)
+{
+	struct kqring_rsrc *r;
+
+	if (ctx->files == NULL)
+		return (ENXIO);
+	if (slot >= ctx->nfiles)
+		return (EINVAL);
+	if ((r = ctx->files[slot]) == NULL)
+		return (EBADF);
+	ctx->files[slot] = NULL;
+	kqring_rsrc_put(ctx, r);
+	return (0);
+}
+
 static struct kqring_op *
 kqring_op_alloc(struct kqring_ctx *ctx)
 {
@@ -786,6 +1546,18 @@ kqring_op_free(struct kqring_op *op)
 		ctx->args_bytes -= op->args_len;
 		free(op->args, M_KQRING);
 		op->args = NULL;
+	}
+	if (op->ffile != NULL) {
+		kqring_rsrc_put(ctx, op->ffile);
+		op->ffile = NULL;
+	}
+	if (op->fbuf != NULL) {
+		kqring_rsrc_put(ctx, op->fbuf);
+		op->fbuf = NULL;
+	}
+	if (op->cred != NULL) {
+		crfree(op->cred);
+		op->cred = NULL;
 	}
 	if (!ctx->closing && ctx->nfree < KQRING_OP_CACHE_MAX) {
 		TAILQ_INSERT_HEAD(&ctx->free_ops, op, active_link);
@@ -838,6 +1610,60 @@ kqring_msg_buf_cap(const struct kqring_msg_args *ma)
 }
 
 /*
+ * The file an op works on: its fixed file (IOSQE_FIXED_FILE), held since
+ * issue and checked against the Capsicum rights it was registered with,
+ * or sqe->fd looked up now.  `fflag` (FREAD, FWRITE or 0) is the open mode
+ * needed, as fget_read() / fget_write() check it.
+ */
+static int
+kqring_op_fget(const struct kqring_op *op, const cap_rights_t *rights,
+    u_int fflag, struct file **fpp)
+{
+	struct thread *td = curthread;
+	struct file *fp;
+	int error;
+
+	if (op->ffile != NULL) {
+		error = cap_check(&op->ffile->caps.fc_rights, rights);
+		if (error != 0)
+			return (error);
+		fp = op->ffile->fp;
+		if (!fhold(fp))
+			return (EBADF);
+	} else {
+		error = fget(td, op->sqe.fd, rights, &fp);
+		if (error != 0)
+			return (error);
+	}
+	if ((fp->f_flag & fflag) != fflag) {
+		fdrop(fp, td);
+		return (EBADF);
+	}
+	*fpp = fp;
+	return (0);
+}
+
+/*
+ * kqring_op_fget(), also returning a copy of the file's Capsicum state
+ * (for the checks sogetopt() and ioctls make, and for accept to pass on);
+ * the caller frees it with filecaps_free().
+ */
+static int
+kqring_op_fget_caps(const struct kqring_op *op, const cap_rights_t *rights,
+    struct file **fpp, struct filecaps *caps)
+{
+	int error;
+
+	if (op->ffile == NULL)
+		return (fget_cap(curthread, op->sqe.fd, rights, NULL, fpp,
+		    caps));
+	error = kqring_op_fget(op, rights, 0, fpp);
+	if (error == 0)
+		(void)filecaps_copy(&op->ffile->caps, caps, false);
+	return (error);
+}
+
+/*
  * Look up the socket an op works on.  For an armed op (taskwork),
  * `expect` is the socket it was armed on.  Every attempt re-resolves
  * sqe->fd (for Capsicum rights), and if the descriptor was closed or
@@ -852,7 +1678,7 @@ kqring_getsock(const struct kqring_op *op, struct socket *expect,
 	struct file *fp;
 	int error;
 
-	error = fget(td, op->sqe.fd, rights, &fp);
+	error = kqring_op_fget(op, rights, 0, &fp);
 	if (error != 0)
 		return (error);
 	if (fp->f_type != DTYPE_SOCKET) {
@@ -903,13 +1729,15 @@ kqring_so_rcv_pending(struct socket *so, bool eof)
 }
 
 /*
- * Pick a provided buffer for a receive of at most `len` bytes (0: the
- * buffer's size).  Returns EAGAIN, without consuming a buffer, if nothing
- * is there to receive.
+ * Pick provided buffers (from sqe->buf_group) for a receive of at most
+ * `len` bytes (0: the buffers' size): one, or up to `nmax` for a bundle.
+ * Returns EAGAIN, without consuming a buffer, if nothing is there to
+ * receive.
  */
 static int
-kqring_recv_pick_buf(struct kqring_ctx *ctx, struct socket *so, uint32_t len,
-    struct io_uring_buf *pbuf)
+kqring_recv_pick_buf(struct kqring_ctx *ctx, const struct kqring_op *op,
+    struct socket *so, uint32_t len, struct iovec *iov, u_int nmax,
+    struct kqring_sel *sel)
 {
 	bool readable;
 	int error;
@@ -919,19 +1747,22 @@ kqring_recv_pick_buf(struct kqring_ctx *ctx, struct socket *so, uint32_t len,
 		return (error);
 	if (!readable)
 		return (EAGAIN);
-	error = kqring_pbuf_peek(ctx, pbuf);
-	if (error != 0)
-		return (error);
-	if (len != 0 && len < pbuf->len)
-		pbuf->len = len;
-	return (0);
+	return (kqring_buf_select(ctx, op->sqe.buf_group, len, iov, nmax,
+	    sel));
 }
 
+/*
+ * READV with IOSQE_BUFFER_SELECT: its single iovec only caps the
+ * provided buffer's length, as in io_uring.
+ */
 static inline uint32_t
-kqring_pbuf_cflags(const struct io_uring_buf *pbuf)
+kqring_buf_cap(const struct kqring_op *op)
 {
-	return (IORING_CQE_F_BUFFER |
-	    ((uint32_t)pbuf->bid << IORING_CQE_BUFFER_SHIFT));
+	const struct iovec *iov = op->args;
+
+	if (kqring_op_readv(op->sqe.opcode))
+		return ((uint32_t)MIN(iov[0].iov_len, UINT32_MAX));
+	return (op->sqe.len);
 }
 
 /* The result of a transfer, which io_uring reports as an int. */
@@ -1021,7 +1852,8 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	struct socket *so;
 	struct uio auio;
 	struct iovec aiov, *iov = &aiov;
-	struct io_uring_buf pbuf;
+	struct iovec biov[KQRING_MAX_BUNDLE];
+	struct kqring_sel sel;
 	cap_rights_t rights;
 	u_int iovcnt = 1;
 	uint32_t cqe_flags = 0;
@@ -1029,6 +1861,8 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	bool multishot = sqe->opcode == IORING_OP_READ_MULTISHOT ||
 	    (sqe->opcode == IORING_OP_RECV &&
 	    (sqe->ioprio & IORING_RECV_MULTISHOT) != 0);
+	bool bundle = sqe->opcode == IORING_OP_RECV &&
+	    (sqe->ioprio & IORING_RECVSEND_BUNDLE) != 0;
 	bool waitall;
 	size_t n;
 	int error, flags, rc;
@@ -1044,18 +1878,26 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 		return (kqring_done(op, -error, 0));
 	}
 	so = fp->f_data;
+#ifdef KQRING_MAC
+	error = mac_socket_check_receive(td->td_ucred, so);
+	if (error != 0) {
+		fdrop(fp, td);
+		return (kqring_done(op, -error, 0));
+	}
+#endif
 
 	if (buf_select) {
-		error = kqring_recv_pick_buf(ctx, so, sqe->len, &pbuf);
+		error = kqring_recv_pick_buf(ctx, op, so, kqring_buf_cap(op),
+		    biov, bundle ? KQRING_MAX_BUNDLE : 1, &sel);
 		if (error != 0) {
 			fdrop(fp, td);
 			if (error == EAGAIN)
 				return (EAGAIN);
 			return (kqring_done(op, -error, 0));
 		}
-		aiov.iov_base = (void *)(uintptr_t)pbuf.addr;
-		aiov.iov_len = pbuf.len;
-	} else if (sqe->opcode == IORING_OP_READV) {
+		iov = biov;
+		iovcnt = sel.nbufs;
+	} else if (kqring_op_readv(sqe->opcode)) {
 		/* uiomove() advances the kernel iovec copy in place. */
 		iov = op->args;
 		iovcnt = sqe->len;
@@ -1081,14 +1923,11 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	}
 
 	/*
-	 * Commit the PBUF_RING buffer ONLY when n > 0!  On EOF (n == 0) the
-	 * buffer stays in the PBUF_RING and res = 0 has no
-	 * IORING_CQE_F_BUFFER.
+	 * Commit the provided buffer ONLY when n > 0!  On EOF (n == 0) the
+	 * buffer stays in its group and res = 0 has no IORING_CQE_F_BUFFER.
 	 */
-	if (buf_select && n > 0) {
-		kqring_pbuf_commit(ctx);
-		cqe_flags |= kqring_pbuf_cflags(&pbuf);
-	}
+	if (buf_select && n > 0)
+		cqe_flags |= kqring_buf_commit(ctx, &sel, n);
 	if (multishot && n > 0) {
 		cqe_flags |= IORING_CQE_F_MORE;
 		*more_out = kqring_so_rcv_pending(so, true);
@@ -1103,9 +1942,14 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	return (kqring_done(op, kqring_xfer_res(n), cqe_flags));
 }
 
-/* SEND, SEND_ZC, and WRITE / WRITEV on a socket. */
+/*
+ * SEND, SEND_ZC, and WRITE / WRITEV on a socket.  SEND may send from
+ * provided buffers (IOSQE_BUFFER_SELECT, several with
+ * IORING_RECVSEND_BUNDLE), consuming those the bytes sent came from.
+ */
 static int
-kqring_exec_send(struct kqring_op *op, struct socket *expect)
+kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
+    struct socket *expect)
 {
 	const struct io_uring_sqe *sqe = &op->sqe;
 	struct thread *td = curthread;
@@ -1114,8 +1958,12 @@ kqring_exec_send(struct kqring_op *op, struct socket *expect)
 	struct sockaddr *to = NULL;
 	struct uio auio;
 	struct iovec aiov, *iov = &aiov;
+	struct iovec biov[KQRING_MAX_BUNDLE];
+	struct kqring_sel sel;
 	cap_rights_t rights;
 	u_int iovcnt = 1;
+	uint32_t cqe_flags = 0;
+	bool buf_select = (sqe->flags & IOSQE_BUFFER_SELECT) != 0;
 	bool waitall = false;
 	size_t n;
 	int error, flags = MSG_DONTWAIT | MSG_NOSIGNAL, rc;
@@ -1135,8 +1983,28 @@ kqring_exec_send(struct kqring_op *op, struct socket *expect)
 	if (error != 0)
 		return (kqring_done(op, -error, 0));
 	so = fp->f_data;
+#ifdef KQRING_MAC
+	if (to != NULL)
+		error = mac_socket_check_connect(td->td_ucred, so, to);
+	if (error == 0)
+		error = mac_socket_check_send(td->td_ucred, so);
+	if (error != 0) {
+		fdrop(fp, td);
+		return (kqring_done(op, -error, 0));
+	}
+#endif
 
-	if (sqe->opcode == IORING_OP_WRITEV) {
+	if (buf_select) {
+		error = kqring_buf_select(ctx, sqe->buf_group, sqe->len, biov,
+		    (sqe->ioprio & IORING_RECVSEND_BUNDLE) != 0 ?
+		    KQRING_MAX_BUNDLE : 1, &sel);
+		if (error != 0) {
+			fdrop(fp, td);
+			return (kqring_done(op, -error, 0));
+		}
+		iov = biov;
+		iovcnt = sel.nbufs;
+	} else if (kqring_op_writev(sqe->opcode)) {
 		iov = op->args;
 		iovcnt = sqe->len;
 	} else {
@@ -1146,7 +2014,8 @@ kqring_exec_send(struct kqring_op *op, struct socket *expect)
 	kqring_uio_init(&auio, iov, iovcnt, UIO_WRITE);
 	ssize_t want = auio.uio_resid;
 
-	waitall = (flags & MSG_WAITALL) != 0 && kqring_so_stream(so);
+	waitall = (flags & MSG_WAITALL) != 0 && !buf_select &&
+	    kqring_so_stream(so);
 	flags &= ~MSG_WAITALL;
 	error = sosend(so, to, &auio, NULL, NULL, flags, td);
 	n = (size_t)(want - auio.uio_resid);
@@ -1154,9 +2023,11 @@ kqring_exec_send(struct kqring_op *op, struct socket *expect)
 
 	if ((rc = kqring_xfer_end(op, error, n)) >= 0)
 		return (rc);
+	if (buf_select)
+		cqe_flags = kqring_buf_commit(ctx, &sel, n);
 	if (waitall && kqring_waitall(op, n, sqe->len, &n) == EAGAIN)
 		return (EAGAIN);
-	return (kqring_done(op, kqring_xfer_res(n), 0));
+	return (kqring_done(op, kqring_xfer_res(n), cqe_flags));
 }
 
 /*
@@ -1190,6 +2061,88 @@ kqring_copyout_control(struct mbuf *control, void *ubuf, size_t space,
 }
 
 /*
+ * kern_recvit() on a socket rather than a descriptor (fixed files have
+ * none).  mp->msg_iov is a kernel copy of user iovecs; the name goes to
+ * `fromseg` memory, and without controlp the control data to user memory.
+ * The byte count goes to *np.
+ */
+static int
+kqring_recvit(struct thread *td, struct socket *so, struct msghdr *mp,
+    enum uio_seg fromseg, struct mbuf **controlp, size_t *np)
+{
+	struct uio auio;
+	struct mbuf *control = NULL, *m;
+	struct sockaddr *fromsa = NULL;
+	caddr_t ctlbuf;
+	ssize_t len;
+	int error;
+
+	if (controlp != NULL)
+		*controlp = NULL;
+#ifdef KQRING_MAC
+	error = mac_socket_check_receive(td->td_ucred, so);
+	if (error != 0)
+		return (error);
+#endif
+	kqring_uio_init(&auio, mp->msg_iov, mp->msg_iovlen, UIO_READ);
+	len = auio.uio_resid;
+	error = soreceive(so, &fromsa, &auio, NULL,
+	    (mp->msg_control != NULL || controlp != NULL) ? &control : NULL,
+	    &mp->msg_flags);
+	if (error != 0 && auio.uio_resid != len && (error == ERESTART ||
+	    error == EINTR || error == EWOULDBLOCK))
+		error = 0;
+	if (error != 0)
+		goto out;
+	*np = (size_t)(len - auio.uio_resid);
+	if (mp->msg_name != NULL) {
+		len = mp->msg_namelen;
+		if (len <= 0 || fromsa == NULL) {
+			len = 0;
+		} else {
+			len = MIN(len, fromsa->sa_len);
+			if (fromseg == UIO_USERSPACE) {
+				error = copyout(fromsa, mp->msg_name,
+				    (unsigned)len);
+				if (error != 0)
+					goto out;
+			} else {
+				bcopy(fromsa, mp->msg_name, len);
+			}
+		}
+		mp->msg_namelen = len;
+	}
+	if (mp->msg_control != NULL && controlp == NULL) {
+		ctlbuf = mp->msg_control;
+		len = mp->msg_controllen;
+		mp->msg_controllen = 0;
+		for (m = control; m != NULL && len >= m->m_len;
+		    m = m->m_next) {
+			error = copyout(mtod(m, caddr_t), ctlbuf, m->m_len);
+			if (error != 0)
+				goto out;
+			ctlbuf += m->m_len;
+			len -= m->m_len;
+			mp->msg_controllen += m->m_len;
+		}
+		if (m != NULL) {
+			mp->msg_flags |= MSG_CTRUNC;
+			m_dispose_extcontrolm(m);
+		}
+	}
+out:
+	free(fromsa, M_SONAME);
+	if (error == 0 && controlp != NULL) {
+		*controlp = control;
+	} else if (control != NULL) {
+		if (error != 0)
+			m_dispose_extcontrolm(control);
+		m_freem(control);
+	}
+	return (error);
+}
+
+/*
  * Multishot RECVMSG: one message per provided buffer, laid out as
  * struct io_uring_recvmsg_out, then the name and control areas sized by
  * the submitted msghdr, then the payload.
@@ -1202,9 +2155,9 @@ kqring_exec_recvmsg_multi(struct kqring_ctx *ctx, struct kqring_op *op,
 	const struct kqring_msg_args *ma = op->args;
 	struct thread *td = curthread;
 	struct io_uring_recvmsg_out out;
-	struct io_uring_buf pbuf;
+	struct kqring_sel sel;
 	struct msghdr m;
-	struct iovec aiov;
+	struct iovec aiov, biov;
 	struct mbuf *control = NULL;
 	uint8_t name[SOCK_MAXADDRLEN];
 	size_t namesz = ma->msg.msg_namelen;
@@ -1213,32 +2166,32 @@ kqring_exec_recvmsg_multi(struct kqring_ctx *ctx, struct kqring_op *op,
 	char *ubuf;
 	int error;
 
-	error = kqring_recv_pick_buf(ctx, so, kqring_msg_buf_cap(ma), &pbuf);
+	error = kqring_recv_pick_buf(ctx, op, so, kqring_msg_buf_cap(ma),
+	    &biov, 1, &sel);
 	if (error != 0) {
 		if (error == EAGAIN)
 			return (EAGAIN);
 		return (kqring_done(op, -error, 0));
 	}
-	if (pbuf.len < hdr)
+	if (biov.iov_len < hdr)
 		return (kqring_done(op, -EFAULT, 0));
-	ubuf = (char *)(uintptr_t)pbuf.addr;
+	ubuf = biov.iov_base;
 
 	/* Ask for the whole name, to report its real length. */
 	bzero(&m, sizeof(m));
 	m.msg_name = name;
 	m.msg_namelen = sizeof(name);
 	aiov.iov_base = ubuf + hdr;
-	aiov.iov_len = pbuf.len - hdr;
+	aiov.iov_len = biov.iov_len - hdr;
 	m.msg_iov = &aiov;
 	m.msg_iovlen = 1;
 	m.msg_flags = (int)sqe->msg_flags | MSG_DONTWAIT;
-	error = kern_recvit(td, sqe->fd, &m, UIO_SYSSPACE,
-	    ctlsz != 0 ? &control : NULL);
+	error = kqring_recvit(td, so, &m, UIO_SYSSPACE,
+	    ctlsz != 0 ? &control : NULL, &n);
 	if (error == EWOULDBLOCK)
 		return (EAGAIN);
 	if (error != 0)
 		return (kqring_done(op, -error, 0));
-	n = td->td_retval[0];
 	if (n == 0 && kqring_so_stream(so)) {
 		/* EOF: ends the multishot, buffer not consumed. */
 		m_freem(control);
@@ -1267,13 +2220,13 @@ kqring_exec_recvmsg_multi(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (error != 0)
 		return (kqring_done(op, -error, 0));
 
-	kqring_pbuf_commit(ctx);
+	n = hdr + MIN(n, aiov.iov_len);
 	*more_out = kqring_so_rcv_pending(so, true);
-	return (kqring_done(op, kqring_xfer_res(hdr + MIN(n, aiov.iov_len)),
-	    kqring_pbuf_cflags(&pbuf) | IORING_CQE_F_MORE));
+	return (kqring_done(op, kqring_xfer_res(n),
+	    kqring_buf_commit(ctx, &sel, n) | IORING_CQE_F_MORE));
 }
 
-/* RECVMSG: kern_recvit() on the kernel copy of the msghdr's iovec. */
+/* RECVMSG: kqring_recvit() on the kernel copy of the msghdr's iovec. */
 static int
 kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
     struct socket *expect, bool *more_out)
@@ -1282,7 +2235,7 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 	struct kqring_msg_args *ma = op->args;
 	struct thread *td = curthread;
 	struct msghdr *umsg = (struct msghdr *)(uintptr_t)sqe->addr;
-	struct io_uring_buf pbuf;
+	struct kqring_sel sel;
 	struct file *fp;
 	struct socket *so;
 	struct msghdr msg;
@@ -1309,16 +2262,14 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 
 	msg = ma->msg;
 	if (buf_select) {
-		error = kqring_recv_pick_buf(ctx, so, kqring_msg_buf_cap(ma),
-		    &pbuf);
+		error = kqring_recv_pick_buf(ctx, op, so,
+		    kqring_msg_buf_cap(ma), &aiov, 1, &sel);
 		if (error != 0) {
 			fdrop(fp, td);
 			if (error == EAGAIN)
 				return (EAGAIN);
 			return (kqring_done(op, -error, 0));
 		}
-		aiov.iov_base = (void *)(uintptr_t)pbuf.addr;
-		aiov.iov_len = pbuf.len;
 		msg.msg_iov = &aiov;
 		msg.msg_iovlen = 1;
 	}
@@ -1326,8 +2277,8 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 	msg.msg_flags = (int)sqe->msg_flags | MSG_DONTWAIT;
 	waitall = (msg.msg_flags & MSG_WAITALL) != 0 && !buf_select &&
 	    kqring_so_stream(so);
-	error = kern_recvit(td, sqe->fd, &msg, UIO_USERSPACE, NULL);
-	n = error == 0 ? (size_t)td->td_retval[0] : 0;
+	n = 0;
+	error = kqring_recvit(td, so, &msg, UIO_USERSPACE, NULL, &n);
 	if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
 		fdrop(fp, td);
 		return (rc);
@@ -1342,10 +2293,8 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 		    sizeof(msg.msg_controllen));
 	if (error == 0)
 		error = copyout(&oflags, &umsg->msg_flags, sizeof(oflags));
-	if (buf_select && n > 0) {
-		kqring_pbuf_commit(ctx);
-		cqe_flags |= kqring_pbuf_cflags(&pbuf);
-	}
+	if (buf_select && n > 0)
+		cqe_flags |= kqring_buf_commit(ctx, &sel, n);
 	if (error != 0) {
 		fdrop(fp, td);
 		return (kqring_done(op, -error, cqe_flags));
@@ -1361,7 +2310,40 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 	return (kqring_done(op, kqring_xfer_res(n), cqe_flags));
 }
 
-/* SENDMSG / SENDMSG_ZC: kern_sendit() on the kernel copy of the msghdr. */
+/*
+ * kern_sendit() on a socket rather than a descriptor (see kqring_recvit()).
+ * Consumes `control`.  The byte count goes to *np.
+ */
+static int
+kqring_sendit(struct thread *td, struct socket *so, struct msghdr *mp,
+    int flags, struct mbuf *control, size_t *np)
+{
+	struct uio auio;
+	ssize_t len;
+	int error;
+
+	*np = 0;
+#ifdef KQRING_MAC
+	error = 0;
+	if (mp->msg_name != NULL)
+		error = mac_socket_check_connect(td->td_ucred, so,
+		    mp->msg_name);
+	if (error == 0)
+		error = mac_socket_check_send(td->td_ucred, so);
+	if (error != 0) {
+		m_freem(control);
+		return (error);
+	}
+#endif
+	kqring_uio_init(&auio, mp->msg_iov, mp->msg_iovlen, UIO_WRITE);
+	len = auio.uio_resid;
+	error = sousrsend(so, mp->msg_name, &auio, control, flags, NULL);
+	if (error == 0)
+		*np = (size_t)(len - auio.uio_resid);
+	return (error);
+}
+
+/* SENDMSG / SENDMSG_ZC: kqring_sendit() on the kernel copy of the msghdr. */
 static int
 kqring_exec_sendmsg(struct kqring_op *op, struct socket *expect)
 {
@@ -1380,8 +2362,11 @@ kqring_exec_sendmsg(struct kqring_op *op, struct socket *expect)
 	/* As sendmsg(2): no addressed sends in capability mode. */
 	if (ma->msg.msg_name != NULL && IN_CAPABILITY_MODE(td))
 		return (kqring_done(op, -ECAPMODE, 0));
-	error = kqring_getsock(op, expect,
-	    cap_rights_init_one(&rights, CAP_SEND), &fp);
+	if (ma->msg.msg_name != NULL)
+		cap_rights_init(&rights, CAP_SEND, CAP_CONNECT);
+	else
+		cap_rights_init_one(&rights, CAP_SEND);
+	error = kqring_getsock(op, expect, &rights, &fp);
 	if (error != 0)
 		return (kqring_done(op, -error, 0));
 	so = fp->f_data;
@@ -1390,7 +2375,7 @@ kqring_exec_sendmsg(struct kqring_op *op, struct socket *expect)
 	msg = ma->msg;
 	size_t want = kqring_iov_len(msg.msg_iov, msg.msg_iovlen);
 	if (msg.msg_controllen != 0) {
-		/* kern_sendit() consumes the mbuf: rebuild it each attempt. */
+		/* kqring_sendit() consumes the mbuf: rebuild it each attempt. */
 		control = m_get2(msg.msg_controllen, M_WAITOK, MT_CONTROL, 0);
 		control->m_len = msg.msg_controllen;
 		bcopy(msg.msg_control, mtod(control, void *),
@@ -1398,8 +2383,7 @@ kqring_exec_sendmsg(struct kqring_op *op, struct socket *expect)
 	}
 	flags = ((int)sqe->msg_flags & ~MSG_WAITALL) | MSG_DONTWAIT |
 	    MSG_NOSIGNAL;
-	error = kern_sendit(td, sqe->fd, &msg, flags, control, UIO_USERSPACE);
-	n = error == 0 ? (size_t)td->td_retval[0] : 0;
+	error = kqring_sendit(td, so, &msg, flags, control, &n);
 	fdrop(fp, td);
 
 	if ((rc = kqring_xfer_end(op, error, n)) >= 0)
@@ -1469,54 +2453,105 @@ kqring_exec_connect(struct kqring_op *op, struct socket *expect)
 	return (kqring_done(op, -error, 0));
 }
 
+/*
+ * ACCEPT: kern_accept4() on the listening socket's file, so that it works
+ * on a fixed file, and can create a direct descriptor (sqe->file_index).
+ * The new file inherits the listener's Capsicum rights, as accept(2)'s
+ * descriptor does, and gets only the flags asked for, as accept4(2).
+ */
 static int
-kqring_exec_accept(struct kqring_op *op, struct socket *expect,
-    bool *more_out)
+kqring_exec_accept(struct kqring_ctx *ctx, struct kqring_op *op,
+    struct socket *expect, bool *more_out)
 {
 	const struct io_uring_sqe *sqe = &op->sqe;
 	struct thread *td = curthread;
 	struct file *headfp = NULL, *nfp = NULL;
-	struct socket *headso;
+	struct filecaps hcaps, ncaps;
+	struct socket *head, *so;
 	struct sockaddr_storage ss = { .ss_len = sizeof(ss) };
 	cap_rights_t rights;
-	int error, nfd = -1, aflags;
+	bool direct = sqe->file_index != 0;
+	u_int fflag;
+	int error, nfd = -1, tmp;
+	int aflags = (int)sqe->accept_flags;
+	int32_t res;
 
-	error = fget(td, sqe->fd, cap_rights_init_one(&rights, CAP_ACCEPT),
-	    &headfp);
+	error = kqring_op_fget_caps(op, cap_rights_init_one(&rights,
+	    CAP_ACCEPT), &headfp, &hcaps);
 	if (error != 0)
 		return (kqring_done(op, -error, 0));
 	if (headfp->f_type != DTYPE_SOCKET) {
-		fdrop(headfp, td);
-		return (kqring_done(op, -ENOTSOCK, 0));
+		error = ENOTSOCK;
+		goto fail;
 	}
-	headso = headfp->f_data;
-	if (expect != NULL && headso != expect) {
-		fdrop(headfp, td);
-		return (kqring_done(op, -EBADF, 0));
+	head = headfp->f_data;
+	if (expect != NULL && head != expect) {
+		error = EBADF;
+		goto fail;
 	}
-	if ((headso->so_options & SO_ACCEPTCONN) == 0) {
-		fdrop(headfp, td);
-		return (kqring_done(op, -EINVAL, 0));
+	if (!SOLISTENING(head)) {
+		error = EINVAL;
+		goto fail;
 	}
 	/* Listening sockets have no so_rcv; only sol_comp/so_error apply. */
-	if (TAILQ_EMPTY(&headso->sol_comp) && headso->so_error == 0) {
+	if (TAILQ_EMPTY(&head->sol_comp) && head->so_error == 0) {
+		filecaps_free(&hcaps);
 		fdrop(headfp, td);
 		return (EAGAIN);
 	}
+#ifdef KQRING_MAC
+	error = mac_socket_check_accept(td->td_ucred, head);
+	if (error != 0)
+		goto fail;
+#endif
 
-	/* The new descriptor gets only the flags asked for, as accept4(2). */
-	aflags = (int)sqe->accept_flags;
-	error = kern_accept4(td, sqe->fd, (struct sockaddr *)&ss, aflags,
-	    &nfp);
-	if (error != 0) {
-		fdrop(headfp, td);
-		if (error == EWOULDBLOCK)
-			return (EAGAIN);
-		return (kqring_done(op, -error, 0));
+	if (direct) {
+		error = falloc_noinstall(td, &nfp);
+	} else {
+		(void)filecaps_copy(&hcaps, &ncaps, false);
+		error = falloc_caps(td, &nfp, &nfd,
+		    ((aflags & SOCK_CLOEXEC) != 0 ? O_CLOEXEC : 0) |
+		    ((aflags & SOCK_CLOFORK) != 0 ? O_CLOFORK : 0), &ncaps);
+		if (error != 0)
+			filecaps_free(&ncaps);
 	}
-	nfd = td->td_retval[0];
-	if (nfp != NULL)
-		fdrop(nfp, td);
+	if (error != 0) {
+		nfp = NULL;
+		goto fail;
+	}
+	SOCK_LOCK(head);
+	if (!SOLISTENING(head)) {
+		SOCK_UNLOCK(head);
+		error = EINVAL;
+		goto fail;
+	}
+	/*
+	 * Re-check under the listen lock: another accepter may have taken
+	 * the connection, and solisten_dequeue() would then sleep (for a
+	 * blocking listener) in the ring owner.
+	 */
+	if (TAILQ_EMPTY(&head->sol_comp) && head->so_error == 0) {
+		SOCK_UNLOCK(head);
+		error = EWOULDBLOCK;
+		goto fail;
+	}
+	error = solisten_dequeue(head, &so, aflags);	/* unlocks head */
+	if (error != 0)
+		goto fail;
+	KNOTE_UNLOCKED(&head->so_rdsel.si_note, 0);
+
+	fflag = atomic_load_int(&headfp->f_flag) & ~(FNONBLOCK | FASYNC);
+	if ((aflags & SOCK_NONBLOCK) != 0)
+		fflag |= FNONBLOCK;
+	finit(nfp, fflag, DTYPE_SOCKET, so, &socketops);
+	/* Sync socket nonblocking/async state with file flags. */
+	tmp = fflag & FNONBLOCK;
+	(void)fo_ioctl(nfp, FIONBIO, &tmp, td->td_ucred, td);
+	tmp = fflag & FASYNC;
+	(void)fo_ioctl(nfp, FIOASYNC, &tmp, td->td_ucred, td);
+	error = soaccept(so, (struct sockaddr *)&ss);
+	if (error != 0)
+		goto fail;
 
 	/* As accept(2): the peer address to addr, its length to *addr2. */
 	if (sqe->addr != 0) {
@@ -1533,20 +2568,40 @@ kqring_exec_accept(struct kqring_op *op, struct socket *expect,
 			error = copyout(&len, (void *)(uintptr_t)sqe->addr2,
 			    sizeof(len));
 		}
-		if (error != 0) {
-			fdrop(headfp, td);
-			(void)kern_close(td, nfd);
-			return (kqring_done(op, -error, 0));
-		}
+		if (error != 0)
+			goto fail;
 	}
 
-	if ((sqe->ioprio & IORING_ACCEPT_MULTISHOT) != 0) {
-		*more_out = !TAILQ_EMPTY(&headso->sol_comp);
+	if (direct) {
+		/* The fixed table takes nfp's reference and hcaps. */
+		res = kqring_fixed_install(ctx, nfp, &hcaps,
+		    sqe->file_index);
+		nfp = NULL;
+	} else {
+		filecaps_free(&hcaps);
+		fdrop(nfp, td);		/* falloc_caps()'s extra reference */
+		res = nfd;
+	}
+	if (res >= 0 && (sqe->ioprio & IORING_ACCEPT_MULTISHOT) != 0) {
+		*more_out = !TAILQ_EMPTY(&head->sol_comp);
 		fdrop(headfp, td);
-		return (kqring_done(op, nfd, IORING_CQE_F_MORE));
+		return (kqring_done(op, res, IORING_CQE_F_MORE));
 	}
 	fdrop(headfp, td);
-	return (kqring_done(op, nfd, 0));
+	return (kqring_done(op, res, 0));
+
+fail:
+	if (nfp != NULL) {
+		/* Closes the accepted socket too, if finit() ran. */
+		if (!direct)
+			fdclose(td, nfp, nfd);
+		fdrop(nfp, td);
+	}
+	filecaps_free(&hcaps);
+	fdrop(headfp, td);
+	if (error == EWOULDBLOCK)
+		return (EAGAIN);
+	return (kqring_done(op, -error, 0));
 }
 
 /*
@@ -1614,8 +2669,8 @@ kqring_exec_poll(struct kqring_op *op, struct socket *expect)
 	int events = sqe->poll32_events ? (int)sqe->poll32_events :
 	    sqe->poll_events;
 
-	error = fget(td, sqe->fd, cap_rights_init_one(&rights, CAP_POLL_EVENT),
-	    &fp);
+	error = kqring_op_fget(op, cap_rights_init_one(&rights, CAP_POLL_EVENT),
+	    0, &fp);
 	if (error != 0)
 		return (kqring_done(op, -error, 0));
 	if (fp->f_type != DTYPE_SOCKET) {
@@ -1627,6 +2682,13 @@ kqring_exec_poll(struct kqring_op *op, struct socket *expect)
 		fdrop(fp, td);
 		return (kqring_done(op, -EBADF, 0));
 	}
+#ifdef KQRING_MAC
+	error = mac_socket_check_poll(td->td_ucred, fp->f_data);
+	if (error != 0) {
+		fdrop(fp, td);
+		return (kqring_done(op, -error, 0));
+	}
+#endif
 	revents = kqring_so_revents(fp->f_data, events);
 	fdrop(fp, td);
 
@@ -1637,9 +2699,24 @@ kqring_exec_poll(struct kqring_op *op, struct socket *expect)
 }
 
 /*
- * READ / WRITE / READV / WRITEV on anything but a socket (sockets go
- * through kqring_exec_recv() / kqring_exec_send() and can be armed).
- * READ may take a provided buffer, only consumed if bytes were read.
+ * A CQE result for an errno.  An interrupted sleep reports EINTR:
+ * ERESTART and EJUSTRETURN are negative, so negating them would look like
+ * a successful byte count.
+ */
+static inline int32_t
+kqring_errno(int error)
+{
+	if (error == ERESTART || error == EJUSTRETURN)
+		return (-EINTR);
+	return (-error);
+}
+
+/*
+ * READ / WRITE / READV / WRITEV and their _FIXED forms on anything but a
+ * socket (sockets go through kqring_exec_recv() / kqring_exec_send() and
+ * can be armed): fo_read() / fo_write() on the file, with the checks
+ * kern_preadv() and dofileread() make.  READ / READV may take a provided
+ * buffer, only consumed if bytes were read.  A SIGPIPE is never raised.
  */
 static int
 kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
@@ -1647,24 +2724,51 @@ kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 {
 	const struct io_uring_sqe *sqe = &op->sqe;
 	struct thread *td = curthread;
-	struct io_uring_buf pbuf;
+	struct kqring_sel sel;
+	struct file *fp;
 	struct uio auio;
 	struct iovec aiov, *iov = &aiov;
+	cap_rights_t rights;
 	off_t offset = (off_t)sqe->off;
 	u_int iovcnt = 1;
 	bool buf_select = (sqe->flags & IOSQE_BUFFER_SELECT) != 0;
-	int error;
+	int error, flags = 0;
+
+	/* off == -1 means "use the file position", as in io_uring. */
+	if (offset != (off_t)-1)
+		flags = FOF_OFFSET;
+	if (is_write && flags == 0)
+		cap_rights_init_one(&rights, CAP_WRITE);
+	else if (is_write)
+		cap_rights_init_one(&rights, CAP_PWRITE);
+	else if (flags == 0)
+		cap_rights_init_one(&rights, CAP_READ);
+	else
+		cap_rights_init_one(&rights, CAP_PREAD);
+	error = kqring_op_fget(op, &rights, is_write ? FWRITE : FREAD, &fp);
+	if (error != 0)
+		return (kqring_done(op, -error, 0));
+	if (flags != 0) {
+		if ((fp->f_ops->fo_flags & DFLAG_SEEKABLE) == 0)
+			error = ESPIPE;
+		else if (offset < 0 && (fp->f_vnode == NULL ||
+		    fp->f_vnode->v_type != VCHR))
+			error = EINVAL;
+		if (error != 0) {
+			fdrop(fp, td);
+			return (kqring_done(op, -error, 0));
+		}
+	}
 
 	if (buf_select) {
-		error = kqring_pbuf_peek(ctx, &pbuf);
-		if (error != 0)
+		error = kqring_buf_select(ctx, sqe->buf_group,
+		    kqring_buf_cap(op), &aiov, 1, &sel);
+		if (error != 0) {
+			fdrop(fp, td);
 			return (kqring_done(op, -error, 0));
-		if (sqe->len != 0 && sqe->len < pbuf.len)
-			pbuf.len = sqe->len;
-		aiov.iov_base = (void *)(uintptr_t)pbuf.addr;
-		aiov.iov_len = pbuf.len;
-	} else if (sqe->opcode == IORING_OP_READV ||
-	    sqe->opcode == IORING_OP_WRITEV) {
+		}
+	} else if (kqring_op_readv(sqe->opcode) ||
+	    kqring_op_writev(sqe->opcode)) {
 		iov = op->args;
 		iovcnt = sqe->len;
 	} else {
@@ -1673,24 +2777,23 @@ kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 	}
 	kqring_uio_init(&auio, iov, iovcnt, is_write ? UIO_WRITE : UIO_READ);
 	ssize_t want = auio.uio_resid;
-	auio.uio_offset = (offset == (off_t)-1) ? 0 : offset;
+	auio.uio_offset = offset;
 
-	/* off == -1 means "use the file position", as in io_uring. */
-	if (offset == (off_t)-1)
-		error = is_write ? kern_writev(td, sqe->fd, &auio) :
-		    kern_readv(td, sqe->fd, &auio);
-	else
-		error = is_write ? kern_pwritev(td, sqe->fd, &auio, offset) :
-		    kern_preadv(td, sqe->fd, &auio, offset);
+	/* Zero-length reads finish here, as in dofileread(). */
+	if (want == 0 && !is_write) {
+		fdrop(fp, td);
+		return (kqring_done(op, 0, 0));
+	}
+	error = is_write ? fo_write(fp, &auio, td->td_ucred, flags, td) :
+	    fo_read(fp, &auio, td->td_ucred, flags, td);
+	fdrop(fp, td);
 
 	size_t done = (size_t)(want - auio.uio_resid);
 	if (error != 0 && done == 0)
-		return (kqring_done(op, -error, 0));
-	if (buf_select && done > 0) {
-		kqring_pbuf_commit(ctx);
+		return (kqring_done(op, kqring_errno(error), 0));
+	if (buf_select && done > 0)
 		return (kqring_done(op, kqring_xfer_res(done),
-		    kqring_pbuf_cflags(&pbuf)));
-	}
+		    kqring_buf_commit(ctx, &sel, done)));
 	return (kqring_done(op, kqring_xfer_res(done), 0));
 }
 
@@ -1818,6 +2921,75 @@ done:
 	return (error);
 }
 
+/*
+ * The vnode-backed file an op works on, as getvnode() (or with `path`,
+ * getvnode_path(), which also takes O_PATH descriptors) looks it up.
+ */
+static int
+kqring_op_getvnode(const struct kqring_op *op, const cap_rights_t *rights,
+    bool path, struct file **fpp)
+{
+	struct file *fp;
+	int error;
+
+	error = kqring_op_fget(op, rights, 0, &fp);
+	if (error != 0)
+		return (error);
+	if (fp->f_vnode == NULL) {
+		fdrop(fp, curthread);
+		return (EINVAL);
+	}
+	if (!path && fp->f_ops == &path_fileops) {
+		fdrop(fp, curthread);
+		return (EBADF);
+	}
+	*fpp = fp;
+	return (0);
+}
+
+/*
+ * extattr_get_vp() (static in vfs_extattr.c): the value into user memory
+ * `data`, or with data NULL just its size; the length goes to *lenp.
+ */
+static int
+kqring_getxattr_vp(struct vnode *vp, const struct kqring_xattr_args *xa,
+    void *data, size_t nbytes, size_t *lenp, struct thread *td)
+{
+	struct uio auio;
+	struct iovec aiov;
+	size_t size;
+	int error;
+
+	vn_lock(vp, LK_SHARED | LK_RETRY);
+#ifdef KQRING_MAC
+	error = mac_vnode_check_getextattr(td->td_ucred, vp, xa->ns,
+	    xa->name);
+	if (error != 0)
+		goto done;
+#endif
+	if (data == NULL) {
+		error = VOP_GETEXTATTR(vp, xa->ns, xa->name, NULL, &size,
+		    td->td_ucred, td);
+		*lenp = size;
+		goto done;
+	}
+	aiov.iov_base = data;
+	aiov.iov_len = nbytes;
+	auio.uio_iov = &aiov;
+	auio.uio_iovcnt = 1;
+	auio.uio_offset = 0;
+	auio.uio_resid = nbytes;
+	auio.uio_rw = UIO_READ;
+	auio.uio_segflg = UIO_USERSPACE;
+	auio.uio_td = td;
+	error = VOP_GETEXTATTR(vp, xa->ns, xa->name, &auio, NULL,
+	    td->td_ucred, td);
+	*lenp = nbytes - auio.uio_resid;
+done:
+	VOP_UNLOCK(vp);
+	return (error);
+}
+
 static int32_t
 kqring_exec_setxattr(struct kqring_op *op)
 {
@@ -1830,14 +3002,14 @@ kqring_exec_setxattr(struct kqring_op *op)
 	int error;
 
 	if (sqe->opcode == IORING_OP_FSETXATTR) {
-		error = getvnode_path(td, sqe->fd,
-		    cap_rights_init_one(&rights, CAP_EXTATTR_SET), NULL, &fp);
+		error = kqring_op_getvnode(op,
+		    cap_rights_init_one(&rights, CAP_EXTATTR_SET), true, &fp);
 		if (error != 0)
 			return (-error);
 		error = kqring_setxattr_vp(fp->f_vnode, xa, sqe->len,
 		    sqe->xattr_flags, td);
 		fdrop(fp, td);
-		return (-error);
+		return (kqring_errno(error));
 	}
 	NDINIT(&nd, LOOKUP, FOLLOW | AUDITVNODE1, UIO_SYSSPACE, xa->path);
 	error = namei(&nd);
@@ -1847,7 +3019,7 @@ kqring_exec_setxattr(struct kqring_op *op)
 	error = kqring_setxattr_vp(nd.ni_vp, xa, sqe->len, sqe->xattr_flags,
 	    td);
 	vrele(nd.ni_vp);
-	return (-error);
+	return (kqring_errno(error));
 }
 
 /*
@@ -1862,48 +3034,240 @@ kqring_exec_getxattr(struct kqring_op *op)
 	const struct kqring_xattr_args *xa = op->args;
 	struct thread *td = curthread;
 	void *data = (void *)(uintptr_t)sqe->addr2;
-	bool fd_op = sqe->opcode == IORING_OP_FGETXATTR;
+	struct file *fp = NULL;
+	cap_rights_t rights;
+	size_t len = 0;
 	int error;
 
+	if (sqe->opcode == IORING_OP_FGETXATTR) {
+		error = kqring_op_getvnode(op,
+		    cap_rights_init_one(&rights, CAP_EXTATTR_GET), true, &fp);
+		if (error != 0)
+			return (-error);
+	}
 	for (int pass = 0; pass < 2; pass++) {
-		if (fd_op)
-			error = kern_extattr_get_fd(td, sqe->fd, xa->ns,
-			    xa->name, pass == 0 ? NULL : data,
-			    pass == 0 ? 0 : sqe->len);
-		else
+		if (fp != NULL) {
+			error = kqring_getxattr_vp(fp->f_vnode, xa,
+			    pass == 0 ? NULL : data, pass == 0 ? 0 : sqe->len,
+			    &len, td);
+		} else {
 			error = kern_extattr_get_path(td, xa->path, xa->ns,
 			    xa->name, pass == 0 ? NULL : data,
 			    pass == 0 ? 0 : sqe->len, FOLLOW, UIO_SYSSPACE);
+			len = (size_t)td->td_retval[0];
+		}
 		if (error != 0)
-			return (-error);
+			break;
 		if (pass == 0 && sqe->len == 0)
 			break;
-		if (pass == 0 && (size_t)td->td_retval[0] > sqe->len)
-			return (-ERANGE);
+		if (pass == 0 && len > sqe->len) {
+			error = ERANGE;
+			break;
+		}
 	}
-	return (kqring_xfer_res((size_t)td->td_retval[0]));
+	if (fp != NULL)
+		fdrop(fp, td);
+	if (error != 0)
+		return (-error);
+	return (kqring_xfer_res(len));
+}
+
+/*
+ * FALLOCATE: posix_fallocate(2), or with KEEP_SIZE | PUNCH_HOLE
+ * fspacectl(2) SPACECTL_DEALLOC, with their checks.
+ */
+static int32_t
+kqring_exec_fallocate(const struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct thread *td = curthread;
+	struct file *fp;
+	cap_rights_t rights;
+	off_t off = (off_t)sqe->off, len = (off_t)sqe->addr;
+	bool punch;
+	int error;
+
+	punch = sqe->len == (FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE);
+	/* FreeBSD cannot allocate without extending (KEEP_SIZE). */
+	if (sqe->len != 0 && !punch)
+		return (-EOPNOTSUPP);
+	if (off < 0 || len <= 0)
+		return (-EINVAL);
+	if (off > OFF_MAX - len)
+		return (punch ? -EINVAL : -EFBIG);
+	error = kqring_op_fget(op, cap_rights_init_one(&rights, CAP_PWRITE),
+	    FWRITE, &fp);
+	if (error != 0)
+		return (-error);
+	if ((fp->f_ops->fo_flags & DFLAG_SEEKABLE) == 0)
+		error = ESPIPE;
+	else if (punch)
+		error = fo_fspacectl(fp, SPACECTL_DEALLOC, &off, &len, 0,
+		    td->td_ucred, td);
+	else
+		error = fo_fallocate(fp, off, len, td);
+	fdrop(fp, td);
+	return (kqring_errno(error));
+}
+
+/* FSYNC / SYNC_FILE_RANGE: kern_fsync() on the op's file. */
+static int32_t
+kqring_exec_fsync(const struct kqring_op *op, bool fullsync)
+{
+	struct thread *td = curthread;
+	struct file *fp;
+	struct vnode *vp;
+	struct mount *mp;
+	cap_rights_t rights;
+	int error;
+
+	error = kqring_op_getvnode(op, cap_rights_init_one(&rights, CAP_FSYNC),
+	    false, &fp);
+	if (error != 0)
+		return (-error);
+	vp = fp->f_vnode;
+retry:
+	error = vn_start_write(vp, &mp, V_WAIT | V_PCATCH);
+	if (error != 0)
+		goto drop;
+	vn_lock(vp, vn_lktype_write(mp, vp) | LK_RETRY);
+	vnode_pager_clean_async(vp);
+	error = fullsync ? VOP_FSYNC(vp, MNT_WAIT, td) : VOP_FDATASYNC(vp, td);
+	VOP_UNLOCK(vp);
+	vn_finished_write(mp);
+	if (error == ERELOOKUP)
+		goto retry;
+drop:
+	fdrop(fp, td);
+	return (kqring_errno(error));
 }
 
 static int32_t
-kqring_exec_fallocate(const struct io_uring_sqe *sqe)
+kqring_exec_ftruncate(const struct kqring_op *op)
 {
 	struct thread *td = curthread;
-	struct spacectl_range sr = {
-		.r_offset = (off_t)sqe->off,
-		.r_len = (off_t)sqe->addr,
-	};
+	struct file *fp;
+	cap_rights_t rights;
+	off_t length = (off_t)op->sqe.off;
+	int error;
 
-	switch (sqe->len) {
-	case 0:
-		return (-kern_posix_fallocate(td, sqe->fd, sr.r_offset,
-		    sr.r_len));
-	case FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE:
-		return (-kern_fspacectl(td, sqe->fd, SPACECTL_DEALLOC, &sr, 0,
-		    &sr));
+	if (length < 0)
+		return (-EINVAL);
+	error = kqring_op_fget(op, cap_rights_init_one(&rights, CAP_FTRUNCATE),
+	    0, &fp);
+	if (error != 0)
+		return (-error);
+	/* As ftruncate(2): EINVAL, not EBADF, if not open for writing. */
+	if ((fp->f_flag & FWRITE) == 0)
+		error = EINVAL;
+	else
+		error = fo_truncate(fp, length, td->td_ucred, td);
+	fdrop(fp, td);
+	return (kqring_errno(error));
+}
+
+/*
+ * FADVISE: kern_posix_fadvise() on the op's file.  SEQUENTIAL, RANDOM and
+ * NOREUSE (and NORMAL, which clears them) record a range on the file that
+ * vn_read() / vn_write() consult; WILLNEED and DONTNEED go to VOP_ADVISE().
+ */
+static int32_t
+kqring_exec_fadvise(const struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct thread *td = curthread;
+	struct fadvise_info *fa, *new = NULL;
+	struct file *fp;
+	struct vnode *vp;
+	int advice = (int)sqe->fadvise_advice;
+	/* A 64-bit length in addr, else the 32-bit one in len. */
+	off_t offset = (off_t)sqe->off;
+	off_t len = sqe->addr != 0 ? (off_t)sqe->addr : (off_t)sqe->len;
+	off_t end;
+	int error;
+
+	if (offset < 0 || len < 0 || offset > OFF_MAX - len)
+		return (-EINVAL);
+	switch (advice) {
+	case POSIX_FADV_SEQUENTIAL:
+	case POSIX_FADV_RANDOM:
+	case POSIX_FADV_NOREUSE:
+		new = malloc(sizeof(*fa), M_FADVISE, M_WAITOK);
+		break;
+	case POSIX_FADV_NORMAL:
+	case POSIX_FADV_WILLNEED:
+	case POSIX_FADV_DONTNEED:
+		break;
 	default:
-		/* FreeBSD cannot allocate without extending (KEEP_SIZE). */
-		return (-EOPNOTSUPP);
+		return (-EINVAL);
 	}
+	error = kqring_op_fget(op, &cap_no_rights, 0, &fp);
+	if (error != 0)
+		goto out;
+	if ((fp->f_ops->fo_flags & DFLAG_SEEKABLE) == 0) {
+		error = ESPIPE;
+		goto drop;
+	}
+	if (fp->f_type != DTYPE_VNODE || (vp = fp->f_vnode)->v_type != VREG) {
+		error = ENODEV;
+		goto drop;
+	}
+	end = len == 0 ? OFF_MAX : offset + len - 1;
+	switch (advice) {
+	case POSIX_FADV_SEQUENTIAL:
+	case POSIX_FADV_RANDOM:
+	case POSIX_FADV_NOREUSE:
+		/* Merge with an overlapping or adjacent range of this advice. */
+		mtx_pool_lock(mtxpool_sleep, fp);
+		fa = fp->f_advice;
+		if (fa != NULL && fa->fa_advice == advice &&
+		    ((fa->fa_start <= end && fa->fa_end >= offset) ||
+		    (end != OFF_MAX && fa->fa_start == end + 1) ||
+		    (fa->fa_end != OFF_MAX && fa->fa_end + 1 == offset))) {
+			if (offset < fa->fa_start)
+				fa->fa_start = offset;
+			if (end > fa->fa_end)
+				fa->fa_end = end;
+		} else {
+			new->fa_advice = advice;
+			new->fa_start = offset;
+			new->fa_end = end;
+			fp->f_advice = new;
+			new = fa;
+		}
+		mtx_pool_unlock(mtxpool_sleep, fp);
+		break;
+	case POSIX_FADV_NORMAL:
+		/* Trim or drop a recorded range this one overlaps. */
+		mtx_pool_lock(mtxpool_sleep, fp);
+		fa = fp->f_advice;
+		if (fa != NULL) {
+			if (offset <= fa->fa_start && end >= fa->fa_end) {
+				new = fa;
+				fp->f_advice = NULL;
+			} else if (offset <= fa->fa_start &&
+			    end >= fa->fa_start) {
+				fa->fa_start = end + 1;
+			} else if (offset <= fa->fa_end && end >= fa->fa_end) {
+				fa->fa_end = offset - 1;
+			} else if (offset >= fa->fa_start &&
+			    end <= fa->fa_end) {
+				new = fa;
+				fp->f_advice = NULL;
+			}
+		}
+		mtx_pool_unlock(mtxpool_sleep, fp);
+		break;
+	case POSIX_FADV_WILLNEED:
+	case POSIX_FADV_DONTNEED:
+		error = VOP_ADVISE(vp, offset, end, advice);
+		break;
+	}
+drop:
+	fdrop(fp, td);
+out:
+	free(new, M_FADVISE);
+	return (-error);
 }
 
 /* Whether fp is a /dev/kqring descriptor. */
@@ -1914,15 +3278,20 @@ kqring_fp_is_ring(const struct file *fp)
 	    fp->f_vnode->v_type == VCHR && fp->f_vnode->v_rdev == kqring_cdev);
 }
 
-/* CLOSE: like close(2), but a ring cannot close itself or another ring. */
+/*
+ * CLOSE: like close(2), or with file_index, empty that fixed slot.  A ring
+ * cannot close itself or another ring.
+ */
 static int32_t
-kqring_exec_close(const struct io_uring_sqe *sqe)
+kqring_exec_close(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
 {
 	struct thread *td = curthread;
 	struct file *fp;
 	bool ring;
 	int error;
 
+	if (sqe->file_index != 0)
+		return (-kqring_fixed_remove(ctx, sqe->file_index - 1));
 	error = fget(td, sqe->fd, &cap_no_rights, &fp);
 	if (error != 0)
 		return (-error);
@@ -1933,48 +3302,439 @@ kqring_exec_close(const struct io_uring_sqe *sqe)
 	return (-kern_close(td, sqe->fd));
 }
 
-/* URING_CMD on a socket: SIOCINQ, SIOCOUTQ, getsockopt, setsockopt. */
+/*
+ * URING_CMD on a socket: SIOCINQ, SIOCOUTQ, getsockopt, setsockopt, with
+ * the Capsicum checks ioctl(2) and kern_getsockopt() make.
+ */
 static int32_t
-kqring_exec_uring_cmd(const struct io_uring_sqe *sqe)
+kqring_exec_uring_cmd(const struct kqring_op *op)
 {
+	const struct io_uring_sqe *sqe = &op->sqe;
 	struct thread *td = curthread;
+	struct filecaps caps;
+	struct sockopt sopt;
 	struct file *fp;
-	socklen_t optlen;
+	cap_rights_t rights;
+	u_long cmd;
 	int error, n;
-	bool sock;
-
-	error = fget(td, sqe->fd, &cap_no_rights, &fp);
-	if (error != 0)
-		return (-error);
-	sock = fp->f_type == DTYPE_SOCKET;
-	fdrop(fp, td);
-	/* No other file type implements commands. */
-	if (!sock)
-		return (-EOPNOTSUPP);
 
 	switch (sqe->cmd_op) {
 	case SOCKET_URING_OP_SIOCINQ:
 	case SOCKET_URING_OP_SIOCOUTQ:
-		error = kern_ioctl(td, sqe->fd,
-		    sqe->cmd_op == SOCKET_URING_OP_SIOCINQ ? FIONREAD :
-		    FIONWRITE, (caddr_t)&n);
-		return (error != 0 ? -error : n);
+		cap_rights_init_one(&rights, CAP_IOCTL);
+		break;
 	case SOCKET_URING_OP_GETSOCKOPT:
 		/* As in io_uring, only SOL_SOCKET options. */
 		if (sqe->level != SOL_SOCKET)
 			return (-EOPNOTSUPP);
-		optlen = sqe->optlen;
-		error = kern_getsockopt(td, sqe->fd, (int)sqe->level,
-		    (int)sqe->optname, (void *)(uintptr_t)sqe->optval,
-		    UIO_USERSPACE, &optlen);
-		return (error != 0 ? -error : (int32_t)optlen);
+		cap_rights_init_one(&rights, CAP_GETSOCKOPT);
+		break;
 	case SOCKET_URING_OP_SETSOCKOPT:
-		return (-kern_setsockopt(td, sqe->fd, (int)sqe->level,
-		    (int)sqe->optname, (const void *)(uintptr_t)sqe->optval,
-		    UIO_USERSPACE, sqe->optlen));
+		cap_rights_init_one(&rights, CAP_SETSOCKOPT);
+		break;
 	default:
 		return (-EOPNOTSUPP);
 	}
+	error = kqring_op_fget_caps(op, &rights, &fp, &caps);
+	if (error != 0)
+		return (-error);
+	/* No other file type implements commands. */
+	if (fp->f_type != DTYPE_SOCKET) {
+		error = EOPNOTSUPP;
+		goto out;
+	}
+
+	switch (sqe->cmd_op) {
+	case SOCKET_URING_OP_SIOCINQ:
+	case SOCKET_URING_OP_SIOCOUTQ:
+		cmd = sqe->cmd_op == SOCKET_URING_OP_SIOCINQ ? FIONREAD :
+		    FIONWRITE;
+		if (caps.fc_nioctls != -1) {
+			int i;
+
+			for (i = 0; i < caps.fc_nioctls; i++)
+				if (caps.fc_ioctls[i] == cmd)
+					break;
+			if (i == caps.fc_nioctls) {
+				error = ENOTCAPABLE;
+				goto out;
+			}
+		}
+		error = fo_ioctl(fp, cmd, (caddr_t)&n, td->td_ucred, td);
+		if (error == 0) {
+			filecaps_free(&caps);
+			fdrop(fp, td);
+			return (n);
+		}
+		break;
+	default:
+		bzero(&sopt, sizeof(sopt));
+		sopt.sopt_dir = sqe->cmd_op == SOCKET_URING_OP_GETSOCKOPT ?
+		    SOPT_GET : SOPT_SET;
+		sopt.sopt_level = (int)sqe->level;
+		sopt.sopt_name = (int)sqe->optname;
+		sopt.sopt_val = (void *)(uintptr_t)sqe->optval;
+		sopt.sopt_valsize = sqe->optlen;
+		sopt.sopt_td = td;
+		sopt.sopt_rights = &caps.fc_rights;
+		/* The checks of kern_getsockopt() / kern_setsockopt(). */
+		if (sopt.sopt_dir == SOPT_GET) {
+			if (sopt.sopt_val == NULL)
+				sopt.sopt_valsize = 0;
+			else if ((int)sqe->optlen < 0)
+				error = EINVAL;
+			if (error == 0)
+				error = sogetopt(fp->f_data, &sopt);
+		} else {
+			if (sopt.sopt_val == NULL && sqe->optlen != 0)
+				error = EFAULT;
+			else if ((int)sqe->optlen < 0)
+				error = EINVAL;
+			if (error == 0)
+				error = sosetopt(fp->f_data, &sopt);
+		}
+		if (error == 0 && sopt.sopt_dir == SOPT_GET) {
+			filecaps_free(&caps);
+			fdrop(fp, td);
+			return ((int32_t)MIN(sopt.sopt_valsize, INT32_MAX));
+		}
+		break;
+	}
+out:
+	filecaps_free(&caps);
+	fdrop(fp, td);
+	return (-error);
+}
+
+/* The socket of a synchronous op (BIND, LISTEN, SHUTDOWN). */
+static int
+kqring_op_sock(const struct kqring_op *op, cap_rights_t *rights,
+    struct file **fpp)
+{
+	return (kqring_getsock(op, NULL, rights, fpp));
+}
+
+static int32_t
+kqring_exec_bind(const struct kqring_op *op)
+{
+	struct thread *td = curthread;
+	struct sockaddr *sa = op->args;
+	struct file *fp;
+	cap_rights_t rights;
+	int error;
+
+	/* As bind(2): only with a directory descriptor in capability mode. */
+	if (IN_CAPABILITY_MODE(td))
+		return (-ECAPMODE);
+	error = kqring_op_sock(op, cap_rights_init_one(&rights, CAP_BIND), &fp);
+	if (error != 0)
+		return (-error);
+#ifdef KQRING_MAC
+	error = mac_socket_check_bind(td->td_ucred, fp->f_data, sa);
+	if (error == 0)
+#endif
+		error = sobind(fp->f_data, sa, td);
+	fdrop(fp, td);
+	return (-error);
+}
+
+static int32_t
+kqring_exec_listen(const struct kqring_op *op)
+{
+	struct thread *td = curthread;
+	struct file *fp;
+	cap_rights_t rights;
+	int error;
+
+	error = kqring_op_sock(op, cap_rights_init_one(&rights, CAP_LISTEN),
+	    &fp);
+	if (error != 0)
+		return (-error);
+#ifdef KQRING_MAC
+	error = mac_socket_check_listen(td->td_ucred, fp->f_data);
+	if (error == 0)
+#endif
+		error = solisten(fp->f_data, (int)op->sqe.len, td);
+	fdrop(fp, td);
+	return (-error);
+}
+
+static int32_t
+kqring_exec_shutdown(const struct kqring_op *op)
+{
+	struct file *fp;
+	cap_rights_t rights;
+	int how = (int)op->sqe.len, error;
+
+	if (how < SHUT_RD || how > SHUT_RDWR)
+		return (-EINVAL);
+	error = kqring_op_sock(op, cap_rights_init_one(&rights, CAP_SHUTDOWN),
+	    &fp);
+	if (error != 0)
+		return (-error);
+	error = soshutdown(fp->f_data, how);
+	fdrop(fp, curthread);
+	return (-error);
+}
+
+/*
+ * SOCKET: socket(2), or with file_index kern_socket() without a
+ * descriptor, into the fixed table.
+ */
+static int32_t
+kqring_exec_socket(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
+{
+	struct thread *td = curthread;
+	struct filecaps caps;
+	struct socket *so;
+	struct file *fp;
+	int domain = sqe->fd, type = (int)sqe->off, proto = (int)sqe->len;
+	int error, fflag = 0;
+
+	if (sqe->file_index == 0) {
+		error = kern_socket(td, domain, type, proto);
+		return (error == 0 ? (int32_t)td->td_retval[0] : -error);
+	}
+	/* Close-on-exec/fork mean nothing without a descriptor. */
+	type &= ~SOCK_CLOFORK;
+	if ((type & SOCK_NONBLOCK) != 0) {
+		type &= ~SOCK_NONBLOCK;
+		fflag |= FNONBLOCK;
+	}
+#ifdef KQRING_MAC
+	error = mac_socket_check_create(td->td_ucred, domain, type, proto);
+	if (error != 0)
+		return (-error);
+#endif
+	error = falloc_noinstall(td, &fp);
+	if (error != 0)
+		return (-error);
+	error = socreate(domain, &so, type, proto, td->td_ucred, td);
+	if (error != 0) {
+		fdrop(fp, td);
+		return (-error);
+	}
+	finit(fp, FREAD | FWRITE | fflag, DTYPE_SOCKET, so, &socketops);
+	if ((fflag & FNONBLOCK) != 0)
+		(void)fo_ioctl(fp, FIONBIO, &fflag, td->td_ucred, td);
+	kqring_caps_all(&caps);
+	return (kqring_fixed_install(ctx, fp, &caps, sqe->file_index));
+}
+
+/*
+ * The Capsicum rights a file opened relative to dirfd gets, which a fixed
+ * slot has to carry itself: as openat(2) does, the directory's rights if
+ * they are limited (namei()'s NIRES_STRICTREL), else all of them.
+ */
+static void
+kqring_open_caps(struct thread *td, int dirfd, struct filecaps *caps)
+{
+	struct file *dfp;
+	cap_rights_t all;
+
+	if (dirfd != AT_FDCWD &&
+	    fget_cap(td, dirfd, &cap_no_rights, NULL, &dfp, caps) == 0) {
+		fdrop(dfp, td);
+		CAP_ALL(&all);
+		if (!cap_rights_contains(&caps->fc_rights, &all))
+			return;
+		filecaps_free(caps);
+	}
+	kqring_caps_all(caps);
+}
+
+/* OPENAT / OPENAT2: openat(2), or with file_index into the fixed table. */
+static int32_t
+kqring_exec_openat(struct kqring_ctx *ctx, const struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	const struct kqring_path_args *pa = op->args;
+	struct thread *td = curthread;
+	struct filecaps caps;
+	struct file *fp;
+	int error;
+
+	if (sqe->file_index == 0) {
+		error = kern_openat(td, sqe->fd, pa->path, UIO_SYSSPACE,
+		    (int)pa->how.flags, (int)pa->how.mode);
+		return (error == 0 ? (int32_t)td->td_retval[0] :
+		    kqring_errno(error));
+	}
+	kqring_open_caps(td, sqe->fd, &caps);
+	error = kern_openatfp(td, sqe->fd, pa->path, UIO_SYSSPACE,
+	    (int)pa->how.flags, (int)pa->how.mode, &fp);
+	if (error != 0) {
+		filecaps_free(&caps);
+		return (kqring_errno(error));
+	}
+	return (kqring_fixed_install(ctx, fp, &caps, sqe->file_index));
+}
+
+/*
+ * PIPE: pipe2(2) into sqe->addr's int[2], or with file_index into two
+ * fixed slots (file_index - 1 and the next, or two free ones), whose
+ * indexes go to sqe->addr instead.  There is no fd-less pipe KPI, so a
+ * direct pipe briefly has descriptors other threads could see.
+ */
+static int32_t
+kqring_exec_pipe(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
+{
+	struct thread *td = curthread;
+	struct filecaps caps[2];
+	struct file *fp[2];
+	int fds[2], slots[2], error;
+	int32_t res;
+
+	/* Two slots from file_index - 1 (and not wrapping into ALLOC). */
+	if (sqe->file_index != 0 && sqe->file_index != IORING_FILE_INDEX_ALLOC &&
+	    sqe->file_index > IORING_FILE_INDEX_ALLOC - 2)
+		return (-EINVAL);
+	error = kern_pipe(td, fds, (int)sqe->pipe_flags, NULL, NULL);
+	if (error != 0)
+		return (-error);
+	if (sqe->file_index == 0) {
+		error = copyout(fds, (void *)(uintptr_t)sqe->addr, sizeof(fds));
+		if (error != 0) {
+			(void)kern_close(td, fds[0]);
+			(void)kern_close(td, fds[1]);
+		}
+		return (-error);
+	}
+	/* Take both ends out of the descriptor table. */
+	for (int i = 0; i < 2; i++) {
+		error = fget_cap(td, fds[i], &cap_no_rights, NULL, &fp[i],
+		    &caps[i]);
+		if (error != 0) {
+			/* Another thread closed it already. */
+			if (i == 0) {
+				(void)kern_close(td, fds[1]);
+			} else {
+				filecaps_free(&caps[0]);
+				fdrop(fp[0], td);
+			}
+			return (-error);
+		}
+		fdclose(td, fp[i], fds[i]);
+	}
+	for (int i = 0; i < 2; i++) {
+		res = kqring_fixed_install(ctx, fp[i], &caps[i],
+		    sqe->file_index == IORING_FILE_INDEX_ALLOC ?
+		    IORING_FILE_INDEX_ALLOC : sqe->file_index + i);
+		if (res < 0) {
+			if (i == 1)
+				(void)kqring_fixed_remove(ctx, slots[0]);
+			else {
+				filecaps_free(&caps[1]);
+				fdrop(fp[1], td);
+			}
+			return (res);
+		}
+		slots[i] = sqe->file_index == IORING_FILE_INDEX_ALLOC ? res :
+		    (int)(sqe->file_index - 1 + i);
+	}
+	error = copyout(slots, (void *)(uintptr_t)sqe->addr, sizeof(slots));
+	if (error != 0) {
+		(void)kqring_fixed_remove(ctx, slots[0]);
+		(void)kqring_fixed_remove(ctx, slots[1]);
+	}
+	return (-error);
+}
+
+/* FIXED_FD_INSTALL: a descriptor for a fixed file, with its rights. */
+static int32_t
+kqring_exec_fixed_fd_install(const struct kqring_op *op)
+{
+	struct filecaps caps;
+	int error, fd;
+
+	(void)filecaps_copy(&op->ffile->caps, &caps, false);
+	error = finstall(curthread, op->ffile->fp, &fd,
+	    (op->sqe.install_fd_flags & IORING_FIXED_FD_NO_CLOEXEC) != 0 ? 0 :
+	    O_CLOEXEC, &caps);
+	if (error != 0) {
+		filecaps_free(&caps);
+		return (-error);
+	}
+	return (fd);
+}
+
+/* A new, empty provided buffer group, not yet in the table. */
+static struct kqring_bgroup *
+kqring_bgroup_new(uint16_t bgid)
+{
+	struct kqring_bgroup *bg;
+
+	bg = malloc(sizeof(*bg), M_KQRING, M_WAITOK | M_ZERO);
+	bg->bgid = bgid;
+	STAILQ_INIT(&bg->bufs);
+	return (bg);
+}
+
+/* mmap(2) of IOU_PBUF_RING_MMAP rings looks groups up under mtx. */
+static void
+kqring_bgroup_insert(struct kqring_ctx *ctx, struct kqring_bgroup *bg)
+{
+	mtx_lock(&ctx->mtx);
+	LIST_INSERT_HEAD(kqring_bgroup_bucket(ctx, bg->bgid), bg, link);
+	mtx_unlock(&ctx->mtx);
+}
+
+/*
+ * PROVIDE_BUFFERS: sqe->fd buffers of sqe->len bytes each from sqe->addr,
+ * with IDs from sqe->off, into group sqe->buf_group (a buffer list,
+ * created if need be).  Limited per group, as in io_uring, and per ring.
+ */
+static int32_t
+kqring_provide_buffers(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
+{
+	struct kqring_bgroup *bg;
+	struct kqring_kbuf *kb;
+	uint32_t nbufs = (uint32_t)sqe->fd;
+
+	bg = kqring_bgroup_find(ctx, sqe->buf_group);
+	if (bg != NULL && bg->is_ring)
+		return (-EINVAL);
+	if ((bg != NULL ? bg->nbufs : 0) + nbufs > KQRING_MAX_GROUP_BUFS ||
+	    ctx->nprovided + nbufs > KQRING_MAX_PROVIDED)
+		return (-ENOMEM);
+	if (bg == NULL) {
+		bg = kqring_bgroup_new(sqe->buf_group);
+		kqring_bgroup_insert(ctx, bg);
+	}
+	for (uint32_t i = 0; i < nbufs; i++) {
+		kb = malloc(sizeof(*kb), M_KQRING, M_WAITOK);
+		kb->addr = sqe->addr + (uint64_t)i * sqe->len;
+		kb->len = sqe->len;
+		kb->bid = (uint16_t)(sqe->off + i);
+		STAILQ_INSERT_TAIL(&bg->bufs, kb, link);
+	}
+	bg->nbufs += nbufs;
+	ctx->nprovided += nbufs;
+	return (0);
+}
+
+/* REMOVE_BUFFERS: up to sqe->fd buffers from a list group; how many. */
+static int32_t
+kqring_remove_buffers(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
+{
+	struct kqring_bgroup *bg;
+	struct kqring_kbuf *kb;
+	int32_t n = 0;
+
+	bg = kqring_bgroup_find(ctx, sqe->buf_group);
+	if (bg == NULL)
+		return (-ENOENT);
+	/* Ring buffers belong to userspace. */
+	if (bg->is_ring)
+		return (-EINVAL);
+	while (n < sqe->fd && (kb = STAILQ_FIRST(&bg->bufs)) != NULL) {
+		STAILQ_REMOVE_HEAD(&bg->bufs, link);
+		free(kb, M_KQRING);
+		n++;
+	}
+	bg->nbufs -= n;
+	ctx->nprovided -= n;
+	return (n);
 }
 
 /*
@@ -1988,7 +3748,6 @@ kqring_exec_sync(struct kqring_ctx *ctx, struct kqring_op *op)
 	const struct kqring_path_args *pa = op->args;
 	struct thread *td = curthread;
 	int32_t res;
-	int error;
 
 	switch (sqe->opcode) {
 	case IORING_OP_NOP:
@@ -1996,44 +3755,61 @@ kqring_exec_sync(struct kqring_ctx *ctx, struct kqring_op *op)
 		break;
 	case IORING_OP_READ:
 	case IORING_OP_READV:
+	case IORING_OP_READ_FIXED:
+	case IORING_OP_READV_FIXED:
 		kqring_exec_file_rw(ctx, op, false);
 		return;
 	case IORING_OP_WRITE:
 	case IORING_OP_WRITEV:
+	case IORING_OP_WRITE_FIXED:
+	case IORING_OP_WRITEV_FIXED:
 		kqring_exec_file_rw(ctx, op, true);
 		return;
 	case IORING_OP_FSYNC:
-		res = -kern_fsync(td, sqe->fd,
+		res = kqring_exec_fsync(op,
 		    (sqe->fsync_flags & IORING_FSYNC_DATASYNC) == 0);
 		break;
 	case IORING_OP_SYNC_FILE_RANGE:
 		/* No range sync on FreeBSD: fdatasync(2) the whole file. */
 		res = sqe->sync_range_flags == 0 ? 0 :
-		    -kern_fsync(td, sqe->fd, false);
+		    kqring_exec_fsync(op, false);
 		break;
 	case IORING_OP_OPENAT:
 	case IORING_OP_OPENAT2:
-		error = kern_openat(td, sqe->fd, pa->path, UIO_SYSSPACE,
-		    (int)pa->how.flags, (int)pa->how.mode);
-		res = error == 0 ? (int32_t)td->td_retval[0] : -error;
+		res = kqring_exec_openat(ctx, op);
 		break;
 	case IORING_OP_CLOSE:
-		res = kqring_exec_close(sqe);
+		res = kqring_exec_close(ctx, sqe);
+		break;
+	case IORING_OP_FILES_UPDATE:
+		res = sqe->off == IORING_FILE_INDEX_ALLOC ?
+		    kqring_files_update_alloc(ctx, sqe->addr, sqe->len) :
+		    kqring_files_update(ctx, (uint32_t)sqe->off, sqe->addr, 0,
+		    sqe->len);
+		break;
+	case IORING_OP_FIXED_FD_INSTALL:
+		res = kqring_exec_fixed_fd_install(op);
+		break;
+	case IORING_OP_PROVIDE_BUFFERS:
+		res = kqring_provide_buffers(ctx, sqe);
+		break;
+	case IORING_OP_REMOVE_BUFFERS:
+		res = kqring_remove_buffers(ctx, sqe);
+		break;
+	case IORING_OP_PIPE:
+		res = kqring_exec_pipe(ctx, sqe);
 		break;
 	case IORING_OP_STATX:
 		res = kqring_exec_statx(op);
 		break;
 	case IORING_OP_FALLOCATE:
-		res = kqring_exec_fallocate(sqe);
+		res = kqring_exec_fallocate(op);
 		break;
 	case IORING_OP_FTRUNCATE:
-		res = -kern_ftruncate(td, sqe->fd, (off_t)sqe->off);
+		res = kqring_exec_ftruncate(op);
 		break;
 	case IORING_OP_FADVISE:
-		/* A 64-bit length in addr, else the 32-bit one in len. */
-		res = -kern_posix_fadvise(td, sqe->fd, (off_t)sqe->off,
-		    sqe->addr != 0 ? (off_t)sqe->addr : (off_t)sqe->len,
-		    (int)sqe->fadvise_advice);
+		res = kqring_exec_fadvise(op);
 		break;
 	case IORING_OP_MADVISE:
 		res = -kern_madvise(td, (uintptr_t)sqe->addr,
@@ -2073,20 +3849,19 @@ kqring_exec_sync(struct kqring_ctx *ctx, struct kqring_op *op)
 		res = kqring_exec_getxattr(op);
 		break;
 	case IORING_OP_SOCKET:
-		error = kern_socket(td, sqe->fd, (int)sqe->off, (int)sqe->len);
-		res = error == 0 ? (int32_t)td->td_retval[0] : -error;
+		res = kqring_exec_socket(ctx, sqe);
 		break;
 	case IORING_OP_BIND:
-		res = -kern_bindat(td, AT_FDCWD, sqe->fd, op->args);
+		res = kqring_exec_bind(op);
 		break;
 	case IORING_OP_LISTEN:
-		res = -kern_listen(td, sqe->fd, (int)sqe->len);
+		res = kqring_exec_listen(op);
 		break;
 	case IORING_OP_SHUTDOWN:
-		res = -kern_shutdown(td, sqe->fd, (int)sqe->len);
+		res = kqring_exec_shutdown(op);
 		break;
 	case IORING_OP_URING_CMD:
-		res = kqring_exec_uring_cmd(sqe);
+		res = kqring_exec_uring_cmd(op);
 		break;
 	default:
 		res = -EOPNOTSUPP;
@@ -2114,6 +3889,8 @@ kqring_op_attempt(struct kqring_ctx *ctx, struct kqring_op *op,
 		case IORING_OP_RECV:
 		case IORING_OP_READ:
 		case IORING_OP_READV:
+		case IORING_OP_READ_FIXED:
+		case IORING_OP_READV_FIXED:
 		case IORING_OP_READ_MULTISHOT:
 			rc = kqring_exec_recv(ctx, op, expect, &more);
 			break;
@@ -2124,7 +3901,9 @@ kqring_op_attempt(struct kqring_ctx *ctx, struct kqring_op *op,
 		case IORING_OP_SEND_ZC:
 		case IORING_OP_WRITE:
 		case IORING_OP_WRITEV:
-			rc = kqring_exec_send(op, expect);
+		case IORING_OP_WRITE_FIXED:
+		case IORING_OP_WRITEV_FIXED:
+			rc = kqring_exec_send(ctx, op, expect);
 			break;
 		case IORING_OP_SENDMSG:
 		case IORING_OP_SENDMSG_ZC:
@@ -2134,7 +3913,7 @@ kqring_op_attempt(struct kqring_ctx *ctx, struct kqring_op *op,
 			rc = kqring_exec_connect(op, expect);
 			break;
 		case IORING_OP_ACCEPT:
-			rc = kqring_exec_accept(op, expect, &more);
+			rc = kqring_exec_accept(ctx, op, expect, &more);
 			break;
 		case IORING_OP_POLL_ADD:
 			rc = kqring_exec_poll(op, expect);
@@ -2207,6 +3986,8 @@ kqring_op_dirs(const struct io_uring_sqe *sqe)
 	case IORING_OP_SENDMSG_ZC:
 	case IORING_OP_WRITE:
 	case IORING_OP_WRITEV:
+	case IORING_OP_WRITE_FIXED:
+	case IORING_OP_WRITEV_FIXED:
 	case IORING_OP_CONNECT:
 		/* soisconnected() / soisdisconnected() also wake so_snd. */
 		return (KQ_DIR_SND);
@@ -2242,7 +4023,7 @@ kqring_arm_socket_op(struct kqring_ctx *ctx, struct kqring_op *op, int dirs)
 	cap_rights_t rights;
 	int error;
 
-	error = fget(td, op->sqe.fd, cap_rights_init_one(&rights, CAP_EVENT),
+	error = kqring_op_fget(op, cap_rights_init_one(&rights, CAP_EVENT), 0,
 	    &fp);
 	if (error != 0) {
 		kqring_req_complete(ctx, op, -error, 0);
@@ -2495,45 +4276,43 @@ kqring_waitid_arm(struct kqring_ctx *ctx, struct kqring_op *op)
 	return (true);
 }
 
-/*
- * MSG_RING (IORING_MSG_DATA): post a CQE to the ring sqe->fd, possibly
- * this one.  The CQE is only queued on the target, whose owner posts it
- * from its own taskwork, so no thread ever touches another ring's CQ.
- * Holding the target's file keeps its context alive.
- */
-static int32_t
-kqring_msg_ring(const struct io_uring_sqe *sqe)
+/* The ring context of a /dev/kqring file. */
+static int
+kqring_fp_ctx(struct file *fp, struct kqring_ctx **ctxp)
 {
 	struct thread *td = curthread;
-	struct file *fp, *saved;
-	struct kqring_ctx *tctx;
-	struct kqring_rcqe *rc;
-	cap_rights_t rights;
+	struct file *saved;
 	int error;
 
-	error = fget(td, sqe->fd, cap_rights_init_one(&rights, CAP_IOCTL),
-	    &fp);
-	if (error != 0)
-		return (-error);
-	if (!kqring_fp_is_ring(fp)) {
-		fdrop(fp, td);
-		return (-EBADF);
-	}
+	if (!kqring_fp_is_ring(fp))
+		return (EBADF);
 	/* devfs_get_cdevpriv() looks at the file being operated on. */
 	saved = td->td_fpop;
 	td->td_fpop = fp;
-	error = devfs_get_cdevpriv((void **)&tctx);
+	error = devfs_get_cdevpriv((void **)ctxp);
 	td->td_fpop = saved;
-	if (error != 0) {
-		fdrop(fp, td);
-		return (-EBADF);
-	}
+	return (error != 0 ? EBADF : 0);
+}
 
-	rc = malloc(sizeof(*rc), M_KQRING, M_WAITOK);
-	rc->cqe.user_data = sqe->off;
-	rc->cqe.res = (int32_t)sqe->len;
-	rc->cqe.flags = (sqe->msg_ring_flags & IORING_MSG_RING_FLAGS_PASS) !=
-	    0 ? sqe->file_index : 0;
+/* Free a queued MSG_RING CQE, with the file it may carry. */
+static void
+kqring_rcqe_free(struct kqring_rcqe *rc)
+{
+	if (rc->fp != NULL) {
+		filecaps_free(&rc->caps);
+		fdrop(rc->fp, curthread);
+	}
+	free(rc, M_KQRING);
+}
+
+/*
+ * Queue rc on ring tctx for its owner to post (and for SEND_FD, first
+ * install its file), and wake the owner.
+ */
+static int
+kqring_rcqe_queue(struct kqring_ctx *tctx, struct kqring_rcqe *rc)
+{
+	int error = 0;
 
 	mtx_lock(&tctx->mtx);
 	if (!tctx->setup_done || !tctx->enabled || tctx->closing) {
@@ -2541,15 +4320,76 @@ kqring_msg_ring(const struct io_uring_sqe *sqe)
 	} else if (tctx->nrcq >= KQRING_MAX_REMOTE) {
 		error = EOVERFLOW;
 	} else {
+		if (STAILQ_EMPTY(&tctx->rcq))
+			kqring_evfd_signal_locked(tctx);
 		STAILQ_INSERT_TAIL(&tctx->rcq, rc, link);
 		tctx->nrcq++;
 		atomic_set_32(&tctx->shm->sq_flags, IORING_SQ_TASKRUN);
 		if (tctx->sleeping)
 			wakeup(&tctx->wakeup_chan);
-		rc = NULL;
 	}
 	mtx_unlock(&tctx->mtx);
-	free(rc, M_KQRING);
+	return (error);
+}
+
+/*
+ * MSG_RING: post a CQE to the ring sqe->fd (IORING_MSG_DATA, possibly this
+ * ring), or pass it our fixed file sqe->addr3 for its fixed slot
+ * sqe->file_index (IORING_MSG_SEND_FD).  Both are only queued on the
+ * target, whose owner posts the CQE, and installs the file, from its own
+ * taskwork: no thread ever touches another ring's CQ or file table.  So a
+ * SEND_FD that the target cannot install (no table, bad slot) reports the
+ * error in the target's CQE, where io_uring reports it to the sender.
+ * Holding the target's file keeps its context alive.
+ */
+static int32_t
+kqring_msg_ring(struct kqring_ctx *ctx, const struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct thread *td = curthread;
+	struct kqring_ctx *tctx;
+	struct kqring_rcqe *rc;
+	struct kqring_rsrc *src;
+	struct file *fp;
+	cap_rights_t rights;
+	int error;
+
+	error = kqring_op_fget(op, cap_rights_init_one(&rights, CAP_IOCTL), 0,
+	    &fp);
+	if (error != 0)
+		return (-error);
+	error = kqring_fp_ctx(fp, &tctx);
+	if (error != 0) {
+		fdrop(fp, td);
+		return (-error);
+	}
+
+	rc = malloc(sizeof(*rc), M_KQRING, M_WAITOK | M_ZERO);
+	rc->cqe.user_data = sqe->off;
+	if (sqe->addr == IORING_MSG_SEND_FD) {
+		if (tctx == ctx) {
+			error = EINVAL;
+		} else if (ctx->files == NULL || sqe->addr3 >= ctx->nfiles ||
+		    (src = ctx->files[sqe->addr3]) == NULL) {
+			error = EBADF;
+		} else if (!fhold(src->fp)) {
+			error = EBADF;
+		} else {
+			rc->fp = src->fp;
+			(void)filecaps_copy(&src->caps, &rc->caps, false);
+			rc->file_index = sqe->file_index;
+			rc->skip_cqe = (sqe->msg_ring_flags &
+			    IORING_MSG_RING_CQE_SKIP) != 0;
+		}
+	} else {
+		rc->cqe.res = (int32_t)sqe->len;
+		rc->cqe.flags = (sqe->msg_ring_flags &
+		    IORING_MSG_RING_FLAGS_PASS) != 0 ? sqe->file_index : 0;
+	}
+	if (error == 0)
+		error = kqring_rcqe_queue(tctx, rc);
+	if (error != 0)
+		kqring_rcqe_free(rc);
 	fdrop(fp, td);
 	return (-error);
 }
@@ -2816,8 +4656,15 @@ kqring_check_timeouts(struct kqring_ctx *ctx)
  * ============================================================================
  */
 
+/*
+ * Whether armed request op matches a cancellation.  CANCEL_FD matches
+ * requests on descriptor sqe->fd, or with CANCEL_FD_FIXED those on the
+ * file in fixed slot sqe->fd (`cfp`); a fixed request's sqe->fd is a slot
+ * number, never compared with a descriptor.
+ */
 static bool
-kqring_cancel_match(const struct kqring_op *op, const struct io_uring_sqe *sqe)
+kqring_cancel_match(const struct kqring_op *op, const struct io_uring_sqe *sqe,
+    const struct file *cfp)
 {
 	uint32_t cflags = sqe->cancel_flags;
 
@@ -2825,8 +4672,11 @@ kqring_cancel_match(const struct kqring_op *op, const struct io_uring_sqe *sqe)
 		return (false);
 	if ((cflags & IORING_ASYNC_CANCEL_ANY) != 0)
 		return (true);
-	if ((cflags & IORING_ASYNC_CANCEL_FD) != 0 && op->sqe.fd != sqe->fd)
-		return (false);
+	if ((cflags & IORING_ASYNC_CANCEL_FD) != 0) {
+		if (cfp != NULL ? op->ffile == NULL || op->ffile->fp != cfp :
+		    op->ffile != NULL || op->sqe.fd != sqe->fd)
+			return (false);
+	}
 	if ((cflags & IORING_ASYNC_CANCEL_OP) != 0 &&
 	    op->sqe.opcode != sqe->len)
 		return (false);
@@ -2850,12 +4700,20 @@ kqring_cancel(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
 	bool all = (sqe->cancel_flags &
 	    (IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_ANY)) != 0;
 	struct kqring_op *op;
+	struct file *cfp = NULL;
 	int32_t n = 0;
 
+	if ((sqe->cancel_flags & IORING_ASYNC_CANCEL_FD_FIXED) != 0) {
+		if (ctx->files == NULL || (uint32_t)sqe->fd >= ctx->nfiles ||
+		    ctx->files[sqe->fd] == NULL)
+			return (-EBADF);
+		/* Only compared: the slot's reference is not needed. */
+		cfp = ctx->files[sqe->fd]->fp;
+	}
 	for (;;) {
 		mtx_lock(&ctx->mtx);
 		TAILQ_FOREACH(op, &ctx->active_ops, active_link) {
-			if (kqring_cancel_match(op, sqe))
+			if (kqring_cancel_match(op, sqe, cfp))
 				break;
 		}
 		if (op != NULL)
@@ -3288,8 +5146,76 @@ kqring_prep_futex_wait(struct kqring_op *op)
 }
 
 #define	KQRING_SQE_FLAGS						\
-	(IOSQE_IO_DRAIN | IOSQE_IO_LINK | IOSQE_IO_HARDLINK |		\
-	IOSQE_ASYNC | IOSQE_BUFFER_SELECT | IOSQE_CQE_SKIP_SUCCESS)
+	(IOSQE_FIXED_FILE | IOSQE_IO_DRAIN | IOSQE_IO_LINK |		\
+	IOSQE_IO_HARDLINK | IOSQE_ASYNC | IOSQE_BUFFER_SELECT |		\
+	IOSQE_CQE_SKIP_SUCCESS)
+
+/* Opcodes working on sqe->fd, which IOSQE_FIXED_FILE makes a fixed slot. */
+static bool
+kqring_op_takes_file(uint8_t opcode)
+{
+	switch (opcode) {
+	case IORING_OP_READV:
+	case IORING_OP_WRITEV:
+	case IORING_OP_FSYNC:
+	case IORING_OP_READ_FIXED:
+	case IORING_OP_WRITE_FIXED:
+	case IORING_OP_POLL_ADD:
+	case IORING_OP_SYNC_FILE_RANGE:
+	case IORING_OP_SENDMSG:
+	case IORING_OP_RECVMSG:
+	case IORING_OP_ACCEPT:
+	case IORING_OP_CONNECT:
+	case IORING_OP_FALLOCATE:
+	case IORING_OP_READ:
+	case IORING_OP_WRITE:
+	case IORING_OP_FADVISE:
+	case IORING_OP_SEND:
+	case IORING_OP_RECV:
+	case IORING_OP_SHUTDOWN:
+	case IORING_OP_MSG_RING:
+	case IORING_OP_FSETXATTR:
+	case IORING_OP_FGETXATTR:
+	case IORING_OP_URING_CMD:
+	case IORING_OP_SEND_ZC:
+	case IORING_OP_SENDMSG_ZC:
+	case IORING_OP_READ_MULTISHOT:
+	case IORING_OP_FIXED_FD_INSTALL:
+	case IORING_OP_FTRUNCATE:
+	case IORING_OP_BIND:
+	case IORING_OP_LISTEN:
+	case IORING_OP_READV_FIXED:
+	case IORING_OP_WRITEV_FIXED:
+		return (true);
+	default:
+		return (false);
+	}
+}
+
+static inline bool
+kqring_bit_isset(const uint64_t *map, u_int bit)
+{
+	return (((map[bit / 64] >> (bit % 64)) & 1) != 0);
+}
+
+static inline void
+kqring_bit_set(uint64_t *map, u_int bit)
+{
+	map[bit / 64] |= (uint64_t)1 << (bit % 64);
+}
+
+/* IORING_REGISTER_RESTRICTIONS: whether the SQE may be submitted. */
+static bool
+kqring_restriction_ok(const struct kqring_ctx *ctx,
+    const struct io_uring_sqe *sqe)
+{
+	const struct kqring_restrictions *r = &ctx->rst;
+
+	return (kqring_bit_isset(r->sqe_op, sqe->opcode) &&
+	    (sqe->flags & r->sqe_flags_required) == r->sqe_flags_required &&
+	    (sqe->flags & ~(r->sqe_flags_allowed |
+	    r->sqe_flags_required)) == 0);
+}
 
 /* msg_flags a receive / send may pass (FreeBSD MSG_* values). */
 #define	KQRING_RECV_MSG_FLAGS						\
@@ -3304,37 +5230,68 @@ kqring_prep_futex_wait(struct kqring_op *op)
  * msghdrs, socket addresses, timespecs, xattr values, futex vectors), as
  * io_uring's prep does, so a linked, drained or armed request does not read
  * user memory later.  Reject flags, ioprio bits and fields kqring does not
- * implement instead of silently ignoring them: IOSQE_FIXED_FILE would turn
- * a fixed-file index into a raw fd.  IOSQE_ASYNC is only a hint.  `prev`
- * is the request this one is linked behind, if any.
+ * implement instead of silently ignoring them.  IOSQE_ASYNC is only a
+ * hint.  `prev` is the request this one is linked behind, if any.
  */
 static int
 kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 {
+	struct kqring_ctx *ctx = op->ctx;
 	const struct io_uring_sqe *sqe = &op->sqe;
 	const struct kqring_msg_args *ma;
 	struct kqring_path_args *pa;
+	struct kqring_cred *kc;
 	uint32_t ioprio_ok;
-	bool multishot = false, buf_select_ok = false;
+	bool direct = sqe->file_index != 0;
+	bool multishot = false, buf_select_ok = false, bundle_ok = false;
 	int error;
 
 	if ((sqe->flags & ~KQRING_SQE_FLAGS) != 0)
 		return (EINVAL);
-	/* Registered personalities do not exist (yet). */
-	if (sqe->personality != 0)
+	if (ctx->restricted && !kqring_restriction_ok(ctx, sqe))
+		return (EACCES);
+	if ((sqe->flags & IOSQE_FIXED_FILE) != 0 &&
+	    !kqring_op_takes_file(sqe->opcode))
 		return (EINVAL);
+	if (sqe->personality != 0) {
+		LIST_FOREACH(kc, &ctx->creds, link) {
+			if (kc->id == sqe->personality)
+				break;
+		}
+		if (kc == NULL)
+			return (EINVAL);
+		/*
+		 * Credentials registered before cap_enter(2) must not take
+		 * the process back out of capability mode.
+		 */
+		if (IN_CAPABILITY_MODE(curthread) &&
+		    (kc->cred->cr_flags & CRED_FLAG_CAPMODE) == 0)
+			return (ECAPMODE);
+		op->cred = crhold(kc->cred);
+	}
 
 	switch (sqe->opcode) {
 	case IORING_OP_READ:
 	case IORING_OP_WRITE:
+	case IORING_OP_READ_FIXED:
+	case IORING_OP_WRITE_FIXED:
 		if (sqe->rw_flags != 0)
 			return (EINVAL);
 		buf_select_ok = sqe->opcode == IORING_OP_READ;
 		break;
 	case IORING_OP_READV:
 	case IORING_OP_WRITEV:
+	case IORING_OP_READV_FIXED:
+	case IORING_OP_WRITEV_FIXED:
 		if (sqe->rw_flags != 0)
 			return (EINVAL);
+		/* A provided buffer replaces READV's (single) iovec. */
+		if (sqe->opcode == IORING_OP_READV &&
+		    (sqe->flags & IOSQE_BUFFER_SELECT) != 0) {
+			if (sqe->len != 1)
+				return (EINVAL);
+			buf_select_ok = true;
+		}
 		error = kqring_prep_iov(op);
 		if (error != 0)
 			return (error);
@@ -3347,8 +5304,10 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		break;
 	case IORING_OP_RECV:
 	case IORING_OP_RECVMSG:
-		if ((sqe->ioprio & ~(IORING_RECVSEND_POLL_FIRST |
-		    IORING_RECV_MULTISHOT)) != 0 ||
+		ioprio_ok = IORING_RECVSEND_POLL_FIRST | IORING_RECV_MULTISHOT;
+		if (sqe->opcode == IORING_OP_RECV)
+			ioprio_ok |= IORING_RECVSEND_BUNDLE;
+		if ((sqe->ioprio & ~ioprio_ok) != 0 ||
 		    (sqe->msg_flags & ~(uint32_t)KQRING_RECV_MSG_FLAGS) != 0)
 			return (EINVAL);
 		multishot = (sqe->ioprio & IORING_RECV_MULTISHOT) != 0;
@@ -3356,7 +5315,7 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		if (multishot && ((sqe->flags & IOSQE_BUFFER_SELECT) == 0 ||
 		    (sqe->msg_flags & MSG_WAITALL) != 0))
 			return (EINVAL);
-		buf_select_ok = true;
+		buf_select_ok = bundle_ok = true;
 		if (sqe->opcode == IORING_OP_RECV)
 			break;
 		error = kqring_prep_msg(op, false);
@@ -3375,11 +5334,18 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 	case IORING_OP_SEND_ZC:
 	case IORING_OP_SENDMSG:
 	case IORING_OP_SENDMSG_ZC:
-		/* FIXED_BUF needs registered buffers. */
 		ioprio_ok = IORING_RECVSEND_POLL_FIRST;
 		if (sqe->opcode == IORING_OP_SEND_ZC ||
 		    sqe->opcode == IORING_OP_SENDMSG_ZC)
 			ioprio_ok |= IORING_SEND_ZC_REPORT_USAGE;
+		/* A registered buffer (buf_index) holds SEND_ZC's data. */
+		if (sqe->opcode == IORING_OP_SEND_ZC)
+			ioprio_ok |= IORING_RECVSEND_FIXED_BUF;
+		/* SEND may take its data from provided buffers. */
+		if (sqe->opcode == IORING_OP_SEND) {
+			ioprio_ok |= IORING_RECVSEND_BUNDLE;
+			buf_select_ok = bundle_ok = true;
+		}
 		if ((sqe->ioprio & ~ioprio_ok) != 0 ||
 		    (sqe->msg_flags & ~(uint32_t)KQRING_SEND_MSG_FLAGS) != 0)
 			return (EINVAL);
@@ -3400,10 +5366,16 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		if ((sqe->ioprio & ~(IORING_ACCEPT_MULTISHOT |
 		    IORING_ACCEPT_DONTWAIT | IORING_ACCEPT_POLL_FIRST)) != 0 ||
 		    (sqe->accept_flags & ~(uint32_t)(SOCK_CLOEXEC |
-		    SOCK_NONBLOCK | SOCK_CLOFORK)) != 0 ||
-		    sqe->len != 0 || sqe->file_index != 0)
+		    SOCK_NONBLOCK | SOCK_CLOFORK)) != 0 || sqe->len != 0)
 			return (EINVAL);
 		multishot = (sqe->ioprio & IORING_ACCEPT_MULTISHOT) != 0;
+		/*
+		 * As in io_uring: no close-on-exec without a descriptor, and
+		 * a multishot accept needs a new slot each time.
+		 */
+		if (direct && ((sqe->accept_flags & SOCK_CLOEXEC) != 0 ||
+		    (multishot && sqe->file_index != IORING_FILE_INDEX_ALLOC)))
+			return (EINVAL);
 		break;
 	case IORING_OP_CONNECT:
 	case IORING_OP_BIND:
@@ -3421,9 +5393,16 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 			return (EINVAL);
 		break;
 	case IORING_OP_SOCKET:
-		/* file_index (direct descriptors) needs fixed files. */
 		if (sqe->rw_flags != 0 || sqe->addr != 0 ||
-		    sqe->file_index != 0)
+		    (direct && (sqe->off & SOCK_CLOEXEC) != 0))
+			return (EINVAL);
+		break;
+	case IORING_OP_PIPE:
+		if (sqe->fd != 0 || sqe->off != 0 || sqe->addr3 != 0 ||
+		    sqe->len != 0 || sqe->buf_index != 0 ||
+		    (sqe->pipe_flags & ~(uint32_t)(O_CLOEXEC | O_CLOFORK |
+		    O_NONBLOCK)) != 0 ||
+		    (direct && (sqe->pipe_flags & O_CLOEXEC) != 0))
 			return (EINVAL);
 		break;
 	case IORING_OP_POLL_ADD:
@@ -3455,10 +5434,57 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 			return (error);
 		break;
 	case IORING_OP_ASYNC_CANCEL:
-		/* CANCEL_FD_FIXED needs fixed files. */
 		if ((sqe->cancel_flags & ~(IORING_ASYNC_CANCEL_ALL |
 		    IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_ANY |
-		    IORING_ASYNC_CANCEL_USERDATA | IORING_ASYNC_CANCEL_OP)) != 0)
+		    IORING_ASYNC_CANCEL_FD_FIXED | IORING_ASYNC_CANCEL_USERDATA |
+		    IORING_ASYNC_CANCEL_OP)) != 0)
+			return (EINVAL);
+		/* FD_FIXED qualifies CANCEL_FD, which ANY would override. */
+		if ((sqe->cancel_flags & IORING_ASYNC_CANCEL_FD) != 0 ?
+		    (sqe->cancel_flags & IORING_ASYNC_CANCEL_ANY) != 0 :
+		    (sqe->cancel_flags & IORING_ASYNC_CANCEL_FD_FIXED) != 0)
+			return (EINVAL);
+		break;
+	case IORING_OP_FILES_UPDATE:
+		if (sqe->rw_flags != 0 || sqe->splice_fd_in != 0 ||
+		    sqe->len == 0)
+			return (EINVAL);
+		break;
+	case IORING_OP_FIXED_FD_INSTALL:
+		if (sqe->off != 0 || sqe->addr != 0 || sqe->len != 0 ||
+		    sqe->buf_index != 0 || sqe->splice_fd_in != 0 ||
+		    sqe->addr3 != 0 ||
+		    (sqe->install_fd_flags & ~IORING_FIXED_FD_NO_CLOEXEC) != 0)
+			return (EINVAL);
+		/* It installs a fixed file, so sqe->fd must be one. */
+		if ((sqe->flags & IOSQE_FIXED_FILE) == 0)
+			return (EBADF);
+		break;
+	case IORING_OP_PROVIDE_BUFFERS:
+		/* sqe->fd buffers, IDs from sqe->off, as in io_uring. */
+		if (sqe->rw_flags != 0 || sqe->splice_fd_in != 0)
+			return (EINVAL);
+		if (sqe->fd <= 0 || sqe->fd > (int)KQRING_MAX_GROUP_BUFS)
+			return (E2BIG);
+		if (sqe->len == 0)
+			return (EINVAL);
+		if (sqe->off > UINT16_MAX)
+			return (E2BIG);
+		if (sqe->off + (uint32_t)sqe->fd > KQRING_MAX_GROUP_BUFS)
+			return (EINVAL);
+		/* The buffers' span must not wrap, and be user memory. */
+		if (sqe->addr + (uint64_t)sqe->len * (uint32_t)sqe->fd <
+		    sqe->addr)
+			return (EOVERFLOW);
+		if (sqe->addr + (uint64_t)sqe->len * (uint32_t)sqe->fd >
+		    VM_MAXUSER_ADDRESS)
+			return (EFAULT);
+		break;
+	case IORING_OP_REMOVE_BUFFERS:
+		if (sqe->rw_flags != 0 || sqe->addr != 0 || sqe->len != 0 ||
+		    sqe->off != 0 || sqe->splice_fd_in != 0)
+			return (EINVAL);
+		if (sqe->fd <= 0 || sqe->fd > (int)KQRING_MAX_GROUP_BUFS)
 			return (EINVAL);
 		break;
 	case IORING_OP_FSYNC:
@@ -3488,8 +5514,8 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 			return (EINVAL);
 		break;
 	case IORING_OP_OPENAT:
-		/* file_index (direct descriptors) needs fixed files. */
-		if (sqe->buf_index != 0 || sqe->file_index != 0)
+		if (sqe->buf_index != 0 ||
+		    (direct && (sqe->open_flags & O_CLOEXEC) != 0))
 			return (EINVAL);
 		error = kqring_prep_paths(op, false);
 		if (error != 0)
@@ -3499,16 +5525,21 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		pa->how.mode = sqe->len;
 		break;
 	case IORING_OP_OPENAT2:
-		if (sqe->buf_index != 0 || sqe->file_index != 0)
+		if (sqe->buf_index != 0)
 			return (EINVAL);
 		error = kqring_prep_openat2(op);
 		if (error != 0)
 			return (error);
+		pa = op->args;
+		/* No close-on-exec without a descriptor, as in io_uring. */
+		if (direct && (pa->how.flags & O_CLOEXEC) != 0)
+			return (EINVAL);
 		break;
 	case IORING_OP_CLOSE:
+		/* sqe->fd, or with file_index that fixed slot. */
 		if (sqe->off != 0 || sqe->addr != 0 || sqe->len != 0 ||
 		    sqe->rw_flags != 0 || sqe->buf_index != 0 ||
-		    sqe->file_index != 0)
+		    (direct && sqe->fd != 0))
 			return (EINVAL);
 		break;
 	case IORING_OP_STATX:
@@ -3578,9 +5609,14 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		    (sqe->msg_ring_flags & ~(IORING_MSG_RING_CQE_SKIP |
 		    IORING_MSG_RING_FLAGS_PASS)) != 0)
 			return (EINVAL);
-		/* SEND_FD needs fixed files. */
-		if (sqe->addr == IORING_MSG_SEND_FD)
-			return (EOPNOTSUPP);
+		if (sqe->addr == IORING_MSG_SEND_FD) {
+			/* addr3: our fixed slot, file_index: the target's. */
+			if (sqe->len != 0 || sqe->addr3 > UINT32_MAX ||
+			    (sqe->msg_ring_flags &
+			    IORING_MSG_RING_FLAGS_PASS) != 0)
+				return (EINVAL);
+			break;
+		}
 		if (sqe->addr != IORING_MSG_DATA || sqe->addr3 != 0 ||
 		    (sqe->msg_ring_flags & IORING_MSG_RING_CQE_SKIP) != 0 ||
 		    ((sqe->msg_ring_flags & IORING_MSG_RING_FLAGS_PASS) == 0 &&
@@ -3602,9 +5638,10 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 	}
 	if ((sqe->flags & IOSQE_BUFFER_SELECT) != 0 && !buf_select_ok)
 		return (EINVAL);
-	/* Only buffer group 0 exists. */
-	if ((sqe->flags & IOSQE_BUFFER_SELECT) != 0 && sqe->buf_group != 0)
-		return (ENOBUFS);
+	/* A bundle is several provided buffers. */
+	if ((sqe->ioprio & IORING_RECVSEND_BUNDLE) != 0 && bundle_ok &&
+	    (sqe->flags & IOSQE_BUFFER_SELECT) == 0)
+		return (EINVAL);
 	/* A LINK_TIMEOUT guards the request it is linked behind. */
 	if (sqe->opcode == IORING_OP_LINK_TIMEOUT && (prev == NULL ||
 	    prev->sqe.opcode == IORING_OP_LINK_TIMEOUT))
@@ -3712,20 +5749,25 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 	kqring_op_free(op);
 }
 
-/* Whether fd is a socket (lookup errors are left to the op itself). */
+/* Whether op's file is a socket (lookup errors are left to the op). */
 static bool
-kqring_fd_is_socket(int fd)
+kqring_op_is_socket(const struct kqring_op *op)
 {
 	struct thread *td = curthread;
 	struct file *fp;
 	bool sock;
 
-	if (fget(td, fd, &cap_no_rights, &fp) != 0)
+	if (op->ffile != NULL)
+		return (op->ffile->fp->f_type == DTYPE_SOCKET);
+	if (fget(td, op->sqe.fd, &cap_no_rights, &fp) != 0)
 		return (false);
 	sock = fp->f_type == DTYPE_SOCKET;
 	fdrop(fp, td);
 	return (sock);
 }
+
+static void kqring_req_issue_cred(struct kqring_ctx *ctx,
+    struct kqring_op *op);
 
 /*
  * Issue a request: run it inline, or arm it to finish later from
@@ -3733,6 +5775,21 @@ kqring_fd_is_socket(int fd)
  */
 static void
 kqring_req_issue(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	struct ucred *saved;
+	int error;
+
+	saved = kqring_cred_enter(op);
+	error = kqring_req_resources(ctx, op);
+	if (error != 0)
+		kqring_req_complete(ctx, op, -error, 0);
+	else
+		kqring_req_issue_cred(ctx, op);
+	kqring_cred_exit(saved);
+}
+
+static void
+kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 {
 	const struct io_uring_sqe *sqe = &op->sqe;
 	bool armed = false;
@@ -3742,11 +5799,15 @@ kqring_req_issue(struct kqring_ctx *ctx, struct kqring_op *op)
 	case IORING_OP_WRITE:
 	case IORING_OP_READV:
 	case IORING_OP_WRITEV:
+	case IORING_OP_READ_FIXED:
+	case IORING_OP_WRITE_FIXED:
+	case IORING_OP_READV_FIXED:
+	case IORING_OP_WRITEV_FIXED:
 		/*
 		 * A socket would block the ring owner in read(2); treat it like
 		 * RECV / SEND instead, so it can be armed.
 		 */
-		if (!kqring_fd_is_socket(sqe->fd)) {
+		if (!kqring_op_is_socket(op)) {
 			kqring_exec_sync(ctx, op);
 			kqring_req_complete(ctx, op, op->res, op->cflags);
 			return;
@@ -3805,7 +5866,7 @@ kqring_req_issue(struct kqring_ctx *ctx, struct kqring_op *op)
 		armed = kqring_waitid_arm(ctx, op);
 		break;
 	case IORING_OP_MSG_RING:
-		kqring_req_complete(ctx, op, kqring_msg_ring(sqe), 0);
+		kqring_req_complete(ctx, op, kqring_msg_ring(ctx, op), 0);
 		return;
 	case IORING_OP_ASYNC_CANCEL:
 		kqring_req_complete(ctx, op, kqring_cancel(ctx, sqe), 0);
@@ -3931,12 +5992,17 @@ kqring_taskwork_run_one(struct kqring_ctx *ctx, struct kqring_op *op)
 	 * spurious wakeup, or a multishot op that drained its burst) keeps
 	 * the op armed.
 	 */
-	if (kqring_op_attempt(ctx, op, op->so) == EAGAIN)
+	struct ucred *saved = kqring_cred_enter(op);
+
+	if (kqring_op_attempt(ctx, op, op->so) == EAGAIN) {
+		kqring_cred_exit(saved);
 		return;
+	}
 	mtx_lock(&ctx->mtx);
 	kqring_op_unarm_locked(ctx, op);
 	mtx_unlock(&ctx->mtx);
 	kqring_req_complete(ctx, op, op->res, op->cflags);
+	kqring_cred_exit(saved);
 }
 
 /* Post the CQEs other rings sent with MSG_RING.  Drops ctx->mtx. */
@@ -3952,9 +6018,16 @@ kqring_post_remote_locked(struct kqring_ctx *ctx)
 	mtx_unlock(&ctx->mtx);
 	while ((rc = STAILQ_FIRST(&q)) != NULL) {
 		STAILQ_REMOVE_HEAD(&q, link);
-		kqring_post_cqe(ctx, rc->cqe.user_data, rc->cqe.res,
-		    rc->cqe.flags);
-		free(rc, M_KQRING);
+		if (rc->fp != NULL) {
+			/* IORING_MSG_SEND_FD: the table takes fp and caps. */
+			rc->cqe.res = kqring_fixed_install(ctx, rc->fp,
+			    &rc->caps, rc->file_index);
+			rc->fp = NULL;
+		}
+		if (!rc->skip_cqe)
+			kqring_post_cqe(ctx, rc->cqe.user_data, rc->cqe.res,
+			    rc->cqe.flags);
+		kqring_rcqe_free(rc);
 	}
 	mtx_lock(&ctx->mtx);
 }
@@ -4016,6 +6089,7 @@ kqring_dtor(void *data)
 	struct kqring_op *op;
 	struct kqring_ocqe *ocqe;
 	struct kqring_rcqe *rc;
+	struct kqring_cred *kc;
 
 	/* closing stops upcalls and callouts from queueing taskwork. */
 	mtx_lock(&ctx->mtx);
@@ -4040,6 +6114,25 @@ kqring_dtor(void *data)
 		TAILQ_REMOVE(&ctx->free_ops, op, active_link);
 		free(op, M_KQRING);
 	}
+
+	/* Every request (and its references) is gone: drop the tables. */
+	kqring_files_free(ctx);
+	kqring_bufs_free(ctx);
+	for (int i = 0; i < KQRING_BGROUP_HASH; i++) {
+		struct kqring_bgroup *bg;
+
+		while ((bg = LIST_FIRST(&ctx->bgroups[i])) != NULL) {
+			LIST_REMOVE(bg, link);
+			kqring_bgroup_free(ctx, bg);
+		}
+	}
+	while ((kc = LIST_FIRST(&ctx->creds)) != NULL) {
+		LIST_REMOVE(kc, link);
+		crfree(kc->cred);
+		free(kc, M_KQRING);
+	}
+	if (ctx->evfd != NULL)
+		eventfd_put(ctx->evfd);
 	while ((ocqe = STAILQ_FIRST(&ctx->ocq)) != NULL) {
 		STAILQ_REMOVE_HEAD(&ctx->ocq, link);
 		free(ocqe, M_KQRING);
@@ -4047,7 +6140,7 @@ kqring_dtor(void *data)
 	/* closing (set under mtx) stops MSG_RING senders from adding more. */
 	while ((rc = STAILQ_FIRST(&ctx->rcq)) != NULL) {
 		STAILQ_REMOVE_HEAD(&ctx->rcq, link);
-		free(rc, M_KQRING);
+		kqring_rcqe_free(rc);
 	}
 
 	kqring_free_shm(ctx->ring_obj, ctx->ring_kva, ctx->ring_alloc_len);
@@ -4072,6 +6165,10 @@ kqring_open(struct cdev *dev __unused, int oflags __unused, int devtype __unused
 	TAILQ_INIT(&ctx->defer_q);
 	STAILQ_INIT(&ctx->ocq);
 	STAILQ_INIT(&ctx->rcq);
+	for (int i = 0; i < KQRING_BGROUP_HASH; i++)
+		LIST_INIT(&ctx->bgroups[i]);
+	LIST_INIT(&ctx->creds);
+	ctx->clockid = CLOCK_MONOTONIC;
 
 	error = devfs_set_cdevpriv(ctx, kqring_dtor);
 	if (error != 0) {
@@ -4192,7 +6289,8 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	    IORING_FEAT_SUBMIT_STABLE | IORING_FEAT_RW_CUR_POS |
 	    IORING_FEAT_EXT_ARG | IORING_FEAT_FAST_POLL |
 	    IORING_FEAT_POLL_32BITS | IORING_FEAT_CQE_SKIP |
-	    IORING_FEAT_LINKED_FILE;
+	    IORING_FEAT_LINKED_FILE | IORING_FEAT_CUR_PERSONALITY |
+	    IORING_FEAT_RSRC_TAGS;
 
 	p.sq_off.head = offsetof(struct kqring_shm_header, sq_head);
 	p.sq_off.tail = offsetof(struct kqring_shm_header, sq_tail);
@@ -4424,6 +6522,8 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	kqring_flush_overflow(ctx);
 	head = shm->sq_head;
 	tail = atomic_load_acq_32(&shm->sq_tail);
+	/* CQEs posted inline here are not "async" (EVENTFD_ASYNC). */
+	ctx->submitting = true;
 	while (head != tail && consumed < ea->to_submit) {
 		uint32_t sqe_idx = ctx->sq_array[head & ctx->sq_mask];
 		head++;
@@ -4456,6 +6556,7 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	}
 	if (chain_head != NULL)
 		kqring_chain_submit(ctx, chain_head, chain_failed);
+	ctx->submitting = false;
 	atomic_store_rel_32(&shm->sq_head, head);
 	ea->SUBMITTED_out = submitted;
 
@@ -4463,8 +6564,10 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	kqring_run_taskwork(ctx);
 	kqring_run_checks(ctx);
 
-	if (!wait)
+	if (!wait) {
+		kqring_evfd_flush(ctx);
 		return (0);
+	}
 
 	/*
 	 * 4. Wait.  As with io_uring_enter(2), once SQEs have been consumed
@@ -4473,6 +6576,7 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	 * sys_ioctl() skip copying SUBMITTED_out back to userspace.
 	 */
 	error = kqring_wait_cqes(ctx, ea->min_complete, has_timeout, sbt);
+	kqring_evfd_flush(ctx);
 	if (error != 0 && submitted > 0)
 		error = 0;
 	return (error);
@@ -4504,6 +6608,8 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		if (has_timeout && sbt == 0)
 			return (ETIMEDOUT);
 
+		/* Tell an eventfd watcher about CQEs before sleeping. */
+		kqring_evfd_flush(ctx);
 		mtx_lock(&ctx->mtx);
 		/* Poll at most once per sleep so EAGAIN can't spin us. */
 		if (ctx->npolled > 0 && may_poll) {
@@ -4546,17 +6652,802 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 	}
 }
 
-static int
-kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
-    struct thread *td)
+/* ============================================================================
+ * Registration (IORING_REGISTER_*)
+ * ============================================================================
+ */
+
+/* Release the fixed file table (UNREGISTER_FILES, teardown). */
+static void
+kqring_files_free(struct kqring_ctx *ctx)
 {
+	struct kqring_rsrc **files = ctx->files;
+	uint32_t n = ctx->nfiles;
+
+	if (files == NULL)
+		return;
+	ctx->files = NULL;
+	ctx->nfiles = 0;
+	ctx->file_alloc_off = ctx->file_alloc_end = ctx->file_alloc_hint = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		if (files[i] != NULL)
+			kqring_rsrc_put(ctx, files[i]);
+	}
+	free(files, M_KQRING);
+}
+
+/* Release the registered buffer table (UNREGISTER_BUFFERS, teardown). */
+static void
+kqring_bufs_free(struct kqring_ctx *ctx)
+{
+	struct kqring_rsrc **bufs = ctx->bufs;
+	uint32_t n = ctx->nbufs;
+
+	if (bufs == NULL)
+		return;
+	ctx->bufs = NULL;
+	ctx->nbufs = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		if (bufs[i] != NULL)
+			kqring_rsrc_put(ctx, bufs[i]);
+	}
+	free(bufs, M_KQRING);
+}
+
+/* Free a provided buffer group already taken out of the table. */
+static void
+kqring_bgroup_free(struct kqring_ctx *ctx, struct kqring_bgroup *bg)
+{
+	struct kqring_kbuf *kb;
+
+	while ((kb = STAILQ_FIRST(&bg->bufs)) != NULL) {
+		STAILQ_REMOVE_HEAD(&bg->bufs, link);
+		free(kb, M_KQRING);
+	}
+	ctx->nprovided -= bg->nbufs;
+	if (bg->ring_obj != NULL) {
+		/* Mappings userspace still has keep their own reference. */
+		ctx->ring_mem -= bg->ring_alloc_len;
+		kqring_free_shm(bg->ring_obj, bg->ring_kva_base,
+		    bg->ring_alloc_len);
+	}
+	free(bg, M_KQRING);
+}
+
+/*
+ * IORING_REGISTER_FILES / FILES2: a table of nr slots, filled from the
+ * user's fds (-1: empty) and optional tags, or all empty (sparse).
+ */
+static int
+kqring_files_register(struct kqring_ctx *ctx, uint64_t ufds, uint64_t utags,
+    uint32_t nr, bool sparse)
+{
+	struct thread *td = curthread;
+	uint64_t tag = 0;
+	int32_t fd;
+	int error = 0;
+
+	if (ctx->files != NULL)
+		return (EBUSY);
+	if (nr == 0)
+		return (EINVAL);
+	if (nr > KQRING_MAX_FILES || (rlim_t)nr > lim_cur(td, RLIMIT_NOFILE))
+		return (EMFILE);
+	ctx->files = mallocarray(nr, sizeof(*ctx->files), M_KQRING,
+	    M_WAITOK | M_ZERO);
+	ctx->nfiles = nr;
+	ctx->file_alloc_off = ctx->file_alloc_hint = 0;
+	ctx->file_alloc_end = nr;
+	for (uint32_t i = 0; i < nr && !sparse; i++) {
+		error = copyin((const void *)(uintptr_t)(ufds + i * sizeof(fd)),
+		    &fd, sizeof(fd));
+		if (error == 0 && utags != 0)
+			error = copyin((const void *)(uintptr_t)(utags +
+			    i * sizeof(tag)), &tag, sizeof(tag));
+		if (error == 0)
+			error = kqring_files_set(ctx, i, fd, tag);
+		if (error != 0)
+			break;
+	}
+	if (error != 0)
+		kqring_files_free(ctx);
+	return (error);
+}
+
+/* IORING_REGISTER_BUFFERS / BUFFERS2: a table of nr registered buffers. */
+static int
+kqring_bufs_register(struct kqring_ctx *ctx, uint64_t uiov, uint64_t utags,
+    uint32_t nr, bool sparse)
+{
+	struct iovec iov = { NULL, 0 };
+	uint64_t tag = 0;
+	int error = 0;
+
+	if (ctx->bufs != NULL)
+		return (EBUSY);
+	if (nr == 0 || nr > KQRING_MAX_BUFS)
+		return (EINVAL);
+	ctx->bufs = mallocarray(nr, sizeof(*ctx->bufs), M_KQRING,
+	    M_WAITOK | M_ZERO);
+	ctx->nbufs = nr;
+	for (uint32_t i = 0; i < nr && !sparse; i++) {
+		error = copyin((const void *)(uintptr_t)(uiov +
+		    i * sizeof(iov)), &iov, sizeof(iov));
+		if (error == 0 && utags != 0)
+			error = copyin((const void *)(uintptr_t)(utags +
+			    i * sizeof(tag)), &tag, sizeof(tag));
+		if (error == 0)
+			error = kqring_bufs_set(ctx, i, &iov, tag);
+		if (error != 0)
+			break;
+	}
+	if (error != 0)
+		kqring_bufs_free(ctx);
+	return (error);
+}
+
+/* BUFFERS_UPDATE: slots [off, off + nr); how many were done. */
+static int32_t
+kqring_bufs_update(struct kqring_ctx *ctx, uint32_t off, uint64_t uiov,
+    uint64_t utags, uint32_t nr)
+{
+	struct iovec iov;
+	uint64_t tag = 0;
+	uint32_t i;
+	int error = 0;
+
+	if (ctx->bufs == NULL)
+		return (-ENXIO);
+	if (off > ctx->nbufs || nr > ctx->nbufs - off)
+		return (-EINVAL);
+	for (i = 0; i < nr; i++) {
+		error = copyin((const void *)(uintptr_t)(uiov +
+		    i * sizeof(iov)), &iov, sizeof(iov));
+		if (error == 0 && utags != 0)
+			error = copyin((const void *)(uintptr_t)(utags +
+			    i * sizeof(tag)), &tag, sizeof(tag));
+		if (error == 0)
+			error = kqring_bufs_set(ctx, off + i, &iov, tag);
+		if (error != 0)
+			break;
+	}
+	return (i != 0 ? (int32_t)i : -error);
+}
+
+/*
+ * IORING_REGISTER_CLONE_BUFFERS: copy registered buffers [src_off,
+ * src_off + nr) of another ring to [dst_off, ...) of this one.  The source
+ * table is its owner's alone, so both rings must have the same owner (this
+ * thread); registered buffers are plain ranges, so a copy shares nothing.
+ */
+static int
+kqring_bufs_clone(struct kqring_ctx *ctx, const struct kqring_register_arg *ra)
+{
+	struct thread *td = curthread;
+	struct io_uring_clone_buffers cb;
+	struct kqring_rsrc **tab, *r, *s, *old;
+	struct kqring_ctx *sctx;
+	struct file *fp;
+	cap_rights_t rights;
+	uint32_t n, nr;
 	int error;
 
-	if (!ctx->setup_done)
+	if (ra->arg == NULL || ra->nr_args != 1)
+		return (EINVAL);
+	error = copyin(ra->arg, &cb, sizeof(cb));
+	if (error != 0)
+		return (error);
+	/* There are no registered ring descriptors (SRC_REGISTERED). */
+	if ((cb.flags & ~IORING_REGISTER_DST_REPLACE) != 0 ||
+	    cb.pad[0] != 0 || cb.pad[1] != 0 || cb.pad[2] != 0)
+		return (EINVAL);
+	if (ctx->bufs != NULL &&
+	    (cb.flags & IORING_REGISTER_DST_REPLACE) == 0)
+		return (EBUSY);
+	error = fget(td, (int)cb.src_fd, cap_rights_init_one(&rights,
+	    CAP_IOCTL), &fp);
+	if (error != 0)
+		return (error);
+	error = kqring_fp_ctx(fp, &sctx);
+	if (error == 0 && sctx == ctx)
+		error = EINVAL;
+	else if (error == 0 && sctx->owner_td != td)
+		error = EEXIST;
+	else if (error == 0 && sctx->bufs == NULL)
+		error = ENXIO;
+	if (error != 0)
+		goto out;
+	nr = cb.nr != 0 ? cb.nr : sctx->nbufs;
+	if (cb.src_off > sctx->nbufs || nr > sctx->nbufs - cb.src_off ||
+	    cb.dst_off > KQRING_MAX_BUFS || nr > KQRING_MAX_BUFS - cb.dst_off) {
+		error = EINVAL;
+		goto out;
+	}
+	n = MAX(ctx->nbufs, cb.dst_off + nr);
+	tab = mallocarray(n, sizeof(*tab), M_KQRING, M_WAITOK | M_ZERO);
+	if (ctx->bufs != NULL)
+		memcpy(tab, ctx->bufs, ctx->nbufs * sizeof(*tab));
+	free(ctx->bufs, M_KQRING);
+	ctx->bufs = tab;
+	ctx->nbufs = n;
+	for (uint32_t i = 0; i < nr; i++) {
+		s = sctx->bufs[cb.src_off + i];
+		r = NULL;
+		if (s != NULL) {
+			r = malloc(sizeof(*r), M_KQRING, M_WAITOK | M_ZERO);
+			r->refs = 1;
+			r->addr = s->addr;
+			r->len = s->len;
+		}
+		old = tab[cb.dst_off + i];
+		tab[cb.dst_off + i] = r;
+		if (old != NULL)
+			kqring_rsrc_put(ctx, old);
+	}
+out:
+	fdrop(fp, td);
+	return (error);
+}
+
+/*
+ * IORING_REGISTER_PBUF_RING: a buffer ring for group bgid, in user memory
+ * (page aligned, as io_uring requires) or, with IOU_PBUF_RING_MMAP, in
+ * wired kernel memory that userspace maps.  A mapped ring is a VM object
+ * its mappings reference, so unregistering it while mapped leaves the
+ * process with plain memory, never freed pages (Linux CVE-2024-0582).
+ */
+static int
+kqring_pbuf_register(struct kqring_ctx *ctx,
+    const struct kqring_register_arg *ra)
+{
+	struct io_uring_buf_reg reg;
+	struct kqring_bgroup *bg, *old;
+	size_t bytes;
+	int error;
+
+	if (ra->nr_args != 1 || ra->arg == NULL)
+		return (EINVAL);
+	error = copyin(ra->arg, &reg, sizeof(reg));
+	if (error != 0)
+		return (error);
+	if (reg.resv[0] != 0 || reg.resv[1] != 0 || reg.resv[2] != 0 ||
+	    (reg.flags & ~(IOU_PBUF_RING_MMAP | IOU_PBUF_RING_INC)) != 0)
+		return (EINVAL);
+	if (reg.ring_entries == 0 ||
+	    reg.ring_entries > KQRING_MAX_PBUF_ENTRIES ||
+	    !powerof2(reg.ring_entries))
+		return (EINVAL);
+	bytes = (size_t)reg.ring_entries * sizeof(struct io_uring_buf);
+	if ((reg.flags & IOU_PBUF_RING_MMAP) != 0) {
+		if (reg.ring_addr != 0)
+			return (EINVAL);
+		if (round_page(bytes) > KQRING_MAX_RING_MEM - ctx->ring_mem)
+			return (ENOMEM);
+	} else {
+		if (reg.ring_addr == 0)
+			return (EFAULT);
+		if ((reg.ring_addr & PAGE_MASK) != 0)
+			return (EINVAL);
+		if (reg.ring_addr + bytes > VM_MAXUSER_ADDRESS)
+			return (EFAULT);
+	}
+	/* An empty buffer list may become a ring, as in io_uring. */
+	old = kqring_bgroup_find(ctx, reg.bgid);
+	if (old != NULL && (old->is_ring || old->nbufs != 0))
+		return (EEXIST);
+
+	bg = kqring_bgroup_new(reg.bgid);
+	bg->is_ring = true;
+	bg->ring_flags = reg.flags;
+	bg->ring_entries = reg.ring_entries;
+	bg->ring_mask = reg.ring_entries - 1;
+	if ((reg.flags & IOU_PBUF_RING_MMAP) != 0) {
+		error = kqring_alloc_shm(bytes, &bg->ring_obj,
+		    &bg->ring_kva_base, &bg->ring_alloc_len);
+		if (error != 0) {
+			free(bg, M_KQRING);
+			return (error);
+		}
+		bg->ring_kva = (struct io_uring_buf_ring *)bg->ring_kva_base;
+		ctx->ring_mem += bg->ring_alloc_len;
+	} else {
+		bg->ring_uaddr = reg.ring_addr;
+	}
+	mtx_lock(&ctx->mtx);
+	if (old != NULL)
+		LIST_REMOVE(old, link);
+	LIST_INSERT_HEAD(kqring_bgroup_bucket(ctx, bg->bgid), bg, link);
+	mtx_unlock(&ctx->mtx);
+	if (old != NULL)
+		kqring_bgroup_free(ctx, old);
+	return (0);
+}
+
+static int
+kqring_pbuf_unregister(struct kqring_ctx *ctx,
+    const struct kqring_register_arg *ra)
+{
+	struct io_uring_buf_reg reg;
+	struct kqring_bgroup *bg;
+	int error;
+
+	if (ra->nr_args != 1 || ra->arg == NULL)
+		return (EINVAL);
+	error = copyin(ra->arg, &reg, sizeof(reg));
+	if (error != 0)
+		return (error);
+	if (reg.resv[0] != 0 || reg.resv[1] != 0 || reg.resv[2] != 0 ||
+	    reg.flags != 0)
+		return (EINVAL);
+	bg = kqring_bgroup_find(ctx, reg.bgid);
+	if (bg == NULL)
+		return (ENOENT);
+	if (!bg->is_ring)
+		return (EINVAL);
+	mtx_lock(&ctx->mtx);
+	LIST_REMOVE(bg, link);
+	mtx_unlock(&ctx->mtx);
+	kqring_bgroup_free(ctx, bg);
+	return (0);
+}
+
+/* IORING_REGISTER_PBUF_STATUS: a ring's kernel head. */
+static int
+kqring_pbuf_status(struct kqring_ctx *ctx,
+    const struct kqring_register_arg *ra)
+{
+	struct io_uring_buf_status st;
+	struct kqring_bgroup *bg;
+	int error;
+
+	if (ra->nr_args != 1 || ra->arg == NULL)
+		return (EINVAL);
+	error = copyin(ra->arg, &st, sizeof(st));
+	if (error != 0)
+		return (error);
+	for (size_t i = 0; i < nitems(st.resv); i++)
+		if (st.resv[i] != 0)
+			return (EINVAL);
+	if (st.buf_group > UINT16_MAX ||
+	    (bg = kqring_bgroup_find(ctx, (uint16_t)st.buf_group)) == NULL)
+		return (ENOENT);
+	if (!bg->is_ring)
+		return (EINVAL);
+	st.head = bg->head;
+	return (copyout(&st, ra->arg, sizeof(st)));
+}
+
+/* IORING_REGISTER_RESTRICTIONS, on a ring created IORING_SETUP_R_DISABLED. */
+static int
+kqring_restrictions_register(struct kqring_ctx *ctx,
+    const struct kqring_register_arg *ra)
+{
+	struct kqring_restrictions *r = &ctx->rst;
+	struct io_uring_restriction res;
+	int error = 0;
+
+	if ((ctx->flags & IORING_SETUP_R_DISABLED) == 0 || ctx->enabled)
 		return (EBADF);
+	if (r->registered)
+		return (EBUSY);
+	if (ra->arg == NULL || ra->nr_args == 0 || ra->nr_args >
+	    IORING_RESTRICTION_LAST + IORING_REGISTER_LAST + IORING_OP_LAST)
+		return (EINVAL);
+	for (uint32_t i = 0; i < ra->nr_args && error == 0; i++) {
+		error = copyin((const char *)ra->arg + i * sizeof(res), &res,
+		    sizeof(res));
+		if (error != 0)
+			break;
+		switch (res.opcode) {
+		case IORING_RESTRICTION_REGISTER_OP:
+			if (res.register_op >= IORING_REGISTER_LAST)
+				error = EINVAL;
+			else
+				kqring_bit_set(r->register_op, res.register_op);
+			break;
+		case IORING_RESTRICTION_SQE_OP:
+			if (res.sqe_op >= IORING_OP_LAST)
+				error = EINVAL;
+			else
+				kqring_bit_set(r->sqe_op, res.sqe_op);
+			break;
+		case IORING_RESTRICTION_SQE_FLAGS_ALLOWED:
+			r->sqe_flags_allowed = res.sqe_flags;
+			break;
+		case IORING_RESTRICTION_SQE_FLAGS_REQUIRED:
+			r->sqe_flags_required = res.sqe_flags;
+			break;
+		default:
+			error = EINVAL;
+			break;
+		}
+	}
+	if (error != 0) {
+		bzero(r, sizeof(*r));
+		return (error);
+	}
+	r->registered = true;
+	return (0);
+}
+
+/*
+ * IORING_REGISTER_PERSONALITY: register this thread's credentials, for
+ * requests to name with sqe->personality.  Ids are 1..65535, cyclic.
+ */
+static int
+kqring_personality_register(struct kqring_ctx *ctx, int *idp)
+{
+	struct kqring_cred *kc, *k;
+	uint16_t id;
+
+	if (ctx->ncreds >= KQRING_MAX_PERSONALITIES)
+		return (EBUSY);
+	for (;;) {
+		id = ++ctx->cred_next;
+		if (id == 0)
+			continue;
+		LIST_FOREACH(k, &ctx->creds, link) {
+			if (k->id == id)
+				break;
+		}
+		if (k == NULL)
+			break;
+	}
+	kc = malloc(sizeof(*kc), M_KQRING, M_WAITOK);
+	kc->id = id;
+	kc->cred = crhold(curthread->td_ucred);
+	LIST_INSERT_HEAD(&ctx->creds, kc, link);
+	ctx->ncreds++;
+	*idp = id;
+	return (0);
+}
+
+/* Requests already using the credentials hold their own reference. */
+static int
+kqring_personality_unregister(struct kqring_ctx *ctx, uint32_t id)
+{
+	struct kqring_cred *kc;
+
+	LIST_FOREACH(kc, &ctx->creds, link) {
+		if (kc->id == id)
+			break;
+	}
+	if (kc == NULL)
+		return (EINVAL);
+	LIST_REMOVE(kc, link);
+	ctx->ncreds--;
+	crfree(kc->cred);
+	free(kc, M_KQRING);
+	return (0);
+}
+
+/*
+ * IORING_REGISTER_EVENTFD(_ASYNC): signal an eventfd as CQEs are posted
+ * (with _ASYNC, only for requests that did not complete inline) and when
+ * taskwork is queued for the owner.  kqring holds an eventfd reference,
+ * and signals it under ctx->mtx, which unregistering also takes.
+ */
+static int
+kqring_evfd_register(struct kqring_ctx *ctx,
+    const struct kqring_register_arg *ra, bool async)
+{
+	struct thread *td = curthread;
+	struct eventfd *efd;
+	struct file *fp;
+	cap_rights_t rights;
+	int error, fd;
+
+	if (ra->nr_args != 1 || ra->arg == NULL)
+		return (EINVAL);
+	if (ctx->evfd != NULL)
+		return (EBUSY);
+	error = copyin(ra->arg, &fd, sizeof(fd));
+	if (error != 0)
+		return (error);
+	error = fget(td, fd, cap_rights_init_one(&rights, CAP_WRITE), &fp);
+	if (error != 0)
+		return (error);
+	efd = eventfd_get(fp);
+	fdrop(fp, td);
+	if (efd == NULL)
+		return (EINVAL);
+	mtx_lock(&ctx->mtx);
+	ctx->evfd = efd;
+	ctx->evfd_async = async;
+	ctx->evfd_cqes = 0;
+	mtx_unlock(&ctx->mtx);
+	return (0);
+}
+
+static int
+kqring_evfd_unregister(struct kqring_ctx *ctx)
+{
+	struct eventfd *efd;
+
+	mtx_lock(&ctx->mtx);
+	efd = ctx->evfd;
+	ctx->evfd = NULL;
+	mtx_unlock(&ctx->mtx);
+	if (efd == NULL)
+		return (ENXIO);
+	eventfd_put(efd);
+	return (0);
+}
+
+/*
+ * Signal the eventfd if CQEs were posted since the last signal; the owner
+ * calls this at the end of each enter and before it sleeps.
+ */
+static void
+kqring_evfd_flush(struct kqring_ctx *ctx)
+{
+	if (ctx->evfd_cqes == 0 || ctx->evfd == NULL)
+		return;
+	ctx->evfd_cqes = 0;
+	mtx_lock(&ctx->mtx);
+	kqring_evfd_signal_locked(ctx);
+	mtx_unlock(&ctx->mtx);
+}
+
+/* Validate ASYNC_CANCEL flags, as kqring_req_prep() does. */
+static int
+kqring_cancel_flags_ok(uint32_t flags)
+{
+	if ((flags & ~(IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD |
+	    IORING_ASYNC_CANCEL_ANY | IORING_ASYNC_CANCEL_FD_FIXED |
+	    IORING_ASYNC_CANCEL_USERDATA | IORING_ASYNC_CANCEL_OP)) != 0)
+		return (EINVAL);
+	if ((flags & IORING_ASYNC_CANCEL_FD) != 0 ?
+	    (flags & IORING_ASYNC_CANCEL_ANY) != 0 :
+	    (flags & IORING_ASYNC_CANCEL_FD_FIXED) != 0)
+		return (EINVAL);
+	return (0);
+}
+
+/*
+ * IORING_REGISTER_SYNC_CANCEL: ASYNC_CANCEL without an SQE.  kqring
+ * cancels armed requests at once, so there is never anything to wait for
+ * and the timeout does not matter.
+ */
+static int
+kqring_sync_cancel(struct kqring_ctx *ctx,
+    const struct kqring_register_arg *ra, int *resp)
+{
+	struct io_uring_sync_cancel_reg sc;
+	struct io_uring_sqe sqe;
+	int32_t res;
+	int error;
+
+	if (ra->nr_args != 1 || ra->arg == NULL)
+		return (EINVAL);
+	error = copyin(ra->arg, &sc, sizeof(sc));
+	if (error != 0)
+		return (error);
+	for (size_t i = 0; i < nitems(sc.pad); i++)
+		if (sc.pad[i] != 0)
+			return (EINVAL);
+	for (size_t i = 0; i < nitems(sc.pad2); i++)
+		if (sc.pad2[i] != 0)
+			return (EINVAL);
+	error = kqring_cancel_flags_ok(sc.flags);
+	if (error != 0)
+		return (error);
+	bzero(&sqe, sizeof(sqe));
+	sqe.opcode = IORING_OP_ASYNC_CANCEL;
+	sqe.cancel_flags = sc.flags;
+	sqe.fd = sc.fd;
+	sqe.addr = sc.addr;
+	sqe.len = sc.opcode;
+	res = kqring_cancel(ctx, &sqe);
+	/* Issue the link successors that cancellation released. */
+	kqring_flush_ready(ctx);
+	if (res < 0)
+		return (-res);
+	*resp = res;
+	return (0);
+}
+
+/*
+ * IORING_REGISTER_SEND_MSG_RING: MSG_RING (IORING_MSG_DATA only, as in
+ * io_uring) without a submission, from any thread.
+ */
+static int
+kqring_register_send_msg(struct kqring_ctx *ctx,
+    const struct kqring_register_arg *ra)
+{
+	struct kqring_op op;
+	int32_t res;
+	int error;
+
+	if (ra->nr_args != 1 || ra->arg == NULL)
+		return (EINVAL);
+	bzero(&op, sizeof(op));
+	error = copyin(ra->arg, &op.sqe, sizeof(op.sqe));
+	if (error != 0)
+		return (error);
+	if (op.sqe.opcode != IORING_OP_MSG_RING || op.sqe.flags != 0 ||
+	    op.sqe.addr != IORING_MSG_DATA || op.sqe.buf_index != 0 ||
+	    op.sqe.addr3 != 0 || (op.sqe.msg_ring_flags &
+	    ~IORING_MSG_RING_FLAGS_PASS) != 0 ||
+	    ((op.sqe.msg_ring_flags & IORING_MSG_RING_FLAGS_PASS) == 0 &&
+	    op.sqe.file_index != 0))
+		return (EINVAL);
+	op.ctx = ctx;
+	res = kqring_msg_ring(ctx, &op);
+	return (res < 0 ? -res : 0);
+}
+
+/*
+ * IORING_REGISTER_FILE_ALLOC_RANGE: the slots IORING_FILE_INDEX_ALLOC
+ * picks from.
+ */
+static int
+kqring_file_alloc_range(struct kqring_ctx *ctx,
+    const struct kqring_register_arg *ra)
+{
+	struct io_uring_file_index_range rr;
+	int error;
+
+	if (ra->arg == NULL || ra->nr_args != 0)
+		return (EINVAL);
+	error = copyin(ra->arg, &rr, sizeof(rr));
+	if (error != 0)
+		return (error);
+	if (rr.len > UINT32_MAX - rr.off)
+		return (EOVERFLOW);
+	if (rr.resv != 0 || rr.off + rr.len > ctx->nfiles)
+		return (EINVAL);
+	ctx->file_alloc_off = ctx->file_alloc_hint = rr.off;
+	ctx->file_alloc_end = rr.off + rr.len;
+	return (0);
+}
+
+/*
+ * IORING_REGISTER_CLOCK: the clock of wait timeouts.  They are relative,
+ * so either clock gives the same result except across a suspend.
+ */
+static int
+kqring_register_clock(struct kqring_ctx *ctx,
+    const struct kqring_register_arg *ra)
+{
+	struct io_uring_clock_register cr;
+	int error;
+
+	if (ra->arg == NULL || ra->nr_args != 0)
+		return (EINVAL);
+	error = copyin(ra->arg, &cr, sizeof(cr));
+	if (error != 0)
+		return (error);
+	if (cr.__resv[0] != 0 || cr.__resv[1] != 0 || cr.__resv[2] != 0)
+		return (EINVAL);
+	if (cr.clockid != CLOCK_MONOTONIC && cr.clockid != CLOCK_BOOTTIME)
+		return (EINVAL);
+	ctx->clockid = cr.clockid;
+	return (0);
+}
+
+/* IORING_REGISTER_PROBE: the opcodes implemented. */
+static int
+kqring_register_probe(const struct kqring_register_arg *ra)
+{
+	static const uint8_t supported_ops[] = {
+		IORING_OP_NOP,
+		IORING_OP_READV,
+		IORING_OP_WRITEV,
+		IORING_OP_FSYNC,
+		IORING_OP_READ_FIXED,
+		IORING_OP_WRITE_FIXED,
+		IORING_OP_POLL_ADD,
+		IORING_OP_POLL_REMOVE,
+		IORING_OP_SYNC_FILE_RANGE,
+		IORING_OP_SENDMSG,
+		IORING_OP_RECVMSG,
+		IORING_OP_TIMEOUT,
+		IORING_OP_TIMEOUT_REMOVE,
+		IORING_OP_ACCEPT,
+		IORING_OP_ASYNC_CANCEL,
+		IORING_OP_LINK_TIMEOUT,
+		IORING_OP_CONNECT,
+		IORING_OP_FALLOCATE,
+		IORING_OP_OPENAT,
+		IORING_OP_CLOSE,
+		IORING_OP_FILES_UPDATE,
+		IORING_OP_STATX,
+		IORING_OP_READ,
+		IORING_OP_WRITE,
+		IORING_OP_FADVISE,
+		IORING_OP_MADVISE,
+		IORING_OP_SEND,
+		IORING_OP_RECV,
+		IORING_OP_OPENAT2,
+		IORING_OP_PROVIDE_BUFFERS,
+		IORING_OP_REMOVE_BUFFERS,
+		IORING_OP_SHUTDOWN,
+		IORING_OP_RENAMEAT,
+		IORING_OP_UNLINKAT,
+		IORING_OP_MKDIRAT,
+		IORING_OP_SYMLINKAT,
+		IORING_OP_LINKAT,
+		IORING_OP_MSG_RING,
+		IORING_OP_FSETXATTR,
+		IORING_OP_SETXATTR,
+		IORING_OP_FGETXATTR,
+		IORING_OP_GETXATTR,
+		IORING_OP_SOCKET,
+		IORING_OP_URING_CMD,
+		IORING_OP_SEND_ZC,
+		IORING_OP_SENDMSG_ZC,
+		IORING_OP_READ_MULTISHOT,
+		IORING_OP_WAITID,
+		IORING_OP_FUTEX_WAIT,
+		IORING_OP_FUTEX_WAKE,
+		IORING_OP_FUTEX_WAITV,
+		IORING_OP_FIXED_FD_INSTALL,
+		IORING_OP_FTRUNCATE,
+		IORING_OP_BIND,
+		IORING_OP_LISTEN,
+		IORING_OP_READV_FIXED,
+		IORING_OP_WRITEV_FIXED,
+		IORING_OP_PIPE,
+	};
+	struct io_uring_probe hdr;
+	int error;
+
+	if (ra->arg == NULL)
+		return (EINVAL);
+	error = copyin(ra->arg, &hdr, sizeof(hdr));
+	if (error != 0)
+		return (error);
+
+	/*
+	 * As in io_uring: last_op is the last opcode this ABI knows and
+	 * ops_len the number of entries filled in, at most IORING_OP_LAST
+	 * (it is a uint8_t, so never 256).
+	 */
+	uint32_t max_ops = MIN(ra->nr_args, (uint32_t)IORING_OP_LAST);
+	hdr.last_op = IORING_OP_LAST - 1;
+	hdr.ops_len = (uint8_t)max_ops;
+	error = copyout(&hdr, ra->arg, sizeof(hdr));
+	if (error != 0)
+		return (error);
+
+	for (uint32_t i = 0; i < max_ops; i++) {
+		struct io_uring_probe_op pop = {
+			.op = (uint8_t)i,
+			.resv = 0,
+			.flags = 0,
+			.resv2 = 0,
+		};
+		for (size_t j = 0; j < nitems(supported_ops); j++) {
+			if (supported_ops[j] == i) {
+				pop.flags = IO_URING_OP_SUPPORTED;
+				break;
+			}
+		}
+		uint8_t *dst = (uint8_t *)ra->arg + sizeof(hdr) +
+		    i * sizeof(pop);
+		error = copyout(&pop, dst, sizeof(pop));
+		if (error != 0)
+			return (error);
+	}
+	return (0);
+}
+
+/* Register opcodes that change the ring, run by kqring_ioc_register(). */
+static int
+kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
+    struct thread *td, int *resp)
+{
+	struct io_uring_rsrc_register rr;
+	struct io_uring_rsrc_update2 up;
+	struct io_uring_files_update fu;
+	int32_t res;
+	int error;
 
 	switch (ra->opcode) {
 	case IORING_REGISTER_ENABLE_RINGS:
+		if (ra->arg != NULL || ra->nr_args != 0)
+			return (EINVAL);
 		mtx_lock(&ctx->mtx);
 		if (ctx->enabled) {
 			mtx_unlock(&ctx->mtx);
@@ -4564,133 +7455,181 @@ kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
 		}
 		ctx->owner_td = td;
 		ctx->enabled = true;
+		ctx->restricted = ctx->rst.registered;
 		mtx_unlock(&ctx->mtx);
 		return (0);
 
-	case IORING_REGISTER_PROBE: {
-		struct io_uring_probe hdr;
+	case IORING_REGISTER_RESTRICTIONS:
+		return (kqring_restrictions_register(ctx, ra));
+
+	case IORING_REGISTER_FILES:
+		return (kqring_files_register(ctx, (uintptr_t)ra->arg, 0,
+		    ra->nr_args, false));
+	case IORING_REGISTER_BUFFERS:
 		if (ra->arg == NULL)
+			return (EFAULT);
+		return (kqring_bufs_register(ctx, (uintptr_t)ra->arg, 0,
+		    ra->nr_args, false));
+	case IORING_REGISTER_FILES2:
+	case IORING_REGISTER_BUFFERS2:
+		if (ra->arg == NULL || ra->nr_args != sizeof(rr))
 			return (EINVAL);
-		error = copyin(ra->arg, &hdr, sizeof(hdr));
+		error = copyin(ra->arg, &rr, sizeof(rr));
 		if (error != 0)
 			return (error);
-
-		static const uint8_t supported_ops[] = {
-			IORING_OP_NOP,
-			IORING_OP_READV,
-			IORING_OP_WRITEV,
-			IORING_OP_FSYNC,
-			IORING_OP_POLL_ADD,
-			IORING_OP_POLL_REMOVE,
-			IORING_OP_SYNC_FILE_RANGE,
-			IORING_OP_SENDMSG,
-			IORING_OP_RECVMSG,
-			IORING_OP_TIMEOUT,
-			IORING_OP_TIMEOUT_REMOVE,
-			IORING_OP_ACCEPT,
-			IORING_OP_ASYNC_CANCEL,
-			IORING_OP_LINK_TIMEOUT,
-			IORING_OP_CONNECT,
-			IORING_OP_FALLOCATE,
-			IORING_OP_OPENAT,
-			IORING_OP_CLOSE,
-			IORING_OP_STATX,
-			IORING_OP_READ,
-			IORING_OP_WRITE,
-			IORING_OP_FADVISE,
-			IORING_OP_MADVISE,
-			IORING_OP_SEND,
-			IORING_OP_RECV,
-			IORING_OP_OPENAT2,
-			IORING_OP_SHUTDOWN,
-			IORING_OP_RENAMEAT,
-			IORING_OP_UNLINKAT,
-			IORING_OP_MKDIRAT,
-			IORING_OP_SYMLINKAT,
-			IORING_OP_LINKAT,
-			IORING_OP_MSG_RING,
-			IORING_OP_FSETXATTR,
-			IORING_OP_SETXATTR,
-			IORING_OP_FGETXATTR,
-			IORING_OP_GETXATTR,
-			IORING_OP_SOCKET,
-			IORING_OP_URING_CMD,
-			IORING_OP_SEND_ZC,
-			IORING_OP_SENDMSG_ZC,
-			IORING_OP_READ_MULTISHOT,
-			IORING_OP_WAITID,
-			IORING_OP_FUTEX_WAIT,
-			IORING_OP_FUTEX_WAKE,
-			IORING_OP_FUTEX_WAITV,
-			IORING_OP_FTRUNCATE,
-			IORING_OP_BIND,
-			IORING_OP_LISTEN,
-		};
-		/*
-		 * As in io_uring: last_op is the last opcode this ABI knows
-		 * and ops_len the number of entries filled in, at most
-		 * IORING_OP_LAST (it is a uint8_t, so never 256).
-		 */
-		uint32_t max_ops = MIN(ra->nr_args, (uint32_t)IORING_OP_LAST);
-		hdr.last_op = IORING_OP_LAST - 1;
-		hdr.ops_len = (uint8_t)max_ops;
-		error = copyout(&hdr, ra->arg, sizeof(hdr));
-		if (error != 0)
-			return (error);
-
-		for (uint32_t i = 0; i < max_ops; i++) {
-			struct io_uring_probe_op pop = {
-				.op = (uint8_t)i,
-				.resv = 0,
-				.flags = 0,
-				.resv2 = 0,
-			};
-			for (size_t j = 0; j < nitems(supported_ops); j++) {
-				if (supported_ops[j] == i) {
-					pop.flags = IO_URING_OP_SUPPORTED;
-					break;
-				}
-			}
-			uint8_t *dst = (uint8_t *)ra->arg + sizeof(hdr) +
-			    i * sizeof(pop);
-			error = copyout(&pop, dst, sizeof(pop));
-			if (error != 0)
-				return (error);
+		if (rr.nr == 0 || rr.resv2 != 0 ||
+		    (rr.flags & ~IORING_RSRC_REGISTER_SPARSE) != 0)
+			return (EINVAL);
+		/* A sparse table starts empty: nothing to read. */
+		if ((rr.flags & IORING_RSRC_REGISTER_SPARSE) != 0 &&
+		    (rr.data != 0 || rr.tags != 0))
+			return (EINVAL);
+		if (ra->opcode == IORING_REGISTER_FILES2)
+			return (kqring_files_register(ctx, rr.data, rr.tags,
+			    rr.nr, (rr.flags & IORING_RSRC_REGISTER_SPARSE) !=
+			    0));
+		return (kqring_bufs_register(ctx, rr.data, rr.tags, rr.nr,
+		    (rr.flags & IORING_RSRC_REGISTER_SPARSE) != 0));
+	case IORING_UNREGISTER_FILES:
+	case IORING_UNREGISTER_BUFFERS:
+		if (ra->arg != NULL || ra->nr_args != 0)
+			return (EINVAL);
+		if (ra->opcode == IORING_UNREGISTER_FILES) {
+			if (ctx->files == NULL)
+				return (ENXIO);
+			kqring_files_free(ctx);
+		} else {
+			if (ctx->bufs == NULL)
+				return (ENXIO);
+			kqring_bufs_free(ctx);
 		}
 		return (0);
-	}
-
-	case IORING_REGISTER_PBUF_RING: {
-		struct io_uring_buf_reg reg;
-		if (ra->nr_args != 1 || ra->arg == NULL)
+	case IORING_REGISTER_FILES_UPDATE:
+		if (ra->arg == NULL || ra->nr_args == 0)
 			return (EINVAL);
-		if (ctx->owner_td != td)
-			return (EEXIST);
-		error = copyin(ra->arg, &reg, sizeof(reg));
+		error = copyin(ra->arg, &fu, sizeof(fu));
 		if (error != 0)
 			return (error);
-		if (reg.bgid != 0 || reg.ring_entries == 0 ||
-		    reg.ring_entries > KQRING_MAX_PBUF_ENTRIES ||
-		    (reg.ring_entries & (reg.ring_entries - 1)) != 0)
+		if (fu.resv != 0)
 			return (EINVAL);
+		res = kqring_files_update(ctx, fu.offset, fu.fds, 0,
+		    ra->nr_args);
+		break;
+	case IORING_REGISTER_FILES_UPDATE2:
+	case IORING_REGISTER_BUFFERS_UPDATE:
+		if (ra->arg == NULL || ra->nr_args != sizeof(up))
+			return (EINVAL);
+		error = copyin(ra->arg, &up, sizeof(up));
+		if (error != 0)
+			return (error);
+		if (up.nr == 0 || up.resv != 0 || up.resv2 != 0)
+			return (EINVAL);
+		if (ra->opcode == IORING_REGISTER_FILES_UPDATE2)
+			res = kqring_files_update(ctx, up.offset, up.data,
+			    up.tags, up.nr);
+		else
+			res = kqring_bufs_update(ctx, up.offset, up.data,
+			    up.tags, up.nr);
+		break;
+	case IORING_REGISTER_FILE_ALLOC_RANGE:
+		return (kqring_file_alloc_range(ctx, ra));
+	case IORING_REGISTER_CLONE_BUFFERS:
+		return (kqring_bufs_clone(ctx, ra));
 
-		ctx->pbuf.user_ring_addr = reg.ring_addr;
-		ctx->pbuf.ring_entries = reg.ring_entries;
-		ctx->pbuf.ring_mask = reg.ring_entries - 1;
-		ctx->pbuf.head = 0;
-		ctx->pbuf.registered = true;
-		return (0);
-	}
-
+	case IORING_REGISTER_PBUF_RING:
+		return (kqring_pbuf_register(ctx, ra));
 	case IORING_UNREGISTER_PBUF_RING:
-		if (ctx->owner_td != td)
-			return (EEXIST);
-		ctx->pbuf.registered = false;
-		return (0);
+		return (kqring_pbuf_unregister(ctx, ra));
+	case IORING_REGISTER_PBUF_STATUS:
+		return (kqring_pbuf_status(ctx, ra));
+
+	case IORING_REGISTER_EVENTFD:
+	case IORING_REGISTER_EVENTFD_ASYNC:
+		return (kqring_evfd_register(ctx, ra,
+		    ra->opcode == IORING_REGISTER_EVENTFD_ASYNC));
+	case IORING_UNREGISTER_EVENTFD:
+		if (ra->arg != NULL || ra->nr_args != 0)
+			return (EINVAL);
+		return (kqring_evfd_unregister(ctx));
+
+	case IORING_REGISTER_PERSONALITY:
+		if (ra->arg != NULL || ra->nr_args != 0)
+			return (EINVAL);
+		return (kqring_personality_register(ctx, resp));
+	case IORING_UNREGISTER_PERSONALITY:
+		if (ra->arg != NULL)
+			return (EINVAL);
+		return (kqring_personality_unregister(ctx, ra->nr_args));
+
+	case IORING_REGISTER_SYNC_CANCEL:
+		return (kqring_sync_cancel(ctx, ra, resp));
+	case IORING_REGISTER_CLOCK:
+		return (kqring_register_clock(ctx, ra));
 
 	default:
+		/*
+		 * IOWQ_AFF / IOWQ_MAX_WORKERS (no workers), RING_FDS (no
+		 * io_uring_enter(2) to take a registered ring), NAPI.
+		 */
 		return (EOPNOTSUPP);
 	}
+	if (res < 0)
+		return (-res);
+	*resp = res;
+	return (0);
+}
+
+/*
+ * KQRING_IOC_REGISTER.  Opcodes that change the ring run in its owner
+ * thread, as SINGLE_ISSUER requires, which is what lets the owner use its
+ * tables without locks; before IORING_REGISTER_ENABLE_RINGS (no owner yet)
+ * any thread may, one at a time.  A positive result (personality id,
+ * slots updated, requests cancelled) becomes ioctl(2)'s return value, as
+ * io_uring_register(2)'s.
+ */
+static int
+kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
+    struct thread *td, int *resp)
+{
+	bool busy = false;
+	int error;
+
+	if (!ctx->setup_done)
+		return (EBADF);
+	if (ctx->restricted && (ra->opcode >= 256 ||
+	    !kqring_bit_isset(ctx->rst.register_op, ra->opcode)))
+		return (EACCES);
+
+	switch (ra->opcode) {
+	case IORING_REGISTER_PROBE:
+		return (kqring_register_probe(ra));
+	case IORING_REGISTER_SEND_MSG_RING:
+		return (kqring_register_send_msg(ctx, ra));
+	}
+
+	mtx_lock(&ctx->mtx);
+	if (ctx->enabled) {
+		if (ctx->owner_td != td) {
+			mtx_unlock(&ctx->mtx);
+			return (EEXIST);	/* SINGLE_ISSUER violation */
+		}
+	} else {
+		if (ctx->reg_busy) {
+			mtx_unlock(&ctx->mtx);
+			return (EBUSY);
+		}
+		ctx->reg_busy = busy = true;
+	}
+	mtx_unlock(&ctx->mtx);
+
+	error = kqring_register_op(ctx, ra, td, resp);
+
+	if (busy) {
+		mtx_lock(&ctx->mtx);
+		ctx->reg_busy = false;
+		mtx_unlock(&ctx->mtx);
+	}
+	return (error);
 }
 
 static int
@@ -4698,7 +7637,7 @@ kqring_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
     int fflag __unused, struct thread *td)
 {
 	struct kqring_ctx *ctx;
-	int error;
+	int error, res = 0;
 
 	error = devfs_get_cdevpriv((void **)&ctx);
 	if (error != 0)
@@ -4715,17 +7654,17 @@ kqring_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 		break;
 	case KQRING_IOC_REGISTER:
 		error = kqring_ioc_register(ctx,
-		    (struct kqring_register_arg *)data, td);
+		    (struct kqring_register_arg *)data, td, &res);
 		break;
 	default:
 		return (ENOTTY);
 	}
 	/*
 	 * kern_*() calls made for SQEs (openat, accept, socket...) leave
-	 * their result in td_retval[0], which would become ioctl(2)'s
-	 * return value.
+	 * their result in td_retval[0], which is ioctl(2)'s return value:
+	 * only a register result may be returned.
 	 */
-	td->td_retval[0] = 0;
+	td->td_retval[0] = error == 0 ? res : 0;
 	return (error);
 }
 
@@ -4758,6 +7697,26 @@ kqring_mmap_single(struct cdev *cdev __unused, vm_ooffset_t *offset,
 		*object = ctx->sqes_obj;
 		*offset = 0;
 		return (0);
+	}
+	if ((*offset & IORING_OFF_MMAP_MASK) == IORING_OFF_PBUF_RING) {
+		/* An IOU_PBUF_RING_MMAP ring, decoded as io_uring does. */
+		uint16_t bgid = (uint16_t)((*offset & ~IORING_OFF_MMAP_MASK) >>
+		    IORING_OFF_PBUF_SHIFT);
+		struct kqring_bgroup *bg;
+
+		error = EINVAL;
+		mtx_lock(&ctx->mtx);
+		bg = kqring_bgroup_find(ctx, bgid);
+		if (bg != NULL && bg->ring_obj != NULL &&
+		    size <= bg->ring_alloc_len) {
+			/* The mapping's own reference outlives unregister. */
+			vm_object_reference(bg->ring_obj);
+			*object = bg->ring_obj;
+			*offset = 0;
+			error = 0;
+		}
+		mtx_unlock(&ctx->mtx);
+		return (error);
 	}
 	return (EINVAL);
 }
