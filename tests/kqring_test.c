@@ -3129,15 +3129,36 @@ test_read_multishot(struct test_ring *r)
 	assert((c.flags & IORING_CQE_F_MORE) == 0);
 	close(sv[0]);
 
-	/* Needs readiness, which only sockets have here. */
+	/* Pipe READ_MULTISHOT: inline and armed reads until EOF. */
 	assert(pipe(pfd) == 0);
 	sqe = ring_prep(r, IORING_OP_READ_MULTISHOT, pfd[0], 35002);
 	sqe->flags = IOSQE_BUFFER_SELECT;
 	ring_push_sqe(r);
-	assert(submit_one(r) == -EOPNOTSUPP);
-	close(pfd[0]);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	for (int i = 0; i < 3; i++) {
+		assert(write(pfd[1], "p", 1) == 1);
+		assert(ring_wait(r, 1, 2000) == 0);
+		c = expect_cqe(r, 35002, 1);
+		assert((c.flags & (IORING_CQE_F_MORE | IORING_CQE_F_BUFFER)) ==
+		    (IORING_CQE_F_MORE | IORING_CQE_F_BUFFER));
+		ring_offer_buf(r, c.flags >> IORING_CQE_BUFFER_SHIFT);
+	}
 	close(pfd[1]);
-	printf("[PASS] READ_MULTISHOT on a socket, until EOF\n");
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = expect_cqe(r, 35002, 0);
+	assert((c.flags & (IORING_CQE_F_MORE | IORING_CQE_F_BUFFER)) == 0);
+	close(pfd[0]);
+
+	/* Regular files are not supported for READ_MULTISHOT. */
+	int nfd = open("/dev/null", O_RDONLY);
+	assert(nfd >= 0);
+	sqe = ring_prep(r, IORING_OP_READ_MULTISHOT, nfd, 35003);
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EOPNOTSUPP);
+	close(nfd);
+	printf("[PASS] READ_MULTISHOT on socket and pipe, until EOF\n");
 }
 
 static void
@@ -3157,8 +3178,7 @@ test_phase2_validation(struct test_ring *r)
 	ring_push_sqe(r);
 	assert(submit_one(r) == -EINVAL);
 	static const uint8_t later[] = {
-		IORING_OP_EPOLL_CTL, IORING_OP_SPLICE, IORING_OP_TEE,
-		IORING_OP_RECV_ZC, IORING_OP_EPOLL_WAIT,
+		IORING_OP_EPOLL_CTL, IORING_OP_RECV_ZC, IORING_OP_EPOLL_WAIT,
 	};
 	for (size_t i = 0; i < sizeof(later); i++) {
 		ring_prep(r, later[i], -1, 36003);
@@ -4865,6 +4885,282 @@ test_worker_process_lifecycle(void)
 	    "_exit(2) SINGLE_EXIT with active workers\n");
 }
 
+/* ============================================================================
+ * Phase 5: SPLICE, TEE, pipe READ_MULTISHOT, and non-socket POLL_ADD
+ * ============================================================================
+ */
+
+static void
+test_splice_and_tee(void)
+{
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	char dir[64], path_in[96], path_out[96], buf[64];
+	int p1[2], p2[2], sv[2], fd_in, fd_out;
+
+	ring_init(&t);
+	make_tmpdir(dir, sizeof(dir));
+	snprintf(path_in, sizeof(path_in), "%s/in", dir);
+	snprintf(path_out, sizeof(path_out), "%s/out", dir);
+	fd_in = open(path_in, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	fd_out = open(path_out, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	assert(fd_in >= 0 && fd_out >= 0);
+	assert(write(fd_in, "0123456789abcdef", 16) == 16);
+	assert(lseek(fd_in, 0, SEEK_SET) == 0);
+	assert(pipe(p1) == 0);
+	assert(pipe(p2) == 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+	/* 1. SPLICE file (positioned at off_in=4) -> pipe p1[1]. */
+	sqe = ring_prep(&t, IORING_OP_SPLICE, p1[1], 70001);
+	sqe->splice_fd_in = fd_in;
+	sqe->splice_off_in = 4;
+	sqe->off = (uint64_t)-1;
+	sqe->len = 8;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 8);
+	assert(lseek(fd_in, 0, SEEK_CUR) == 0);
+
+	/* 2. TEE p1[0] -> p2[1]: copies 8 bytes without consuming p1[0]. */
+	sqe = ring_prep(&t, IORING_OP_TEE, p2[1], 70002);
+	sqe->splice_fd_in = p1[0];
+	sqe->len = 8;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 8);
+
+	/* Both p2[0] and p1[0] now hold "456789ab". */
+	memset(buf, 0, sizeof(buf));
+	assert(read(p2[0], buf, 8) == 8 && memcmp(buf, "456789ab", 8) == 0);
+
+	/* 3. SPLICE p1[0] -> fd_out (positioned at off=2). */
+	sqe = ring_prep(&t, IORING_OP_SPLICE, fd_out, 70003);
+	sqe->splice_fd_in = p1[0];
+	sqe->splice_off_in = (uint64_t)-1;
+	sqe->off = 2;
+	sqe->len = 8;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 8);
+	memset(buf, 0, sizeof(buf));
+	assert(pread(fd_out, buf, 8, 2) == 8 &&
+	    memcmp(buf, "456789ab", 8) == 0);
+
+	/* 4. SPLICE socket sv[0] -> p1[1], then p1[0] -> socket sv[0]. */
+	assert(write(sv[1], "sockpipe", 8) == 8);
+	sqe = ring_prep(&t, IORING_OP_SPLICE, p1[1], 70004);
+	sqe->splice_fd_in = sv[0];
+	sqe->splice_off_in = (uint64_t)-1;
+	sqe->off = (uint64_t)-1;
+	sqe->len = 8;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 8);
+
+	sqe = ring_prep(&t, IORING_OP_SPLICE, sv[0], 70005);
+	sqe->splice_fd_in = p1[0];
+	sqe->splice_off_in = (uint64_t)-1;
+	sqe->off = (uint64_t)-1;
+	sqe->len = 8;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 8);
+	memset(buf, 0, sizeof(buf));
+	assert(read(sv[1], buf, 8) == 8 && memcmp(buf, "sockpipe", 8) == 0);
+
+	/* 5. SPLICE_F_NONBLOCK on empty pipe -> -EAGAIN; blocking waits. */
+	sqe = ring_prep(&t, IORING_OP_SPLICE, p2[1], 70006);
+	sqe->splice_fd_in = p1[0];
+	sqe->splice_off_in = (uint64_t)-1;
+	sqe->off = (uint64_t)-1;
+	sqe->len = 4;
+	sqe->splice_flags = SPLICE_F_NONBLOCK;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EAGAIN);
+
+	sqe = ring_prep(&t, IORING_OP_TEE, p2[1], 70007);
+	sqe->splice_fd_in = p1[0];
+	sqe->len = 4;
+	sqe->splice_flags = SPLICE_F_NONBLOCK;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EAGAIN);
+
+	/* Blocking SPLICE on empty p1[0] stays armed until p1[1] is written. */
+	sqe = ring_prep(&t, IORING_OP_SPLICE, p2[1], 70008);
+	sqe->splice_fd_in = p1[0];
+	sqe->splice_off_in = (uint64_t)-1;
+	sqe->off = (uint64_t)-1;
+	sqe->len = 4;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+	assert(write(p1[1], "wait", 4) == 4);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 70008, 4);
+	assert(read(p2[0], buf, 4) == 4 && memcmp(buf, "wait", 4) == 0);
+
+	/* 6. Fixed files: SPLICE_F_FD_IN_FIXED and IOSQE_FIXED_FILE. */
+	int fds[4] = { p1[0], p1[1], p2[0], p2[1] };
+	assert(reg(&t, IORING_REGISTER_FILES, fds, 4) == 0);
+	assert(write(p1[1], "fxfd", 4) == 4);
+	sqe = ring_prep(&t, IORING_OP_TEE, 3, 70009);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->splice_fd_in = 0;
+	sqe->splice_flags = SPLICE_F_FD_IN_FIXED;
+	sqe->len = 4;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 4);
+
+	sqe = ring_prep(&t, IORING_OP_SPLICE, 3, 70010);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->splice_fd_in = 0;
+	sqe->splice_off_in = (uint64_t)-1;
+	sqe->off = (uint64_t)-1;
+	sqe->splice_flags = SPLICE_F_FD_IN_FIXED;
+	sqe->len = 4;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 4);
+	assert(read(p2[0], buf, 8) == 8 && memcmp(buf, "fxfdfxfd", 8) == 0);
+
+	/* 7. Validation: non-pipe endpoints, offsets on pipes, same pipe. */
+	sqe = ring_prep(&t, IORING_OP_SPLICE, fd_out, 70011);
+	sqe->splice_fd_in = fd_in;
+	sqe->splice_off_in = 0;
+	sqe->off = 0;
+	sqe->len = 4;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+
+	sqe = ring_prep(&t, IORING_OP_SPLICE, p1[1], 70012);
+	sqe->splice_fd_in = p1[0];
+	sqe->splice_off_in = (uint64_t)-1;
+	sqe->off = (uint64_t)-1;
+	sqe->len = 4;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+
+	sqe = ring_prep(&t, IORING_OP_SPLICE, p2[1], 70013);
+	sqe->splice_fd_in = p1[0];
+	sqe->splice_off_in = 0;
+	sqe->off = (uint64_t)-1;
+	sqe->len = 4;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -ESPIPE);
+
+	sqe = ring_prep(&t, IORING_OP_TEE, fd_out, 70014);
+	sqe->splice_fd_in = p1[0];
+	sqe->len = 4;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+
+	close(sv[0]);
+	close(sv[1]);
+	close(p1[0]);
+	close(p1[1]);
+	close(p2[0]);
+	close(p2[1]);
+	close(fd_in);
+	close(fd_out);
+	close(t.fd);
+	unlink(path_in);
+	unlink(path_out);
+	rmdir(dir);
+	printf("[PASS] SPLICE and TEE: file/pipe/socket, nonblock, blocking, "
+	    "fixed files, validation\n");
+}
+
+static void
+test_nonsock_poll(void)
+{
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	struct test_ring t;
+	int pfd[2], efd;
+	eventfd_t ev;
+	char ch;
+
+	ring_init(&t);
+	assert(pipe(pfd) == 0);
+	efd = eventfd(0, EFD_NONBLOCK);
+	assert(efd >= 0);
+
+	/* 1. Single-shot POLL_ADD on a pipe: inline and armed. */
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, pfd[1], 71001);
+	sqe->poll32_events = POLLOUT;
+	ring_push_sqe(&t);
+	assert((submit_one(&t) & POLLOUT) != 0);
+
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, pfd[0], 71002);
+	sqe->poll32_events = POLLIN;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+	assert(write(pfd[1], "a", 1) == 1);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 71002 && (c.res & POLLIN) != 0);
+	assert(read(pfd[0], &ch, 1) == 1 && ch == 'a');
+
+	/* 2. Multishot POLL_ADD on a pipe, then POLL_REMOVE. */
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, pfd[0], 71003);
+	sqe->poll32_events = POLLIN;
+	sqe->len = IORING_POLL_ADD_MULTI;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+	for (int i = 0; i < 3; i++) {
+		assert(write(pfd[1], "x", 1) == 1);
+		assert(ring_wait(&t, 1, 2000) == 0);
+		c = ring_pop_cqe(&t);
+		assert(c.user_data == 71003 && (c.res & POLLIN) != 0);
+		assert((c.flags & IORING_CQE_F_MORE) != 0);
+		assert(read(pfd[0], &ch, 1) == 1);
+	}
+	ring_prep(&t, IORING_OP_POLL_REMOVE, -1, 71004)->addr = 71003;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	expect_cqe(&t, 71003, -ECANCELED);
+	expect_cqe(&t, 71004, 0);
+
+	/* 3. Multishot POLL_ADD on an eventfd (via IOSQE_FIXED_FILE). */
+	int fds[2] = { efd, pfd[0] };
+	assert(reg(&t, IORING_REGISTER_FILES, fds, 2) == 0);
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, 0, 71005);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->poll32_events = POLLIN;
+	sqe->len = IORING_POLL_ADD_MULTI;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+	for (int i = 0; i < 3; i++) {
+		assert(eventfd_write(efd, 1) == 0);
+		assert(ring_wait(&t, 1, 2000) == 0);
+		c = ring_pop_cqe(&t);
+		assert(c.user_data == 71005 && (c.res & POLLIN) != 0);
+		assert((c.flags & IORING_CQE_F_MORE) != 0);
+		assert(eventfd_read(efd, &ev) == 0 && ev == 1);
+	}
+	ring_prep(&t, IORING_OP_POLL_REMOVE, -1, 71006)->addr = 71005;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	expect_cqe(&t, 71005, -ECANCELED);
+	expect_cqe(&t, 71006, 0);
+
+	/* 4. Peer close wakes armed pipe POLL_ADD with POLLHUP. */
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, 1, 71007);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->poll32_events = POLLIN;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+	close(pfd[1]);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 71007 && (c.res & (POLLIN | POLLHUP)) != 0);
+
+	close(pfd[0]);
+	close(efd);
+	close(t.fd);
+	printf("[PASS] Non-socket POLL_ADD: pipe and eventfd single/multishot, "
+	    "FIXED_FILE, POLL_REMOVE, POLLHUP\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -4932,6 +5228,8 @@ main(int argc, char **argv)
 		test_worker_cancel_and_timeout();
 		test_worker_max_workers();
 		test_worker_process_lifecycle();
+		test_splice_and_tee();
+		test_nonsock_poll();
 		printf("%s: %d failure(s)\n", failures ? "[FAIL]" : "[OK]",
 		    failures);
 	}
