@@ -86,6 +86,10 @@ struct io_uring_sqe {
 	union {
 		__u64	addr;	/* buffer pointer or msghdr/futex addr */
 		__u64	splice_off_in;
+		struct {
+			__u32	level;		/* URING_CMD socket options */
+			__u32	optname;
+		};
 	};
 	__u32	len;		/* buffer length or flags */
 	union {
@@ -108,6 +112,8 @@ struct io_uring_sqe {
 		__u32	xattr_flags;
 		__u32	msg_ring_flags;
 		__u32	uring_cmd_flags;
+		__u32	waitid_flags;
+		__u32	futex_flags;
 	};
 	__u64	user_data;	/* echoed back in CQE */
 	union {
@@ -118,6 +124,7 @@ struct io_uring_sqe {
 	union {
 		__s32	splice_fd_in;
 		__u32	file_index;
+		__u32	optlen;
 		struct {
 			__u16	addr_len;
 			__u16	__pad3[1];
@@ -128,6 +135,7 @@ struct io_uring_sqe {
 			__u64	addr3;
 			__u64	__pad2[1];
 		};
+		__u64	optval;
 		__u8	cmd[0];
 	};
 };
@@ -245,6 +253,151 @@ enum io_uring_op {
 #define IORING_RECVSEND_POLL_FIRST	(1U << 0)
 #define IORING_RECV_MULTISHOT		(1U << 1)
 #define IORING_RECVSEND_FIXED_BUF	(1U << 2)
+#define IORING_SEND_ZC_REPORT_USAGE	(1U << 3)
+#define IORING_RECVSEND_BUNDLE		(1U << 4)
+
+/*
+ * SEND_ZC / SENDMSG_ZC notification CQE result bit: the data was copied.
+ * kqring always copies, so a notification asked for with
+ * IORING_SEND_ZC_REPORT_USAGE always carries it.
+ */
+#define IORING_NOTIF_USAGE_ZC_COPIED	(1U << 31)
+
+/*
+ * Multishot RECVMSG: each selected buffer starts with this header, then
+ * msg_namelen bytes of name, msg_controllen bytes of control data, and the
+ * payload (sizes taken from the msghdr given at submission).
+ */
+struct io_uring_recvmsg_out {
+	__u32	namelen;
+	__u32	controllen;
+	__u32	payloadlen;
+	__u32	flags;
+};
+
+/*
+ * MSG_RING: sqe->addr is the command, sqe->msg_ring_flags the flags.
+ */
+#define IORING_MSG_DATA			0
+#define IORING_MSG_SEND_FD		1
+#define IORING_MSG_RING_CQE_SKIP	(1U << 0)
+#define IORING_MSG_RING_FLAGS_PASS	(1U << 1)
+
+/*
+ * URING_CMD on sockets (sqe->cmd_op)
+ */
+#define SOCKET_URING_OP_SIOCINQ		0
+#define SOCKET_URING_OP_SIOCOUTQ	1
+#define SOCKET_URING_OP_GETSOCKOPT	2
+#define SOCKET_URING_OP_SETSOCKOPT	3
+
+/*
+ * Linux constants FreeBSD lacks, for opcodes that take them.  Everything
+ * else (O_*, AT_*, MSG_*, POSIX_FADV_*, MADV_*, idtype_t, W*) is passed
+ * with its native FreeBSD value.
+ */
+#ifndef FALLOC_FL_KEEP_SIZE
+#define FALLOC_FL_KEEP_SIZE		0x01
+#endif
+#ifndef FALLOC_FL_PUNCH_HOLE
+#define FALLOC_FL_PUNCH_HOLE		0x02
+#endif
+#ifndef SYNC_FILE_RANGE_WAIT_BEFORE
+#define SYNC_FILE_RANGE_WAIT_BEFORE	0x1
+#define SYNC_FILE_RANGE_WRITE		0x2
+#define SYNC_FILE_RANGE_WAIT_AFTER	0x4
+#endif
+#ifndef XATTR_CREATE
+#define XATTR_CREATE			0x1
+#define XATTR_REPLACE			0x2
+#endif
+#define KQRING_XATTR_NAME_MAX		255
+#define KQRING_XATTR_SIZE_MAX		65536
+
+/*
+ * OPENAT2 (sqe->addr2 points to it, sqe->len is its size).  how.flags are
+ * FreeBSD O_* flags.
+ */
+struct open_how {
+	__u64	flags;
+	__u64	mode;
+	__u64	resolve;
+};
+
+#ifndef RESOLVE_NO_XDEV
+#define RESOLVE_NO_XDEV			0x01
+#define RESOLVE_NO_MAGICLINKS		0x02
+#define RESOLVE_NO_SYMLINKS		0x04
+#define RESOLVE_BENEATH			0x08
+#define RESOLVE_IN_ROOT			0x10
+#define RESOLVE_CACHED			0x20
+#endif
+
+/*
+ * STATX: Linux struct statx, filled from FreeBSD stat(2).  sqe->statx_flags
+ * are FreeBSD AT_* flags.
+ */
+struct statx_timestamp {
+	__s64	tv_sec;
+	__u32	tv_nsec;
+	__s32	__reserved;
+};
+
+struct statx {
+	__u32	stx_mask;
+	__u32	stx_blksize;
+	__u64	stx_attributes;
+	__u32	stx_nlink;
+	__u32	stx_uid;
+	__u32	stx_gid;
+	__u16	stx_mode;
+	__u16	__spare0[1];
+	__u64	stx_ino;
+	__u64	stx_size;
+	__u64	stx_blocks;
+	__u64	stx_attributes_mask;
+	struct statx_timestamp	stx_atime;
+	struct statx_timestamp	stx_btime;
+	struct statx_timestamp	stx_ctime;
+	struct statx_timestamp	stx_mtime;
+	__u32	stx_rdev_major;
+	__u32	stx_rdev_minor;
+	__u32	stx_dev_major;
+	__u32	stx_dev_minor;
+	__u64	stx_mnt_id;
+	__u32	stx_dio_mem_align;
+	__u32	stx_dio_offset_align;
+	__u64	__spare3[12];
+};
+
+_Static_assert(sizeof(struct statx) == 256, "struct statx must be 256 bytes");
+
+#define STATX_TYPE			0x00000001U
+#define STATX_MODE			0x00000002U
+#define STATX_NLINK			0x00000004U
+#define STATX_UID			0x00000008U
+#define STATX_GID			0x00000010U
+#define STATX_ATIME			0x00000020U
+#define STATX_MTIME			0x00000040U
+#define STATX_CTIME			0x00000080U
+#define STATX_INO			0x00000100U
+#define STATX_SIZE			0x00000200U
+#define STATX_BLOCKS			0x00000400U
+#define STATX_BASIC_STATS		0x000007ffU
+#define STATX_BTIME			0x00000800U
+#define STATX__RESERVED			0x80000000U
+
+#define STATX_ATTR_COMPRESSED		0x00000004
+#define STATX_ATTR_IMMUTABLE		0x00000010
+#define STATX_ATTR_APPEND		0x00000020
+#define STATX_ATTR_NODUMP		0x00000040
+
+/*
+ * ACCEPT flags (sqe->ioprio)
+ */
+#define IORING_ACCEPT_MULTISHOT		(1U << 0)
+#define IORING_ACCEPT_DONTWAIT		(1U << 1)
+#define IORING_ACCEPT_POLL_FIRST	(1U << 2)
 
 /*
  * sqe->fsync_flags
@@ -463,13 +616,31 @@ struct io_uring_getevents_arg {
  * Futex flags for IORING_OP_FUTEX_WAIT compatibility
  */
 #ifndef FUTEX2_SIZE_U32
+#define FUTEX2_SIZE_U8		0x00
+#define FUTEX2_SIZE_U16		0x01
 #define FUTEX2_SIZE_U32		0x02
+#define FUTEX2_SIZE_U64		0x03
+#define FUTEX2_NUMA		0x04
+#endif
+#ifndef FUTEX2_SIZE_MASK
+#define FUTEX2_SIZE_MASK	0x03
 #endif
 #ifndef FUTEX2_PRIVATE
 #define FUTEX2_PRIVATE		128
 #endif
 #ifndef FUTEX_BITSET_MATCH_ANY
 #define FUTEX_BITSET_MATCH_ANY	0xffffffffU
+#endif
+#ifndef FUTEX_WAITV_MAX
+#define FUTEX_WAITV_MAX		128
+
+/* FUTEX_WAITV vector entry (sqe->addr, sqe->len entries). */
+struct futex_waitv {
+	__u64	val;
+	__u64	uaddr;
+	__u32	flags;
+	__u32	__reserved;
+};
 #endif
 
 /*

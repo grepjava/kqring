@@ -39,21 +39,33 @@
 #include <sys/unistd.h>
 #include <sys/file.h>
 #include <sys/filedesc.h>
+#include <sys/filio.h>
 #include <sys/capsicum.h>
 #include <sys/fcntl.h>
+#include <sys/extattr.h>
+#include <sys/mbuf.h>
+#include <sys/mount.h>
+#include <sys/namei.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <sys/domain.h>
 #include <sys/protosw.h>
 #include <sys/uio.h>
 #include <sys/poll.h>
+#include <sys/signal.h>
 #include <sys/stat.h>
 #include <sys/syscallsubr.h>
 #include <sys/sysproto.h>
 #include <sys/time.h>
+#include <sys/umtxvar.h>
 #include <sys/vnode.h>
+#include <sys/wait.h>
 
 #include <machine/atomic.h>
+
+#ifdef KQRING_MAC
+#include <security/mac/mac_framework.h>
+#endif
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
@@ -73,6 +85,14 @@ MALLOC_DEFINE(M_KQRING, "kqring", "FreeBSD kqring I/O ring state");
 #define KQRING_MAX_PBUF_ENTRIES	32768U
 /* CQEs held in the kernel while the CQ ring is full (IORING_FEAT_NODROP). */
 #define KQRING_MAX_OVERFLOW	16384U
+/* MSG_RING CQEs queued for a ring's owner and not yet posted. */
+#define KQRING_MAX_REMOTE	16384U
+/*
+ * Kernel memory a ring may hold in SQE arguments copied at submission
+ * (paths, iovecs, msghdrs, xattr values, futex vectors) for requests that
+ * have not completed; past it submission fails with -ENOMEM.
+ */
+#define KQRING_MAX_ARG_BYTES	(32U * 1024 * 1024)
 
 /* io_uring_params flags accepted by KQRING_IOC_SETUP. */
 #define	KQRING_SETUP_FLAGS						\
@@ -155,10 +175,52 @@ struct kqring_op {
 	uint32_t		target_seq;	/* completion-count TIMEOUT */
 	uint32_t		repeats;	/* multishot: left, 0 = forever */
 	bool			seq_timeout;	/* counted in ctx->nseqto */
+	/*
+	 * SQE arguments copied in at submission (IORING_FEAT_SUBMIT_STABLE):
+	 * a request that runs later (linked, drained, armed) never reads
+	 * user memory the SQE pointed to, except for output buffers.
+	 */
+	void			*args;
+	size_t			args_len;
+	size_t			done_io;	/* MSG_WAITALL: bytes so far */
+	bool			sock_rw;	/* READ/WRITE(V) on a socket */
+	bool			connecting;	/* CONNECT: soconnect() issued */
+	bool			futex_woken;	/* FUTEX_WAKE hit; res in ->res */
+	uint32_t		nfwait;		/* FUTEX_WAIT(V) nodes in args */
 	struct io_uring_sqe	sqe;
 };
 
 TAILQ_HEAD(kqring_op_list, kqring_op);
+
+/*
+ * An armed FUTEX_WAIT, or one word of an armed FUTEX_WAITV, hashed by its
+ * umtx key in kqring_futex_hash so that FUTEX_WAKE from any ring (or
+ * process, for shared futexes) finds it.  Lock order: kqring_futex_mtx,
+ * then ctx->mtx.
+ */
+struct kqring_fwait {
+	LIST_ENTRY(kqring_fwait) link;
+	struct kqring_op	*op;
+	struct umtx_key		key;
+	uint64_t		uaddr;
+	uint64_t		val;
+	uint32_t		mask;
+	uint32_t		flags;		/* FUTEX2_* */
+	uint32_t		idx;		/* FUTEX_WAITV index */
+	bool			keyed;		/* key holds a reference */
+	bool			hashed;		/* on kqring_futex_hash */
+};
+
+#define	KQRING_FUTEX_HASH	256
+static LIST_HEAD(kqring_fwait_list, kqring_fwait)
+    kqring_futex_hash[KQRING_FUTEX_HASH];
+static struct mtx kqring_futex_mtx;
+
+/* A MSG_RING CQE queued for the target ring's owner to post. */
+struct kqring_rcqe {
+	STAILQ_ENTRY(kqring_rcqe) link;
+	struct io_uring_cqe	cqe;
+};
 
 #define	KQ_DIR_RCV	0x1
 #define	KQ_DIR_SND	0x2
@@ -217,8 +279,16 @@ struct kqring_ctx {
 	/* Armed operations and deferred taskwork queue */
 	struct kqring_op_list	active_ops;
 	struct kqring_op_list	taskwork_ops;
-	int			nfutex;		/* armed FUTEX_WAIT ops */
+	int			nfutex;		/* armed FUTEX_WAIT(V) ops */
 	int			nseqto;		/* armed completion-count TIMEOUTs */
+	int			nwaitid;	/* armed WAITID ops */
+	size_t			args_bytes;	/* sum of live ops' args_len */
+	/*
+	 * MSG_RING CQEs from other rings (or this one), posted by the owner
+	 * in kqring_run_taskwork().  Under mtx.
+	 */
+	STAILQ_HEAD(, kqring_rcqe) rcq;
+	uint32_t		nrcq;
 	/*
 	 * Requests to issue (link successors) and IOSQE_IO_DRAIN-deferred
 	 * chains.  Owner thread only.  nreqs counts every live request,
@@ -576,6 +646,33 @@ kqring_sb_disarm(struct kqring_op *op, struct socket *so, int which)
 	SOCK_BUF_UNLOCK(so, which);
 }
 
+/*
+ * Take op's FUTEX_WAIT(V) words off kqring_futex_hash.  Only the owner
+ * thread hashes and unhashes, so ->hashed is stable without the lock.
+ */
+static void
+kqring_futex_unhash_locked(struct kqring_op *op)
+{
+	struct kqring_fwait *fw = op->args;
+	uint32_t i;
+
+	for (i = 0; i < op->nfwait && !fw[i].hashed; i++)
+		;
+	if (i == op->nfwait)
+		return;
+	/* Lock order: kqring_futex_mtx before ctx->mtx. */
+	mtx_unlock(&op->ctx->mtx);
+	mtx_lock(&kqring_futex_mtx);
+	for (; i < op->nfwait; i++) {
+		if (fw[i].hashed) {
+			LIST_REMOVE(&fw[i], link);
+			fw[i].hashed = false;
+		}
+	}
+	mtx_unlock(&kqring_futex_mtx);
+	mtx_lock(&op->ctx->mtx);
+}
+
 static void
 kqring_op_disarm_locked(struct kqring_op *op)
 {
@@ -587,6 +684,7 @@ kqring_op_disarm_locked(struct kqring_op *op)
 		op->ctx->npolled--;
 	}
 	kqring_timer_stop_locked(op);
+	kqring_futex_unhash_locked(op);
 	if (so != NULL) {
 		op->so = NULL;
 		/*
@@ -624,8 +722,10 @@ kqring_op_unarm_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 	op->cancelled = true;
 	op->armed = false;
 	TAILQ_REMOVE(&ctx->active_ops, op, active_link);
-	if (op->sqe.opcode == IORING_OP_FUTEX_WAIT)
+	if (op->nfwait != 0)
 		ctx->nfutex--;
+	if (op->sqe.opcode == IORING_OP_WAITID)
+		ctx->nwaitid--;
 	if (op->seq_timeout) {
 		op->seq_timeout = false;
 		ctx->nseqto--;
@@ -675,6 +775,18 @@ kqring_op_free(struct kqring_op *op)
 	 */
 	if (op->timer_init)
 		callout_drain(&op->callout);
+	if (op->args != NULL) {
+		struct kqring_fwait *fw = op->args;
+
+		for (uint32_t i = 0; i < op->nfwait; i++) {
+			KASSERT(!fw[i].hashed, ("kqring: freeing hashed futex"));
+			if (fw[i].keyed)
+				umtx_key_release(&fw[i].key);
+		}
+		ctx->args_bytes -= op->args_len;
+		free(op->args, M_KQRING);
+		op->args = NULL;
+	}
 	if (!ctx->closing && ctx->nfree < KQRING_OP_CACHE_MAX) {
 		TAILQ_INSERT_HEAD(&ctx->free_ops, op, active_link);
 		ctx->nfree++;
@@ -698,8 +810,199 @@ kqring_done(struct kqring_op *op, int32_t res, uint32_t cflags)
 }
 
 /*
- * Try a non-blocking socket receive (direct buffer or IOSQE_BUFFER_SELECT).
- * Returns:
+ * Argument layouts in op->args, copied in by kqring_req_prep():
+ *   READV / WRITEV:		struct iovec[sqe->len]
+ *   CONNECT / BIND:		struct sockaddr (sa_len = its length)
+ *   SEND / SEND_ZC:		struct sockaddr, if a destination was given
+ *   SENDMSG(_ZC) / RECVMSG:	struct kqring_msg_args
+ *   path ops / OPENAT2:	struct kqring_path_args
+ *   xattr ops:			struct kqring_xattr_args
+ *   FUTEX_WAIT(V):		struct kqring_fwait[op->nfwait]
+ */
+struct kqring_msg_args {
+	struct msghdr	msg;		/* msg_iov -> iov[] */
+	uint8_t		name[SOCK_MAXADDRLEN];	/* SENDMSG: msg_name */
+	struct iovec	iov[];		/* then SENDMSG control data */
+};
+
+/*
+ * RECVMSG with a provided buffer: the msghdr has at most one iovec, whose
+ * length (0: none) caps the buffer used, as in io_uring.
+ */
+static inline uint32_t
+kqring_msg_buf_cap(const struct kqring_msg_args *ma)
+{
+	if (ma->msg.msg_iovlen == 0)
+		return (0);
+	return ((uint32_t)MIN(ma->iov[0].iov_len, UINT32_MAX));
+}
+
+/*
+ * Look up the socket an op works on.  For an armed op (taskwork),
+ * `expect` is the socket it was armed on.  Every attempt re-resolves
+ * sqe->fd (for Capsicum rights), and if the descriptor was closed or
+ * reused for another file in the meantime the op fails with EBADF rather
+ * than operating on the new file.
+ */
+static int
+kqring_getsock(const struct kqring_op *op, struct socket *expect,
+    cap_rights_t *rights, struct file **fpp)
+{
+	struct thread *td = curthread;
+	struct file *fp;
+	int error;
+
+	error = fget(td, op->sqe.fd, rights, &fp);
+	if (error != 0)
+		return (error);
+	if (fp->f_type != DTYPE_SOCKET) {
+		fdrop(fp, td);
+		return (ENOTSOCK);
+	}
+	if (expect != NULL && fp->f_data != expect) {
+		fdrop(fp, td);
+		return (EBADF);
+	}
+	*fpp = fp;
+	return (0);
+}
+
+static inline bool
+kqring_so_stream(const struct socket *so)
+{
+	return (so->so_type == SOCK_STREAM || so->so_type == SOCK_SEQPACKET);
+}
+
+/*
+ * Whether a receive would not block: bytes buffered, EOF or a pending
+ * error.  ENOTCONN for a listening socket.  Checked before popping a
+ * provided buffer, which is only consumed when bytes are received.
+ */
+static int
+kqring_so_readable(struct socket *so, bool *readable)
+{
+	SOCK_RECVBUF_LOCK(so);
+	/* Checked under the sockbuf lock; see kqring_sb_disarm(). */
+	if (SOLISTENING(so)) {
+		SOCK_RECVBUF_UNLOCK(so);
+		return (ENOTCONN);
+	}
+	*readable = sbavail(&so->so_rcv) > 0 ||
+	    (so->so_rcv.sb_state & SBS_CANTRCVMORE) != 0 ||
+	    so->so_error != 0;
+	SOCK_RECVBUF_UNLOCK(so);
+	return (0);
+}
+
+/* Unlocked hint: more is buffered (or EOF) after a receive. */
+static inline bool
+kqring_so_rcv_pending(struct socket *so, bool eof)
+{
+	return (!SOLISTENING(so) && (sbavail(&so->so_rcv) > 0 ||
+	    (eof && (so->so_rcv.sb_state & SBS_CANTRCVMORE) != 0)));
+}
+
+/*
+ * Pick a provided buffer for a receive of at most `len` bytes (0: the
+ * buffer's size).  Returns EAGAIN, without consuming a buffer, if nothing
+ * is there to receive.
+ */
+static int
+kqring_recv_pick_buf(struct kqring_ctx *ctx, struct socket *so, uint32_t len,
+    struct io_uring_buf *pbuf)
+{
+	bool readable;
+	int error;
+
+	error = kqring_so_readable(so, &readable);
+	if (error != 0)
+		return (error);
+	if (!readable)
+		return (EAGAIN);
+	error = kqring_pbuf_peek(ctx, pbuf);
+	if (error != 0)
+		return (error);
+	if (len != 0 && len < pbuf->len)
+		pbuf->len = len;
+	return (0);
+}
+
+static inline uint32_t
+kqring_pbuf_cflags(const struct io_uring_buf *pbuf)
+{
+	return (IORING_CQE_F_BUFFER |
+	    ((uint32_t)pbuf->bid << IORING_CQE_BUFFER_SHIFT));
+}
+
+/* The result of a transfer, which io_uring reports as an int. */
+static inline int32_t
+kqring_xfer_res(size_t n)
+{
+	return ((int32_t)MIN(n, (size_t)INT32_MAX));
+}
+
+/*
+ * End one attempt that transferred `n` bytes with `error`.  An error after
+ * earlier MSG_WAITALL progress reports the progress, as in io_uring.
+ * Returns EAGAIN to wait (nothing transferred yet), else 0 with the
+ * result in op->res.
+ */
+static int
+kqring_xfer_end(struct kqring_op *op, int error, size_t n)
+{
+	if (n == 0 && error == EWOULDBLOCK)
+		return (EAGAIN);
+	if (n == 0 && error != 0) {
+		if (op->done_io != 0)
+			return (kqring_done(op, kqring_xfer_res(op->done_io), 0));
+		return (kqring_done(op, -error, 0));
+	}
+	return (-1);
+}
+
+/*
+ * MSG_WAITALL on a stream socket: keep a short transfer's progress and
+ * wait for the rest (EAGAIN), as io_uring retries.  Returns the total so
+ * far once done.
+ */
+static int
+kqring_waitall(struct kqring_op *op, size_t n, size_t want, size_t *total)
+{
+	op->done_io += n;
+	if (n > 0 && op->done_io < want)
+		return (EAGAIN);
+	*total = op->done_io;
+	return (0);
+}
+
+static size_t
+kqring_iov_len(const struct iovec *iov, u_int iovcnt)
+{
+	size_t len = 0;
+
+	/* kqring_req_prep() checked that the sum fits in a ssize_t. */
+	for (u_int i = 0; i < iovcnt; i++)
+		len += iov[i].iov_len;
+	return (len);
+}
+
+static void
+kqring_uio_init(struct uio *auio, struct iovec *iov, u_int iovcnt,
+    enum uio_rw rw)
+{
+	auio->uio_iov = iov;
+	auio->uio_iovcnt = iovcnt;
+	auio->uio_offset = 0;
+	auio->uio_resid = kqring_iov_len(iov, iovcnt);
+	auio->uio_segflg = UIO_USERSPACE;
+	auio->uio_rw = rw;
+	auio->uio_td = curthread;
+}
+
+/*
+ * Socket receive for RECV, READ_MULTISHOT, and READ / READV on a socket:
+ * into the SQE's buffer, its iovec, or a provided buffer
+ * (IOSQE_BUFFER_SELECT).  Returns:
  *   0: the attempt finished, with its result in op->res / op->cflags;
  *      IORING_CQE_F_MORE in op->cflags means a multishot receive goes on.
  *   EAGAIN: socket would block; caller should arm (or keep armed) upcall.
@@ -707,11 +1010,6 @@ kqring_done(struct kqring_op *op, int32_t res, uint32_t cflags)
  * (bytes still buffered or EOF), used to end multishot drain loops without
  * a final EAGAIN soreceive(); a stale value is harmless because the upcall
  * stays armed.
- *
- * For an armed op (taskwork), `expect` is the socket the op was armed on.
- * All exec functions re-resolve sqe->fd (for Capsicum rights), and if the
- * descriptor was closed or reused for another file in the meantime they
- * complete with -EBADF rather than operating on the new file.
  */
 static int
 kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
@@ -722,110 +1020,90 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	struct file *fp = NULL;
 	struct socket *so;
 	struct uio auio;
-	struct iovec aiov;
+	struct iovec aiov, *iov = &aiov;
 	struct io_uring_buf pbuf;
 	cap_rights_t rights;
-	void *uaddr;
-	size_t ulen;
+	u_int iovcnt = 1;
 	uint32_t cqe_flags = 0;
 	bool buf_select = (sqe->flags & IOSQE_BUFFER_SELECT) != 0;
-	bool multishot = (sqe->ioprio & IORING_RECV_MULTISHOT) != 0;
-	int error, flags;
+	bool multishot = sqe->opcode == IORING_OP_READ_MULTISHOT ||
+	    (sqe->opcode == IORING_OP_RECV &&
+	    (sqe->ioprio & IORING_RECV_MULTISHOT) != 0);
+	bool waitall;
+	size_t n;
+	int error, flags, rc;
 
 	*more_out = false;
 
-	error = fget_read(td, sqe->fd, cap_rights_init_one(&rights, CAP_RECV),
-	    &fp);
-	if (error != 0)
+	error = kqring_getsock(op, expect,
+	    cap_rights_init_one(&rights, CAP_RECV), &fp);
+	if (error != 0) {
+		/* READ_MULTISHOT needs readiness, which only sockets have yet. */
+		if (error == ENOTSOCK && sqe->opcode == IORING_OP_READ_MULTISHOT)
+			error = EOPNOTSUPP;
 		return (kqring_done(op, -error, 0));
-	if (fp->f_type != DTYPE_SOCKET) {
-		fdrop(fp, td);
-		return (kqring_done(op, -ENOTSOCK, 0));
 	}
 	so = fp->f_data;
-	if (expect != NULL && so != expect) {
+
+	if (buf_select) {
+		error = kqring_recv_pick_buf(ctx, so, sqe->len, &pbuf);
+		if (error != 0) {
+			fdrop(fp, td);
+			if (error == EAGAIN)
+				return (EAGAIN);
+			return (kqring_done(op, -error, 0));
+		}
+		aiov.iov_base = (void *)(uintptr_t)pbuf.addr;
+		aiov.iov_len = pbuf.len;
+	} else if (sqe->opcode == IORING_OP_READV) {
+		/* uiomove() advances the kernel iovec copy in place. */
+		iov = op->args;
+		iovcnt = sqe->len;
+	} else {
+		aiov.iov_base = (char *)(uintptr_t)sqe->addr + op->done_io;
+		aiov.iov_len = sqe->len - op->done_io;
+	}
+	kqring_uio_init(&auio, iov, iovcnt, UIO_READ);
+	ssize_t want = auio.uio_resid;
+
+	flags = MSG_DONTWAIT;
+	if (sqe->opcode == IORING_OP_RECV)
+		flags |= (int)sqe->msg_flags;
+	waitall = (flags & MSG_WAITALL) != 0 && !buf_select &&
+	    kqring_so_stream(so);
+	error = soreceive(so, NULL, &auio, NULL, NULL, &flags);
+	/* MSG_TRUNC on a datagram: uio_resid underflows to the real size. */
+	n = (size_t)(want - auio.uio_resid);
+
+	if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
 		fdrop(fp, td);
-		return (kqring_done(op, -EBADF, 0));
+		return (rc);
 	}
 
 	/*
-	 * If buffer selection is requested, check whether bytes or EOF/error
-	 * are actually waiting before popping a buffer, and only commit the
-	 * buffer when > 0 bytes are read.
+	 * Commit the PBUF_RING buffer ONLY when n > 0!  On EOF (n == 0) the
+	 * buffer stays in the PBUF_RING and res = 0 has no
+	 * IORING_CQE_F_BUFFER.
 	 */
-	if (buf_select) {
-		SOCK_RECVBUF_LOCK(so);
-		/* Checked under the sockbuf lock; see kqring_sb_disarm(). */
-		if (SOLISTENING(so)) {
-			SOCK_RECVBUF_UNLOCK(so);
-			fdrop(fp, td);
-			return (kqring_done(op, -ENOTCONN, 0));
-		}
-		bool readable = (sbavail(&so->so_rcv) > 0) ||
-		    (so->so_rcv.sb_state & SBS_CANTRCVMORE) != 0 ||
-		    so->so_error != 0;
-		SOCK_RECVBUF_UNLOCK(so);
-		if (!readable) {
-			fdrop(fp, td);
-			return (EAGAIN);
-		}
-		error = kqring_pbuf_peek(ctx, &pbuf);
-		if (error != 0) {
-			fdrop(fp, td);
-			return (kqring_done(op, -error, 0));
-		}
-		uaddr = (void *)(uintptr_t)pbuf.addr;
-		ulen = pbuf.len;
-	} else {
-		uaddr = (void *)(uintptr_t)sqe->addr;
-		ulen = sqe->len;
+	if (buf_select && n > 0) {
+		kqring_pbuf_commit(ctx);
+		cqe_flags |= kqring_pbuf_cflags(&pbuf);
 	}
-
-	aiov.iov_base = uaddr;
-	aiov.iov_len = ulen;
-	auio.uio_iov = &aiov;
-	auio.uio_iovcnt = 1;
-	auio.uio_offset = 0;
-	auio.uio_resid = ulen;
-	auio.uio_segflg = UIO_USERSPACE;
-	auio.uio_rw = UIO_READ;
-	auio.uio_td = td;
-
-	flags = MSG_DONTWAIT | MSG_NOSIGNAL;
-	error = soreceive(so, NULL, &auio, NULL, NULL, &flags);
-	size_t transferred = ulen - auio.uio_resid;
-
-	if (error == EWOULDBLOCK && transferred == 0) {
+	if (multishot && n > 0) {
+		cqe_flags |= IORING_CQE_F_MORE;
+		*more_out = kqring_so_rcv_pending(so, true);
+	} else if (kqring_so_rcv_pending(so, false)) {
+		cqe_flags |= IORING_CQE_F_SOCK_NONEMPTY;
+	}
+	if (waitall && kqring_waitall(op, n, sqe->len, &n) == EAGAIN) {
 		fdrop(fp, td);
 		return (EAGAIN);
 	}
-
-	if (error != 0 && transferred == 0) {
-		fdrop(fp, td);
-		return (kqring_done(op, -error, 0));
-	}
-
-	/*
-	 * Commit the PBUF_RING buffer ONLY when transferred > 0!
-	 * On EOF (transferred == 0), we leave the buffer in PBUF_RING and
-	 * post res = 0 without IORING_CQE_F_BUFFER.
-	 */
-	if (buf_select && transferred > 0) {
-		kqring_pbuf_commit(ctx);
-		cqe_flags |= IORING_CQE_F_BUFFER |
-		    ((uint32_t)pbuf.bid << IORING_CQE_BUFFER_SHIFT);
-	}
-
-	if (multishot && transferred > 0) {
-		cqe_flags |= IORING_CQE_F_MORE;
-		*more_out = !SOLISTENING(so) && (sbavail(&so->so_rcv) > 0 ||
-		    (so->so_rcv.sb_state & SBS_CANTRCVMORE) != 0);
-	}
-
 	fdrop(fp, td);
-	return (kqring_done(op, (int32_t)transferred, cqe_flags));
+	return (kqring_done(op, kqring_xfer_res(n), cqe_flags));
 }
 
+/* SEND, SEND_ZC, and WRITE / WRITEV on a socket. */
 static int
 kqring_exec_send(struct kqring_op *op, struct socket *expect)
 {
@@ -833,49 +1111,367 @@ kqring_exec_send(struct kqring_op *op, struct socket *expect)
 	struct thread *td = curthread;
 	struct file *fp = NULL;
 	struct socket *so;
+	struct sockaddr *to = NULL;
 	struct uio auio;
+	struct iovec aiov, *iov = &aiov;
+	cap_rights_t rights;
+	u_int iovcnt = 1;
+	bool waitall = false;
+	size_t n;
+	int error, flags = MSG_DONTWAIT | MSG_NOSIGNAL, rc;
+
+	if (sqe->opcode == IORING_OP_SEND || sqe->opcode == IORING_OP_SEND_ZC) {
+		flags |= (int)sqe->msg_flags;
+		to = op->args;
+	}
+	/* As sendto(2): no addressed sends in capability mode. */
+	if (to != NULL && IN_CAPABILITY_MODE(td))
+		return (kqring_done(op, -ECAPMODE, 0));
+	if (to != NULL)
+		cap_rights_init(&rights, CAP_SEND, CAP_CONNECT);
+	else
+		cap_rights_init_one(&rights, CAP_SEND);
+	error = kqring_getsock(op, expect, &rights, &fp);
+	if (error != 0)
+		return (kqring_done(op, -error, 0));
+	so = fp->f_data;
+
+	if (sqe->opcode == IORING_OP_WRITEV) {
+		iov = op->args;
+		iovcnt = sqe->len;
+	} else {
+		aiov.iov_base = (char *)(uintptr_t)sqe->addr + op->done_io;
+		aiov.iov_len = sqe->len - op->done_io;
+	}
+	kqring_uio_init(&auio, iov, iovcnt, UIO_WRITE);
+	ssize_t want = auio.uio_resid;
+
+	waitall = (flags & MSG_WAITALL) != 0 && kqring_so_stream(so);
+	flags &= ~MSG_WAITALL;
+	error = sosend(so, to, &auio, NULL, NULL, flags, td);
+	n = (size_t)(want - auio.uio_resid);
+	fdrop(fp, td);
+
+	if ((rc = kqring_xfer_end(op, error, n)) >= 0)
+		return (rc);
+	if (waitall && kqring_waitall(op, n, sqe->len, &n) == EAGAIN)
+		return (EAGAIN);
+	return (kqring_done(op, kqring_xfer_res(n), 0));
+}
+
+/*
+ * Copy a received message's control data (SCM_RIGHTS already installed
+ * as descriptors) to `ubuf`, as recvmsg(2) does; what does not fit is
+ * disposed of (closing such descriptors) and flagged MSG_CTRUNC.
+ */
+static int
+kqring_copyout_control(struct mbuf *control, void *ubuf, size_t space,
+    size_t *lenp, int *flagsp)
+{
+	struct mbuf *m;
+	size_t len = 0;
+	int error = 0;
+
+	for (m = control; m != NULL && space - len >= (size_t)m->m_len;
+	    m = m->m_next) {
+		error = copyout(mtod(m, void *), (char *)ubuf + len, m->m_len);
+		if (error != 0)
+			break;
+		len += m->m_len;
+	}
+	if (m != NULL) {
+		if (error == 0)
+			*flagsp |= MSG_CTRUNC;
+		m_dispose_extcontrolm(m);
+	}
+	m_freem(control);
+	*lenp = len;
+	return (error);
+}
+
+/*
+ * Multishot RECVMSG: one message per provided buffer, laid out as
+ * struct io_uring_recvmsg_out, then the name and control areas sized by
+ * the submitted msghdr, then the payload.
+ */
+static int
+kqring_exec_recvmsg_multi(struct kqring_ctx *ctx, struct kqring_op *op,
+    struct socket *so, bool *more_out)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	const struct kqring_msg_args *ma = op->args;
+	struct thread *td = curthread;
+	struct io_uring_recvmsg_out out;
+	struct io_uring_buf pbuf;
+	struct msghdr m;
 	struct iovec aiov;
+	struct mbuf *control = NULL;
+	uint8_t name[SOCK_MAXADDRLEN];
+	size_t namesz = ma->msg.msg_namelen;
+	size_t ctlsz = ma->msg.msg_controllen;
+	size_t hdr = sizeof(out) + namesz + ctlsz, clen, n;
+	char *ubuf;
+	int error;
+
+	error = kqring_recv_pick_buf(ctx, so, kqring_msg_buf_cap(ma), &pbuf);
+	if (error != 0) {
+		if (error == EAGAIN)
+			return (EAGAIN);
+		return (kqring_done(op, -error, 0));
+	}
+	if (pbuf.len < hdr)
+		return (kqring_done(op, -EFAULT, 0));
+	ubuf = (char *)(uintptr_t)pbuf.addr;
+
+	/* Ask for the whole name, to report its real length. */
+	bzero(&m, sizeof(m));
+	m.msg_name = name;
+	m.msg_namelen = sizeof(name);
+	aiov.iov_base = ubuf + hdr;
+	aiov.iov_len = pbuf.len - hdr;
+	m.msg_iov = &aiov;
+	m.msg_iovlen = 1;
+	m.msg_flags = (int)sqe->msg_flags | MSG_DONTWAIT;
+	error = kern_recvit(td, sqe->fd, &m, UIO_SYSSPACE,
+	    ctlsz != 0 ? &control : NULL);
+	if (error == EWOULDBLOCK)
+		return (EAGAIN);
+	if (error != 0)
+		return (kqring_done(op, -error, 0));
+	n = td->td_retval[0];
+	if (n == 0 && kqring_so_stream(so)) {
+		/* EOF: ends the multishot, buffer not consumed. */
+		m_freem(control);
+		return (kqring_done(op, 0, 0));
+	}
+
+	bzero(&out, sizeof(out));
+	out.namelen = m.msg_namelen;
+	if (MIN(out.namelen, namesz) != 0)
+		error = copyout(name, ubuf + sizeof(out),
+		    MIN(out.namelen, namesz));
+	clen = 0;
+	if (control != NULL) {
+		if (error == 0)
+			error = kqring_copyout_control(control,
+			    ubuf + sizeof(out) + namesz, ctlsz, &clen,
+			    &m.msg_flags);
+		else
+			m_freem(control);
+	}
+	out.controllen = (uint32_t)clen;
+	out.payloadlen = (uint32_t)MIN(n, UINT32_MAX);
+	out.flags = (uint32_t)(m.msg_flags & ~MSG_DONTWAIT);
+	if (error == 0)
+		error = copyout(&out, ubuf, sizeof(out));
+	if (error != 0)
+		return (kqring_done(op, -error, 0));
+
+	kqring_pbuf_commit(ctx);
+	*more_out = kqring_so_rcv_pending(so, true);
+	return (kqring_done(op, kqring_xfer_res(hdr + MIN(n, aiov.iov_len)),
+	    kqring_pbuf_cflags(&pbuf) | IORING_CQE_F_MORE));
+}
+
+/* RECVMSG: kern_recvit() on the kernel copy of the msghdr's iovec. */
+static int
+kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
+    struct socket *expect, bool *more_out)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct kqring_msg_args *ma = op->args;
+	struct thread *td = curthread;
+	struct msghdr *umsg = (struct msghdr *)(uintptr_t)sqe->addr;
+	struct io_uring_buf pbuf;
+	struct file *fp;
+	struct socket *so;
+	struct msghdr msg;
+	struct iovec aiov;
+	cap_rights_t rights;
+	uint32_t cqe_flags = 0;
+	bool buf_select = (sqe->flags & IOSQE_BUFFER_SELECT) != 0;
+	bool waitall;
+	size_t n;
+	int error, rc;
+
+	*more_out = false;
+	error = kqring_getsock(op, expect,
+	    cap_rights_init_one(&rights, CAP_RECV), &fp);
+	if (error != 0)
+		return (kqring_done(op, -error, 0));
+	so = fp->f_data;
+
+	if ((sqe->ioprio & IORING_RECV_MULTISHOT) != 0) {
+		rc = kqring_exec_recvmsg_multi(ctx, op, so, more_out);
+		fdrop(fp, td);
+		return (rc);
+	}
+
+	msg = ma->msg;
+	if (buf_select) {
+		error = kqring_recv_pick_buf(ctx, so, kqring_msg_buf_cap(ma),
+		    &pbuf);
+		if (error != 0) {
+			fdrop(fp, td);
+			if (error == EAGAIN)
+				return (EAGAIN);
+			return (kqring_done(op, -error, 0));
+		}
+		aiov.iov_base = (void *)(uintptr_t)pbuf.addr;
+		aiov.iov_len = pbuf.len;
+		msg.msg_iov = &aiov;
+		msg.msg_iovlen = 1;
+	}
+	size_t want = kqring_iov_len(msg.msg_iov, msg.msg_iovlen);
+	msg.msg_flags = (int)sqe->msg_flags | MSG_DONTWAIT;
+	waitall = (msg.msg_flags & MSG_WAITALL) != 0 && !buf_select &&
+	    kqring_so_stream(so);
+	error = kern_recvit(td, sqe->fd, &msg, UIO_USERSPACE, NULL);
+	n = error == 0 ? (size_t)td->td_retval[0] : 0;
+	if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
+		fdrop(fp, td);
+		return (rc);
+	}
+
+	/* As recvmsg(2), report the name, control and flags lengths. */
+	int oflags = msg.msg_flags & ~(MSG_DONTWAIT & ~(int)sqe->msg_flags);
+	error = copyout(&msg.msg_namelen, &umsg->msg_namelen,
+	    sizeof(msg.msg_namelen));
+	if (error == 0)
+		error = copyout(&msg.msg_controllen, &umsg->msg_controllen,
+		    sizeof(msg.msg_controllen));
+	if (error == 0)
+		error = copyout(&oflags, &umsg->msg_flags, sizeof(oflags));
+	if (buf_select && n > 0) {
+		kqring_pbuf_commit(ctx);
+		cqe_flags |= kqring_pbuf_cflags(&pbuf);
+	}
+	if (error != 0) {
+		fdrop(fp, td);
+		return (kqring_done(op, -error, cqe_flags));
+	}
+	if (kqring_so_rcv_pending(so, false))
+		cqe_flags |= IORING_CQE_F_SOCK_NONEMPTY;
+	if (waitall && kqring_waitall(op, n, want + op->done_io, &n) ==
+	    EAGAIN) {
+		fdrop(fp, td);
+		return (EAGAIN);
+	}
+	fdrop(fp, td);
+	return (kqring_done(op, kqring_xfer_res(n), cqe_flags));
+}
+
+/* SENDMSG / SENDMSG_ZC: kern_sendit() on the kernel copy of the msghdr. */
+static int
+kqring_exec_sendmsg(struct kqring_op *op, struct socket *expect)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct kqring_msg_args *ma = op->args;
+	struct thread *td = curthread;
+	struct mbuf *control = NULL;
+	struct file *fp;
+	struct socket *so;
+	struct msghdr msg;
+	cap_rights_t rights;
+	bool waitall;
+	size_t n;
+	int error, flags, rc;
+
+	/* As sendmsg(2): no addressed sends in capability mode. */
+	if (ma->msg.msg_name != NULL && IN_CAPABILITY_MODE(td))
+		return (kqring_done(op, -ECAPMODE, 0));
+	error = kqring_getsock(op, expect,
+	    cap_rights_init_one(&rights, CAP_SEND), &fp);
+	if (error != 0)
+		return (kqring_done(op, -error, 0));
+	so = fp->f_data;
+	waitall = (sqe->msg_flags & MSG_WAITALL) != 0 && kqring_so_stream(so);
+
+	msg = ma->msg;
+	size_t want = kqring_iov_len(msg.msg_iov, msg.msg_iovlen);
+	if (msg.msg_controllen != 0) {
+		/* kern_sendit() consumes the mbuf: rebuild it each attempt. */
+		control = m_get2(msg.msg_controllen, M_WAITOK, MT_CONTROL, 0);
+		control->m_len = msg.msg_controllen;
+		bcopy(msg.msg_control, mtod(control, void *),
+		    msg.msg_controllen);
+	}
+	flags = ((int)sqe->msg_flags & ~MSG_WAITALL) | MSG_DONTWAIT |
+	    MSG_NOSIGNAL;
+	error = kern_sendit(td, sqe->fd, &msg, flags, control, UIO_USERSPACE);
+	n = error == 0 ? (size_t)td->td_retval[0] : 0;
+	fdrop(fp, td);
+
+	if ((rc = kqring_xfer_end(op, error, n)) >= 0)
+		return (rc);
+	/* The control data went with the first part, as in io_uring. */
+	if (n > 0)
+		ma->msg.msg_controllen = 0;
+	if (waitall && kqring_waitall(op, n, want + op->done_io, &n) ==
+	    EAGAIN)
+		return (EAGAIN);
+	return (kqring_done(op, kqring_xfer_res(n), 0));
+}
+
+/*
+ * CONNECT: start a non-blocking connect, then (armed on so_snd, which
+ * soisconnected() and soisdisconnected() wake) wait for it to finish.
+ * The checks mirror kern_connectat(), which would sleep.
+ */
+static int
+kqring_exec_connect(struct kqring_op *op, struct socket *expect)
+{
+	struct thread *td = curthread;
+	struct sockaddr *sa = op->args;
+	struct file *fp;
+	struct socket *so;
 	cap_rights_t rights;
 	int error;
 
-	error = fget_write(td, sqe->fd, cap_rights_init_one(&rights, CAP_SEND),
-	    &fp);
+	if (IN_CAPABILITY_MODE(td))
+		return (kqring_done(op, -ECAPMODE, 0));
+	error = kqring_getsock(op, expect,
+	    cap_rights_init_one(&rights, CAP_CONNECT), &fp);
 	if (error != 0)
 		return (kqring_done(op, -error, 0));
-	if (fp->f_type != DTYPE_SOCKET) {
-		fdrop(fp, td);
-		return (kqring_done(op, -ENOTSOCK, 0));
-	}
 	so = fp->f_data;
-	if (expect != NULL && so != expect) {
-		fdrop(fp, td);
-		return (kqring_done(op, -EBADF, 0));
+
+	if (!op->connecting) {
+		if ((so->so_state & SS_ISCONNECTING) != 0) {
+			fdrop(fp, td);
+			return (kqring_done(op, -EALREADY, 0));
+		}
+#ifdef KQRING_MAC
+		error = mac_socket_check_connect(td->td_ucred, so, sa);
+		if (error != 0) {
+			fdrop(fp, td);
+			return (kqring_done(op, -error, 0));
+		}
+#endif
+		error = soconnect(so, sa, td);
+		if (error != 0) {
+			fdrop(fp, td);
+			return (kqring_done(op, -error, 0));
+		}
+		op->connecting = true;
 	}
 
-	aiov.iov_base = (void *)(uintptr_t)sqe->addr;
-	aiov.iov_len = sqe->len;
-	auio.uio_iov = &aiov;
-	auio.uio_iovcnt = 1;
-	auio.uio_offset = 0;
-	auio.uio_resid = sqe->len;
-	auio.uio_segflg = UIO_USERSPACE;
-	auio.uio_rw = UIO_WRITE;
-	auio.uio_td = td;
-
-	error = sosend(so, NULL, &auio, NULL, NULL, MSG_DONTWAIT | MSG_NOSIGNAL,
-	    td);
-	size_t sent = sqe->len - auio.uio_resid;
-	fdrop(fp, td);
-
-	if (error == EWOULDBLOCK && sent == 0)
+	SOCK_LOCK(so);
+	if ((so->so_state & SS_ISCONNECTING) != 0 && so->so_error == 0) {
+		SOCK_UNLOCK(so);
+		fdrop(fp, td);
 		return (EAGAIN);
-	if (error != 0 && sent == 0)
-		return (kqring_done(op, -error, 0));
-	return (kqring_done(op, (int32_t)sent, 0));
+	}
+	error = so->so_error;
+	so->so_error = 0;
+	SOCK_UNLOCK(so);
+	fdrop(fp, td);
+	return (kqring_done(op, -error, 0));
 }
 
 static int
-kqring_exec_accept(struct kqring_op *op, struct socket *expect)
+kqring_exec_accept(struct kqring_op *op, struct socket *expect,
+    bool *more_out)
 {
 	const struct io_uring_sqe *sqe = &op->sqe;
 	struct thread *td = curthread;
@@ -907,15 +1503,13 @@ kqring_exec_accept(struct kqring_op *op, struct socket *expect)
 		fdrop(headfp, td);
 		return (EAGAIN);
 	}
-	fdrop(headfp, td);
 
-	aflags = SOCK_NONBLOCK;
-	if (sqe->accept_flags & SOCK_CLOEXEC)
-		aflags |= SOCK_CLOEXEC;
-
+	/* The new descriptor gets only the flags asked for, as accept4(2). */
+	aflags = (int)sqe->accept_flags;
 	error = kern_accept4(td, sqe->fd, (struct sockaddr *)&ss, aflags,
 	    &nfp);
 	if (error != 0) {
+		fdrop(headfp, td);
 		if (error == EWOULDBLOCK)
 			return (EAGAIN);
 		return (kqring_done(op, -error, 0));
@@ -923,6 +1517,35 @@ kqring_exec_accept(struct kqring_op *op, struct socket *expect)
 	nfd = td->td_retval[0];
 	if (nfp != NULL)
 		fdrop(nfp, td);
+
+	/* As accept(2): the peer address to addr, its length to *addr2. */
+	if (sqe->addr != 0) {
+		socklen_t len;
+
+		error = copyin((const void *)(uintptr_t)sqe->addr2, &len,
+		    sizeof(len));
+		if (error == 0) {
+			len = MIN(len, ss.ss_len);
+			error = copyout(&ss, (void *)(uintptr_t)sqe->addr, len);
+		}
+		if (error == 0) {
+			len = ss.ss_len;
+			error = copyout(&len, (void *)(uintptr_t)sqe->addr2,
+			    sizeof(len));
+		}
+		if (error != 0) {
+			fdrop(headfp, td);
+			(void)kern_close(td, nfd);
+			return (kqring_done(op, -error, 0));
+		}
+	}
+
+	if ((sqe->ioprio & IORING_ACCEPT_MULTISHOT) != 0) {
+		*more_out = !TAILQ_EMPTY(&headso->sol_comp);
+		fdrop(headfp, td);
+		return (kqring_done(op, nfd, IORING_CQE_F_MORE));
+	}
+	fdrop(headfp, td);
 	return (kqring_done(op, nfd, 0));
 }
 
@@ -1013,24 +1636,43 @@ kqring_exec_poll(struct kqring_op *op, struct socket *expect)
 	    (sqe->len & IORING_POLL_ADD_MULTI) != 0 ? IORING_CQE_F_MORE : 0));
 }
 
-static int32_t
-kqring_exec_file_rw(const struct io_uring_sqe *sqe, bool is_write)
+/*
+ * READ / WRITE / READV / WRITEV on anything but a socket (sockets go
+ * through kqring_exec_recv() / kqring_exec_send() and can be armed).
+ * READ may take a provided buffer, only consumed if bytes were read.
+ */
+static int
+kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
+    bool is_write)
 {
+	const struct io_uring_sqe *sqe = &op->sqe;
 	struct thread *td = curthread;
+	struct io_uring_buf pbuf;
 	struct uio auio;
-	struct iovec aiov;
+	struct iovec aiov, *iov = &aiov;
 	off_t offset = (off_t)sqe->off;
+	u_int iovcnt = 1;
+	bool buf_select = (sqe->flags & IOSQE_BUFFER_SELECT) != 0;
 	int error;
 
-	aiov.iov_base = (void *)(uintptr_t)sqe->addr;
-	aiov.iov_len = sqe->len;
-	auio.uio_iov = &aiov;
-	auio.uio_iovcnt = 1;
-	auio.uio_resid = sqe->len;
-	auio.uio_segflg = UIO_USERSPACE;
-	auio.uio_rw = is_write ? UIO_WRITE : UIO_READ;
-	auio.uio_td = td;
-
+	if (buf_select) {
+		error = kqring_pbuf_peek(ctx, &pbuf);
+		if (error != 0)
+			return (kqring_done(op, -error, 0));
+		if (sqe->len != 0 && sqe->len < pbuf.len)
+			pbuf.len = sqe->len;
+		aiov.iov_base = (void *)(uintptr_t)pbuf.addr;
+		aiov.iov_len = pbuf.len;
+	} else if (sqe->opcode == IORING_OP_READV ||
+	    sqe->opcode == IORING_OP_WRITEV) {
+		iov = op->args;
+		iovcnt = sqe->len;
+	} else {
+		aiov.iov_base = (void *)(uintptr_t)sqe->addr;
+		aiov.iov_len = sqe->len;
+	}
+	kqring_uio_init(&auio, iov, iovcnt, is_write ? UIO_WRITE : UIO_READ);
+	ssize_t want = auio.uio_resid;
 	auio.uio_offset = (offset == (off_t)-1) ? 0 : offset;
 
 	/* off == -1 means "use the file position", as in io_uring. */
@@ -1041,38 +1683,416 @@ kqring_exec_file_rw(const struct io_uring_sqe *sqe, bool is_write)
 		error = is_write ? kern_pwritev(td, sqe->fd, &auio, offset) :
 		    kern_preadv(td, sqe->fd, &auio, offset);
 
-	size_t done = sqe->len - auio.uio_resid;
+	size_t done = (size_t)(want - auio.uio_resid);
 	if (error != 0 && done == 0)
-		return (-error);
-	return ((int32_t)done);
+		return (kqring_done(op, -error, 0));
+	if (buf_select && done > 0) {
+		kqring_pbuf_commit(ctx);
+		return (kqring_done(op, kqring_xfer_res(done),
+		    kqring_pbuf_cflags(&pbuf)));
+	}
+	return (kqring_done(op, kqring_xfer_res(done), 0));
 }
 
-/* Ops that complete in one synchronous call; returns the CQE result. */
+/* Path operations; OPENAT2 also uses `how`. */
+struct kqring_path_args {
+	struct open_how	how;
+	char		path[MAXPATHLEN];
+	char		path2[MAXPATHLEN];	/* RENAMEAT, LINKAT, SYMLINKAT */
+};
+
+/* xattr operations; Linux "user." / "system." names map to extattr. */
+struct kqring_xattr_args {
+	int		ns;			/* EXTATTR_NAMESPACE_* */
+	char		name[KQRING_XATTR_NAME_MAX + 1];	/* no prefix */
+	char		path[MAXPATHLEN];	/* GETXATTR / SETXATTR */
+	char		value[];		/* SETXATTR / FSETXATTR */
+};
+
+/* Fill a Linux struct statx from FreeBSD stat(2) data. */
+static void
+kqring_stat_to_statx(const struct stat *sb, struct statx *stx)
+{
+	bzero(stx, sizeof(*stx));
+	stx->stx_mask = STATX_BASIC_STATS;
+	stx->stx_blksize = (uint32_t)sb->st_blksize;
+	stx->stx_nlink = (uint32_t)MIN(sb->st_nlink, UINT32_MAX);
+	stx->stx_uid = sb->st_uid;
+	stx->stx_gid = sb->st_gid;
+	stx->stx_mode = (uint16_t)sb->st_mode;
+	stx->stx_ino = sb->st_ino;
+	stx->stx_size = (uint64_t)sb->st_size;
+	stx->stx_blocks = (uint64_t)sb->st_blocks;
+	stx->stx_atime.tv_sec = sb->st_atim.tv_sec;
+	stx->stx_atime.tv_nsec = (uint32_t)sb->st_atim.tv_nsec;
+	stx->stx_mtime.tv_sec = sb->st_mtim.tv_sec;
+	stx->stx_mtime.tv_nsec = (uint32_t)sb->st_mtim.tv_nsec;
+	stx->stx_ctime.tv_sec = sb->st_ctim.tv_sec;
+	stx->stx_ctime.tv_nsec = (uint32_t)sb->st_ctim.tv_nsec;
+	/* File systems without a birth time leave it at VNOVAL. */
+	if (sb->st_birthtim.tv_sec != (time_t)VNOVAL) {
+		stx->stx_mask |= STATX_BTIME;
+		stx->stx_btime.tv_sec = sb->st_birthtim.tv_sec;
+		stx->stx_btime.tv_nsec = (uint32_t)sb->st_birthtim.tv_nsec;
+	}
+	stx->stx_rdev_major = (uint32_t)major(sb->st_rdev);
+	stx->stx_rdev_minor = (uint32_t)minor(sb->st_rdev);
+	stx->stx_dev_major = (uint32_t)major(sb->st_dev);
+	stx->stx_dev_minor = (uint32_t)minor(sb->st_dev);
+	stx->stx_attributes_mask = STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND |
+	    STATX_ATTR_NODUMP;
+	if ((sb->st_flags & (UF_IMMUTABLE | SF_IMMUTABLE)) != 0)
+		stx->stx_attributes |= STATX_ATTR_IMMUTABLE;
+	if ((sb->st_flags & (UF_APPEND | SF_APPEND)) != 0)
+		stx->stx_attributes |= STATX_ATTR_APPEND;
+	if ((sb->st_flags & UF_NODUMP) != 0)
+		stx->stx_attributes |= STATX_ATTR_NODUMP;
+}
+
 static int32_t
-kqring_exec_sync(const struct io_uring_sqe *sqe)
+kqring_exec_statx(struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	const struct kqring_path_args *pa = op->args;
+	struct statx stx;
+	struct stat sb;
+	int error;
+
+	error = kern_statat(curthread, (int)sqe->statx_flags, sqe->fd,
+	    pa->path, UIO_SYSSPACE, &sb);
+	if (error != 0)
+		return (-error);
+	kqring_stat_to_statx(&sb, &stx);
+	return (-copyout(&stx, (void *)(uintptr_t)sqe->addr2, sizeof(stx)));
+}
+
+/*
+ * Set an extended attribute from the kernel copy of its value, as
+ * extattr_set_vp() does for user memory.  XATTR_CREATE / XATTR_REPLACE
+ * are checked under the same exclusive vnode lock as the set.
+ */
+static int
+kqring_setxattr_vp(struct vnode *vp, const struct kqring_xattr_args *xa,
+    size_t vlen, uint32_t xflags, struct thread *td)
+{
+	struct mount *mp;
+	struct uio auio;
+	struct iovec aiov;
+	size_t size;
+	int error;
+
+	error = vn_start_write(vp, &mp, V_WAIT | V_PCATCH);
+	if (error != 0)
+		return (error);
+	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
+
+	if (xflags != 0) {
+		error = VOP_GETEXTATTR(vp, xa->ns, xa->name, NULL, &size,
+		    td->td_ucred, td);
+		if (error == 0 && (xflags & XATTR_CREATE) != 0)
+			error = EEXIST;
+		else if (error == ENOATTR && (xflags & XATTR_CREATE) != 0)
+			error = 0;
+		if (error != 0)
+			goto done;
+	}
+#ifdef KQRING_MAC
+	error = mac_vnode_check_setextattr(td->td_ucred, vp, xa->ns,
+	    xa->name);
+	if (error != 0)
+		goto done;
+#endif
+	aiov.iov_base = __DECONST(char *, xa->value);
+	aiov.iov_len = vlen;
+	auio.uio_iov = &aiov;
+	auio.uio_iovcnt = 1;
+	auio.uio_offset = 0;
+	auio.uio_resid = vlen;
+	auio.uio_rw = UIO_WRITE;
+	auio.uio_segflg = UIO_SYSSPACE;
+	auio.uio_td = td;
+	error = VOP_SETEXTATTR(vp, xa->ns, xa->name, &auio, td->td_ucred, td);
+done:
+	VOP_UNLOCK(vp);
+	vn_finished_write(mp);
+	return (error);
+}
+
+static int32_t
+kqring_exec_setxattr(struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	const struct kqring_xattr_args *xa = op->args;
+	struct thread *td = curthread;
+	struct nameidata nd;
+	struct file *fp;
+	cap_rights_t rights;
+	int error;
+
+	if (sqe->opcode == IORING_OP_FSETXATTR) {
+		error = getvnode_path(td, sqe->fd,
+		    cap_rights_init_one(&rights, CAP_EXTATTR_SET), NULL, &fp);
+		if (error != 0)
+			return (-error);
+		error = kqring_setxattr_vp(fp->f_vnode, xa, sqe->len,
+		    sqe->xattr_flags, td);
+		fdrop(fp, td);
+		return (-error);
+	}
+	NDINIT(&nd, LOOKUP, FOLLOW | AUDITVNODE1, UIO_SYSSPACE, xa->path);
+	error = namei(&nd);
+	if (error != 0)
+		return (-error);
+	NDFREE_PNBUF(&nd);
+	error = kqring_setxattr_vp(nd.ni_vp, xa, sqe->len, sqe->xattr_flags,
+	    td);
+	vrele(nd.ni_vp);
+	return (-error);
+}
+
+/*
+ * GETXATTR / FGETXATTR into the user buffer.  extattr_get(2) truncates
+ * silently, so ask for the size first and fail with ERANGE like Linux
+ * when the buffer is too small (len 0 asks for the size).
+ */
+static int32_t
+kqring_exec_getxattr(struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	const struct kqring_xattr_args *xa = op->args;
+	struct thread *td = curthread;
+	void *data = (void *)(uintptr_t)sqe->addr2;
+	bool fd_op = sqe->opcode == IORING_OP_FGETXATTR;
+	int error;
+
+	for (int pass = 0; pass < 2; pass++) {
+		if (fd_op)
+			error = kern_extattr_get_fd(td, sqe->fd, xa->ns,
+			    xa->name, pass == 0 ? NULL : data,
+			    pass == 0 ? 0 : sqe->len);
+		else
+			error = kern_extattr_get_path(td, xa->path, xa->ns,
+			    xa->name, pass == 0 ? NULL : data,
+			    pass == 0 ? 0 : sqe->len, FOLLOW, UIO_SYSSPACE);
+		if (error != 0)
+			return (-error);
+		if (pass == 0 && sqe->len == 0)
+			break;
+		if (pass == 0 && (size_t)td->td_retval[0] > sqe->len)
+			return (-ERANGE);
+	}
+	return (kqring_xfer_res((size_t)td->td_retval[0]));
+}
+
+static int32_t
+kqring_exec_fallocate(const struct io_uring_sqe *sqe)
 {
 	struct thread *td = curthread;
+	struct spacectl_range sr = {
+		.r_offset = (off_t)sqe->off,
+		.r_len = (off_t)sqe->addr,
+	};
+
+	switch (sqe->len) {
+	case 0:
+		return (-kern_posix_fallocate(td, sqe->fd, sr.r_offset,
+		    sr.r_len));
+	case FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE:
+		return (-kern_fspacectl(td, sqe->fd, SPACECTL_DEALLOC, &sr, 0,
+		    &sr));
+	default:
+		/* FreeBSD cannot allocate without extending (KEEP_SIZE). */
+		return (-EOPNOTSUPP);
+	}
+}
+
+/* Whether fp is a /dev/kqring descriptor. */
+static bool
+kqring_fp_is_ring(const struct file *fp)
+{
+	return (fp->f_type == DTYPE_VNODE && fp->f_vnode != NULL &&
+	    fp->f_vnode->v_type == VCHR && fp->f_vnode->v_rdev == kqring_cdev);
+}
+
+/* CLOSE: like close(2), but a ring cannot close itself or another ring. */
+static int32_t
+kqring_exec_close(const struct io_uring_sqe *sqe)
+{
+	struct thread *td = curthread;
+	struct file *fp;
+	bool ring;
+	int error;
+
+	error = fget(td, sqe->fd, &cap_no_rights, &fp);
+	if (error != 0)
+		return (-error);
+	ring = kqring_fp_is_ring(fp);
+	fdrop(fp, td);
+	if (ring)
+		return (-EBADF);
+	return (-kern_close(td, sqe->fd));
+}
+
+/* URING_CMD on a socket: SIOCINQ, SIOCOUTQ, getsockopt, setsockopt. */
+static int32_t
+kqring_exec_uring_cmd(const struct io_uring_sqe *sqe)
+{
+	struct thread *td = curthread;
+	struct file *fp;
+	socklen_t optlen;
+	int error, n;
+	bool sock;
+
+	error = fget(td, sqe->fd, &cap_no_rights, &fp);
+	if (error != 0)
+		return (-error);
+	sock = fp->f_type == DTYPE_SOCKET;
+	fdrop(fp, td);
+	/* No other file type implements commands. */
+	if (!sock)
+		return (-EOPNOTSUPP);
+
+	switch (sqe->cmd_op) {
+	case SOCKET_URING_OP_SIOCINQ:
+	case SOCKET_URING_OP_SIOCOUTQ:
+		error = kern_ioctl(td, sqe->fd,
+		    sqe->cmd_op == SOCKET_URING_OP_SIOCINQ ? FIONREAD :
+		    FIONWRITE, (caddr_t)&n);
+		return (error != 0 ? -error : n);
+	case SOCKET_URING_OP_GETSOCKOPT:
+		/* As in io_uring, only SOL_SOCKET options. */
+		if (sqe->level != SOL_SOCKET)
+			return (-EOPNOTSUPP);
+		optlen = sqe->optlen;
+		error = kern_getsockopt(td, sqe->fd, (int)sqe->level,
+		    (int)sqe->optname, (void *)(uintptr_t)sqe->optval,
+		    UIO_USERSPACE, &optlen);
+		return (error != 0 ? -error : (int32_t)optlen);
+	case SOCKET_URING_OP_SETSOCKOPT:
+		return (-kern_setsockopt(td, sqe->fd, (int)sqe->level,
+		    (int)sqe->optname, (const void *)(uintptr_t)sqe->optval,
+		    UIO_USERSPACE, sqe->optlen));
+	default:
+		return (-EOPNOTSUPP);
+	}
+}
+
+/*
+ * Ops that complete in one synchronous call; the result goes to op->res
+ * and op->cflags.
+ */
+static void
+kqring_exec_sync(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	const struct kqring_path_args *pa = op->args;
+	struct thread *td = curthread;
+	int32_t res;
 	int error;
 
 	switch (sqe->opcode) {
 	case IORING_OP_NOP:
-		return (0);
+		res = 0;
+		break;
 	case IORING_OP_READ:
-		return (kqring_exec_file_rw(sqe, false));
+	case IORING_OP_READV:
+		kqring_exec_file_rw(ctx, op, false);
+		return;
 	case IORING_OP_WRITE:
-		return (kqring_exec_file_rw(sqe, true));
+	case IORING_OP_WRITEV:
+		kqring_exec_file_rw(ctx, op, true);
+		return;
 	case IORING_OP_FSYNC:
-		error = kern_fsync(td, sqe->fd,
+		res = -kern_fsync(td, sqe->fd,
 		    (sqe->fsync_flags & IORING_FSYNC_DATASYNC) == 0);
-		return (-error);
+		break;
+	case IORING_OP_SYNC_FILE_RANGE:
+		/* No range sync on FreeBSD: fdatasync(2) the whole file. */
+		res = sqe->sync_range_flags == 0 ? 0 :
+		    -kern_fsync(td, sqe->fd, false);
+		break;
 	case IORING_OP_OPENAT:
-		error = kern_openat(td, sqe->fd,
-		    (const char *)(uintptr_t)sqe->addr, UIO_USERSPACE,
-		    sqe->open_flags, sqe->len);
-		return (error == 0 ? (int32_t)td->td_retval[0] : -error);
+	case IORING_OP_OPENAT2:
+		error = kern_openat(td, sqe->fd, pa->path, UIO_SYSSPACE,
+		    (int)pa->how.flags, (int)pa->how.mode);
+		res = error == 0 ? (int32_t)td->td_retval[0] : -error;
+		break;
+	case IORING_OP_CLOSE:
+		res = kqring_exec_close(sqe);
+		break;
+	case IORING_OP_STATX:
+		res = kqring_exec_statx(op);
+		break;
+	case IORING_OP_FALLOCATE:
+		res = kqring_exec_fallocate(sqe);
+		break;
+	case IORING_OP_FTRUNCATE:
+		res = -kern_ftruncate(td, sqe->fd, (off_t)sqe->off);
+		break;
+	case IORING_OP_FADVISE:
+		/* A 64-bit length in addr, else the 32-bit one in len. */
+		res = -kern_posix_fadvise(td, sqe->fd, (off_t)sqe->off,
+		    sqe->addr != 0 ? (off_t)sqe->addr : (off_t)sqe->len,
+		    (int)sqe->fadvise_advice);
+		break;
+	case IORING_OP_MADVISE:
+		res = -kern_madvise(td, (uintptr_t)sqe->addr,
+		    sqe->off != 0 ? (size_t)sqe->off : (size_t)sqe->len,
+		    (int)sqe->fadvise_advice);
+		break;
+	case IORING_OP_RENAMEAT:
+		res = -kern_renameat(td, sqe->fd, pa->path, (int)sqe->len,
+		    pa->path2, UIO_SYSSPACE, sqe->rename_flags);
+		break;
+	case IORING_OP_UNLINKAT:
+		if ((sqe->unlink_flags & AT_REMOVEDIR) != 0)
+			res = -kern_frmdirat(td, sqe->fd, pa->path, FD_NONE,
+			    UIO_SYSSPACE, (int)sqe->unlink_flags & ~AT_REMOVEDIR);
+		else
+			res = -kern_funlinkat(td, sqe->fd, pa->path, FD_NONE,
+			    UIO_SYSSPACE, (int)sqe->unlink_flags, 0);
+		break;
+	case IORING_OP_MKDIRAT:
+		res = -kern_mkdirat(td, sqe->fd, pa->path, UIO_SYSSPACE,
+		    (int)sqe->len);
+		break;
+	case IORING_OP_SYMLINKAT:
+		res = -kern_symlinkat(td, pa->path, sqe->fd, pa->path2,
+		    UIO_SYSSPACE);
+		break;
+	case IORING_OP_LINKAT:
+		res = -kern_linkat(td, sqe->fd, (int)sqe->len, pa->path,
+		    pa->path2, UIO_SYSSPACE, (int)sqe->hardlink_flags);
+		break;
+	case IORING_OP_FSETXATTR:
+	case IORING_OP_SETXATTR:
+		res = kqring_exec_setxattr(op);
+		break;
+	case IORING_OP_FGETXATTR:
+	case IORING_OP_GETXATTR:
+		res = kqring_exec_getxattr(op);
+		break;
+	case IORING_OP_SOCKET:
+		error = kern_socket(td, sqe->fd, (int)sqe->off, (int)sqe->len);
+		res = error == 0 ? (int32_t)td->td_retval[0] : -error;
+		break;
+	case IORING_OP_BIND:
+		res = -kern_bindat(td, AT_FDCWD, sqe->fd, op->args);
+		break;
+	case IORING_OP_LISTEN:
+		res = -kern_listen(td, sqe->fd, (int)sqe->len);
+		break;
+	case IORING_OP_SHUTDOWN:
+		res = -kern_shutdown(td, sqe->fd, (int)sqe->len);
+		break;
+	case IORING_OP_URING_CMD:
+		res = kqring_exec_uring_cmd(sqe);
+		break;
 	default:
-		return (-EOPNOTSUPP);
+		res = -EOPNOTSUPP;
+		break;
 	}
+	kqring_done(op, res, 0);
 }
 
 /*
@@ -1092,13 +2112,29 @@ kqring_op_attempt(struct kqring_ctx *ctx, struct kqring_op *op,
 		more = false;
 		switch (op->sqe.opcode) {
 		case IORING_OP_RECV:
+		case IORING_OP_READ:
+		case IORING_OP_READV:
+		case IORING_OP_READ_MULTISHOT:
 			rc = kqring_exec_recv(ctx, op, expect, &more);
 			break;
+		case IORING_OP_RECVMSG:
+			rc = kqring_exec_recvmsg(ctx, op, expect, &more);
+			break;
 		case IORING_OP_SEND:
+		case IORING_OP_SEND_ZC:
+		case IORING_OP_WRITE:
+		case IORING_OP_WRITEV:
 			rc = kqring_exec_send(op, expect);
 			break;
+		case IORING_OP_SENDMSG:
+		case IORING_OP_SENDMSG_ZC:
+			rc = kqring_exec_sendmsg(op, expect);
+			break;
+		case IORING_OP_CONNECT:
+			rc = kqring_exec_connect(op, expect);
+			break;
 		case IORING_OP_ACCEPT:
-			rc = kqring_exec_accept(op, expect);
+			rc = kqring_exec_accept(op, expect, &more);
 			break;
 		case IORING_OP_POLL_ADD:
 			rc = kqring_exec_poll(op, expect);
@@ -1166,6 +2202,13 @@ kqring_op_dirs(const struct io_uring_sqe *sqe)
 
 	switch (sqe->opcode) {
 	case IORING_OP_SEND:
+	case IORING_OP_SEND_ZC:
+	case IORING_OP_SENDMSG:
+	case IORING_OP_SENDMSG_ZC:
+	case IORING_OP_WRITE:
+	case IORING_OP_WRITEV:
+	case IORING_OP_CONNECT:
+		/* soisconnected() / soisdisconnected() also wake so_snd. */
 		return (KQ_DIR_SND);
 	case IORING_OP_POLL_ADD:
 		/*
@@ -1280,29 +2323,235 @@ retry:
 	return (true);
 }
 
-/* Arm FUTEX_WAIT; re-checked by kqring_check_futexes() on every enter. */
+/*
+ * Futexes.  A FUTEX_WAIT(V) is armed with its words hashed by umtx key
+ * (the same key _umtx_op(2) uses: vmspace + address for FUTEX2_PRIVATE,
+ * else the backing VM object + offset for shared mappings), so FUTEX_WAKE
+ * from any ring, in any process sharing the memory, finds it.  The waker
+ * only marks the request and queues it as taskwork for its ring's owner.
+ * Armed words are also re-read on every enter (kqring_check_futexes()), so
+ * a word changed without a FUTEX_WAKE still ends the wait, a spurious
+ * wakeup futex users must already handle.
+ */
+static int
+kqring_futex_key(uint64_t uaddr, uint32_t flags, struct umtx_key *key)
+{
+	return (umtx_key_get((void *)(uintptr_t)uaddr, TYPE_SIMPLE_WAIT,
+	    (flags & FUTEX2_PRIVATE) != 0 ? THREAD_SHARE : AUTO_SHARE, key));
+}
+
+static inline struct kqring_fwait_list *
+kqring_futex_bucket(const struct umtx_key *key)
+{
+	return (&kqring_futex_hash[(u_int)key->hash % KQRING_FUTEX_HASH]);
+}
+
+/* Arm FUTEX_WAIT / FUTEX_WAITV; returns false if completed instead. */
 static bool
 kqring_futex_arm(struct kqring_ctx *ctx, struct kqring_op *op)
 {
-	uint32_t uval = 0;
+	struct kqring_fwait *fw = op->args;
+	uint32_t i, uval = 0;
+	int32_t res;
+	int error = 0;
+
+	for (i = 0; i < op->nfwait; i++) {
+		error = kqring_futex_key(fw[i].uaddr, fw[i].flags, &fw[i].key);
+		if (error != 0) {
+			kqring_req_complete(ctx, op, -error, 0);
+			return (false);
+		}
+		fw[i].keyed = true;
+	}
+
+	mtx_lock(&ctx->mtx);
+	op->cancelled = false;
+	op->futex_woken = false;
+	ctx->nfutex++;
+	kqring_op_arm_locked(ctx, op);
+	mtx_unlock(&ctx->mtx);
+
+	/* Hash before reading the words, so a racing FUTEX_WAKE is seen. */
+	mtx_lock(&kqring_futex_mtx);
+	for (i = 0; i < op->nfwait; i++) {
+		LIST_INSERT_HEAD(kqring_futex_bucket(&fw[i].key), &fw[i], link);
+		fw[i].hashed = true;
+	}
+	mtx_unlock(&kqring_futex_mtx);
+
+	for (i = 0; i < op->nfwait; i++) {
+		error = copyin((const void *)(uintptr_t)fw[i].uaddr, &uval,
+		    sizeof(uval));
+		if (error != 0 || uval != (uint32_t)fw[i].val)
+			break;
+	}
+	if (i == op->nfwait)
+		return (true);
+
+	mtx_lock(&ctx->mtx);
+	/* A FUTEX_WAKE that already counted this waiter wins. */
+	res = op->futex_woken ? op->res : (error != 0 ? -error : -EAGAIN);
+	kqring_op_unarm_locked(ctx, op);
+	mtx_unlock(&ctx->mtx);
+	kqring_req_complete(ctx, op, res, 0);
+	return (false);
+}
+
+/*
+ * FUTEX_WAKE: wake up to sqe->addr2 waiters whose mask intersects
+ * sqe->addr3, returning how many ring waiters were woken.  Threads
+ * sleeping in _umtx_op(UMTX_OP_WAIT_UINT[_PRIVATE]) on the word are woken
+ * too, within the same budget.
+ */
+static int32_t
+kqring_futex_wake(const struct io_uring_sqe *sqe)
+{
+	struct umtx_key key;
+	struct kqring_fwait *fw;
+	uint64_t nr = MIN(sqe->addr2, (uint64_t)INT32_MAX);
+	uint32_t mask = sqe->addr3 != 0 ? (uint32_t)sqe->addr3 :
+	    FUTEX_BITSET_MATCH_ANY;
+	int32_t n = 0;
 	int error;
 
-	error = copyin((const void *)(uintptr_t)op->sqe.addr, &uval,
-	    sizeof(uval));
-	if (error != 0) {
-		kqring_req_complete(ctx, op, -error, 0);
-		return (false);
+	error = kqring_futex_key(sqe->addr, (uint32_t)sqe->fd, &key);
+	if (error != 0)
+		return (-error);
+	mtx_lock(&kqring_futex_mtx);
+	LIST_FOREACH(fw, kqring_futex_bucket(&key), link) {
+		struct kqring_op *op = fw->op;
+
+		if ((uint64_t)n >= nr)
+			break;
+		if (!umtx_key_match(&fw->key, &key) || (fw->mask & mask) == 0)
+			continue;
+		mtx_lock(&op->ctx->mtx);
+		if (!op->cancelled && !op->futex_woken) {
+			op->futex_woken = true;
+			op->res = (int32_t)fw->idx;
+			kqring_taskwork_add_locked(op->ctx, op);
+			n++;
+		}
+		mtx_unlock(&op->ctx->mtx);
 	}
-	if (uval != (uint32_t)op->sqe.off) {
-		kqring_req_complete(ctx, op, -EAGAIN, 0);
+	mtx_unlock(&kqring_futex_mtx);
+	umtx_key_release(&key);
+
+	if ((uint64_t)n < nr)
+		(void)kern_umtx_wake(curthread, (void *)(uintptr_t)sqe->addr,
+		    (int)(nr - (uint64_t)n), (sqe->fd & FUTEX2_PRIVATE) != 0);
+	return (n);
+}
+
+/*
+ * WAITID: one wait6(2) poll with WNOHANG.  EAGAIN keeps the request armed
+ * (re-polled by kqring_check_waitids(), as no wakeup reaches us when a
+ * child changes state) unless the caller itself asked for WNOHANG.
+ */
+static int
+kqring_exec_waitid(struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct thread *td = curthread;
+	siginfo_t si;
+	int status, error;
+
+	bzero(&si, sizeof(si));
+	td->td_retval[0] = 0;
+	error = kern_wait6(td, (idtype_t)sqe->len, (id_t)sqe->fd, &status,
+	    (int)sqe->file_index | WNOHANG, NULL, &si);
+	if (error != 0)
+		return (kqring_done(op, -error, 0));
+	if (td->td_retval[0] == 0) {
+		if ((sqe->file_index & WNOHANG) == 0)
+			return (EAGAIN);
+		/*
+		 * proc_to_reap() fills siginfo for a live child too; as
+		 * libc's waitid(), report zeroes when nothing changed.
+		 */
+		bzero(&si, sizeof(si));
+	}
+	if (sqe->addr2 != 0) {
+		error = copyout(&si, (void *)(uintptr_t)sqe->addr2,
+		    sizeof(si));
+		if (error != 0)
+			return (kqring_done(op, -error, 0));
+	}
+	return (kqring_done(op, 0, 0));
+}
+
+static bool
+kqring_waitid_arm(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	if (kqring_exec_waitid(op) == 0) {
+		kqring_req_complete(ctx, op, op->res, 0);
 		return (false);
 	}
 	mtx_lock(&ctx->mtx);
 	op->cancelled = false;
-	ctx->nfutex++;
+	ctx->nwaitid++;
 	kqring_op_arm_locked(ctx, op);
 	mtx_unlock(&ctx->mtx);
 	return (true);
+}
+
+/*
+ * MSG_RING (IORING_MSG_DATA): post a CQE to the ring sqe->fd, possibly
+ * this one.  The CQE is only queued on the target, whose owner posts it
+ * from its own taskwork, so no thread ever touches another ring's CQ.
+ * Holding the target's file keeps its context alive.
+ */
+static int32_t
+kqring_msg_ring(const struct io_uring_sqe *sqe)
+{
+	struct thread *td = curthread;
+	struct file *fp, *saved;
+	struct kqring_ctx *tctx;
+	struct kqring_rcqe *rc;
+	cap_rights_t rights;
+	int error;
+
+	error = fget(td, sqe->fd, cap_rights_init_one(&rights, CAP_IOCTL),
+	    &fp);
+	if (error != 0)
+		return (-error);
+	if (!kqring_fp_is_ring(fp)) {
+		fdrop(fp, td);
+		return (-EBADF);
+	}
+	/* devfs_get_cdevpriv() looks at the file being operated on. */
+	saved = td->td_fpop;
+	td->td_fpop = fp;
+	error = devfs_get_cdevpriv((void **)&tctx);
+	td->td_fpop = saved;
+	if (error != 0) {
+		fdrop(fp, td);
+		return (-EBADF);
+	}
+
+	rc = malloc(sizeof(*rc), M_KQRING, M_WAITOK);
+	rc->cqe.user_data = sqe->off;
+	rc->cqe.res = (int32_t)sqe->len;
+	rc->cqe.flags = (sqe->msg_ring_flags & IORING_MSG_RING_FLAGS_PASS) !=
+	    0 ? sqe->file_index : 0;
+
+	mtx_lock(&tctx->mtx);
+	if (!tctx->setup_done || !tctx->enabled || tctx->closing) {
+		error = EBADF;
+	} else if (tctx->nrcq >= KQRING_MAX_REMOTE) {
+		error = EOVERFLOW;
+	} else {
+		STAILQ_INSERT_TAIL(&tctx->rcq, rc, link);
+		tctx->nrcq++;
+		atomic_set_32(&tctx->shm->sq_flags, IORING_SQ_TASKRUN);
+		if (tctx->sleeping)
+			wakeup(&tctx->wakeup_chan);
+		rc = NULL;
+	}
+	mtx_unlock(&tctx->mtx);
+	free(rc, M_KQRING);
+	fdrop(fp, td);
+	return (-error);
 }
 
 /* ============================================================================
@@ -1660,18 +2909,401 @@ kqring_poll_remove(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
 }
 
 /* ============================================================================
- * Request Lifecycle: Validation, Links, Drain, Issue and Completion
+ * Submission: SQE Validation and Argument Copy-in
  * ============================================================================
  */
+
+/* Allocate op->args (zeroed), charged to the ring's argument budget. */
+static void *
+kqring_args_alloc(struct kqring_op *op, size_t len, int *errorp)
+{
+	struct kqring_ctx *ctx = op->ctx;
+
+	KASSERT(op->args == NULL, ("kqring: op args allocated twice"));
+	if (len > KQRING_MAX_ARG_BYTES - ctx->args_bytes) {
+		*errorp = ENOMEM;
+		return (NULL);
+	}
+	op->args = malloc(len, M_KQRING, M_WAITOK | M_ZERO);
+	op->args_len = len;
+	ctx->args_bytes += len;
+	*errorp = 0;
+	return (op->args);
+}
+
+/* Copy in an iovec array, checking that its total length fits ssize_t. */
+static int
+kqring_copyin_iov(uint64_t uaddr, u_int iovcnt, struct iovec *iov)
+{
+	size_t total = 0;
+	int error;
+
+	error = copyin((const void *)(uintptr_t)uaddr, iov,
+	    iovcnt * sizeof(*iov));
+	if (error != 0)
+		return (error);
+	for (u_int i = 0; i < iovcnt; i++) {
+		if (iov[i].iov_len > IOSIZE_MAX - total)
+			return (EINVAL);
+		total += iov[i].iov_len;
+	}
+	return (0);
+}
+
+/* READV / WRITEV: sqe->addr is an iovec array of sqe->len entries. */
+static int
+kqring_prep_iov(struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct iovec *iov;
+	int error;
+
+	if (sqe->len > UIO_MAXIOV)
+		return (EINVAL);
+	if (sqe->len == 0)
+		return (0);
+	iov = kqring_args_alloc(op, sqe->len * sizeof(*iov), &error);
+	if (iov == NULL)
+		return (error);
+	return (kqring_copyin_iov(sqe->addr, sqe->len, iov));
+}
+
+/* A socket address, as getsockaddr() copies one in. */
+static int
+kqring_prep_sockaddr(struct kqring_op *op, uint64_t uaddr, uint64_t len)
+{
+	struct sockaddr *sa;
+	int error;
+
+	if (len > SOCK_MAXADDRLEN)
+		return (ENAMETOOLONG);
+	if (len < offsetof(struct sockaddr, sa_data[0]))
+		return (EINVAL);
+	sa = kqring_args_alloc(op, len, &error);
+	if (sa == NULL)
+		return (error);
+	error = copyin((const void *)(uintptr_t)uaddr, sa, len);
+	if (error != 0)
+		return (error);
+	sa->sa_len = (uint8_t)len;
+	return (0);
+}
+
+/*
+ * SENDMSG(_ZC) / RECVMSG: copy the msghdr and its iovec, and for a send
+ * the name and control data too.  A receive's name and control buffers
+ * are outputs and stay user pointers.
+ */
+static int
+kqring_prep_msg(struct kqring_op *op, bool is_send)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct kqring_msg_args *ma;
+	struct msghdr msg;
+	size_t ctllen = 0, iovsz;
+	int error;
+
+	error = copyin((const void *)(uintptr_t)sqe->addr, &msg, sizeof(msg));
+	if (error != 0)
+		return (error);
+	if ((u_int)msg.msg_iovlen > UIO_MAXIOV)
+		return (EMSGSIZE);
+	if (is_send && msg.msg_name != NULL && msg.msg_namelen != 0 &&
+	    (msg.msg_namelen > SOCK_MAXADDRLEN ||
+	    msg.msg_namelen < offsetof(struct sockaddr, sa_data[0])))
+		return (msg.msg_namelen > SOCK_MAXADDRLEN ? ENAMETOOLONG :
+		    EINVAL);
+	if (is_send && msg.msg_control != NULL && msg.msg_controllen != 0) {
+		/* As sendit() / sockargs(). */
+		if (msg.msg_controllen < sizeof(struct cmsghdr) ||
+		    msg.msg_controllen > MCLBYTES)
+			return (EINVAL);
+		ctllen = msg.msg_controllen;
+	}
+	iovsz = (size_t)msg.msg_iovlen * sizeof(struct iovec);
+	ma = kqring_args_alloc(op, sizeof(*ma) + iovsz + ctllen, &error);
+	if (ma == NULL)
+		return (error);
+	if (msg.msg_iovlen != 0) {
+		error = kqring_copyin_iov((uint64_t)(uintptr_t)msg.msg_iov,
+		    msg.msg_iovlen, ma->iov);
+		if (error != 0)
+			return (error);
+	}
+	ma->msg = msg;
+	ma->msg.msg_iov = ma->iov;
+	if (!is_send)
+		return (0);
+
+	if (msg.msg_name != NULL && msg.msg_namelen != 0) {
+		error = copyin(msg.msg_name, ma->name, msg.msg_namelen);
+		if (error != 0)
+			return (error);
+		((struct sockaddr *)ma->name)->sa_len =
+		    (uint8_t)msg.msg_namelen;
+		ma->msg.msg_name = ma->name;
+	} else {
+		ma->msg.msg_name = NULL;
+		ma->msg.msg_namelen = 0;
+	}
+	if (ctllen != 0) {
+		ma->msg.msg_control = (char *)ma->iov + iovsz;
+		error = copyin(msg.msg_control, ma->msg.msg_control, ctllen);
+		if (error != 0)
+			return (error);
+	} else {
+		ma->msg.msg_control = NULL;
+		ma->msg.msg_controllen = 0;
+	}
+	return (0);
+}
+
+static int
+kqring_copyin_path(uint64_t uaddr, char *buf)
+{
+	return (copyinstr((const void *)(uintptr_t)uaddr, buf, MAXPATHLEN,
+	    NULL));
+}
+
+/* One path (sqe->addr), or two (sqe->addr2 too). */
+static int
+kqring_prep_paths(struct kqring_op *op, bool two)
+{
+	struct kqring_path_args *pa;
+	int error;
+
+	pa = kqring_args_alloc(op, two ? sizeof(*pa) :
+	    offsetof(struct kqring_path_args, path2), &error);
+	if (pa == NULL)
+		return (error);
+	error = kqring_copyin_path(op->sqe.addr, pa->path);
+	if (error == 0 && two)
+		error = kqring_copyin_path(op->sqe.addr2, pa->path2);
+	return (error);
+}
+
+/* OPENAT2: struct open_how at sqe->addr2, sqe->len bytes. */
+static int
+kqring_prep_openat2(struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct kqring_path_args *pa;
+	struct open_how how;
+	uint8_t extra[64];
+	int error;
+
+	if (sqe->len < sizeof(how))
+		return (EINVAL);
+	if (sqe->len > PAGE_SIZE)
+		return (E2BIG);
+	error = copyin((const void *)(uintptr_t)sqe->addr2, &how, sizeof(how));
+	if (error != 0)
+		return (error);
+	/* A larger (newer) struct is fine if the fields we lack are zero. */
+	for (size_t off = sizeof(how); off < sqe->len; off += sizeof(extra)) {
+		size_t n = MIN(sizeof(extra), sqe->len - off);
+
+		error = copyin((const char *)(uintptr_t)sqe->addr2 + off,
+		    extra, n);
+		if (error != 0)
+			return (error);
+		for (size_t i = 0; i < n; i++)
+			if (extra[i] != 0)
+				return (E2BIG);
+	}
+	if ((how.flags & ~(uint64_t)FUSERALLOWED) != 0 ||
+	    (how.mode & ~(uint64_t)07777) != 0 ||
+	    (how.mode != 0 && (how.flags & O_CREAT) == 0))
+		return (EINVAL);
+	/*
+	 * FreeBSD has no magic links, and RESOLVE_CACHED only asks to fail
+	 * rather than block, so both are honored by a normal lookup.
+	 */
+	if ((how.resolve & ~(uint64_t)(RESOLVE_BENEATH |
+	    RESOLVE_NO_MAGICLINKS | RESOLVE_CACHED)) != 0)
+		return (EINVAL);
+	if ((how.resolve & RESOLVE_BENEATH) != 0)
+		how.flags |= O_RESOLVE_BENEATH;
+
+	error = kqring_prep_paths(op, false);
+	if (error != 0)
+		return (error);
+	pa = op->args;
+	pa->how = how;
+	return (0);
+}
+
+/*
+ * xattr ops: Linux "namespace.name" names.  "user." maps to the user
+ * extattr namespace, "system." and "trusted." (both privileged) to the
+ * system one; others (such as "security.") have no FreeBSD counterpart.
+ */
+static int
+kqring_prep_xattr(struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	static const struct {
+		const char	*prefix;
+		int		ns;
+	} nsmap[] = {
+		{ "user.", EXTATTR_NAMESPACE_USER },
+		{ "system.", EXTATTR_NAMESPACE_SYSTEM },
+		{ "trusted.", EXTATTR_NAMESPACE_SYSTEM },
+	};
+	bool set = sqe->opcode == IORING_OP_SETXATTR ||
+	    sqe->opcode == IORING_OP_FSETXATTR;
+	bool path = sqe->opcode == IORING_OP_SETXATTR ||
+	    sqe->opcode == IORING_OP_GETXATTR;
+	char name[KQRING_XATTR_NAME_MAX + 1];
+	struct kqring_xattr_args *xa;
+	size_t i, plen;
+	int error;
+
+	if ((sqe->xattr_flags & ~(uint32_t)(set ? XATTR_CREATE |
+	    XATTR_REPLACE : 0)) != 0 ||
+	    sqe->xattr_flags == (XATTR_CREATE | XATTR_REPLACE))
+		return (EINVAL);
+	if (set && sqe->len > KQRING_XATTR_SIZE_MAX)
+		return (E2BIG);
+	error = copyinstr((const void *)(uintptr_t)sqe->addr, name,
+	    sizeof(name), NULL);
+	if (error == ENAMETOOLONG)
+		return (ERANGE);
+	if (error != 0)
+		return (error);
+	for (i = 0; i < nitems(nsmap); i++) {
+		plen = strlen(nsmap[i].prefix);
+		if (strncmp(name, nsmap[i].prefix, plen) == 0)
+			break;
+	}
+	if (i == nitems(nsmap))
+		return (EOPNOTSUPP);
+	if (name[plen] == '\0')
+		return (EINVAL);
+
+	xa = kqring_args_alloc(op, sizeof(*xa) + (set ? sqe->len : 0),
+	    &error);
+	if (xa == NULL)
+		return (error);
+	xa->ns = nsmap[i].ns;
+	strlcpy(xa->name, name + plen, sizeof(xa->name));
+	if (path) {
+		error = kqring_copyin_path(sqe->addr3, xa->path);
+		if (error != 0)
+			return (error);
+	}
+	if (set && sqe->len != 0)
+		error = copyin((const void *)(uintptr_t)sqe->addr2, xa->value,
+		    sqe->len);
+	return (error);
+}
+
+/* futex2 flags: 32-bit words only, as in io_uring. */
+static bool
+kqring_futex_flags_ok(uint32_t flags)
+{
+	return ((flags & ~(uint32_t)(FUTEX2_SIZE_MASK | FUTEX2_PRIVATE)) ==
+	    0 && (flags & FUTEX2_SIZE_MASK) == FUTEX2_SIZE_U32);
+}
+
+static int
+kqring_futex_word_ok(uint64_t uaddr, uint64_t val, uint32_t flags)
+{
+	if (!kqring_futex_flags_ok(flags) || (uaddr & 3) != 0 ||
+	    val > UINT32_MAX)
+		return (EINVAL);
+	return (0);
+}
+
+/*
+ * FUTEX_WAIT: fd = futex2 flags, addr = word, addr2 = expected value,
+ * addr3 = wake mask (0 is taken as FUTEX_BITSET_MATCH_ANY).
+ * FUTEX_WAITV: addr = struct futex_waitv[len].
+ */
+static int
+kqring_prep_futex_wait(struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct futex_waitv *wv = NULL;
+	struct kqring_fwait *fw;
+	uint32_t n;
+	int error;
+
+	if (sqe->futex_flags != 0 || sqe->buf_index != 0 ||
+	    sqe->file_index != 0)
+		return (EINVAL);
+	if (sqe->opcode == IORING_OP_FUTEX_WAIT) {
+		if (sqe->len != 0 || sqe->addr3 > UINT32_MAX)
+			return (EINVAL);
+		error = kqring_futex_word_ok(sqe->addr, sqe->addr2,
+		    (uint32_t)sqe->fd);
+		if (error != 0)
+			return (error);
+		n = 1;
+	} else {
+		if (sqe->fd != 0 || sqe->addr2 != 0 || sqe->addr3 != 0 ||
+		    sqe->len == 0 || sqe->len > FUTEX_WAITV_MAX)
+			return (EINVAL);
+		n = sqe->len;
+		wv = malloc(n * sizeof(*wv), M_KQRING, M_WAITOK);
+		error = copyin((const void *)(uintptr_t)sqe->addr, wv,
+		    n * sizeof(*wv));
+		for (uint32_t i = 0; error == 0 && i < n; i++) {
+			if (wv[i].__reserved != 0)
+				error = EINVAL;
+			else
+				error = kqring_futex_word_ok(wv[i].uaddr,
+				    wv[i].val, wv[i].flags);
+		}
+		if (error != 0) {
+			free(wv, M_KQRING);
+			return (error);
+		}
+	}
+
+	fw = kqring_args_alloc(op, n * sizeof(*fw), &error);
+	if (fw == NULL) {
+		free(wv, M_KQRING);
+		return (error);
+	}
+	op->nfwait = n;
+	for (uint32_t i = 0; i < n; i++) {
+		fw[i].op = op;
+		fw[i].idx = i;
+		if (wv == NULL) {
+			fw[i].uaddr = sqe->addr;
+			fw[i].val = sqe->addr2;
+			fw[i].flags = (uint32_t)sqe->fd;
+			fw[i].mask = sqe->addr3 != 0 ? (uint32_t)sqe->addr3 :
+			    FUTEX_BITSET_MATCH_ANY;
+		} else {
+			fw[i].uaddr = wv[i].uaddr;
+			fw[i].val = wv[i].val;
+			fw[i].flags = wv[i].flags;
+			fw[i].mask = FUTEX_BITSET_MATCH_ANY;
+		}
+	}
+	free(wv, M_KQRING);
+	return (0);
+}
 
 #define	KQRING_SQE_FLAGS						\
 	(IOSQE_IO_DRAIN | IOSQE_IO_LINK | IOSQE_IO_HARDLINK |		\
 	IOSQE_ASYNC | IOSQE_BUFFER_SELECT | IOSQE_CQE_SKIP_SUCCESS)
 
+/* msg_flags a receive / send may pass (FreeBSD MSG_* values). */
+#define	KQRING_RECV_MSG_FLAGS						\
+	(MSG_OOB | MSG_PEEK | MSG_TRUNC | MSG_WAITALL | MSG_DONTWAIT |	\
+	MSG_CMSG_CLOEXEC | MSG_CMSG_CLOFORK)
+#define	KQRING_SEND_MSG_FLAGS						\
+	(MSG_OOB | MSG_DONTROUTE | MSG_EOR | MSG_WAITALL | MSG_DONTWAIT | \
+	MSG_EOF | MSG_NOSIGNAL | MSG_MORETOCOME)
+
 /*
- * Validate an SQE and copy in the arguments it points to (timespecs), as
- * io_uring's prep does, so a linked or drained request does not read user
- * memory later.  Reject flags, ioprio bits and fields kqring does not
+ * Validate an SQE and copy in the arguments it points to (paths, iovecs,
+ * msghdrs, socket addresses, timespecs, xattr values, futex vectors), as
+ * io_uring's prep does, so a linked, drained or armed request does not read
+ * user memory later.  Reject flags, ioprio bits and fields kqring does not
  * implement instead of silently ignoring them: IOSQE_FIXED_FILE would turn
  * a fixed-file index into a raw fd.  IOSQE_ASYNC is only a hint.  `prev`
  * is the request this one is linked behind, if any.
@@ -1680,28 +3312,118 @@ static int
 kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 {
 	const struct io_uring_sqe *sqe = &op->sqe;
-	bool multishot = false;
+	const struct kqring_msg_args *ma;
+	struct kqring_path_args *pa;
+	uint32_t ioprio_ok;
+	bool multishot = false, buf_select_ok = false;
 	int error;
 
 	if ((sqe->flags & ~KQRING_SQE_FLAGS) != 0)
 		return (EINVAL);
+	/* Registered personalities do not exist (yet). */
+	if (sqe->personality != 0)
+		return (EINVAL);
 
 	switch (sqe->opcode) {
+	case IORING_OP_READ:
+	case IORING_OP_WRITE:
+		if (sqe->rw_flags != 0)
+			return (EINVAL);
+		buf_select_ok = sqe->opcode == IORING_OP_READ;
+		break;
+	case IORING_OP_READV:
+	case IORING_OP_WRITEV:
+		if (sqe->rw_flags != 0)
+			return (EINVAL);
+		error = kqring_prep_iov(op);
+		if (error != 0)
+			return (error);
+		break;
+	case IORING_OP_READ_MULTISHOT:
+		if (sqe->rw_flags != 0 ||
+		    (sqe->flags & IOSQE_BUFFER_SELECT) == 0)
+			return (EINVAL);
+		buf_select_ok = multishot = true;
+		break;
 	case IORING_OP_RECV:
+	case IORING_OP_RECVMSG:
 		if ((sqe->ioprio & ~(IORING_RECVSEND_POLL_FIRST |
-		    IORING_RECV_MULTISHOT)) != 0)
+		    IORING_RECV_MULTISHOT)) != 0 ||
+		    (sqe->msg_flags & ~(uint32_t)KQRING_RECV_MSG_FLAGS) != 0)
 			return (EINVAL);
 		multishot = (sqe->ioprio & IORING_RECV_MULTISHOT) != 0;
 		/* Each multishot completion needs its own buffer. */
-		if (multishot && (sqe->flags & IOSQE_BUFFER_SELECT) == 0)
+		if (multishot && ((sqe->flags & IOSQE_BUFFER_SELECT) == 0 ||
+		    (sqe->msg_flags & MSG_WAITALL) != 0))
 			return (EINVAL);
-		/* Only buffer group 0 exists. */
+		buf_select_ok = true;
+		if (sqe->opcode == IORING_OP_RECV)
+			break;
+		error = kqring_prep_msg(op, false);
+		if (error != 0)
+			return (error);
+		ma = op->args;
+		/* A provided buffer replaces the (single) iovec. */
 		if ((sqe->flags & IOSQE_BUFFER_SELECT) != 0 &&
-		    sqe->buf_group != 0)
-			return (ENOBUFS);
+		    ma->msg.msg_iovlen > 1)
+			return (EINVAL);
+		if (multishot && (ma->msg.msg_namelen > 65536 ||
+		    ma->msg.msg_controllen > 65536))
+			return (EINVAL);
 		break;
 	case IORING_OP_SEND:
-		if ((sqe->ioprio & ~IORING_RECVSEND_POLL_FIRST) != 0)
+	case IORING_OP_SEND_ZC:
+	case IORING_OP_SENDMSG:
+	case IORING_OP_SENDMSG_ZC:
+		/* FIXED_BUF needs registered buffers. */
+		ioprio_ok = IORING_RECVSEND_POLL_FIRST;
+		if (sqe->opcode == IORING_OP_SEND_ZC ||
+		    sqe->opcode == IORING_OP_SENDMSG_ZC)
+			ioprio_ok |= IORING_SEND_ZC_REPORT_USAGE;
+		if ((sqe->ioprio & ~ioprio_ok) != 0 ||
+		    (sqe->msg_flags & ~(uint32_t)KQRING_SEND_MSG_FLAGS) != 0)
+			return (EINVAL);
+		if (sqe->opcode == IORING_OP_SENDMSG ||
+		    sqe->opcode == IORING_OP_SENDMSG_ZC) {
+			error = kqring_prep_msg(op, true);
+			if (error != 0)
+				return (error);
+		} else if (sqe->addr2 != 0 || sqe->addr_len != 0) {
+			/* sendto(2): destination at addr2, addr_len bytes. */
+			error = kqring_prep_sockaddr(op, sqe->addr2,
+			    sqe->addr_len);
+			if (error != 0)
+				return (error);
+		}
+		break;
+	case IORING_OP_ACCEPT:
+		if ((sqe->ioprio & ~(IORING_ACCEPT_MULTISHOT |
+		    IORING_ACCEPT_DONTWAIT | IORING_ACCEPT_POLL_FIRST)) != 0 ||
+		    (sqe->accept_flags & ~(uint32_t)(SOCK_CLOEXEC |
+		    SOCK_NONBLOCK | SOCK_CLOFORK)) != 0 ||
+		    sqe->len != 0 || sqe->file_index != 0)
+			return (EINVAL);
+		multishot = (sqe->ioprio & IORING_ACCEPT_MULTISHOT) != 0;
+		break;
+	case IORING_OP_CONNECT:
+	case IORING_OP_BIND:
+		if (sqe->len != 0 || sqe->rw_flags != 0 || sqe->buf_index != 0 ||
+		    sqe->splice_fd_in != 0)
+			return (EINVAL);
+		error = kqring_prep_sockaddr(op, sqe->addr, sqe->addr2);
+		if (error != 0)
+			return (error);
+		break;
+	case IORING_OP_LISTEN:
+	case IORING_OP_SHUTDOWN:
+		if (sqe->addr != 0 || sqe->addr2 != 0 || sqe->rw_flags != 0 ||
+		    sqe->buf_index != 0 || sqe->splice_fd_in != 0)
+			return (EINVAL);
+		break;
+	case IORING_OP_SOCKET:
+		/* file_index (direct descriptors) needs fixed files. */
+		if (sqe->rw_flags != 0 || sqe->addr != 0 ||
+		    sqe->file_index != 0)
 			return (EINVAL);
 		break;
 	case IORING_OP_POLL_ADD:
@@ -1739,10 +3461,150 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		    IORING_ASYNC_CANCEL_USERDATA | IORING_ASYNC_CANCEL_OP)) != 0)
 			return (EINVAL);
 		break;
+	case IORING_OP_FSYNC:
+		if ((sqe->fsync_flags & ~IORING_FSYNC_DATASYNC) != 0 ||
+		    sqe->addr != 0 || sqe->buf_index != 0 ||
+		    sqe->splice_fd_in != 0)
+			return (EINVAL);
+		break;
+	case IORING_OP_SYNC_FILE_RANGE:
+		if ((sqe->sync_range_flags & ~(SYNC_FILE_RANGE_WAIT_BEFORE |
+		    SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER)) != 0 ||
+		    sqe->addr != 0 || sqe->buf_index != 0 ||
+		    sqe->splice_fd_in != 0)
+			return (EINVAL);
+		break;
+	case IORING_OP_FALLOCATE:
+	case IORING_OP_FADVISE:
+	case IORING_OP_MADVISE:
+		if ((sqe->opcode == IORING_OP_FALLOCATE && sqe->rw_flags != 0) ||
+		    sqe->buf_index != 0 || sqe->splice_fd_in != 0)
+			return (EINVAL);
+		break;
+	case IORING_OP_FTRUNCATE:
+		if (sqe->rw_flags != 0 || sqe->addr != 0 || sqe->len != 0 ||
+		    sqe->buf_index != 0 || sqe->splice_fd_in != 0 ||
+		    sqe->addr3 != 0)
+			return (EINVAL);
+		break;
+	case IORING_OP_OPENAT:
+		/* file_index (direct descriptors) needs fixed files. */
+		if (sqe->buf_index != 0 || sqe->file_index != 0)
+			return (EINVAL);
+		error = kqring_prep_paths(op, false);
+		if (error != 0)
+			return (error);
+		pa = op->args;
+		pa->how.flags = sqe->open_flags;
+		pa->how.mode = sqe->len;
+		break;
+	case IORING_OP_OPENAT2:
+		if (sqe->buf_index != 0 || sqe->file_index != 0)
+			return (EINVAL);
+		error = kqring_prep_openat2(op);
+		if (error != 0)
+			return (error);
+		break;
+	case IORING_OP_CLOSE:
+		if (sqe->off != 0 || sqe->addr != 0 || sqe->len != 0 ||
+		    sqe->rw_flags != 0 || sqe->buf_index != 0 ||
+		    sqe->file_index != 0)
+			return (EINVAL);
+		break;
+	case IORING_OP_STATX:
+		if (sqe->buf_index != 0 || sqe->splice_fd_in != 0 ||
+		    (sqe->statx_flags & ~(uint32_t)(AT_SYMLINK_NOFOLLOW |
+		    AT_EMPTY_PATH | AT_RESOLVE_BENEATH)) != 0 ||
+		    (sqe->len & STATX__RESERVED) != 0)
+			return (EINVAL);
+		error = kqring_prep_paths(op, false);
+		if (error != 0)
+			return (error);
+		break;
+	case IORING_OP_RENAMEAT:
+	case IORING_OP_LINKAT:
+	case IORING_OP_SYMLINKAT:
+		if (sqe->buf_index != 0 || sqe->splice_fd_in != 0)
+			return (EINVAL);
+		if ((sqe->opcode == IORING_OP_RENAMEAT &&
+		    (sqe->rename_flags & ~(uint32_t)AT_RENAME_NOREPLACE) != 0) ||
+		    (sqe->opcode == IORING_OP_LINKAT &&
+		    (sqe->hardlink_flags & ~(uint32_t)(AT_SYMLINK_FOLLOW |
+		    AT_RESOLVE_BENEATH | AT_EMPTY_PATH)) != 0) ||
+		    (sqe->opcode == IORING_OP_SYMLINKAT &&
+		    (sqe->len != 0 || sqe->rw_flags != 0)))
+			return (EINVAL);
+		error = kqring_prep_paths(op, true);
+		if (error != 0)
+			return (error);
+		break;
+	case IORING_OP_UNLINKAT:
+	case IORING_OP_MKDIRAT:
+		if (sqe->off != 0 || sqe->buf_index != 0 ||
+		    sqe->splice_fd_in != 0 ||
+		    (sqe->opcode == IORING_OP_UNLINKAT && (sqe->len != 0 ||
+		    (sqe->unlink_flags & ~(uint32_t)(AT_REMOVEDIR |
+		    AT_RESOLVE_BENEATH)) != 0)) ||
+		    (sqe->opcode == IORING_OP_MKDIRAT && sqe->rw_flags != 0))
+			return (EINVAL);
+		error = kqring_prep_paths(op, false);
+		if (error != 0)
+			return (error);
+		break;
+	case IORING_OP_FGETXATTR:
+	case IORING_OP_FSETXATTR:
+	case IORING_OP_GETXATTR:
+	case IORING_OP_SETXATTR:
+		error = kqring_prep_xattr(op);
+		if (error != 0)
+			return (error);
+		break;
+	case IORING_OP_FUTEX_WAIT:
+	case IORING_OP_FUTEX_WAITV:
+		error = kqring_prep_futex_wait(op);
+		if (error != 0)
+			return (error);
+		break;
+	case IORING_OP_FUTEX_WAKE:
+		if (sqe->len != 0 || sqe->futex_flags != 0 ||
+		    sqe->buf_index != 0 || sqe->file_index != 0 ||
+		    sqe->addr3 > UINT32_MAX ||
+		    !kqring_futex_flags_ok((uint32_t)sqe->fd) ||
+		    (sqe->addr & 3) != 0)
+			return (EINVAL);
+		break;
+	case IORING_OP_MSG_RING:
+		if (sqe->buf_index != 0 ||
+		    (sqe->msg_ring_flags & ~(IORING_MSG_RING_CQE_SKIP |
+		    IORING_MSG_RING_FLAGS_PASS)) != 0)
+			return (EINVAL);
+		/* SEND_FD needs fixed files. */
+		if (sqe->addr == IORING_MSG_SEND_FD)
+			return (EOPNOTSUPP);
+		if (sqe->addr != IORING_MSG_DATA || sqe->addr3 != 0 ||
+		    (sqe->msg_ring_flags & IORING_MSG_RING_CQE_SKIP) != 0 ||
+		    ((sqe->msg_ring_flags & IORING_MSG_RING_FLAGS_PASS) == 0 &&
+		    sqe->file_index != 0))
+			return (EINVAL);
+		break;
+	case IORING_OP_WAITID:
+		if (sqe->addr != 0 || sqe->buf_index != 0 || sqe->addr3 != 0 ||
+		    sqe->waitid_flags != 0 ||
+		    (sqe->file_index & ~(uint32_t)(WNOHANG | WUNTRACED |
+		    WCONTINUED | WNOWAIT | WEXITED | WTRAPPED)) != 0)
+			return (EINVAL);
+		break;
+	case IORING_OP_URING_CMD:
+		/* IORING_URING_CMD_FIXED needs registered buffers. */
+		if (sqe->__pad1 != 0 || sqe->uring_cmd_flags != 0)
+			return (EINVAL);
+		break;
 	}
-	if ((sqe->flags & IOSQE_BUFFER_SELECT) != 0 &&
-	    sqe->opcode != IORING_OP_RECV)
+	if ((sqe->flags & IOSQE_BUFFER_SELECT) != 0 && !buf_select_ok)
 		return (EINVAL);
+	/* Only buffer group 0 exists. */
+	if ((sqe->flags & IOSQE_BUFFER_SELECT) != 0 && sqe->buf_group != 0)
+		return (ENOBUFS);
 	/* A LINK_TIMEOUT guards the request it is linked behind. */
 	if (sqe->opcode == IORING_OP_LINK_TIMEOUT && (prev == NULL ||
 	    prev->sqe.opcode == IORING_OP_LINK_TIMEOUT))
@@ -1753,6 +3615,11 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		return (EINVAL);
 	return (0);
 }
+
+/* ============================================================================
+ * Request Lifecycle: Links, Drain, Issue and Completion
+ * ============================================================================
+ */
 
 /*
  * Complete every request of a chain that will not run: with its own
@@ -1785,13 +3652,23 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
     uint32_t cflags)
 {
 	struct kqring_op *next, *lt;
-	bool failed;
+	bool failed, zc;
 
 	KASSERT(!op->armed, ("kqring: completing an armed op"));
 	failed = res < 0 && !(res == -ETIME &&
 	    (op->sqe.opcode == IORING_OP_TIMEOUT ||
 	    op->sqe.opcode == IORING_OP_LINK_TIMEOUT) &&
 	    (op->sqe.timeout_flags & IORING_TIMEOUT_ETIME_SUCCESS) != 0);
+
+	/*
+	 * SEND_ZC / SENDMSG_ZC: IORING_CQE_F_MORE announces the notification
+	 * CQE that the buffer may be reused.  kqring copies the data, so
+	 * that is right away.
+	 */
+	zc = op->sqe.opcode == IORING_OP_SEND_ZC ||
+	    op->sqe.opcode == IORING_OP_SENDMSG_ZC;
+	if (zc)
+		cflags |= IORING_CQE_F_MORE;
 
 	if (res < 0 || (op->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) == 0) {
 		if (op->sqe.opcode == IORING_OP_TIMEOUT)
@@ -1800,6 +3677,11 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 		else
 			kqring_post_cqe(ctx, op->sqe.user_data, res, cflags);
 	}
+	if (zc)
+		kqring_post_cqe(ctx, op->sqe.user_data,
+		    (op->sqe.ioprio & IORING_SEND_ZC_REPORT_USAGE) != 0 ?
+		    (int32_t)IORING_NOTIF_USAGE_ZC_COPIED : 0,
+		    IORING_CQE_F_NOTIF);
 
 	lt = op->ltimeout;
 	if (lt != NULL) {
@@ -1830,6 +3712,21 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 	kqring_op_free(op);
 }
 
+/* Whether fd is a socket (lookup errors are left to the op itself). */
+static bool
+kqring_fd_is_socket(int fd)
+{
+	struct thread *td = curthread;
+	struct file *fp;
+	bool sock;
+
+	if (fget(td, fd, &cap_no_rights, &fp) != 0)
+		return (false);
+	sock = fp->f_type == DTYPE_SOCKET;
+	fdrop(fp, td);
+	return (sock);
+}
+
 /*
  * Issue a request: run it inline, or arm it to finish later from
  * taskwork.  Every path ends in kqring_req_complete() or an armed op.
@@ -1841,8 +3738,29 @@ kqring_req_issue(struct kqring_ctx *ctx, struct kqring_op *op)
 	bool armed = false;
 
 	switch (sqe->opcode) {
+	case IORING_OP_READ:
+	case IORING_OP_WRITE:
+	case IORING_OP_READV:
+	case IORING_OP_WRITEV:
+		/*
+		 * A socket would block the ring owner in read(2); treat it like
+		 * RECV / SEND instead, so it can be armed.
+		 */
+		if (!kqring_fd_is_socket(sqe->fd)) {
+			kqring_exec_sync(ctx, op);
+			kqring_req_complete(ctx, op, op->res, op->cflags);
+			return;
+		}
+		op->sock_rw = true;
+		/* FALLTHROUGH */
 	case IORING_OP_RECV:
+	case IORING_OP_RECVMSG:
+	case IORING_OP_READ_MULTISHOT:
 	case IORING_OP_SEND:
+	case IORING_OP_SEND_ZC:
+	case IORING_OP_SENDMSG:
+	case IORING_OP_SENDMSG_ZC:
+	case IORING_OP_CONNECT:
 	case IORING_OP_ACCEPT:
 	case IORING_OP_POLL_ADD:
 		/*
@@ -1860,6 +3778,12 @@ kqring_req_issue(struct kqring_ctx *ctx, struct kqring_op *op)
 				return;
 			}
 		}
+		/* IORING_ACCEPT_DONTWAIT: fail rather than wait. */
+		if (sqe->opcode == IORING_OP_ACCEPT &&
+		    (sqe->ioprio & IORING_ACCEPT_DONTWAIT) != 0) {
+			kqring_req_complete(ctx, op, -EAGAIN, 0);
+			return;
+		}
 		armed = kqring_arm_socket_op(ctx, op, kqring_op_dirs(sqe));
 		break;
 	case IORING_OP_TIMEOUT:
@@ -1871,8 +3795,18 @@ kqring_req_issue(struct kqring_ctx *ctx, struct kqring_op *op)
 		kqring_req_complete(ctx, op, -EINVAL, 0);
 		return;
 	case IORING_OP_FUTEX_WAIT:
+	case IORING_OP_FUTEX_WAITV:
 		armed = kqring_futex_arm(ctx, op);
 		break;
+	case IORING_OP_FUTEX_WAKE:
+		kqring_req_complete(ctx, op, kqring_futex_wake(sqe), 0);
+		return;
+	case IORING_OP_WAITID:
+		armed = kqring_waitid_arm(ctx, op);
+		break;
+	case IORING_OP_MSG_RING:
+		kqring_req_complete(ctx, op, kqring_msg_ring(sqe), 0);
+		return;
 	case IORING_OP_ASYNC_CANCEL:
 		kqring_req_complete(ctx, op, kqring_cancel(ctx, sqe), 0);
 		return;
@@ -1883,7 +3817,8 @@ kqring_req_issue(struct kqring_ctx *ctx, struct kqring_op *op)
 		kqring_req_complete(ctx, op, kqring_poll_remove(ctx, sqe), 0);
 		return;
 	default:
-		kqring_req_complete(ctx, op, kqring_exec_sync(sqe), 0);
+		kqring_exec_sync(ctx, op);
+		kqring_req_complete(ctx, op, op->res, op->cflags);
 		return;
 	}
 	if (armed)
@@ -1980,6 +3915,16 @@ kqring_taskwork_run_one(struct kqring_ctx *ctx, struct kqring_op *op)
 	case IORING_OP_LINK_TIMEOUT:
 		kqring_timeout_fire(ctx, op);
 		return;
+	case IORING_OP_FUTEX_WAIT:
+	case IORING_OP_FUTEX_WAITV:
+		/* Queued by FUTEX_WAKE, which set ->res; nothing else queues. */
+		if (!op->futex_woken)
+			return;
+		mtx_lock(&ctx->mtx);
+		kqring_op_unarm_locked(ctx, op);
+		mtx_unlock(&ctx->mtx);
+		kqring_req_complete(ctx, op, op->res, 0);
+		return;
 	}
 	/*
 	 * Only this thread disarms ops, so op->so stays put.  EAGAIN (a
@@ -1994,9 +3939,29 @@ kqring_taskwork_run_one(struct kqring_ctx *ctx, struct kqring_op *op)
 	kqring_req_complete(ctx, op, op->res, op->cflags);
 }
 
+/* Post the CQEs other rings sent with MSG_RING.  Drops ctx->mtx. */
+static void
+kqring_post_remote_locked(struct kqring_ctx *ctx)
+{
+	STAILQ_HEAD(, kqring_rcqe) q = STAILQ_HEAD_INITIALIZER(q);
+	struct kqring_rcqe *rc;
+
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	STAILQ_CONCAT(&q, &ctx->rcq);
+	ctx->nrcq = 0;
+	mtx_unlock(&ctx->mtx);
+	while ((rc = STAILQ_FIRST(&q)) != NULL) {
+		STAILQ_REMOVE_HEAD(&q, link);
+		kqring_post_cqe(ctx, rc->cqe.user_data, rc->cqe.res,
+		    rc->cqe.flags);
+		free(rc, M_KQRING);
+	}
+	mtx_lock(&ctx->mtx);
+}
+
 /*
- * Run deferred taskwork in curthread context (DEFER_TASKRUN), and issue
- * the link successors it unblocks.
+ * Run deferred taskwork in curthread context (DEFER_TASKRUN), post
+ * MSG_RING CQEs, and issue the link successors it unblocks.
  */
 static void
 kqring_run_taskwork(struct kqring_ctx *ctx)
@@ -2016,14 +3981,21 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 			break;
 
 		mtx_lock(&ctx->mtx);
-		while ((op = TAILQ_FIRST(&ctx->taskwork_ops)) != NULL) {
-			TAILQ_REMOVE(&ctx->taskwork_ops, op, taskwork_link);
-			op->in_taskwork = false;
-			if (op->cancelled || ctx->closing)
+		for (;;) {
+			if ((op = TAILQ_FIRST(&ctx->taskwork_ops)) != NULL) {
+				TAILQ_REMOVE(&ctx->taskwork_ops, op,
+				    taskwork_link);
+				op->in_taskwork = false;
+				if (op->cancelled || ctx->closing)
+					continue;
+				mtx_unlock(&ctx->mtx);
+				kqring_taskwork_run_one(ctx, op);
+				mtx_lock(&ctx->mtx);
 				continue;
-			mtx_unlock(&ctx->mtx);
-			kqring_taskwork_run_one(ctx, op);
-			mtx_lock(&ctx->mtx);
+			}
+			if (STAILQ_EMPTY(&ctx->rcq))
+				break;
+			kqring_post_remote_locked(ctx);
 		}
 		if (ctx->shm != NULL)
 			atomic_clear_32(&ctx->shm->sq_flags, IORING_SQ_TASKRUN);
@@ -2043,6 +4015,7 @@ kqring_dtor(void *data)
 	struct kqring_ctx *ctx = data;
 	struct kqring_op *op;
 	struct kqring_ocqe *ocqe;
+	struct kqring_rcqe *rc;
 
 	/* closing stops upcalls and callouts from queueing taskwork. */
 	mtx_lock(&ctx->mtx);
@@ -2071,6 +4044,11 @@ kqring_dtor(void *data)
 		STAILQ_REMOVE_HEAD(&ctx->ocq, link);
 		free(ocqe, M_KQRING);
 	}
+	/* closing (set under mtx) stops MSG_RING senders from adding more. */
+	while ((rc = STAILQ_FIRST(&ctx->rcq)) != NULL) {
+		STAILQ_REMOVE_HEAD(&ctx->rcq, link);
+		free(rc, M_KQRING);
+	}
 
 	kqring_free_shm(ctx->ring_obj, ctx->ring_kva, ctx->ring_alloc_len);
 	kqring_free_shm(ctx->sqes_obj, ctx->sqes_kva, ctx->sqes_alloc_len);
@@ -2093,6 +4071,7 @@ kqring_open(struct cdev *dev __unused, int oflags __unused, int devtype __unused
 	TAILQ_INIT(&ctx->ready_q);
 	TAILQ_INIT(&ctx->defer_q);
 	STAILQ_INIT(&ctx->ocq);
+	STAILQ_INIT(&ctx->rcq);
 
 	error = devfs_set_cdevpriv(ctx, kqring_dtor);
 	if (error != 0) {
@@ -2304,35 +4283,63 @@ kqring_poll_fallback_locked(struct kqring_ctx *ctx)
 }
 
 /*
- * Complete armed FUTEX_WAIT ops whose word no longer holds the expected
- * value (or can no longer be read).  Only the owner thread (this one)
- * modifies active_ops, so it is walked without ctx->mtx, which must not be
- * held across copyin().
+ * Complete armed FUTEX_WAIT(V) ops one of whose words no longer holds the
+ * expected value (or can no longer be read), with that word's index.
+ * Only the owner thread (this one) modifies active_ops, so it is walked
+ * without ctx->mtx, which must not be held across copyin().
  */
 static void
 kqring_check_futexes(struct kqring_ctx *ctx)
 {
 	struct kqring_op *op, *tmp;
-	uint32_t uval;
-	int error;
+	struct kqring_fwait *fw;
+	uint32_t i, uval;
+	int32_t res;
+	int error = 0;
 
 	if (ctx->nfutex == 0)
 		return;
 	TAILQ_FOREACH_SAFE(op, &ctx->active_ops, active_link, tmp) {
-		if (op->sqe.opcode != IORING_OP_FUTEX_WAIT || op->cancelled)
+		if (op->nfwait == 0 || op->cancelled)
 			continue;
-		error = copyin((const void *)(uintptr_t)op->sqe.addr, &uval,
-		    sizeof(uval));
-		if (error == 0 && uval == (uint32_t)op->sqe.off)
+		fw = op->args;
+		for (i = 0; i < op->nfwait; i++) {
+			error = copyin((const void *)(uintptr_t)fw[i].uaddr,
+			    &uval, sizeof(uval));
+			if (error != 0 || uval != (uint32_t)fw[i].val)
+				break;
+		}
+		if (i == op->nfwait)
 			continue;
 		/*
 		 * Completion only queues link successors (never touches
 		 * active_ops), so tmp stays valid.
 		 */
 		mtx_lock(&ctx->mtx);
+		res = op->futex_woken ? op->res :
+		    (error != 0 ? -error : (int32_t)i);
 		kqring_op_unarm_locked(ctx, op);
 		mtx_unlock(&ctx->mtx);
-		kqring_req_complete(ctx, op, -error, 0);
+		kqring_req_complete(ctx, op, res, 0);
+	}
+}
+
+/* Complete armed WAITIDs whose child changed state. */
+static void
+kqring_check_waitids(struct kqring_ctx *ctx)
+{
+	struct kqring_op *op, *tmp;
+
+	if (ctx->nwaitid == 0)
+		return;
+	TAILQ_FOREACH_SAFE(op, &ctx->active_ops, active_link, tmp) {
+		if (op->sqe.opcode != IORING_OP_WAITID || op->cancelled ||
+		    kqring_exec_waitid(op) == EAGAIN)
+			continue;
+		mtx_lock(&ctx->mtx);
+		kqring_op_unarm_locked(ctx, op);
+		mtx_unlock(&ctx->mtx);
+		kqring_req_complete(ctx, op, op->res, 0);
 	}
 }
 
@@ -2341,6 +4348,7 @@ static void
 kqring_run_checks(struct kqring_ctx *ctx)
 {
 	kqring_check_futexes(ctx);
+	kqring_check_waitids(ctx);
 	kqring_check_timeouts(ctx);
 	kqring_flush_ready(ctx);
 }
@@ -2502,18 +4510,23 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 			kqring_poll_fallback_locked(ctx);
 			may_poll = false;
 		}
-		if (!TAILQ_EMPTY(&ctx->taskwork_ops)) {
+		if (!TAILQ_EMPTY(&ctx->taskwork_ops) ||
+		    !STAILQ_EMPTY(&ctx->rcq)) {
 			mtx_unlock(&ctx->mtx);
 			continue;
 		}
 		/*
 		 * If a futex or polled op is armed, wake periodically (50 us)
-		 * to re-check it in addition to socket upcalls.
+		 * to re-check it in addition to socket upcalls; a WAITID is
+		 * re-polled every millisecond.
 		 */
-		sbintime_t sleep_sbt = sbt;
-		if ((ctx->nfutex > 0 || ctx->npolled > 0) &&
-		    (!has_timeout || sleep_sbt > 50 * SBT_1US))
-			sleep_sbt = 50 * SBT_1US;
+		sbintime_t sleep_sbt = sbt, period = 0;
+		if (ctx->nfutex > 0 || ctx->npolled > 0)
+			period = 50 * SBT_1US;
+		else if (ctx->nwaitid > 0)
+			period = SBT_1MS;
+		if (period != 0 && (!has_timeout || sleep_sbt > period))
+			sleep_sbt = period;
 
 		/* Timeout is sbintime_t, not ticks: use the _sbt variant. */
 		ctx->sleeping = true;
@@ -2564,20 +4577,54 @@ kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
 
 		static const uint8_t supported_ops[] = {
 			IORING_OP_NOP,
+			IORING_OP_READV,
+			IORING_OP_WRITEV,
 			IORING_OP_FSYNC,
 			IORING_OP_POLL_ADD,
 			IORING_OP_POLL_REMOVE,
+			IORING_OP_SYNC_FILE_RANGE,
+			IORING_OP_SENDMSG,
+			IORING_OP_RECVMSG,
 			IORING_OP_TIMEOUT,
 			IORING_OP_TIMEOUT_REMOVE,
 			IORING_OP_ACCEPT,
 			IORING_OP_ASYNC_CANCEL,
 			IORING_OP_LINK_TIMEOUT,
+			IORING_OP_CONNECT,
+			IORING_OP_FALLOCATE,
 			IORING_OP_OPENAT,
+			IORING_OP_CLOSE,
+			IORING_OP_STATX,
 			IORING_OP_READ,
 			IORING_OP_WRITE,
+			IORING_OP_FADVISE,
+			IORING_OP_MADVISE,
 			IORING_OP_SEND,
 			IORING_OP_RECV,
+			IORING_OP_OPENAT2,
+			IORING_OP_SHUTDOWN,
+			IORING_OP_RENAMEAT,
+			IORING_OP_UNLINKAT,
+			IORING_OP_MKDIRAT,
+			IORING_OP_SYMLINKAT,
+			IORING_OP_LINKAT,
+			IORING_OP_MSG_RING,
+			IORING_OP_FSETXATTR,
+			IORING_OP_SETXATTR,
+			IORING_OP_FGETXATTR,
+			IORING_OP_GETXATTR,
+			IORING_OP_SOCKET,
+			IORING_OP_URING_CMD,
+			IORING_OP_SEND_ZC,
+			IORING_OP_SENDMSG_ZC,
+			IORING_OP_READ_MULTISHOT,
+			IORING_OP_WAITID,
 			IORING_OP_FUTEX_WAIT,
+			IORING_OP_FUTEX_WAKE,
+			IORING_OP_FUTEX_WAITV,
+			IORING_OP_FTRUNCATE,
+			IORING_OP_BIND,
+			IORING_OP_LISTEN,
 		};
 		/*
 		 * As in io_uring: last_op is the last opcode this ABI knows
@@ -2659,17 +4706,27 @@ kqring_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 
 	switch (cmd) {
 	case KQRING_IOC_SETUP:
-		return (kqring_ioc_setup(ctx, (struct kqring_setup_arg *)data,
-		    td));
+		error = kqring_ioc_setup(ctx, (struct kqring_setup_arg *)data,
+		    td);
+		break;
 	case KQRING_IOC_ENTER:
-		return (kqring_ioc_enter(ctx, (struct kqring_enter_arg *)data,
-		    td));
+		error = kqring_ioc_enter(ctx, (struct kqring_enter_arg *)data,
+		    td);
+		break;
 	case KQRING_IOC_REGISTER:
-		return (kqring_ioc_register(ctx,
-		    (struct kqring_register_arg *)data, td));
+		error = kqring_ioc_register(ctx,
+		    (struct kqring_register_arg *)data, td);
+		break;
 	default:
 		return (ENOTTY);
 	}
+	/*
+	 * kern_*() calls made for SQEs (openat, accept, socket...) leave
+	 * their result in td_retval[0], which would become ioctl(2)'s
+	 * return value.
+	 */
+	td->td_retval[0] = 0;
+	return (error);
 }
 
 static int
@@ -2715,16 +4772,26 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 {
 	switch (type) {
 	case MOD_LOAD:
+		mtx_init(&kqring_futex_mtx, "kqring futex", NULL, MTX_DEF);
+		for (int i = 0; i < KQRING_FUTEX_HASH; i++)
+			LIST_INIT(&kqring_futex_hash[i]);
 		kqring_cdev = make_dev(&kqring_cdevsw, 0, UID_ROOT, GID_WHEEL,
 		    0666, "kqring");
-		if (kqring_cdev == NULL)
+		if (kqring_cdev == NULL) {
+			mtx_destroy(&kqring_futex_mtx);
 			return (ENOMEM);
+		}
 		printf("kqring: loaded (/dev/kqring, SINGLE_ISSUER | DEFER_TASKRUN)\n");
 		return (0);
 
 	case MOD_UNLOAD:
+		/*
+		 * destroy_dev() runs the destructor of every ring still open,
+		 * so no futex is hashed after it.
+		 */
 		if (kqring_cdev != NULL)
 			destroy_dev(kqring_cdev);
+		mtx_destroy(&kqring_futex_mtx);
 		printf("kqring: unloaded\n");
 		return (0);
 
