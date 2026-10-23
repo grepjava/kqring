@@ -5907,45 +5907,6 @@ kqring_prep_sockaddr(struct kqring_op *op, uint64_t uaddr, uint64_t len)
 	return (0);
 }
 
-static int
-kqring_check_scm_rights(void *ctl, size_t ctllen)
-{
-	struct thread *td = curthread;
-	uint8_t *p = ctl;
-	size_t rem = ctllen;
-
-	while (rem >= sizeof(struct cmsghdr)) {
-		struct cmsghdr *cm = (void *)p;
-		size_t clen = cm->cmsg_len, alen;
-
-		if (clen < sizeof(struct cmsghdr) || clen > rem)
-			break;
-		if (cm->cmsg_level == SOL_SOCKET &&
-		    cm->cmsg_type == SCM_RIGHTS) {
-			const int *fds = (const int *)CMSG_DATA(cm);
-			size_t nfds = (clen - CMSG_LEN(0)) / sizeof(int);
-
-			for (size_t i = 0; i < nfds; i++) {
-				struct file *fp;
-				bool is_ring;
-
-				if (fget(td, fds[i], &cap_no_rights, &fp) != 0)
-					continue;
-				is_ring = kqring_fp_is_ring(fp);
-				fdrop(fp, td);
-				if (is_ring)
-					return (EINVAL);
-			}
-		}
-		alen = CMSG_ALIGN(clen);
-		if (alen < clen || alen >= rem)
-			break;
-		p += alen;
-		rem -= alen;
-	}
-	return (0);
-}
-
 /*
  * SENDMSG(_ZC) / RECVMSG: copy the msghdr and its iovec, and for a send
  * the name and control data too.  A receive's name and control buffers
@@ -6006,9 +5967,6 @@ kqring_prep_msg(struct kqring_op *op, bool is_send)
 	if (ctllen != 0) {
 		ma->msg.msg_control = (char *)ma->iov + iovsz;
 		error = copyin(msg.msg_control, ma->msg.msg_control, ctllen);
-		if (error != 0)
-			return (error);
-		error = kqring_check_scm_rights(ma->msg.msg_control, ctllen);
 		if (error != 0)
 			return (error);
 	} else {
@@ -8058,6 +8016,13 @@ kqring_ctx_cancel_all(struct kqring_ctx *ctx)
 		TAILQ_REMOVE(&ctx->defer_q, op, q_link);
 		kqring_req_destroy(ctx, op);
 	}
+	/*
+	 * Drop fixed-file and registered-buffer tables on process exit/exec
+	 * as well as ring close, breaking any AF_UNIX SCM_RIGHTS cycle where
+	 * a ring's own fd is in flight on a socket held in its fixed table.
+	 */
+	kqring_files_free(ctx);
+	kqring_bufs_free(ctx);
 }
 
 static void
@@ -9197,14 +9162,7 @@ kqring_proc_clear(struct proc *p)
 }
 
 static void
-kqring_proc_exit(void *arg __unused, struct proc *p)
-{
-	kqring_proc_clear(p);
-}
-
-static void
-kqring_proc_exec(void *arg __unused, struct proc *p,
-    struct image_params *imgp __unused)
+kqring_proc_rings_teardown(struct proc *p)
 {
 	struct kqring_ctx *ctx;
 
@@ -9224,9 +9182,26 @@ kqring_proc_exec(void *arg __unused, struct proc *p,
 		mtx_unlock(&kqring_proc_mtx);
 		if (ctx == NULL)
 			break;
+		mtx_lock(&ctx->mtx);
+		if (ctx->owner_proc == p)
+			kqring_clear_owner(ctx);
+		mtx_unlock(&ctx->mtx);
 		kqring_ctx_cancel_all(ctx);
 		kqring_ctx_rele(ctx);
 	}
+}
+
+static void
+kqring_proc_exit(void *arg __unused, struct proc *p)
+{
+	kqring_proc_rings_teardown(p);
+}
+
+static void
+kqring_proc_exec(void *arg __unused, struct proc *p,
+    struct image_params *imgp __unused)
+{
+	kqring_proc_rings_teardown(p);
 }
 
 static int

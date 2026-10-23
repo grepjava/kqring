@@ -19,13 +19,16 @@
  *      CQEs and releases request resources. Cancellation of running I/O is
  *      deferred until worker release; ring close detaches running workers and
  *      defers final context/pool deallocation until the last worker returns
- *      (module unload drains any remaining workers). execve(2) cancels and
- *      disarms open rings in the calling process.
+ *      (module unload drains any remaining workers). Process exit and
+ *      execve(2) close and disarm open rings in the calling process and
+ *      release their fixed tables.
  *   3. Fixed slots retain file references and Capsicum rights. Rings are
- *      rejected from fixed tables and SCM_RIGHTS control messages;
- *      registered-ring descriptors separately retain ring file references
- *      until unregister, exec or process exit. Ordinary descriptors are
- *      resolved with rights checks when used.
+ *      rejected from fixed tables, and fixed tables are released on process
+ *      exit/exec so an AF_UNIX SCM_RIGHTS message carrying a ring fd on a
+ *      fixed-table socket cannot leak a reference cycle; registered-ring
+ *      descriptors separately retain ring file references until unregister,
+ *      exec or process exit. Ordinary descriptors are resolved with rights
+ *      checks when used.
  *   4. User I/O buffers are not pinned: registered buffers are checked
  *      address ranges, accessed through copyin/copyout or uiomove in process
  *      context. Kernel-allocated ring VM objects are wired and referenced
