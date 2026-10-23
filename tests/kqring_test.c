@@ -12,7 +12,11 @@
 #include <sys/event.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/uio.h>
+#include <sys/umtx.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -561,7 +565,7 @@ test_sqe_validation(struct test_ring *r)
 	sqe->buf_group = 1;
 	ring_push_sqe(r);
 	assert(submit_one(r) == -ENOBUFS);
-	/* Buffer selection is RECV-only. */
+	/* Buffer selection is for receives only. */
 	sqe = ring_prep(r, IORING_OP_SEND, sv[0], 11104);
 	sqe->flags = IOSQE_BUFFER_SELECT;
 	ring_push_sqe(r);
@@ -937,7 +941,8 @@ test_accept(struct test_ring *r)
 	assert(c.user_data == 5001 && c.res >= 0);
 	int a1 = c.res;
 	assert((fcntl(a1, F_GETFD) & FD_CLOEXEC) != 0);
-	assert((fcntl(a1, F_GETFL) & O_NONBLOCK) != 0);
+	/* Only the flags asked for, as accept4(2). */
+	assert((fcntl(a1, F_GETFL) & O_NONBLOCK) == 0);
 	assert(write(c1, "ping", 4) == 4);
 	wait_readable(a1);
 	assert(read(a1, buf, sizeof(buf)) == 4);
@@ -947,6 +952,7 @@ test_accept(struct test_ring *r)
 	int c2 = tcp_connect(port);
 	wait_readable(lfd);
 	sqe = ring_prep(r, IORING_OP_ACCEPT, lfd, 5002);
+	sqe->accept_flags = SOCK_NONBLOCK;
 	ring_push_sqe(r);
 	ring_submit(r);
 	assert(ring_cq_ready(r) == 1);
@@ -954,13 +960,14 @@ test_accept(struct test_ring *r)
 	assert(c.user_data == 5002 && c.res >= 0);
 	int a2 = c.res;
 	assert((fcntl(a2, F_GETFD) & FD_CLOEXEC) == 0);
+	assert((fcntl(a2, F_GETFL) & O_NONBLOCK) != 0);
 
 	close(a1);
 	close(a2);
 	close(c1);
 	close(c2);
 	close(lfd);
-	printf("[PASS] ACCEPT: armed on listener + inline, SOCK_CLOEXEC\n");
+	printf("[PASS] ACCEPT: armed on listener + inline, accept4 flags\n");
 
 	/*
 	 * listen(2) on a socket with an op armed on its so_rcv reuses that
@@ -1932,6 +1939,1224 @@ bench_ping_pong(struct test_ring *r)
 }
 
 /* Usage: kqring_test [tests|bench]  (default: both) */
+/* ------------------------------------------------------------------------
+ * Phase 2: the remaining inline opcodes.
+ * ------------------------------------------------------------------------
+ */
+
+static void
+make_tmpdir(char *dir, size_t len)
+{
+	snprintf(dir, len, "/tmp/kqring.XXXXXX");
+	assert(mkdtemp(dir) != NULL);
+}
+
+static struct sockaddr_in
+udp_bound(int *fdp)
+{
+	struct sockaddr_in sin = {
+		.sin_len = sizeof(sin),
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	socklen_t slen = sizeof(sin);
+	int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+
+	assert(fd >= 0);
+	assert(bind(fd, (struct sockaddr *)&sin, sizeof(sin)) == 0);
+	assert(getsockname(fd, (struct sockaddr *)&sin, &slen) == 0);
+	*fdp = fd;
+	return (sin);
+}
+
+static void
+test_vectored_io(struct test_ring *r)
+{
+	char dir[64], path[128], a[5], b[6];
+	struct iovec wv[2] = {
+		{ .iov_base = "hello ", .iov_len = 6 },
+		{ .iov_base = "world", .iov_len = 5 },
+	};
+	struct iovec rv[2] = {
+		{ .iov_base = a, .iov_len = sizeof(a) },
+		{ .iov_base = b, .iov_len = sizeof(b) },
+	};
+	struct io_uring_sqe *sqe;
+	int fd, sv[2];
+
+	make_tmpdir(dir, sizeof(dir));
+	snprintf(path, sizeof(path), "%s/v", dir);
+	fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	assert(fd >= 0);
+
+	sqe = ring_prep(r, IORING_OP_WRITEV, fd, 30001);
+	sqe->addr = (uint64_t)(uintptr_t)wv;
+	sqe->len = 2;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 11);
+	sqe = ring_prep(r, IORING_OP_READV, fd, 30002);
+	sqe->addr = (uint64_t)(uintptr_t)rv;
+	sqe->len = 2;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 11);
+	assert(memcmp(a, "hello", 5) == 0 && memcmp(b, " world", 6) == 0);
+	/* off -1: the file position (still 0 after the positioned I/O). */
+	memset(a, 0, sizeof(a));
+	sqe = ring_prep(r, IORING_OP_READV, fd, 30003);
+	sqe->addr = (uint64_t)(uintptr_t)rv;
+	sqe->len = 1;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 5);
+	assert(lseek(fd, 0, SEEK_CUR) == 5);
+	/* Too many iovecs. */
+	sqe = ring_prep(r, IORING_OP_READV, fd, 30004);
+	sqe->addr = (uint64_t)(uintptr_t)rv;
+	sqe->len = 1025;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EINVAL);
+	close(fd);
+	unlink(path);
+	rmdir(dir);
+
+	/* On a blocking socket, READV / READ are armed, not blocking. */
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	sqe = ring_prep(r, IORING_OP_READV, sv[0], 30005);
+	sqe->addr = (uint64_t)(uintptr_t)rv;
+	sqe->len = 2;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	assert(write(sv[1], "abcdefghijk", 11) == 11);
+	assert(ring_wait(r, 1, 2000) == 0);
+	expect_cqe(r, 30005, 11);
+	assert(memcmp(a, "abcde", 5) == 0 && memcmp(b, "fghijk", 6) == 0);
+
+	sqe = ring_prep(r, IORING_OP_READ, sv[0], 30006);
+	sqe->addr = (uint64_t)(uintptr_t)a;
+	sqe->len = sizeof(a);
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	assert(write(sv[1], "xy", 2) == 2);
+	assert(ring_wait(r, 1, 2000) == 0);
+	expect_cqe(r, 30006, 2);
+
+	sqe = ring_prep(r, IORING_OP_WRITEV, sv[0], 30007);
+	sqe->addr = (uint64_t)(uintptr_t)wv;
+	sqe->len = 2;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 11);
+	char got[16];
+	assert(read(sv[1], got, sizeof(got)) == 11);
+	assert(memcmp(got, "hello world", 11) == 0);
+	close(sv[0]);
+	close(sv[1]);
+	printf("[PASS] READV/WRITEV on files and sockets; socket READ is "
+	    "armed\n");
+}
+
+/*
+ * IORING_FEAT_SUBMIT_STABLE: arguments are copied at submission, so a
+ * request that runs later does not see buffers reused after submit.
+ */
+static void
+test_submit_stable(struct test_ring *r)
+{
+	static char buf[8];
+	char dir[64], path[128], saved[128], a[4];
+	struct iovec iov = { .iov_base = a, .iov_len = sizeof(a) };
+	struct io_uring_sqe *sqe;
+	struct stat st;
+	int sv[2];
+
+	make_tmpdir(dir, sizeof(dir));
+	snprintf(path, sizeof(path), "%s/stable", dir);
+	strlcpy(saved, path, sizeof(saved));
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+	prep_recv(r, sv[0], 30101, buf, sizeof(buf), IOSQE_IO_LINK);
+	sqe = ring_prep(r, IORING_OP_MKDIRAT, AT_FDCWD, 30102);
+	sqe->addr = (uint64_t)(uintptr_t)path;
+	sqe->len = 0700;
+	sqe->flags = IOSQE_IO_LINK;
+	ring_push_sqe(r);
+	sqe = ring_prep(r, IORING_OP_WRITEV, sv[0], 30103);
+	sqe->addr = (uint64_t)(uintptr_t)&iov;
+	sqe->len = 1;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+
+	/* Reuse the path and iovec memory before the chain runs. */
+	memset(path, 'X', sizeof(path) - 1);
+	memcpy(a, "abcd", 4);
+	iov.iov_len = 1;
+	assert(write(sv[1], "go", 2) == 2);
+	assert(ring_wait(r, 3, 2000) == 0);
+	expect_cqe(r, 30101, 2);
+	expect_cqe(r, 30102, 0);
+	expect_cqe(r, 30103, 4);
+	assert(stat(saved, &st) == 0 && S_ISDIR(st.st_mode));
+	assert(read(sv[1], buf, sizeof(buf)) == 4);
+	assert(memcmp(buf, "abcd", 4) == 0);
+	rmdir(saved);
+	rmdir(dir);
+	close(sv[0]);
+	close(sv[1]);
+	printf("[PASS] SUBMIT_STABLE: paths and iovecs copied at submission\n");
+}
+
+static void
+test_msg_ops(struct test_ring *r)
+{
+	char data[16];
+	_Alignas(struct cmsghdr) char ctl[CMSG_SPACE(sizeof(int))];
+	_Alignas(struct cmsghdr) char rctl[CMSG_SPACE(sizeof(int))];
+	struct iovec siov[2] = {
+		{ .iov_base = "hello ", .iov_len = 6 },
+		{ .iov_base = "world", .iov_len = 5 },
+	};
+	struct iovec riov = { .iov_base = data, .iov_len = sizeof(data) };
+	struct msghdr smsg, rmsg;
+	struct cmsghdr *cm;
+	struct io_uring_sqe *sqe;
+	int sv[2], pfd[2];
+
+	/* SENDMSG with SCM_RIGHTS, RECVMSG receiving the descriptor. */
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	assert(pipe(pfd) == 0);
+	memset(&smsg, 0, sizeof(smsg));
+	smsg.msg_iov = siov;
+	smsg.msg_iovlen = 2;
+	smsg.msg_control = ctl;
+	smsg.msg_controllen = sizeof(ctl);
+	cm = CMSG_FIRSTHDR(&smsg);
+	cm->cmsg_level = SOL_SOCKET;
+	cm->cmsg_type = SCM_RIGHTS;
+	cm->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(cm), &pfd[0], sizeof(int));
+	sqe = ring_prep(r, IORING_OP_SENDMSG, sv[1], 30201);
+	sqe->addr = (uint64_t)(uintptr_t)&smsg;
+	sqe->len = 1;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 11);
+
+	memset(&rmsg, 0, sizeof(rmsg));
+	rmsg.msg_iov = &riov;
+	rmsg.msg_iovlen = 1;
+	rmsg.msg_control = rctl;
+	rmsg.msg_controllen = sizeof(rctl);
+	sqe = ring_prep(r, IORING_OP_RECVMSG, sv[0], 30202);
+	sqe->addr = (uint64_t)(uintptr_t)&rmsg;
+	sqe->len = 1;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 11);
+	assert(memcmp(data, "hello world", 11) == 0);
+	assert(rmsg.msg_controllen >= CMSG_LEN(sizeof(int)));
+	cm = CMSG_FIRSTHDR(&rmsg);
+	assert(cm != NULL && cm->cmsg_type == SCM_RIGHTS);
+	int rfd;
+	memcpy(&rfd, CMSG_DATA(cm), sizeof(int));
+	assert(rfd >= 0 && rfd != pfd[0]);
+	assert(write(pfd[1], "p", 1) == 1);
+	assert(read(rfd, data, 1) == 1 && data[0] == 'p');
+	close(rfd);
+
+	/* RECVMSG is armed until data arrives. */
+	rmsg.msg_control = NULL;
+	rmsg.msg_controllen = 0;
+	sqe = ring_prep(r, IORING_OP_RECVMSG, sv[0], 30203);
+	sqe->addr = (uint64_t)(uintptr_t)&rmsg;
+	sqe->len = 1;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	smsg.msg_control = NULL;
+	smsg.msg_controllen = 0;
+	sqe = ring_prep(r, IORING_OP_SENDMSG, sv[1], 30204);
+	sqe->addr = (uint64_t)(uintptr_t)&smsg;
+	sqe->len = 1;
+	ring_push_sqe(r);
+	assert(ring_wait(r, 2, 2000) == 0);
+	expect_cqe(r, 30204, 11);
+	expect_cqe(r, 30203, 11);
+
+	/* RECVMSG into a provided buffer. */
+	assert(write(sv[1], "bufsel", 6) == 6);
+	rmsg.msg_iov = NULL;
+	rmsg.msg_iovlen = 0;
+	sqe = ring_prep(r, IORING_OP_RECVMSG, sv[0], 30205);
+	sqe->addr = (uint64_t)(uintptr_t)&rmsg;
+	sqe->len = 1;
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	ring_push_sqe(r);
+	ring_submit(r);
+	struct io_uring_cqe c = expect_cqe(r, 30205, 6);
+	assert((c.flags & IORING_CQE_F_BUFFER) != 0);
+	uint16_t bid = c.flags >> IORING_CQE_BUFFER_SHIFT;
+	assert(memcmp(r->bufs + (size_t)bid * BUF_SIZE, "bufsel", 6) == 0);
+	ring_offer_buf(r, bid);
+	close(sv[0]);
+	close(sv[1]);
+	close(pfd[0]);
+	close(pfd[1]);
+
+	/* UDP: SENDMSG to an address, RECVMSG reporting the sender. */
+	int ua, ub;
+	struct sockaddr_in aaddr = udp_bound(&ua), baddr = udp_bound(&ub);
+	struct sockaddr_in from;
+	smsg.msg_name = &aaddr;
+	smsg.msg_namelen = sizeof(aaddr);
+	smsg.msg_iov = siov;
+	smsg.msg_iovlen = 2;
+	sqe = ring_prep(r, IORING_OP_SENDMSG, ub, 30206);
+	sqe->addr = (uint64_t)(uintptr_t)&smsg;
+	sqe->len = 1;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 11);
+	memset(&from, 0, sizeof(from));
+	rmsg.msg_name = &from;
+	rmsg.msg_namelen = sizeof(from);
+	rmsg.msg_iov = &riov;
+	rmsg.msg_iovlen = 1;
+	wait_readable(ua);
+	sqe = ring_prep(r, IORING_OP_RECVMSG, ua, 30207);
+	sqe->addr = (uint64_t)(uintptr_t)&rmsg;
+	sqe->len = 1;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 11);
+	assert(rmsg.msg_namelen == sizeof(from));
+	assert(from.sin_port == baddr.sin_port);
+	close(ua);
+	close(ub);
+	printf("[PASS] SENDMSG/RECVMSG: iovecs, SCM_RIGHTS, armed, buffer "
+	    "select, names\n");
+}
+
+static void
+test_recvmsg_multishot(struct test_ring *r)
+{
+	static const char *msgs[] = { "one", "two", "three" };
+	struct msghdr tmpl;
+	struct io_uring_sqe *sqe;
+	int ua, ub;
+	struct sockaddr_in aaddr = udp_bound(&ua), baddr = udp_bound(&ub);
+
+	memset(&tmpl, 0, sizeof(tmpl));
+	tmpl.msg_namelen = sizeof(struct sockaddr_in);
+	sqe = ring_prep(r, IORING_OP_RECVMSG, ua, 30301);
+	sqe->addr = (uint64_t)(uintptr_t)&tmpl;
+	sqe->len = 1;
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	sqe->ioprio = IORING_RECV_MULTISHOT;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	/* The template may be reused right away. */
+	tmpl.msg_namelen = 0;
+
+	for (int i = 0; i < 3; i++)
+		assert(sendto(ub, msgs[i], strlen(msgs[i]), 0,
+		    (struct sockaddr *)&aaddr, sizeof(aaddr)) ==
+		    (ssize_t)strlen(msgs[i]));
+	for (int i = 0; i < 3; i++) {
+		if (ring_cq_ready(r) == 0)
+			assert(ring_wait(r, 1, 2000) == 0);
+		struct io_uring_cqe c = ring_pop_cqe(r);
+		size_t plen = strlen(msgs[i]);
+		assert(c.user_data == 30301);
+		assert((c.flags & IORING_CQE_F_MORE) != 0);
+		assert((c.flags & IORING_CQE_F_BUFFER) != 0);
+		uint16_t bid = c.flags >> IORING_CQE_BUFFER_SHIFT;
+		char *buf = r->bufs + (size_t)bid * BUF_SIZE;
+		struct io_uring_recvmsg_out out;
+		struct sockaddr_in name;
+		memcpy(&out, buf, sizeof(out));
+		memcpy(&name, buf + sizeof(out), sizeof(name));
+		assert(out.namelen == sizeof(struct sockaddr_in));
+		assert(out.controllen == 0);
+		assert(out.payloadlen == plen);
+		assert(name.sin_port == baddr.sin_port);
+		assert(memcmp(buf + sizeof(out) + sizeof(name), msgs[i],
+		    plen) == 0);
+		assert(c.res == (int32_t)(sizeof(out) + sizeof(name) + plen));
+		ring_offer_buf(r, bid);
+	}
+	sqe = ring_prep(r, IORING_OP_ASYNC_CANCEL, -1, 30302);
+	sqe->addr = 30301;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	struct io_uring_cqe c = ring_pop_cqe(r);
+	assert(c.user_data == 30301 && c.res == -ECANCELED &&
+	    (c.flags & IORING_CQE_F_MORE) == 0);
+	expect_cqe(r, 30302, 0);
+	close(ua);
+	close(ub);
+	printf("[PASS] multishot RECVMSG: io_uring_recvmsg_out, names, "
+	    "payloads\n");
+}
+
+static void
+test_waitall(struct test_ring *r)
+{
+	static char buf[16];
+	struct io_uring_sqe *sqe;
+	int sv[2];
+
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	sqe = ring_prep(r, IORING_OP_RECV, sv[0], 30401);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 10;
+	sqe->msg_flags = MSG_WAITALL;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(write(sv[1], "0123", 4) == 4);
+	assert(ring_wait(r, 1, 30) == ETIMEDOUT);
+	assert(write(sv[1], "456789", 6) == 6);
+	assert(ring_wait(r, 1, 2000) == 0);
+	expect_cqe(r, 30401, 10);
+	assert(memcmp(buf, "0123456789", 10) == 0);
+
+	/* EOF ends it with what arrived. */
+	sqe = ring_prep(r, IORING_OP_RECV, sv[0], 30402);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 10;
+	sqe->msg_flags = MSG_WAITALL;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(write(sv[1], "abc", 3) == 3);
+	assert(ring_wait(r, 1, 30) == ETIMEDOUT);
+	close(sv[1]);
+	assert(ring_wait(r, 1, 2000) == 0);
+	expect_cqe(r, 30402, 3);
+	close(sv[0]);
+
+	/* Multishot with MSG_WAITALL is rejected. */
+	sqe = ring_prep(r, IORING_OP_RECV, sv[0], 30403);
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	sqe->ioprio = IORING_RECV_MULTISHOT;
+	sqe->msg_flags = MSG_WAITALL;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EINVAL);
+	printf("[PASS] MSG_WAITALL: RECV waits for the full length or EOF\n");
+}
+
+static void
+test_send_zc(struct test_ring *r)
+{
+	struct iovec iov = { .iov_base = "zcmsg", .iov_len = 5 };
+	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	char buf[16];
+	int sv[2];
+
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, sv[0], 30501);
+	sqe->addr = (uint64_t)(uintptr_t)"zcdata";
+	sqe->len = 6;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	c = expect_cqe(r, 30501, 6);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	c = expect_cqe(r, 30501, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+
+	sqe = ring_prep(r, IORING_OP_SENDMSG_ZC, sv[0], 30502);
+	sqe->addr = (uint64_t)(uintptr_t)&msg;
+	sqe->len = 1;
+	sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	c = expect_cqe(r, 30502, 5);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	c = expect_cqe(r, 30502, (int32_t)IORING_NOTIF_USAGE_ZC_COPIED);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+
+	/* Skipping the result still delivers the notification. */
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, sv[0], 30503);
+	sqe->addr = (uint64_t)(uintptr_t)"s";
+	sqe->len = 1;
+	sqe->flags = IOSQE_CQE_SKIP_SUCCESS;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 1);
+	c = expect_cqe(r, 30503, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	assert(read(sv[1], buf, sizeof(buf)) == 12);
+	assert(memcmp(buf, "zcdatazcmsgs", 12) == 0);
+	close(sv[0]);
+	close(sv[1]);
+
+	/* SEND with a destination address (sendto). */
+	int ua, ub;
+	struct sockaddr_in aaddr = udp_bound(&ua);
+	(void)udp_bound(&ub);
+	sqe = ring_prep(r, IORING_OP_SEND, ub, 30504);
+	sqe->addr = (uint64_t)(uintptr_t)"dgram";
+	sqe->len = 5;
+	sqe->addr2 = (uint64_t)(uintptr_t)&aaddr;
+	sqe->addr_len = sizeof(aaddr);
+	ring_push_sqe(r);
+	assert(submit_one(r) == 5);
+	wait_readable(ua);
+	assert(recv(ua, buf, sizeof(buf), 0) == 5);
+	close(ua);
+	close(ub);
+	printf("[PASS] SEND_ZC/SENDMSG_ZC notifications, SEND to an address\n");
+}
+
+static void
+test_socket_ops(struct test_ring *r)
+{
+	struct sockaddr_in sin = {
+		.sin_len = sizeof(sin),
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	}, peer, local;
+	socklen_t slen = sizeof(sin), plen;
+	struct io_uring_sqe *sqe;
+	char c1;
+
+	sqe = ring_prep(r, IORING_OP_SOCKET, AF_INET, 30601);
+	sqe->off = SOCK_STREAM;
+	ring_push_sqe(r);
+	int lfd = submit_one(r);
+	assert(lfd >= 0);
+	sqe = ring_prep(r, IORING_OP_BIND, lfd, 30602);
+	sqe->addr = (uint64_t)(uintptr_t)&sin;
+	sqe->addr2 = sizeof(sin);
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	sqe = ring_prep(r, IORING_OP_LISTEN, lfd, 30603);
+	sqe->len = 16;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	assert(getsockname(lfd, (struct sockaddr *)&sin, &slen) == 0);
+
+	sqe = ring_prep(r, IORING_OP_SOCKET, AF_INET, 30604);
+	sqe->off = SOCK_STREAM;
+	ring_push_sqe(r);
+	int cfd = submit_one(r);
+	assert(cfd >= 0);
+	sqe = ring_prep(r, IORING_OP_CONNECT, cfd, 30605);
+	sqe->addr = (uint64_t)(uintptr_t)&sin;
+	sqe->addr2 = sizeof(sin);
+	ring_push_sqe(r);
+	assert(ring_wait(r, 1, 2000) == 0);
+	expect_cqe(r, 30605, 0);
+
+	plen = sizeof(peer);
+	sqe = ring_prep(r, IORING_OP_ACCEPT, lfd, 30606);
+	sqe->addr = (uint64_t)(uintptr_t)&peer;
+	sqe->addr2 = (uint64_t)(uintptr_t)&plen;
+	ring_push_sqe(r);
+	assert(ring_wait(r, 1, 2000) == 0);
+	int afd = ring_pop_cqe(r).res;
+	assert(afd >= 0);
+	slen = sizeof(local);
+	assert(getsockname(cfd, (struct sockaddr *)&local, &slen) == 0);
+	assert(plen == sizeof(peer) && peer.sin_port == local.sin_port);
+
+	sqe = ring_prep(r, IORING_OP_SHUTDOWN, cfd, 30607);
+	sqe->len = SHUT_WR;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	assert(read(afd, &c1, 1) == 0);
+
+	sqe = ring_prep(r, IORING_OP_CLOSE, afd, 30608);
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	assert(fcntl(afd, F_GETFD) == -1 && errno == EBADF);
+	/* A ring cannot close itself. */
+	sqe = ring_prep(r, IORING_OP_CLOSE, r->fd, 30609);
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EBADF);
+	close(cfd);
+
+	/* A refused connection. */
+	close(lfd);
+	sqe = ring_prep(r, IORING_OP_SOCKET, AF_INET, 30610);
+	sqe->off = SOCK_STREAM;
+	ring_push_sqe(r);
+	cfd = submit_one(r);
+	sqe = ring_prep(r, IORING_OP_CONNECT, cfd, 30611);
+	sqe->addr = (uint64_t)(uintptr_t)&sin;
+	sqe->addr2 = sizeof(sin);
+	ring_push_sqe(r);
+	assert(ring_wait(r, 1, 2000) == 0);
+	expect_cqe(r, 30611, -ECONNREFUSED);
+	close(cfd);
+	printf("[PASS] SOCKET/BIND/LISTEN/CONNECT/ACCEPT addr/SHUTDOWN/CLOSE\n");
+}
+
+static void
+test_accept_multishot(struct test_ring *r)
+{
+	uint16_t port;
+	int lfd = tcp_listener(&port), cfd[3];
+	struct io_uring_sqe *sqe;
+
+	sqe = ring_prep(r, IORING_OP_ACCEPT, lfd, 30701);
+	sqe->ioprio = IORING_ACCEPT_MULTISHOT;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	for (int i = 0; i < 3; i++)
+		cfd[i] = tcp_connect(port);
+	for (int i = 0; i < 3; i++) {
+		if (ring_cq_ready(r) == 0)
+			assert(ring_wait(r, 1, 2000) == 0);
+		struct io_uring_cqe c = ring_pop_cqe(r);
+		assert(c.user_data == 30701 && c.res >= 0);
+		assert((c.flags & IORING_CQE_F_MORE) != 0);
+		close(c.res);
+	}
+	sqe = ring_prep(r, IORING_OP_ASYNC_CANCEL, -1, 30702);
+	sqe->addr = 30701;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	struct io_uring_cqe c = expect_cqe(r, 30701, -ECANCELED);
+	assert((c.flags & IORING_CQE_F_MORE) == 0);
+	expect_cqe(r, 30702, 0);
+
+	/* DONTWAIT fails instead of arming. */
+	sqe = ring_prep(r, IORING_OP_ACCEPT, lfd, 30703);
+	sqe->ioprio = IORING_ACCEPT_DONTWAIT;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EAGAIN);
+	for (int i = 0; i < 3; i++)
+		close(cfd[i]);
+	close(lfd);
+	printf("[PASS] multishot ACCEPT, ACCEPT_DONTWAIT\n");
+}
+
+static void
+test_path_ops(struct test_ring *r)
+{
+	char dir[64], lbuf[16];
+	struct open_how how = {
+		.flags = O_RDWR | O_CREAT,
+		.mode = 0644,
+		.resolve = RESOLVE_BENEATH,
+	};
+	struct statx stx;
+	struct stat st;
+	struct io_uring_sqe *sqe;
+	int dfd, fd, res;
+
+	make_tmpdir(dir, sizeof(dir));
+	dfd = open(dir, O_DIRECTORY);
+	assert(dfd >= 0);
+
+	sqe = ring_prep(r, IORING_OP_MKDIRAT, dfd, 30801);
+	sqe->addr = (uint64_t)(uintptr_t)"sub";
+	sqe->len = 0755;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+
+	sqe = ring_prep(r, IORING_OP_OPENAT2, dfd, 30802);
+	sqe->addr = (uint64_t)(uintptr_t)"sub/f";
+	sqe->addr2 = (uint64_t)(uintptr_t)&how;
+	sqe->len = sizeof(how);
+	ring_push_sqe(r);
+	fd = submit_one(r);
+	assert(fd >= 0);
+	assert(write(fd, "0123456789", 10) == 10);
+
+	/* RESOLVE_BENEATH stops an escape from dfd. */
+	how.flags = O_RDONLY;
+	how.mode = 0;
+	sqe = ring_prep(r, IORING_OP_OPENAT2, dfd, 30803);
+	sqe->addr = (uint64_t)(uintptr_t)"../";
+	sqe->addr2 = (uint64_t)(uintptr_t)&how;
+	sqe->len = sizeof(how);
+	ring_push_sqe(r);
+	assert(submit_one(r) == -ENOTCAPABLE);
+	/* A mode without O_CREAT, and unknown trailing struct bytes. */
+	how.mode = 0600;
+	sqe = ring_prep(r, IORING_OP_OPENAT2, dfd, 30804);
+	sqe->addr = (uint64_t)(uintptr_t)"sub/f";
+	sqe->addr2 = (uint64_t)(uintptr_t)&how;
+	sqe->len = sizeof(how);
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EINVAL);
+	struct { struct open_how h; uint64_t extra; } big = {
+		.h = { .flags = O_RDONLY }, .extra = 1,
+	};
+	sqe = ring_prep(r, IORING_OP_OPENAT2, dfd, 30805);
+	sqe->addr = (uint64_t)(uintptr_t)"sub/f";
+	sqe->addr2 = (uint64_t)(uintptr_t)&big;
+	sqe->len = sizeof(big);
+	ring_push_sqe(r);
+	assert(submit_one(r) == -E2BIG);
+
+	memset(&stx, 0, sizeof(stx));
+	sqe = ring_prep(r, IORING_OP_STATX, dfd, 30806);
+	sqe->addr = (uint64_t)(uintptr_t)"sub/f";
+	sqe->len = STATX_BASIC_STATS;
+	sqe->addr2 = (uint64_t)(uintptr_t)&stx;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	assert((stx.stx_mask & STATX_BASIC_STATS) == STATX_BASIC_STATS);
+	assert(stx.stx_size == 10 && S_ISREG(stx.stx_mode));
+	assert((stx.stx_mode & 0777) == 0644);
+	assert(fstat(fd, &st) == 0 && stx.stx_ino == st.st_ino);
+	/* AT_EMPTY_PATH: the descriptor itself. */
+	sqe = ring_prep(r, IORING_OP_STATX, fd, 30807);
+	sqe->addr = (uint64_t)(uintptr_t)"";
+	sqe->statx_flags = AT_EMPTY_PATH;
+	sqe->addr2 = (uint64_t)(uintptr_t)&stx;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0 && stx.stx_size == 10);
+
+	sqe = ring_prep(r, IORING_OP_FTRUNCATE, fd, 30808);
+	sqe->off = 4;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	assert(fstat(fd, &st) == 0 && st.st_size == 4);
+	sqe = ring_prep(r, IORING_OP_FALLOCATE, fd, 30809);
+	sqe->off = 0;
+	sqe->addr = 8192;
+	ring_push_sqe(r);
+	res = submit_one(r);
+	assert(res == 0 || res == -EOPNOTSUPP || res == -EINVAL);
+	if (res == 0)
+		assert(fstat(fd, &st) == 0 && st.st_size == 8192);
+	sqe = ring_prep(r, IORING_OP_FADVISE, fd, 30810);
+	sqe->fadvise_advice = POSIX_FADV_SEQUENTIAL;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	sqe = ring_prep(r, IORING_OP_SYNC_FILE_RANGE, fd, 30811);
+	sqe->sync_range_flags = SYNC_FILE_RANGE_WRITE;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	void *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(page != MAP_FAILED);
+	sqe = ring_prep(r, IORING_OP_MADVISE, -1, 30812);
+	sqe->addr = (uint64_t)(uintptr_t)page;
+	sqe->len = 4096;
+	sqe->fadvise_advice = MADV_WILLNEED;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	munmap(page, 4096);
+	close(fd);
+
+	sqe = ring_prep(r, IORING_OP_RENAMEAT, dfd, 30813);
+	sqe->addr = (uint64_t)(uintptr_t)"sub/f";
+	sqe->len = (uint32_t)dfd;
+	sqe->addr2 = (uint64_t)(uintptr_t)"sub/g";
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	sqe = ring_prep(r, IORING_OP_LINKAT, dfd, 30814);
+	sqe->addr = (uint64_t)(uintptr_t)"sub/g";
+	sqe->len = (uint32_t)dfd;
+	sqe->addr2 = (uint64_t)(uintptr_t)"sub/h";
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	assert(fstatat(dfd, "sub/g", &st, 0) == 0 && st.st_nlink == 2);
+	sqe = ring_prep(r, IORING_OP_SYMLINKAT, dfd, 30815);
+	sqe->addr = (uint64_t)(uintptr_t)"g";
+	sqe->addr2 = (uint64_t)(uintptr_t)"sub/s";
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	memset(lbuf, 0, sizeof(lbuf));
+	assert(readlinkat(dfd, "sub/s", lbuf, sizeof(lbuf)) == 1);
+	assert(lbuf[0] == 'g');
+	sqe = ring_prep(r, IORING_OP_RENAMEAT, dfd, 30816);
+	sqe->addr = (uint64_t)(uintptr_t)"sub/g";
+	sqe->len = (uint32_t)dfd;
+	sqe->addr2 = (uint64_t)(uintptr_t)"sub/h";
+	sqe->rename_flags = AT_RENAME_NOREPLACE;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EEXIST);
+
+	static const char *gone[] = { "sub/s", "sub/h", "sub/g" };
+	for (int i = 0; i < 3; i++) {
+		sqe = ring_prep(r, IORING_OP_UNLINKAT, dfd, 30817);
+		sqe->addr = (uint64_t)(uintptr_t)gone[i];
+		ring_push_sqe(r);
+		assert(submit_one(r) == 0);
+	}
+	sqe = ring_prep(r, IORING_OP_UNLINKAT, dfd, 30818);
+	sqe->addr = (uint64_t)(uintptr_t)"sub";
+	sqe->unlink_flags = AT_REMOVEDIR;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	close(dfd);
+	assert(rmdir(dir) == 0);
+	printf("[PASS] MKDIRAT/OPENAT2/STATX/FTRUNCATE/FALLOCATE/FADVISE/"
+	    "MADVISE/RENAMEAT/LINKAT/SYMLINKAT/UNLINKAT\n");
+}
+
+static int32_t
+xattr_op(struct test_ring *r, uint8_t opcode, int fd, const char *name,
+    void *value, uint32_t len, const char *path, uint32_t xflags)
+{
+	struct io_uring_sqe *sqe = ring_prep(r, opcode, fd, 30900);
+	sqe->addr = (uint64_t)(uintptr_t)name;
+	sqe->addr2 = (uint64_t)(uintptr_t)value;
+	sqe->len = len;
+	sqe->addr3 = (uint64_t)(uintptr_t)path;
+	sqe->xattr_flags = xflags;
+	ring_push_sqe(r);
+	return (submit_one(r));
+}
+
+static void
+test_xattr(struct test_ring *r)
+{
+	char dir[64], path[128], val[16];
+	int fd, res;
+
+	make_tmpdir(dir, sizeof(dir));
+	snprintf(path, sizeof(path), "%s/x", dir);
+	fd = open(path, O_RDWR | O_CREAT, 0600);
+	assert(fd >= 0);
+
+	res = xattr_op(r, IORING_OP_FSETXATTR, fd, "user.kq", "v1", 2, NULL,
+	    0);
+	if (res == -EOPNOTSUPP) {
+		printf("[SKIP] xattr: file system has no extended attributes\n");
+		goto out;
+	}
+	assert(res == 0);
+	assert(xattr_op(r, IORING_OP_FGETXATTR, fd, "user.kq", NULL, 0, NULL,
+	    0) == 2);
+	assert(xattr_op(r, IORING_OP_FGETXATTR, fd, "user.kq", val, 1, NULL,
+	    0) == -ERANGE);
+	memset(val, 0, sizeof(val));
+	assert(xattr_op(r, IORING_OP_FGETXATTR, fd, "user.kq", val,
+	    sizeof(val), NULL, 0) == 2);
+	assert(memcmp(val, "v1", 2) == 0);
+	assert(xattr_op(r, IORING_OP_FSETXATTR, fd, "user.kq", "v2", 2, NULL,
+	    XATTR_CREATE) == -EEXIST);
+	assert(xattr_op(r, IORING_OP_FSETXATTR, fd, "user.none", "v", 1,
+	    NULL, XATTR_REPLACE) == -ENOATTR);
+	assert(xattr_op(r, IORING_OP_SETXATTR, -1, "user.p", "path!", 5, path,
+	    0) == 0);
+	memset(val, 0, sizeof(val));
+	assert(xattr_op(r, IORING_OP_GETXATTR, -1, "user.p", val, sizeof(val),
+	    path, 0) == 5);
+	assert(memcmp(val, "path!", 5) == 0);
+	assert(xattr_op(r, IORING_OP_FSETXATTR, fd, "security.x", "v", 1,
+	    NULL, 0) == -EOPNOTSUPP);
+	assert(xattr_op(r, IORING_OP_FSETXATTR, fd, "user.", "v", 1, NULL,
+	    0) == -EINVAL);
+	printf("[PASS] FSETXATTR/FGETXATTR/SETXATTR/GETXATTR via extattr\n");
+out:
+	close(fd);
+	unlink(path);
+	rmdir(dir);
+}
+
+static void
+prep_futex(struct test_ring *r, uint8_t opcode, _Atomic uint32_t *word,
+    uint64_t val, uint64_t mask, uint64_t ud)
+{
+	struct io_uring_sqe *sqe = ring_prep(r, opcode,
+	    FUTEX2_SIZE_U32 | FUTEX2_PRIVATE, ud);
+	sqe->addr = (uint64_t)(uintptr_t)word;
+	sqe->addr2 = val;
+	sqe->addr3 = mask;
+	ring_push_sqe(r);
+}
+
+static _Atomic uint32_t umtx_word;
+static _Atomic int umtx_woken;
+
+static void *
+umtx_sleeper(void *arg)
+{
+	(void)arg;
+	_umtx_op(&umtx_word, UMTX_OP_WAIT_UINT_PRIVATE, 0, NULL, NULL);
+	atomic_store(&umtx_woken, 1);
+	return (NULL);
+}
+
+static void
+test_futex_wake(struct test_ring *r)
+{
+	static _Atomic uint32_t w, wv[3];
+	struct test_ring r2;
+	struct io_uring_sqe *sqe;
+
+	/* FUTEX_WAKE ends a wait without the word changing. */
+	atomic_store(&w, 0);
+	prep_futex(r, IORING_OP_FUTEX_WAIT, &w, 0, 0, 31001);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	prep_futex(r, IORING_OP_FUTEX_WAKE, &w, 1, 0, 31002);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	expect_cqe(r, 31002, 1);
+	expect_cqe(r, 31001, 0);
+
+	/* Masks must intersect. */
+	prep_futex(r, IORING_OP_FUTEX_WAIT, &w, 0, 0x1, 31003);
+	ring_submit(r);
+	prep_futex(r, IORING_OP_FUTEX_WAKE, &w, 1, 0x2, 31004);
+	assert(submit_one(r) == 0);
+	prep_futex(r, IORING_OP_FUTEX_WAKE, &w, 1, 0x3, 31005);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	expect_cqe(r, 31005, 1);
+	expect_cqe(r, 31003, 0);
+
+	/* Another ring's FUTEX_WAKE wakes this ring's waiter. */
+	ring_init(&r2);
+	prep_futex(r, IORING_OP_FUTEX_WAIT, &w, 0, 0, 31006);
+	ring_submit(r);
+	prep_futex(&r2, IORING_OP_FUTEX_WAKE, &w, 10, 0, 31007);
+	assert(submit_one(&r2) == 1);
+	assert(ring_wait(r, 1, 2000) == 0);
+	expect_cqe(r, 31006, 0);
+
+	/* FUTEX_WAITV completes with the index of the woken word. */
+	struct futex_waitv vec[3];
+	for (int i = 0; i < 3; i++) {
+		atomic_store(&wv[i], 0);
+		vec[i] = (struct futex_waitv){
+			.val = 0,
+			.uaddr = (uint64_t)(uintptr_t)&wv[i],
+			.flags = FUTEX2_SIZE_U32 | FUTEX2_PRIVATE,
+		};
+	}
+	sqe = ring_prep(r, IORING_OP_FUTEX_WAITV, 0, 31008);
+	sqe->addr = (uint64_t)(uintptr_t)vec;
+	sqe->len = 3;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	prep_futex(&r2, IORING_OP_FUTEX_WAKE, &wv[1], 1, 0, 31009);
+	assert(submit_one(&r2) == 1);
+	assert(ring_wait(r, 1, 2000) == 0);
+	expect_cqe(r, 31008, 1);
+	/* A word changed before arming. */
+	atomic_store(&wv[2], 5);
+	sqe = ring_prep(r, IORING_OP_FUTEX_WAITV, 0, 31010);
+	sqe->addr = (uint64_t)(uintptr_t)vec;
+	sqe->len = 3;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EAGAIN);
+	close(r2.fd);
+
+	/* Threads in _umtx_op(UMTX_OP_WAIT_UINT_PRIVATE) are woken too. */
+	pthread_t t;
+	atomic_store(&umtx_word, 0);
+	atomic_store(&umtx_woken, 0);
+	assert(pthread_create(&t, NULL, umtx_sleeper, NULL) == 0);
+	for (int i = 0; i < 200 && atomic_load(&umtx_woken) == 0; i++) {
+		usleep(10000);
+		prep_futex(r, IORING_OP_FUTEX_WAKE, &umtx_word, 1, 0, 31011);
+		assert(submit_one(r) == 0);
+	}
+	assert(pthread_join(t, NULL) == 0);
+	assert(atomic_load(&umtx_woken) == 1);
+
+	/* Only 32-bit, aligned words. */
+	sqe = ring_prep(r, IORING_OP_FUTEX_WAIT, FUTEX2_SIZE_U8, 31012);
+	sqe->addr = (uint64_t)(uintptr_t)&w;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EINVAL);
+	prep_futex(r, IORING_OP_FUTEX_WAKE,
+	    (_Atomic uint32_t *)((char *)&w + 1), 1, 0, 31013);
+	assert(submit_one(r) == -EINVAL);
+	printf("[PASS] FUTEX_WAKE (same/other ring, masks, umtx), "
+	    "FUTEX_WAITV\n");
+}
+
+static _Atomic int msg_ring_fd = -1;
+static _Atomic int msg_ring_got;
+
+static void *
+msg_ring_receiver(void *arg)
+{
+	struct test_ring r2;
+
+	(void)arg;
+	ring_init(&r2);
+	atomic_store(&msg_ring_fd, r2.fd);
+	/* Sleeps in the kernel until the other thread's MSG_RING. */
+	assert(ring_wait(&r2, 1, 5000) == 0);
+	struct io_uring_cqe c = ring_pop_cqe(&r2);
+	assert(c.user_data == 0xfeed && c.res == 77);
+	atomic_store(&msg_ring_got, 1);
+	close(r2.fd);
+	return (NULL);
+}
+
+static void
+test_msg_ring(struct test_ring *r)
+{
+	struct test_ring r2;
+	struct io_uring_sqe *sqe;
+	int pfd[2];
+
+	ring_init(&r2);
+	sqe = ring_prep(r, IORING_OP_MSG_RING, r2.fd, 32001);
+	sqe->addr = IORING_MSG_DATA;
+	sqe->len = 123;
+	sqe->off = 0xabc;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	assert(kqring_enter(r2.fd, 0, 0, 0, NULL, 0) == 0);
+	struct io_uring_cqe c = expect_cqe(&r2, 0xabc, 123);
+	assert(c.flags == 0);
+
+	/* FLAGS_PASS sets the target CQE's flags. */
+	sqe = ring_prep(r, IORING_OP_MSG_RING, r2.fd, 32002);
+	sqe->addr = IORING_MSG_DATA;
+	sqe->off = 0xabd;
+	sqe->msg_ring_flags = IORING_MSG_RING_FLAGS_PASS;
+	sqe->file_index = 0x5a0000;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	assert(kqring_enter(r2.fd, 0, 0, 0, NULL, 0) == 0);
+	c = expect_cqe(&r2, 0xabd, 0);
+	assert(c.flags == 0x5a0000);
+	close(r2.fd);
+
+	/* To itself. */
+	sqe = ring_prep(r, IORING_OP_MSG_RING, r->fd, 32003);
+	sqe->addr = IORING_MSG_DATA;
+	sqe->len = 9;
+	sqe->off = 0xabe;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	expect_cqe(r, 32003, 0);
+	expect_cqe(r, 0xabe, 9);
+
+	/* Not a ring; SEND_FD needs fixed files. */
+	assert(pipe(pfd) == 0);
+	sqe = ring_prep(r, IORING_OP_MSG_RING, pfd[0], 32004);
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EBADF);
+	sqe = ring_prep(r, IORING_OP_MSG_RING, pfd[0], 32005);
+	sqe->addr = IORING_MSG_SEND_FD;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EOPNOTSUPP);
+	close(pfd[0]);
+	close(pfd[1]);
+
+	/* Wakes a ring owner sleeping in another thread. */
+	pthread_t t;
+	atomic_store(&msg_ring_fd, -1);
+	atomic_store(&msg_ring_got, 0);
+	assert(pthread_create(&t, NULL, msg_ring_receiver, NULL) == 0);
+	while (atomic_load(&msg_ring_fd) < 0)
+		usleep(1000);
+	usleep(20000);
+	sqe = ring_prep(r, IORING_OP_MSG_RING, atomic_load(&msg_ring_fd),
+	    32006);
+	sqe->addr = IORING_MSG_DATA;
+	sqe->len = 77;
+	sqe->off = 0xfeed;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	assert(pthread_join(t, NULL) == 0);
+	assert(atomic_load(&msg_ring_got) == 1);
+	printf("[PASS] MSG_RING: data, FLAGS_PASS, self, wakes sleeper\n");
+}
+
+static void
+test_waitid(struct test_ring *r)
+{
+	struct io_uring_sqe *sqe;
+	siginfo_t si;
+	pid_t pid;
+
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		usleep(30000);
+		_exit(7);
+	}
+	memset(&si, 0, sizeof(si));
+	sqe = ring_prep(r, IORING_OP_WAITID, (int)pid, 33001);
+	sqe->len = P_PID;
+	sqe->file_index = WEXITED;
+	sqe->addr2 = (uint64_t)(uintptr_t)&si;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	assert(ring_wait(r, 1, 3000) == 0);
+	expect_cqe(r, 33001, 0);
+	assert(si.si_pid == pid && si.si_status == 7 &&
+	    si.si_code == CLD_EXITED);
+
+	/*
+	 * WNOHANG: nothing to report is not an error, and reports zeroes
+	 * (as waitid(2), though the kernel fills siginfo for a live child).
+	 */
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		usleep(200000);
+		_exit(0);
+	}
+	memset(&si, 0xff, sizeof(si));
+	sqe = ring_prep(r, IORING_OP_WAITID, (int)pid, 33002);
+	sqe->len = P_PID;
+	sqe->file_index = WEXITED | WNOHANG;
+	sqe->addr2 = (uint64_t)(uintptr_t)&si;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0 && si.si_pid == 0 && si.si_signo == 0);
+	assert(waitpid(pid, NULL, 0) == pid);
+	sqe = ring_prep(r, IORING_OP_WAITID, (int)pid, 33003);
+	sqe->len = P_PID;
+	sqe->file_index = WEXITED;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -ECHILD);
+	printf("[PASS] WAITID: armed until the child exits, WNOHANG, ECHILD\n");
+}
+
+static void
+test_uring_cmd(struct test_ring *r)
+{
+	struct io_uring_sqe *sqe;
+	int sv[2], v = 0, pfd[2];
+
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	assert(write(sv[1], "12345", 5) == 5);
+	sqe = ring_prep(r, IORING_OP_URING_CMD, sv[0], 34001);
+	sqe->cmd_op = SOCKET_URING_OP_SIOCINQ;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 5);
+	sqe = ring_prep(r, IORING_OP_URING_CMD, sv[1], 34002);
+	sqe->cmd_op = SOCKET_URING_OP_SIOCOUTQ;
+	ring_push_sqe(r);
+	assert(submit_one(r) >= 0);
+
+	sqe = ring_prep(r, IORING_OP_URING_CMD, sv[0], 34003);
+	sqe->cmd_op = SOCKET_URING_OP_GETSOCKOPT;
+	sqe->level = SOL_SOCKET;
+	sqe->optname = SO_TYPE;
+	sqe->optval = (uint64_t)(uintptr_t)&v;
+	sqe->optlen = sizeof(v);
+	ring_push_sqe(r);
+	assert(submit_one(r) == (int32_t)sizeof(v) && v == SOCK_STREAM);
+
+	v = 32768;
+	sqe = ring_prep(r, IORING_OP_URING_CMD, sv[0], 34004);
+	sqe->cmd_op = SOCKET_URING_OP_SETSOCKOPT;
+	sqe->level = SOL_SOCKET;
+	sqe->optname = SO_SNDBUF;
+	sqe->optval = (uint64_t)(uintptr_t)&v;
+	sqe->optlen = sizeof(v);
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	socklen_t vlen = sizeof(v);
+	v = 0;
+	assert(getsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &v, &vlen) == 0);
+	assert(v >= 32768);
+
+	sqe = ring_prep(r, IORING_OP_URING_CMD, sv[0], 34005);
+	sqe->cmd_op = SOCKET_URING_OP_GETSOCKOPT;
+	sqe->level = IPPROTO_TCP;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EOPNOTSUPP);
+	close(sv[0]);
+	close(sv[1]);
+
+	assert(pipe(pfd) == 0);
+	sqe = ring_prep(r, IORING_OP_URING_CMD, pfd[0], 34006);
+	sqe->cmd_op = SOCKET_URING_OP_SIOCINQ;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EOPNOTSUPP);
+	close(pfd[0]);
+	close(pfd[1]);
+	printf("[PASS] URING_CMD: SIOCINQ/SIOCOUTQ/GETSOCKOPT/SETSOCKOPT\n");
+}
+
+static void
+test_read_multishot(struct test_ring *r)
+{
+	struct io_uring_sqe *sqe;
+	int sv[2], pfd[2];
+
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	sqe = ring_prep(r, IORING_OP_READ_MULTISHOT, sv[0], 35001);
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	for (int i = 0; i < 3; i++) {
+		assert(write(sv[1], "m", 1) == 1);
+		assert(ring_wait(r, 1, 2000) == 0);
+		struct io_uring_cqe c = expect_cqe(r, 35001, 1);
+		assert((c.flags & (IORING_CQE_F_MORE | IORING_CQE_F_BUFFER)) ==
+		    (IORING_CQE_F_MORE | IORING_CQE_F_BUFFER));
+		ring_offer_buf(r, c.flags >> IORING_CQE_BUFFER_SHIFT);
+	}
+	/* EOF ends it. */
+	close(sv[1]);
+	assert(ring_wait(r, 1, 2000) == 0);
+	struct io_uring_cqe c = expect_cqe(r, 35001, 0);
+	assert((c.flags & IORING_CQE_F_MORE) == 0);
+	close(sv[0]);
+
+	/* Needs readiness, which only sockets have here. */
+	assert(pipe(pfd) == 0);
+	sqe = ring_prep(r, IORING_OP_READ_MULTISHOT, pfd[0], 35002);
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EOPNOTSUPP);
+	close(pfd[0]);
+	close(pfd[1]);
+	printf("[PASS] READ_MULTISHOT on a socket, until EOF\n");
+}
+
+static void
+test_phase2_validation(struct test_ring *r)
+{
+	struct io_uring_sqe *sqe;
+	char buf[8];
+
+	sqe = ring_prep(r, IORING_OP_READ, 0, 36001);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->rw_flags = 1;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EINVAL);
+	sqe = ring_prep(r, IORING_OP_NOP, -1, 36002);
+	sqe->personality = 1;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EINVAL);
+	static const uint8_t later[] = {
+		IORING_OP_EPOLL_CTL, IORING_OP_SPLICE, IORING_OP_TEE,
+		IORING_OP_READ_FIXED, IORING_OP_PROVIDE_BUFFERS,
+	};
+	for (size_t i = 0; i < sizeof(later); i++) {
+		ring_prep(r, later[i], -1, 36003);
+		ring_push_sqe(r);
+		assert(submit_one(r) == -EOPNOTSUPP);
+	}
+
+	/* ioctl(2) itself returns 0, not an SQE's result (a new fd). */
+	sqe = ring_prep(r, IORING_OP_OPENAT, AT_FDCWD, 36004);
+	sqe->addr = (uint64_t)(uintptr_t)"/dev/null";
+	sqe->open_flags = O_RDONLY;
+	ring_push_sqe(r);
+	struct kqring_enter_arg ea = { .to_submit = 1 };
+	assert(ioctl(r->fd, KQRING_IOC_ENTER, &ea) == 0);
+	assert(ea.SUBMITTED_out == 1);
+	assert(ring_cq_ready(r) == 1);
+	struct io_uring_cqe c = ring_pop_cqe(r);
+	int nfd = c.res;
+	assert(c.user_data == 36004 && nfd >= 0);
+	close(nfd);
+	printf("[PASS] Phase 2 validation: rw_flags, personality, unsupported "
+	    "ops, ioctl return\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1967,6 +3192,22 @@ main(int argc, char **argv)
 		test_poll_remove(&r);
 		test_cancel_flags(&r);
 		test_close_with_timers();
+		test_vectored_io(&r);
+		test_submit_stable(&r);
+		test_msg_ops(&r);
+		test_recvmsg_multishot(&r);
+		test_waitall(&r);
+		test_send_zc(&r);
+		test_socket_ops(&r);
+		test_accept_multishot(&r);
+		test_path_ops(&r);
+		test_xattr(&r);
+		test_futex_wake(&r);
+		test_msg_ring(&r);
+		test_waitid(&r);
+		test_uring_cmd(&r);
+		test_read_multishot(&r);
+		test_phase2_validation(&r);
 		printf("%s: %d failure(s)\n", failures ? "[FAIL]" : "[OK]",
 		    failures);
 	}

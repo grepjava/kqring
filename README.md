@@ -19,6 +19,42 @@
 | **`IOSQE_FIXED_FILE` reference cycles** | No fixed-file table or `unix_gc` bypass. Every SQE resolves standard file descriptors with Capsicum rights checks (`fget_read` / `fget_write`) and holds explicit `soref()` / `sorele()` references on armed sockets. |
 | **Pinned user-buffer page lifetime bugs** | `PBUF_RING` descriptor pages (`struct io_uring_buf`) are wired kernel/user shared memory, while data buffers remain ordinary userspace virtual addresses copied via standard `uiomove()` inside `soreceive()` in `curthread` context. |
 | **EOF buffer-ID leak on `IOSQE_BUFFER_SELECT`** | Unlike Linux `io_uring` (which consumes a `PBUF_RING` buffer ID even when `recv` returns `0` at EOF), `kqring_pbuf_commit()` only advances the kernel ring head when `transferred > 0`. |
+| **`MSG_RING` cross-ring CQ races** | A ring's CQ is only ever written by its owner thread. `MSG_RING` queues the CQE on the target ring under its lock and wakes the owner, which posts it from its own taskwork. |
+| **SQE argument TOCTOU / stale user pointers** | Everything an SQE points to (paths, iovecs, `msghdr`s, socket addresses, `open_how`, xattr names and values, futex vectors, timespecs) is copied in at submission (`IORING_FEAT_SUBMIT_STABLE`), charged to a per-ring budget. Only output buffers are touched later. |
+
+---
+
+## Supported Operations
+
+All I/O runs in the ring owner's thread inside `KQRING_IOC_ENTER`. Socket operations try the transfer inline first, and then wait on a socket upcall. Futexes, `WAITID` and timers are re-checked from the same thread.
+
+- **I/O:** `READ`, `WRITE`, `READV`, `WRITEV`, `FSYNC`, `SYNC_FILE_RANGE`, `FALLOCATE`, `FTRUNCATE`, `FADVISE`, `MADVISE`.
+  - `READ` takes a provided buffer.
+  - On a socket, the read and write operations wait like `RECV` and `SEND` instead of blocking.
+- **Sockets:** `RECV`, `SEND`, `RECVMSG`, `SENDMSG`, `SEND_ZC`, `SENDMSG_ZC`, `ACCEPT`, `CONNECT`, `SOCKET`, `BIND`, `LISTEN`, `SHUTDOWN`, `READ_MULTISHOT`, `URING_CMD`.
+  - Multishot is supported for `RECV`, `RECVMSG`, `ACCEPT` and `READ_MULTISHOT`.
+  - `MSG_WAITALL` works on stream sockets, and `SEND` can take a destination address.
+  - `URING_CMD` supports `SIOCINQ`, `SIOCOUTQ`, `GETSOCKOPT` and `SETSOCKOPT`.
+- **Files and paths:** `OPENAT`, `OPENAT2`, `CLOSE`, `STATX`, `RENAMEAT`, `UNLINKAT`, `MKDIRAT`, `SYMLINKAT`, `LINKAT`, `GETXATTR`, `SETXATTR`, `FGETXATTR`, `FSETXATTR`.
+- **Synchronisation:** `FUTEX_WAIT`, `FUTEX_WAITV`, `FUTEX_WAKE`, `WAITID`, `MSG_RING` (`IORING_MSG_DATA`).
+- **Control:** `NOP`, `POLL_ADD` (including multishot), `POLL_REMOVE`, `TIMEOUT`, `TIMEOUT_REMOVE`, `LINK_TIMEOUT`, `ASYNC_CANCEL`.
+- **SQE flags:** `IOSQE_IO_LINK`, `IOSQE_IO_HARDLINK`, `IOSQE_IO_DRAIN`, `IOSQE_CQE_SKIP_SUCCESS` and `IOSQE_BUFFER_SELECT` (buffer group 0).
+
+These operations and flags are rejected for now, with `-EOPNOTSUPP` or `-EINVAL`:
+
+- **Fixed files and registered buffers:** `READ_FIXED`, `WRITE_FIXED`, `FILES_UPDATE`, `FIXED_FD_INSTALL`, `PROVIDE_BUFFERS`, `REMOVE_BUFFERS`, `IORING_MSG_SEND_FD`, `IOSQE_FIXED_FILE`, and `file_index` (direct descriptors).
+- **Pipe and other non-socket readiness:** `SPLICE`, `TEE`, and `READ_MULTISHOT` on anything other than a socket.
+- **No FreeBSD equivalent:** `EPOLL_CTL`.
+
+**Differences from Linux:**
+
+- **Native values.** Flags and constants use their FreeBSD values: `O_*`, `AT_*`, `MSG_*`, `SOCK_*`, `POSIX_FADV_*`, `MADV_*`, `idtype_t` and `W*`. CQE errors are negated FreeBSD errnos.
+- **Timeouts.** These complete with `-ETIME`, which the header defines as `ETIMEDOUT`.
+- **Zero-copy send.** `SEND_ZC` copies the data, so its notification CQE follows at once. With `IORING_SEND_ZC_REPORT_USAGE`, the notification carries `IORING_NOTIF_USAGE_ZC_COPIED`.
+- **`STATX`.** It fills Linux's `struct statx` from `stat(2)`.
+- **Xattrs.** Names are mapped to `extattr` namespaces: `user.` to user, and `system.` and `trusted.` to system.
+- **`SYNC_FILE_RANGE`.** It syncs the whole file's data.
+- **`SIGPIPE`.** It is never raised.
 
 ---
 
