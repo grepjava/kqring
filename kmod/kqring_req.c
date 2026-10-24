@@ -1589,6 +1589,41 @@ kqring_chain_fail(struct kqring_ctx *ctx, struct kqring_op *op)
 }
 
 /*
+ * kqring_req_complete() for a retired op (cancelled while a worker ran
+ * it): if the worker is still running, record the result for its return
+ * and leave the op retired; otherwise take it off retired_ops.
+ */
+static void
+kqring_req_complete_retired_locked(struct kqring_ctx *ctx,
+    struct kqring_op *op, int32_t *resp, uint32_t *cflagsp)
+{
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	if (!op->wq_retired)
+		return;
+	if (op->ltimeout != NULL)
+		kqring_timer_stop_locked(op->ltimeout);
+	if (op->wq_running) {
+		op->wq_complete_pending = true;
+		op->wq_cancel_res = *resp;
+		op->wq_cancel_flags = *cflagsp;
+		return;
+	}
+	/* Report a consumed provided buffer even if cancellation raced I/O. */
+	if (*resp == -ECANCELED && op->wq_done && op->res > 0 &&
+	    (op->cflags & IORING_CQE_F_BUFFER) != 0) {
+		*resp = op->res;
+		*cflagsp = op->cflags;
+	}
+	TAILQ_REMOVE(&ctx->retired_ops, op, active_link);
+	op->wq_retired = false;
+	if (TAILQ_EMPTY(&ctx->retired_ops) && ctx->wq_abort_pending) {
+		callout_stop(&ctx->wq_abort_callout);
+		ctx->wq_abort_pending = false;
+	}
+	kqring_op_disarm_locked(op);
+}
+
+/*
  * Final completion of a request that is no longer armed: post its CQE
  * (unless IOSQE_CQE_SKIP_SUCCESS), cancel its LINK_TIMEOUT, and queue the
  * next request of its chain, or fail the rest of the chain if this one
@@ -1603,33 +1638,21 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 	struct kqring_op *next, *lt;
 	bool failed, zc;
 
-	/* Cancellation never waits for a running worker or frees its state. */
-	mtx_lock(&ctx->mtx);
-	if (op->wq_retired) {
-		if (op->ltimeout != NULL)
-			kqring_timer_stop_locked(op->ltimeout);
-		if (op->wq_running) {
-			op->wq_complete_pending = true;
-			op->wq_cancel_res = res;
-			op->wq_cancel_flags = cflags;
+	/*
+	 * Cancellation never waits for a running worker or frees its state.
+	 * Only the issuer retires an op (kqring_op_disarm_locked()), and this
+	 * runs on the issuer, so the common case is told without ctx->mtx.
+	 */
+	if (__predict_false(op->wq_retired)) {
+		mtx_lock(&ctx->mtx);
+		kqring_req_complete_retired_locked(ctx, op, &res, &cflags);
+		if (op->wq_retired) {
+			/* Still running: the worker's return completes it. */
 			mtx_unlock(&ctx->mtx);
 			return;
 		}
-		/* Report a consumed provided buffer even if cancellation raced I/O. */
-		if (res == -ECANCELED && op->wq_done && op->res > 0 &&
-		    (op->cflags & IORING_CQE_F_BUFFER) != 0) {
-			res = op->res;
-			cflags = op->cflags;
-		}
-		TAILQ_REMOVE(&ctx->retired_ops, op, active_link);
-		op->wq_retired = false;
-		if (TAILQ_EMPTY(&ctx->retired_ops) && ctx->wq_abort_pending) {
-			callout_stop(&ctx->wq_abort_callout);
-			ctx->wq_abort_pending = false;
-		}
-		kqring_op_disarm_locked(op);
+		mtx_unlock(&ctx->mtx);
 	}
-	mtx_unlock(&ctx->mtx);
 	KASSERT(!op->armed, ("kqring: completing an armed op"));
 	failed = res < 0 && !(res == -ETIME &&
 	    (op->sqe.opcode == IORING_OP_TIMEOUT ||

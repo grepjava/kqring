@@ -41,6 +41,7 @@
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/rwlock.h>
+#include <sys/rmlock.h>
 #include <sys/sx.h>
 #include <sys/condvar.h>
 #include <sys/queue.h>
@@ -153,6 +154,8 @@ MALLOC_DECLARE(M_SELFD);
  * by requests in flight; beyond either, the request runs on a worker.
  */
 #define KQRING_BIO_MAX_IOV	16
+/* The longest busy-wait IORING_REGISTER_NAPI sets (microseconds). */
+#define KQRING_MAX_BUSY_POLL_US	100000
 #define KQRING_BIO_MAX_HELD	(64UL * 1024 * 1024)
 #define KQRING_MAX_ZC_PAGES	16384U
 #define KQRING_MAX_PERSONALITIES 1024U
@@ -361,6 +364,12 @@ LIST_HEAD(kqring_proc_list, kqring_proc_rings);
 extern struct kqring_proc_list kqring_proc_hash[KQRING_PROC_HASH];
 extern LIST_HEAD(kqring_ctx_list_head, kqring_ctx) kqring_ctx_list;
 extern struct mtx kqring_proc_mtx;
+/*
+ * The registered-ring tables (kqring_proc_hash and each table's rings[]):
+ * changed with kqring_proc_mtx and this write-locked, looked up on every
+ * IORING_ENTER_REGISTERED_RING enter with it read-locked only.
+ */
+extern struct rmlock kqring_rings_rm;
 extern uint32_t kqring_live_workers;
 extern uint32_t kqring_live_zc;
 extern bool kqring_unloading;
@@ -642,6 +651,11 @@ struct kqring_ctx {
 	struct kqring_restrictions rst;
 	bool			restricted;	/* rst in force */
 	uint32_t		clockid;	/* IORING_REGISTER_CLOCK */
+	/* IORING_REGISTER_NAPI: busy-wait before sleeping (0: never) */
+	sbintime_t		busy_poll_sbt;
+	uint32_t		busy_poll_us;
+	uint8_t			napi_prefer;
+	uint8_t			napi_track;
 	bool			reg_busy;	/* register on a disabled ring */
 
 	/* Armed operations and deferred taskwork queue */

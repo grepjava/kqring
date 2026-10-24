@@ -669,6 +669,32 @@ struct io_uring_clock_register {
 	__u32	__resv[3];
 };
 
+/*
+ * IORING_REGISTER_NAPI / IORING_UNREGISTER_NAPI.  kqring busy-waits up to
+ * busy_poll_to microseconds for completions before sleeping in a wait;
+ * FreeBSD has no NAPI ids, so the static id operations are not supported.
+ */
+enum io_uring_napi_op {
+	IO_URING_NAPI_REGISTER_OP	= 0,
+	IO_URING_NAPI_STATIC_ADD_ID	= 1,
+	IO_URING_NAPI_STATIC_DEL_ID	= 2,
+};
+
+enum io_uring_napi_tracking_strategy {
+	IO_URING_NAPI_TRACKING_DYNAMIC	= 0,
+	IO_URING_NAPI_TRACKING_STATIC	= 1,
+	IO_URING_NAPI_TRACKING_INACTIVE	= 255,
+};
+
+struct io_uring_napi {
+	__u32	busy_poll_to;
+	__u8	prefer_busy_poll;
+	__u8	opcode;
+	__u8	pad[2];
+	__u32	op_param;
+	__u32	resv;
+};
+
 /* IORING_REGISTER_IOWQ_MAX_WORKERS (uint32_t max[2]: bound, unbound) */
 enum io_wq_type {
 	IO_WQ_BOUND,

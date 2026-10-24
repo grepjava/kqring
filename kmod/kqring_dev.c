@@ -14,6 +14,7 @@ struct kqring_proc_list kqring_proc_hash[KQRING_PROC_HASH];
 struct kqring_ctx_list_head kqring_ctx_list =
     LIST_HEAD_INITIALIZER(kqring_ctx_list);
 struct mtx kqring_proc_mtx;
+struct rmlock kqring_rings_rm;
 uint32_t kqring_live_workers;
 uint32_t kqring_live_zc;
 bool kqring_unloading;
@@ -316,6 +317,7 @@ kqring_open(struct cdev *dev __unused, int oflags __unused, int devtype __unused
 		LIST_INIT(&ctx->bgroups[i]);
 	LIST_INIT(&ctx->creds);
 	ctx->clockid = CLOCK_MONOTONIC;
+	ctx->napi_track = IO_URING_NAPI_TRACKING_INACTIVE;
 
 	error = devfs_set_cdevpriv(ctx, kqring_dtor);
 	if (error != 0) {
@@ -641,10 +643,15 @@ kqring_poll_fallback_locked(struct kqring_ctx *ctx)
 void
 kqring_run_checks(struct kqring_ctx *ctx)
 {
-	kqring_check_futexes(ctx);
-	kqring_check_waitids(ctx);
-	kqring_check_timeouts(ctx);
-	kqring_flush_ready(ctx);
+	/* Each is a no-op without its kind of request: skip the calls. */
+	if (ctx->nfutex != 0)
+		kqring_check_futexes(ctx);
+	if (ctx->nwaitid != 0)
+		kqring_check_waitids(ctx);
+	if (ctx->nseqto != 0)
+		kqring_check_timeouts(ctx);
+	if (!TAILQ_EMPTY(&ctx->ready_q) || !TAILQ_EMPTY(&ctx->defer_q))
+		kqring_flush_ready(ctx);
 }
 
 /*
@@ -829,6 +836,7 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 	struct kqring_shm_header *shm = ctx->shm;
 	bool iopoll = (ctx->flags & IORING_SETUP_IOPOLL) != 0;
 	bool may_poll = true;
+	sbintime_t spin = ctx->busy_poll_sbt;
 	int error;
 
 	for (;;) {
@@ -840,6 +848,36 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 
 		if (has_timeout && sbt == 0)
 			return (ETIMEDOUT);
+
+		/*
+		 * IORING_REGISTER_NAPI: busy-wait (once per wait) for work
+		 * that arrives within busy_poll_to, rather than sleep and be
+		 * woken.  The queues are peeked at without ctx->mtx; the
+		 * locked checks below still decide whether to sleep.
+		 */
+		if (spin != 0) {
+			sbintime_t start = getsbinuptime(), now = start;
+
+			if (has_timeout && spin > sbt)
+				spin = sbt;
+			while (now - start < spin) {
+				if (atomic_load_acq_32(&shm->cq_tail) -
+				    atomic_load_acq_32(&shm->cq_head) >=
+				    min_complete ||
+				    !TAILQ_EMPTY(&ctx->taskwork_ops) ||
+				    !STAILQ_EMPTY(&ctx->rcq))
+					break;
+				cpu_spinwait();
+				now = getsbinuptime();
+			}
+			spin = 0;
+			if (has_timeout)
+				sbt = MAX(sbt - (now - start), 0);
+			if (!TAILQ_EMPTY(&ctx->taskwork_ops) ||
+			    !STAILQ_EMPTY(&ctx->rcq))
+				goto drain;
+			continue;
+		}
 
 		/* Tell an eventfd watcher about CQEs before sleeping. */
 		kqring_evfd_flush(ctx);
@@ -916,17 +954,23 @@ drain:
 }
 
 
-struct kqring_proc_rings *
-kqring_proc_find_locked(const struct proc *p)
+static struct kqring_proc_rings *
+kqring_proc_find(const struct proc *p)
 {
 	struct kqring_proc_rings *pr;
 
-	mtx_assert(&kqring_proc_mtx, MA_OWNED);
 	LIST_FOREACH(pr, kqring_proc_bucket(p), link) {
 		if (pr->proc == p)
 			return (pr);
 	}
 	return (NULL);
+}
+
+struct kqring_proc_rings *
+kqring_proc_find_locked(const struct proc *p)
+{
+	mtx_assert(&kqring_proc_mtx, MA_OWNED);
+	return (kqring_proc_find(p));
 }
 
 int
@@ -936,20 +980,22 @@ kqring_reg_ring_fget(struct thread *td, uint32_t slot, bool is_enter,
 	struct kqring_proc_rings *pr;
 	struct file *fp;
 
+	struct rm_priotracker tracker;
+
 	if (slot >= KQRING_MAX_REG_RINGS)
 		return (EINVAL);
-	mtx_lock(&kqring_proc_mtx);
-	pr = kqring_proc_find_locked(td->td_proc);
+	rm_rlock(&kqring_rings_rm, &tracker);
+	pr = kqring_proc_find(td->td_proc);
 	if (pr == NULL) {
-		mtx_unlock(&kqring_proc_mtx);
+		rm_runlock(&kqring_rings_rm, &tracker);
 		return (is_enter ? EINVAL : EBADF);
 	}
 	fp = pr->rings[slot];
 	if (fp == NULL || !fhold(fp)) {
-		mtx_unlock(&kqring_proc_mtx);
+		rm_runlock(&kqring_rings_rm, &tracker);
 		return (EBADF);
 	}
-	mtx_unlock(&kqring_proc_mtx);
+	rm_runlock(&kqring_rings_rm, &tracker);
 	*fpp = fp;
 	return (0);
 }
@@ -961,8 +1007,11 @@ kqring_proc_clear(struct proc *p)
 
 	mtx_lock(&kqring_proc_mtx);
 	pr = kqring_proc_find_locked(p);
-	if (pr != NULL)
+	if (pr != NULL) {
+		rm_wlock(&kqring_rings_rm);
 		LIST_REMOVE(pr, link);
+		rm_wunlock(&kqring_rings_rm);
+	}
 	mtx_unlock(&kqring_proc_mtx);
 	if (pr == NULL)
 		return;
@@ -1371,6 +1420,7 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 	case MOD_LOAD:
 		mtx_init(&kqring_futex_mtx, "kqring futex", NULL, MTX_DEF);
 		mtx_init(&kqring_proc_mtx, "kqring proc", NULL, MTX_DEF);
+		rm_init(&kqring_rings_rm, "kqring rings");
 		mtx_init(&kqring_zc_mtx, "kqring zc", NULL, MTX_DEF);
 		for (int i = 0; i < KQRING_FUTEX_HASH; i++)
 			LIST_INIT(&kqring_futex_hash[i]);
@@ -1389,6 +1439,7 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			EVENTHANDLER_DEREGISTER(process_exec, kqring_exec_tag);
 			EVENTHANDLER_DEREGISTER(process_exit, kqring_exit_tag);
 			mtx_destroy(&kqring_zc_mtx);
+			rm_destroy(&kqring_rings_rm);
 			mtx_destroy(&kqring_proc_mtx);
 			mtx_destroy(&kqring_futex_mtx);
 			return (ENOMEM);
@@ -1445,8 +1496,11 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			for (;;) {
 				mtx_lock(&kqring_proc_mtx);
 				pr = LIST_FIRST(&kqring_proc_hash[i]);
-				if (pr != NULL)
+				if (pr != NULL) {
+					rm_wlock(&kqring_rings_rm);
 					LIST_REMOVE(pr, link);
+					rm_wunlock(&kqring_rings_rm);
+				}
 				mtx_unlock(&kqring_proc_mtx);
 				if (pr == NULL)
 					break;
@@ -1459,6 +1513,7 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			}
 		}
 		mtx_destroy(&kqring_zc_mtx);
+		rm_destroy(&kqring_rings_rm);
 		mtx_destroy(&kqring_proc_mtx);
 		mtx_destroy(&kqring_futex_mtx);
 		printf("kqring: unloaded\n");

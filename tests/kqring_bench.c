@@ -703,6 +703,24 @@ bench_accept(void)
 		close(c);
 	}
 	row("accept", "kqring_multishot", now_ns() - t0, ACCEPT_ITERS);
+
+	/* The same, busy-waiting up to 50 us before sleeping. */
+	struct io_uring_napi napi = {
+		.busy_poll_to = 50,
+		.op_param = IO_URING_NAPI_TRACKING_DYNAMIC,
+	};
+	assert(kqring_register(r.fd, IORING_REGISTER_NAPI, &napi, 1) == 0);
+	t0 = now_ns();
+	for (int i = 0; i < ACCEPT_ITERS; i++) {
+		c = accept_client(&sin);
+		ring_enter(&r, 1);
+		struct io_uring_cqe cq = ring_pop(&r);
+		assert(cq.res >= 0 && (cq.flags & IORING_CQE_F_MORE) != 0);
+		close(cq.res);
+		close(c);
+	}
+	row("accept", "kqring_multishot_busypoll", now_ns() - t0,
+	    ACCEPT_ITERS);
 	ring_fini(&r);
 	close(l);
 }

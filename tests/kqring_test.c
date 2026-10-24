@@ -5531,6 +5531,84 @@ prep_pread(struct test_ring *r, int fd, void *buf, size_t len, off_t off,
 	ring_push_sqe(r);
 }
 
+static void *
+napi_writer(void *arg)
+{
+	int fd = *(int *)arg;
+
+	usleep(2000);
+	assert(write(fd, "n", 1) == 1);
+	return (NULL);
+}
+
+/*
+ * IORING_REGISTER_NAPI sets a busy-wait before sleeping; the previous
+ * settings come back as on Linux.  A wait still honours a shorter timeout,
+ * and completions arriving after the spin still wake it.
+ */
+static void
+test_napi_busy_poll(void)
+{
+	struct io_uring_napi napi = {
+		.busy_poll_to = 20000,
+		.opcode = IO_URING_NAPI_REGISTER_OP,
+		.op_param = IO_URING_NAPI_TRACKING_DYNAMIC,
+	};
+	struct __kernel_timespec ts = { .tv_nsec = 5 * 1000000 };
+	struct io_uring_getevents_arg ga = { .ts = (uint64_t)(uintptr_t)&ts };
+	struct timespec t0, t1;
+	struct test_ring t;
+	pthread_t th;
+	char buf[8];
+	int sv[2];
+
+	ring_init(&t);
+	assert(reg(&t, IORING_REGISTER_NAPI, &napi, 0) == -EINVAL);
+	assert(reg(&t, IORING_REGISTER_NAPI, NULL, 1) == -EFAULT);
+	napi.resv = 1;
+	assert(reg(&t, IORING_REGISTER_NAPI, &napi, 1) == -EINVAL);
+	napi.resv = 0;
+	napi.opcode = IO_URING_NAPI_STATIC_ADD_ID;
+	assert(reg(&t, IORING_REGISTER_NAPI, &napi, 1) == -EOPNOTSUPP);
+	napi.opcode = IO_URING_NAPI_REGISTER_OP;
+	assert(reg(&t, IORING_REGISTER_NAPI, &napi, 1) == 0);
+	/* The previous settings: none. */
+	assert(napi.busy_poll_to == 0 &&
+	    napi.op_param == IO_URING_NAPI_TRACKING_INACTIVE);
+
+	/* A 5 ms timeout ends a wait with a 20 ms spin after 5 ms. */
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	assert(kqring_enter(t.fd, 0, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
+	    sizeof(ga)) == -1 && errno == ETIME);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	long ms = (t1.tv_sec - t0.tv_sec) * 1000 +
+	    (t1.tv_nsec - t0.tv_nsec) / 1000000;
+	assert(ms >= 4 && ms < 15);
+
+	/* Data that comes during the spin completes an armed RECV. */
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	prep_recv(&t, sv[0], 60001, buf, sizeof(buf), 0);
+	ring_submit(&t);
+	assert(pthread_create(&th, NULL, napi_writer, &sv[1]) == 0);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 60001, 1);
+	pthread_join(th, NULL);
+
+	/* Unregister returns the settings it clears. */
+	memset(&napi, 0, sizeof(napi));
+	assert(reg(&t, IORING_UNREGISTER_NAPI, &napi, 1) == 0);
+	assert(napi.busy_poll_to == 20000 &&
+	    napi.op_param == IO_URING_NAPI_TRACKING_DYNAMIC);
+	assert(reg(&t, IORING_UNREGISTER_NAPI, &napi, 1) == 0);
+	assert(napi.busy_poll_to == 0);
+	close(sv[0]);
+	close(sv[1]);
+	close(t.fd);
+	printf("[PASS] IORING_REGISTER_NAPI busy-wait: settings, timeout, "
+	    "wakeups\n");
+}
+
 /* Prepare a positioned READ / WRITE (plain, V or _FIXED) on fd. */
 static struct io_uring_sqe *
 prep_rw(struct test_ring *r, uint8_t opcode, int fd, void *addr,
@@ -7209,6 +7287,7 @@ main(int argc, char **argv)
 		test_worker_nonblocking_pipe();
 		test_inline_file_pipe();
 		test_disk_bio();
+		test_napi_busy_poll();
 		test_worker_buffer_reservation();
 		test_worker_cancel_and_timeout();
 		test_worker_max_workers();

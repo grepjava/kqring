@@ -30,7 +30,9 @@ kqring_ring_fds_register(struct thread *td,
 	if (pr == NULL) {
 		pr = alloc_pr;
 		alloc_pr = NULL;
+		rm_wlock(&kqring_rings_rm);
 		LIST_INSERT_HEAD(kqring_proc_bucket(td->td_proc), pr, link);
+		rm_wunlock(&kqring_rings_rm);
 	}
 	mtx_unlock(&kqring_proc_mtx);
 	free(alloc_pr, M_KQRING);
@@ -74,7 +76,9 @@ kqring_ring_fds_register(struct thread *td,
 			error = EBUSY;
 		}
 		if (error == 0) {
+			rm_wlock(&kqring_rings_rm);
 			pr->rings[slot] = fp;
+			rm_wunlock(&kqring_rings_rm);
 			pr->nrings++;
 		}
 		mtx_unlock(&kqring_proc_mtx);
@@ -88,7 +92,9 @@ kqring_ring_fds_register(struct thread *td,
 			if (error != 0) {
 				mtx_lock(&kqring_proc_mtx);
 				if (pr->rings[slot] == fp) {
+					rm_wlock(&kqring_rings_rm);
 					pr->rings[slot] = NULL;
+					rm_wunlock(&kqring_rings_rm);
 					pr->nrings--;
 				} else {
 					fp = NULL;
@@ -133,7 +139,9 @@ kqring_ring_fds_unregister(struct thread *td,
 		pr = kqring_proc_find_locked(td->td_proc);
 		fp = pr != NULL ? pr->rings[up.offset] : NULL;
 		if (fp != NULL) {
+			rm_wlock(&kqring_rings_rm);
 			pr->rings[up.offset] = NULL;
+			rm_wunlock(&kqring_rings_rm);
 			pr->nrings--;
 		}
 		mtx_unlock(&kqring_proc_mtx);
@@ -406,6 +414,62 @@ kqring_register_clock(struct kqring_ctx *ctx,
 	if (cr.clockid != CLOCK_MONOTONIC && cr.clockid != CLOCK_BOOTTIME)
 		return (EINVAL);
 	ctx->clockid = cr.clockid;
+	return (0);
+}
+
+/*
+ * IORING_REGISTER_NAPI / IORING_UNREGISTER_NAPI.  Linux busy-polls the
+ * NAPI contexts of a ring's sockets while it waits; FreeBSD has no such
+ * per-socket polling for a module to call, so kqring keeps the setting's
+ * other half: a wait spins up to busy_poll_to microseconds for completions
+ * (from the network stack, disk drivers or workers on other CPUs) before
+ * it sleeps, saving the sleep and wake-up when they come quickly.  The
+ * previous settings are copied back, as io_uring does.
+ */
+static int
+kqring_register_napi(struct kqring_ctx *ctx,
+    const struct kqring_register_arg *ra, bool reg)
+{
+	struct io_uring_napi napi, curr = {
+		.busy_poll_to = ctx->busy_poll_us,
+		.prefer_busy_poll = ctx->napi_prefer,
+		.op_param = ctx->napi_track,
+	};
+	int error;
+
+	if (ra->nr_args != 1)
+		return (EINVAL);
+	if (reg) {
+		if (ra->arg == NULL)
+			return (EFAULT);
+		error = copyin(ra->arg, &napi, sizeof(napi));
+		if (error != 0)
+			return (error);
+		if (napi.pad[0] != 0 || napi.pad[1] != 0 || napi.resv != 0)
+			return (EINVAL);
+		if (napi.opcode != IO_URING_NAPI_REGISTER_OP)
+			return (EOPNOTSUPP);	/* NAPI ids */
+		if (napi.op_param != IO_URING_NAPI_TRACKING_DYNAMIC &&
+		    napi.op_param != IO_URING_NAPI_TRACKING_STATIC)
+			return (EINVAL);
+	}
+	if (ra->arg != NULL) {
+		error = copyout(&curr, ra->arg, sizeof(curr));
+		if (error != 0)
+			return (error);
+	}
+	if (reg) {
+		ctx->busy_poll_us = MIN(napi.busy_poll_to,
+		    KQRING_MAX_BUSY_POLL_US);
+		ctx->busy_poll_sbt = ctx->busy_poll_us * SBT_1US;
+		ctx->napi_prefer = napi.prefer_busy_poll;
+		ctx->napi_track = (uint8_t)napi.op_param;
+	} else {
+		ctx->busy_poll_us = 0;
+		ctx->busy_poll_sbt = 0;
+		ctx->napi_prefer = 0;
+		ctx->napi_track = IO_URING_NAPI_TRACKING_INACTIVE;
+	}
 	return (0);
 }
 
@@ -762,8 +826,12 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 	case IORING_UNREGISTER_RING_FDS:
 		return (kqring_ring_fds_unregister(td, ra, resp));
 
+	case IORING_REGISTER_NAPI:
+		return (kqring_register_napi(ctx, ra, true));
+	case IORING_UNREGISTER_NAPI:
+		return (kqring_register_napi(ctx, ra, false));
+
 	default:
-		/* NAPI. */
 		return (EOPNOTSUPP);
 	}
 	if (res < 0)
