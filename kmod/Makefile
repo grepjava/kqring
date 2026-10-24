@@ -5,7 +5,9 @@
 # Load with:  sudo kldload ./kqring.ko
 
 KMOD=	kqring
-SRCS=	kqring.c vnode_if.h
+SRCS=	kqring_dev.c kqring_req.c kqring_rsrc.c kqring_register.c \
+	kqring_sock.c kqring_file.c kqring_sync.c kqring_wq.c \
+	kqring_zc.c vnode_if.h
 
 CFLAGS+= -I${.CURDIR}/../include -Wall -Wextra -Werror
 # FreeBSD kernel headers (e.g. sys/ktrace.h) have unused parameters.
