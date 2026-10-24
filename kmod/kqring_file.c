@@ -510,6 +510,8 @@ kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 		return (kqring_done(op, -error, 0));
 
 	if (buf_select) {
+		struct kqring_bgroup *bg;
+again:
 		if (!is_write && !kqring_pipe_readable(fp)) {
 			error = kqring_pipe_wait_read(ctx, fp, op);
 			if (error != 0) {
@@ -521,6 +523,23 @@ kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 		sx_xlock(&ctx->bg_sx);
 		error = kqring_buf_select(ctx, sqe->buf_group,
 		    kqring_buf_cap(op), &aiov, 1, &sel);
+		/*
+		 * On a worker, another read holding the group's head buffer
+		 * (for as long as its fo_read() takes) is waited for rather
+		 * than failed with ENOBUFS, as io_uring readers share a group.
+		 */
+		if (error == ENOBUFS && op->wq_running && !op->wq_canceled &&
+		    !op->cancelled && !ctx->closing &&
+		    (bg = kqring_bgroup_find(ctx, sqe->buf_group)) != NULL &&
+		    bg->busy) {
+			sx_xunlock(&ctx->bg_sx);
+			if (kqring_wq_suspend_point(ctx)) {
+				fdrop(fp, td);
+				return (kqring_done(op, -ECANCELED, 0));
+			}
+			pause("kqbgbz", 1);
+			goto again;
+		}
 		if (error != 0) {
 			sx_xunlock(&ctx->bg_sx);
 			fdrop(fp, td);

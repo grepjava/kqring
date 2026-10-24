@@ -1523,15 +1523,18 @@ test_timeouts(struct test_ring *r)
 	expect_cqe(r, 24005, 0);
 	expect_cqe(r, 24003, 0);
 
-	/* TIMEOUT_REMOVE cancels; a second remove finds nothing. */
+	/*
+	 * TIMEOUT_REMOVE cancels (its CQE first, as io_uring posts them); a
+	 * second remove finds nothing.
+	 */
 	prep_timeout(r, IORING_OP_TIMEOUT, 24011, &t5s, 0, 0, 0);
 	ring_prep(r, IORING_OP_TIMEOUT_REMOVE, -1, 24012)->addr = 24011;
 	ring_push_sqe(r);
 	ring_prep(r, IORING_OP_TIMEOUT_REMOVE, -1, 24013)->addr = 24011;
 	ring_push_sqe(r);
 	ring_submit(r);
-	expect_cqe(r, 24011, -ECANCELED);
 	expect_cqe(r, 24012, 0);
+	expect_cqe(r, 24011, -ECANCELED);
 	expect_cqe(r, 24013, -ENOENT);
 
 	/* TIMEOUT_UPDATE re-arms a 5 s timeout to 10 ms. */
@@ -5288,7 +5291,7 @@ test_send_fd(void)
 	ring_push_sqe(&a);
 	assert(submit_one(&a) == 0);
 	assert(kqring_enter(c.fd, 0, 0, 0, NULL, 0) == 0);
-	expect_cqe(&c, 0x5e4f, -ENXIO);
+	expect_cqe(&c, 0x5e4f, -ENFILE);	/* no table to allocate from */
 	sqe = ring_prep(&a, IORING_OP_MSG_RING, b.fd, 48008);
 	sqe->addr = IORING_MSG_SEND_FD;
 	sqe->file_index = 9;

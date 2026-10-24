@@ -1137,6 +1137,9 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 	bool multishot = false, buf_select_ok = false, bundle_ok = false;
 	int error;
 
+	/* An opcode past the ABI fails here (and ends a submission). */
+	if (sqe->opcode >= IORING_OP_LAST)
+		return (EINVAL);
 	if ((sqe->flags & ~KQRING_SQE_FLAGS) != 0)
 		return (EINVAL);
 	if (ctx->restricted && !kqring_restriction_ok(ctx, sqe))
@@ -1162,6 +1165,25 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		    (kc->cred->cr_flags & CRED_FLAG_CAPMODE) == 0)
 			return (ECAPMODE);
 		op->cred = crhold(kc->cred);
+	}
+
+	/*
+	 * A READ/WRITE's ioprio is an I/O priority, checked as Linux's
+	 * ioprio_check_cap() does (class 13 bits up, level below), then
+	 * ignored: the realtime class needs privilege, and class or level
+	 * out of range is EINVAL.
+	 */
+	if (kqring_op_readv(sqe->opcode) || kqring_op_writev(sqe->opcode) ||
+	    sqe->opcode == IORING_OP_READ || sqe->opcode == IORING_OP_WRITE ||
+	    sqe->opcode == IORING_OP_READ_FIXED ||
+	    sqe->opcode == IORING_OP_WRITE_FIXED) {
+		u_int pclass = (uint16_t)sqe->ioprio >> 13;
+		u_int plevel = (uint16_t)sqe->ioprio & 0x1fff;
+
+		if (pclass > 3 || ((pclass == 1 || pclass == 2) && plevel >= 8))
+			return (EINVAL);
+		if (pclass == 1 && priv_check(curthread, PRIV_SCHED_RTPRIO) != 0)
+			return (EPERM);
 	}
 
 	switch (sqe->opcode) {
@@ -1577,18 +1599,22 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 
 /*
  * Complete every request of a chain that will not run: with its own
- * submission error if it had one, else -ECANCELED.
+ * submission error if it had one, else -ECANCELED.  With skip_cqes (the
+ * request that failed had IOSQE_CQE_SKIP_SUCCESS) their CQEs are not
+ * posted, as io_uring's REQ_F_SKIP_LINK_CQES.
  */
 static void
-kqring_chain_fail(struct kqring_ctx *ctx, struct kqring_op *op)
+kqring_chain_fail(struct kqring_ctx *ctx, struct kqring_op *op,
+    bool skip_cqes)
 {
 	struct kqring_op *next;
 
 	for (; op != NULL; op = next) {
 		next = op->link;
 		op->link = NULL;
-		kqring_post_cqe(ctx, op->sqe.user_data,
-		    op->prep_err != 0 ? -op->prep_err : -ECANCELED, 0);
+		if (!skip_cqes)
+			kqring_post_cqe(ctx, op->sqe.user_data,
+			    op->prep_err != 0 ? -op->prep_err : -ECANCELED, 0);
 		kqring_op_free(op);
 	}
 }
@@ -1674,7 +1700,12 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 	if (zc)
 		cflags |= IORING_CQE_F_MORE;
 
-	if (res < 0 || (op->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) == 0) {
+	/*
+	 * IOSQE_CQE_SKIP_SUCCESS skips a success, and a LINK_TIMEOUT that
+	 * fired (-ETIME), which io_uring does not count as failing.
+	 */
+	if ((op->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) == 0 || (res < 0 &&
+	    !(op->sqe.opcode == IORING_OP_LINK_TIMEOUT && res == -ETIME))) {
 		if (op->sqe.opcode == IORING_OP_TIMEOUT)
 			kqring_post_cqe_uncounted(ctx, op->sqe.user_data, res,
 			    cflags);
@@ -1702,7 +1733,12 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 		mtx_lock(&ctx->mtx);
 		kqring_timer_stop_locked(lt);
 		mtx_unlock(&ctx->mtx);
-		kqring_post_cqe(ctx, lt->sqe.user_data, -ECANCELED, 0);
+		/*
+		 * Disarmed, not failed: IOSQE_CQE_SKIP_SUCCESS still skips its
+		 * CQE, as in io_uring.
+		 */
+		if ((lt->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) == 0)
+			kqring_post_cqe(ctx, lt->sqe.user_data, -ECANCELED, 0);
 		kqring_op_free(lt);
 	}
 
@@ -1713,12 +1749,14 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 		lt = next;
 		next = lt->link;
 		lt->link = NULL;
-		kqring_post_cqe(ctx, lt->sqe.user_data, -ECANCELED, 0);
+		if ((lt->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) == 0)
+			kqring_post_cqe(ctx, lt->sqe.user_data, -ECANCELED, 0);
 		kqring_op_free(lt);
 	}
 	if (next != NULL) {
 		if (failed && (op->sqe.flags & IOSQE_IO_HARDLINK) == 0)
-			kqring_chain_fail(ctx, next);
+			kqring_chain_fail(ctx, next,
+			    (op->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) != 0);
 		else
 			TAILQ_INSERT_TAIL(&ctx->ready_q, next, q_link);
 	}
@@ -1928,9 +1966,15 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 	case IORING_OP_ASYNC_CANCEL:
 		kqring_req_complete(ctx, op, kqring_cancel(ctx, sqe), 0);
 		return;
-	case IORING_OP_TIMEOUT_REMOVE:
-		kqring_req_complete(ctx, op, kqring_timeout_remove(ctx, op), 0);
+	case IORING_OP_TIMEOUT_REMOVE: {
+		struct kqring_op *gone = NULL;
+		int32_t res = kqring_timeout_remove(ctx, op, &gone);
+
+		kqring_req_complete(ctx, op, res, 0);
+		if (gone != NULL)
+			kqring_req_complete(ctx, gone, -ECANCELED, 0);
 		return;
+	}
 	case IORING_OP_POLL_REMOVE:
 		kqring_req_complete(ctx, op, kqring_poll_remove(ctx, sqe), 0);
 		return;
@@ -1988,7 +2032,7 @@ kqring_chain_submit(struct kqring_ctx *ctx, struct kqring_op *head,
 
 	if (failed) {
 		/* As in io_uring, a bad SQE fails its whole chain. */
-		kqring_chain_fail(ctx, head);
+		kqring_chain_fail(ctx, head, false);
 		return;
 	}
 	others = ctx->nreqs - ctx->ndeferred - head->nchain;
@@ -2207,7 +2251,7 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 				sqe = ctx->sqes[sqe_idx];
 			}
 			if (chain_head != NULL) {
-				kqring_chain_fail(ctx, chain_head);
+				kqring_chain_fail(ctx, chain_head, false);
 				chain_head = chain_tail = NULL;
 				chain_failed = false;
 			}
@@ -2247,9 +2291,21 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 		if ((op->sqe.flags & IOSQE_IO_DRAIN) != 0)
 			chain_head->drain = true;
 		if ((op->sqe.flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK)) == 0) {
+			int err = op->prep_err;
+
 			atomic_store_rel_32(&shm->sq_head, head);
 			kqring_chain_submit(ctx, chain_head, chain_failed);
 			chain_head = chain_tail = NULL;
+			/*
+			 * Without SUBMIT_ALL, an SQE that fails its checks ends
+			 * the submission (counted, with its error CQE), as in
+			 * io_uring; one inside a link only fails the link.
+			 */
+			if (err != 0 &&
+			    (ctx->flags & IORING_SETUP_SUBMIT_ALL) == 0) {
+				submitted++;
+				break;
+			}
 		}
 		submitted++;
 	}

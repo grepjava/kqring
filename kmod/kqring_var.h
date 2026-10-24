@@ -46,6 +46,7 @@
 #include <sys/condvar.h>
 #include <sys/queue.h>
 #include <sys/proc.h>
+#include <sys/priv.h>
 #include <sys/kthread.h>
 #include <sys/sched.h>
 #include <sys/sleepqueue.h>
@@ -872,6 +873,16 @@ kqring_evfd_signal_locked(struct kqring_ctx *ctx)
 	}
 }
 
+/* No room for another CQE in the CQ ring (it would overflow). */
+static inline bool
+kqring_cq_full(const struct kqring_ctx *ctx)
+{
+	const struct kqring_shm_header *shm = ctx->shm;
+
+	return (!STAILQ_EMPTY(&ctx->ocq) || atomic_load_acq_32(&shm->cq_tail) -
+	    atomic_load_acq_32(&shm->cq_head) >= ctx->cq_entries);
+}
+
 /*
  * The ring descriptor is readable: CQEs to reap, an overflow to flush, or
  * taskwork that an enter would run (as io_uring_poll() reports
@@ -1298,7 +1309,7 @@ void	kqring_timeout_arm(struct kqring_ctx *ctx, struct kqring_op *op);
 void	kqring_ltimeout_arm(struct kqring_ctx *ctx, struct kqring_op *op);
 void	kqring_timeout_fire(struct kqring_ctx *ctx, struct kqring_op *op);
 int32_t	kqring_timeout_remove(struct kqring_ctx *ctx,
-	    const struct kqring_op *rop);
+	    const struct kqring_op *rop, struct kqring_op **gonep);
 void	kqring_check_timeouts(struct kqring_ctx *ctx);
 int32_t	kqring_cancel(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe);
 int32_t	kqring_poll_remove(struct kqring_ctx *ctx,

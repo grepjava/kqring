@@ -817,6 +817,16 @@ kqring_sqpoll_thread(void *arg)
 					wakeup(&ctx->sqpoll_wait_chan);
 				mtx_unlock(&ctx->mtx);
 			}
+			/*
+			 * Completions only: enter waiters sleep on wakeup_chan
+			 * (kqring_wait_cqes() re-checks the CQ under mtx).
+			 */
+			if (taskrun) {
+				mtx_lock(&ctx->mtx);
+				if (ctx->sleeping)
+					wakeup(&ctx->wakeup_chan);
+				mtx_unlock(&ctx->mtx);
+			}
 			continue;
 		}
 

@@ -460,8 +460,9 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	 * describes, in an enter (liburing enters when IORING_SQ_TASKRUN is
 	 * set).  Without SINGLE_ISSUER, any thread of the process may submit
 	 * and wait (ctx->shared); DEFER_TASKRUN needs SINGLE_ISSUER, as in
-	 * io_uring.  COOP_TASKRUN, TASKRUN_FLAG and SUBMIT_ALL describe what
-	 * kqring always does.
+	 * io_uring.  COOP_TASKRUN and TASKRUN_FLAG describe what kqring
+	 * always does; without SUBMIT_ALL, submission stops at an SQE that
+	 * fails its checks (kqring_submit_sqes()).
 	 */
 	if ((p.flags & ~KQRING_SETUP_FLAGS) != 0)
 		return (EINVAL);
@@ -952,8 +953,9 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		    atomic_load_acq_32(&ctx->cq_timeouts) != timeouts)
 			return (0);
 
+		/* Timed out with CQEs (if fewer): success, as io_uring. */
 		if (has_timeout && sbt == 0)
-			return (ETIMEDOUT);
+			return (cq_count > 0 ? 0 : ETIMEDOUT);
 
 		/*
 		 * IORING_REGISTER_NAPI: busy-wait (once per wait) for work
@@ -1000,6 +1002,17 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 			mtx_unlock(&ctx->mtx);
 			goto drain;
 		}
+		/*
+		 * A ring's kthread may have posted CQEs since the check above;
+		 * it wakes waiters only under mtx, so look again here.
+		 */
+		if (atomic_load_acq_32(&shm->cq_tail) -
+		    atomic_load_acq_32(&shm->cq_head) >= min_complete ||
+		    !STAILQ_EMPTY(&ctx->ocq) ||
+		    atomic_load_acq_32(&ctx->cq_timeouts) != timeouts) {
+			mtx_unlock(&ctx->mtx);
+			return (0);
+		}
 		if (iopoll && ctx->nreqs == ctx->ndeferred) {
 			mtx_unlock(&ctx->mtx);
 			return (0);
@@ -1020,8 +1033,9 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 
 		/* Timeout is sbintime_t, not ticks: use the _sbt variant. */
 		ctx->sleeping++;
+		/* As precise as the io_uring_enter(2) timeout (an hrtimer). */
 		error = msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, PCATCH,
-		    "kqwait", sleep_sbt, 0, 0);
+		    "kqwait", sleep_sbt, 0, C_PREL(10));
 		ctx->sleeping--;
 		may_poll = true;
 		mtx_unlock(&ctx->mtx);
@@ -1039,8 +1053,7 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 				kqring_enter_unlock(ctx, lock);
 				cq_count = atomic_load_acq_32(&shm->cq_tail) -
 				    atomic_load_acq_32(&shm->cq_head);
-				if (cq_count >= min_complete ||
-				    !STAILQ_EMPTY(&ctx->ocq))
+				if (cq_count > 0 || !STAILQ_EMPTY(&ctx->ocq))
 					return (0);
 				return (ETIMEDOUT);
 			}

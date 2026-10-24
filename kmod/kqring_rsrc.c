@@ -297,7 +297,8 @@ kqring_fixed_install(struct kqring_ctx *ctx, struct file *fp,
 	int error;
 
 	if (ctx->files == NULL) {
-		res = -ENXIO;
+		/* No slot to allocate from: ENFILE, as io_uring. */
+		res = file_index == IORING_FILE_INDEX_ALLOC ? -ENFILE : -ENXIO;
 		goto fail;
 	}
 	/*

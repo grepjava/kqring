@@ -402,8 +402,12 @@ kqring_timer_start_locked(struct kqring_op *op)
 		callout_init_mtx(&op->callout, &op->ctx->mtx, 0);
 		op->timer_init = true;
 	}
+	/*
+	 * Within 0.1%, not the default kern.timecounter.alloweddeviation
+	 * (5%): io_uring timeouts are hrtimers, and programs time them.
+	 */
 	callout_reset_sbt(&op->callout, kqring_timeout_rel(op), 0,
-	    kqring_timer_cb, op, 0);
+	    kqring_timer_cb, op, C_PREL(10));
 	op->timer_pending = true;
 }
 
@@ -526,8 +530,12 @@ kqring_timeout_fire(struct kqring_ctx *ctx, struct kqring_op *op)
 	}
 	/* A TIMEOUT that fires ends a wait for more CQEs, as in io_uring. */
 	atomic_add_32(&ctx->cq_timeouts, 1);
+	/*
+	 * A multishot TIMEOUT whose CQE would overflow ends instead (its
+	 * last CQE without F_MORE), as io_uring stops it.
+	 */
 	if ((op->sqe.timeout_flags & IORING_TIMEOUT_MULTISHOT) != 0 &&
-	    (op->repeats == 0 || --op->repeats > 0)) {
+	    (op->repeats == 0 || --op->repeats > 0) && !kqring_cq_full(ctx)) {
 		kqring_post_cqe_uncounted(ctx, op->sqe.user_data, -ETIME,
 		    IORING_CQE_F_MORE);
 		mtx_lock(&ctx->mtx);
@@ -541,9 +549,15 @@ kqring_timeout_fire(struct kqring_ctx *ctx, struct kqring_op *op)
 	kqring_req_complete(ctx, op, -ETIME, 0);
 }
 
-/* TIMEOUT_REMOVE: cancel, or (UPDATE flags) re-arm, a pending timeout. */
+/*
+ * TIMEOUT_REMOVE: cancel, or (UPDATE flags) re-arm, a pending timeout.  A
+ * cancelled one is unarmed and returned in *gonep, for the caller to
+ * complete with -ECANCELED after the remove's own CQE, the order io_uring
+ * posts them in.
+ */
 int32_t
-kqring_timeout_remove(struct kqring_ctx *ctx, const struct kqring_op *rop)
+kqring_timeout_remove(struct kqring_ctx *ctx, const struct kqring_op *rop,
+    struct kqring_op **gonep)
 {
 	const struct io_uring_sqe *sqe = &rop->sqe;
 	uint32_t tflags = sqe->timeout_flags;
@@ -583,7 +597,7 @@ kqring_timeout_remove(struct kqring_ctx *ctx, const struct kqring_op *rop)
 	}
 	kqring_op_unarm_locked(ctx, found);
 	mtx_unlock(&ctx->mtx);
-	kqring_req_complete(ctx, found, -ECANCELED, 0);
+	*gonep = found;
 	return (0);
 }
 

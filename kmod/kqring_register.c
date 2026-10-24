@@ -266,17 +266,24 @@ kqring_evfd_unregister(struct kqring_ctx *ctx)
 }
 
 /*
- * Signal the eventfd if CQEs were posted since the last signal; the owner
- * calls this at the end of each enter and before it sleeps.
+ * Signal the eventfd and pollers if CQEs were posted since the last
+ * signal; whoever posts them (an enter, the ring's kthread) calls this
+ * before it sleeps or returns.  On a ring that other threads may wait on
+ * (shared, or with a kthread), wake those waiters too.
  */
 void
 kqring_evfd_flush(struct kqring_ctx *ctx)
 {
-	if (ctx->evfd_cqes == 0 || (ctx->evfd == NULL && !ctx->pollers))
+	bool waiters = ctx->shared || kqring_has_kthread(ctx);
+
+	if (ctx->evfd_cqes == 0 ||
+	    (ctx->evfd == NULL && !ctx->pollers && !waiters))
 		return;
 	ctx->evfd_cqes = 0;
 	mtx_lock(&ctx->mtx);
 	kqring_evfd_signal_locked(ctx);
+	if (waiters && ctx->sleeping)
+		wakeup(&ctx->wakeup_chan);
 	mtx_unlock(&ctx->mtx);
 }
 
