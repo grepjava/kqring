@@ -29,12 +29,12 @@
  *      descriptors separately retain ring file references until unregister,
  *      exec or process exit. Ordinary descriptors are resolved with rights
  *      checks when used.
- *   4. User I/O buffers are not pinned: registered buffers are checked
- *      address ranges, accessed through copyin/copyout or uiomove in process
- *      context. Kernel-allocated ring VM objects are wired and referenced
- *      independently by mappings. A worker reserves a provided group's head
- *      without holding the group lock across blocking I/O; conflicting
- *      selections fail ENOBUFS and removal/unregister fails EBUSY.
+ *   4. Ordinary user I/O buffers are accessed through copyin/copyout or
+ *      uiomove in process context. Registered buffers hold their backing
+ *      pages for zero-copy SEND_ZC (IORING_RECVSEND_FIXED_BUF), charged against
+ *      RLIMIT_MEMLOCK and vm.max_user_wired until released by the slot and all
+ *      in-flight mbufs. Kernel-allocated ring VM objects are wired; workers
+ *      reserve a provided group's head across blocking I/O (ENOBUFS / EBUSY).
  */
 
 #ifndef _SYS_KQRING_H_
@@ -294,8 +294,8 @@ enum io_uring_op {
 
 /*
  * SEND_ZC / SENDMSG_ZC notification CQE result bit: the data was copied.
- * kqring always copies, so a notification asked for with
- * IORING_SEND_ZC_REPORT_USAGE always carries it.
+ * Reported when IORING_SEND_ZC_REPORT_USAGE is set and the request used the
+ * copy path rather than zero-copy EXT_SFBUF page attachment.
  */
 #define IORING_NOTIF_USAGE_ZC_COPIED	(1U << 31)
 

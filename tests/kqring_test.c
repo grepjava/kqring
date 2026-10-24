@@ -9,11 +9,14 @@
  */
 
 #include <sys/types.h>
+#include <sys/param.h>
 #include <sys/capsicum.h>
 #include <sys/cpuset.h>
 #include <sys/event.h>
 #include <sys/eventfd.h>
+#include <sys/linker.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -2368,6 +2371,39 @@ test_waitall(struct test_ring *r)
 	printf("[PASS] MSG_WAITALL: RECV waits for the full length or EOF\n");
 }
 
+struct zc_unload_race_ctx {
+	atomic_bool	done;
+	int		attempts;
+};
+
+static void *
+zc_unload_racer_thread(void *arg)
+{
+	struct zc_unload_race_ctx *ctx = arg;
+	int fileid = kldfind("kqring");
+	assert(fileid >= 0);
+
+	for (int i = 0; i < 3; i++) {
+		struct timespec t0, t1;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		if (geteuid() == 0) {
+			int rc = kldunload(fileid);
+			assert(rc == -1 && errno == EBUSY);
+		} else {
+			int st = system(
+			    "sudo -n kldunload kqring 2>&1 | grep -q 'Device busy'");
+			assert(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+		}
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		long elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+		    (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+		assert(elapsed_ms < 2000);
+		ctx->attempts++;
+	}
+	atomic_store_explicit(&ctx->done, true, memory_order_release);
+	return (NULL);
+}
+
 static void
 test_send_zc(struct test_ring *r)
 {
@@ -2432,7 +2468,345 @@ test_send_zc(struct test_ring *r)
 	assert(recv(ua, buf, sizeof(buf), 0) == 5);
 	close(ua);
 	close(ub);
-	printf("[PASS] SEND_ZC/SENDMSG_ZC notifications, SEND to an address\n");
+
+	/*
+	 * Phase A genuine zero-copy SEND_ZC with IORING_RECVSEND_FIXED_BUF:
+	 * attaches EXT_SFBUF mbufs over held physical pages, posts the
+	 * primary CQE (IORING_CQE_F_MORE) immediately, and defers the
+	 * IORING_CQE_F_NOTIF CQE (res == 0, not IORING_NOTIF_USAGE_ZC_COPIED)
+	 * until the peer drains the socket buffer.
+	 */
+	size_t zlen = (size_t)sysconf(_SC_PAGESIZE) * 2;
+	char *zbuf = mmap(NULL, zlen, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	char *rbuf = malloc(zlen);
+	assert(zbuf != MAP_FAILED && rbuf != NULL);
+	memset(zbuf, 'A', zlen);
+	struct iovec ziov = { .iov_base = zbuf, .iov_len = zlen };
+	assert(kqring_register(r->fd, IORING_REGISTER_BUFFERS, &ziov, 1) == 0);
+
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, sv[0], 30505);
+	sqe->addr = (uint64_t)(uintptr_t)zbuf;
+	sqe->len = (uint32_t)zlen;
+	sqe->ioprio = IORING_RECVSEND_FIXED_BUF | IORING_SEND_ZC_REPORT_USAGE;
+	sqe->buf_index = 0;
+	ring_push_sqe(r);
+	ring_submit(r);
+	/* Primary CQE is ready; notification CQE waits for mbuf release. */
+	assert(ring_cq_ready(r) == 1);
+	c = expect_cqe(r, 30505, (int32_t)zlen);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	/* Mutate the pinned page while unread in sv[1] to prove zero-copy. */
+	zbuf[0] = 'Z';
+	zbuf[zlen - 1] = 'Y';
+	assert(read(sv[1], rbuf, zlen) == (ssize_t)zlen);
+	assert(rbuf[0] == 'Z' && rbuf[1] == 'A' && rbuf[zlen - 1] == 'Y');
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = expect_cqe(r, 30505, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	close(sv[0]);
+	close(sv[1]);
+
+	/* TCP loopback zero-copy SEND_ZC + FIXED_BUF. */
+	uint16_t port;
+	int lfd = tcp_listener(&port);
+	int cfd = tcp_connect(port);
+	wait_readable(lfd);
+	int afd = accept(lfd, NULL, NULL);
+	assert(afd >= 0);
+	memset(zbuf, 'T', zlen);
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, cfd, 30506);
+	sqe->addr = (uint64_t)(uintptr_t)zbuf;
+	sqe->len = (uint32_t)zlen;
+	sqe->ioprio = IORING_RECVSEND_FIXED_BUF | IORING_SEND_ZC_REPORT_USAGE;
+	sqe->buf_index = 0;
+	ring_push_sqe(r);
+	ring_submit(r);
+	size_t got = 0;
+	while (got < zlen) {
+		wait_readable(afd);
+		ssize_t n = read(afd, rbuf + got, zlen - got);
+		assert(n > 0);
+		got += (size_t)n;
+	}
+	assert(ring_wait(r, 2, 2000) == 0);
+	c = expect_cqe(r, 30506, (int32_t)zlen);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	c = expect_cqe(r, 30506, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	close(afd);
+	close(cfd);
+	close(lfd);
+	/*
+	 * Copy-on-write after fork() refreshes held pages before SEND_ZC,
+	 * while an earlier unread SEND_ZC keeps its old pages held and charged
+	 * until the mbuf referencing them is drained.
+	 */
+	size_t page = (size_t)sysconf(_SC_PAGESIZE);
+	struct rlimit old_rl, rl;
+	assert(getrlimit(RLIMIT_MEMLOCK, &old_rl) == 0);
+	rl.rlim_cur = (rlim_t)(4 * page);
+	rl.rlim_max = old_rl.rlim_max;
+	assert(setrlimit(RLIMIT_MEMLOCK, &rl) == 0);
+
+	memset(zbuf, 'A', zlen);
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, sv[0], 30507);
+	sqe->addr = (uint64_t)(uintptr_t)zbuf;
+	sqe->len = (uint32_t)zlen;
+	sqe->ioprio = IORING_RECVSEND_FIXED_BUF | IORING_SEND_ZC_REPORT_USAGE;
+	sqe->buf_index = 0;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 1);
+	c = expect_cqe(r, 30507, (int32_t)zlen);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+
+	/* sv[1] still holds the unread mbuf referencing old_zb (refs == 2). */
+	int cow_pipe[2];
+	assert(pipe(cow_pipe) == 0);
+	pid_t zpid = fork();
+	assert(zpid >= 0);
+	if (zpid == 0) {
+		close(cow_pipe[1]);
+		assert(zbuf[0] == 'A' && zbuf[zlen - 1] == 'A');
+		char ch;
+		(void)read(cow_pipe[0], &ch, 1);
+		assert(zbuf[0] == 'A' && zbuf[zlen - 1] == 'A');
+		close(cow_pipe[0]);
+		_exit(0);
+	}
+	close(cow_pipe[0]);
+	/* Fault in parent while child still maps the pre-COW 'A' pages. */
+	zbuf[0] = 'P';
+	zbuf[zlen - 1] = 'Q';
+	close(cow_pipe[1]);
+	int zstatus = 0;
+	assert(waitpid(zpid, &zstatus, 0) == zpid);
+	assert(WIFEXITED(zstatus) && WEXITSTATUS(zstatus) == 0);
+
+	int sv2[2];
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv2) == 0);
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, sv2[0], 30508);
+	sqe->addr = (uint64_t)(uintptr_t)zbuf;
+	sqe->len = (uint32_t)zlen;
+	sqe->ioprio = IORING_RECVSEND_FIXED_BUF | IORING_SEND_ZC_REPORT_USAGE;
+	sqe->buf_index = 0;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 1);
+	c = expect_cqe(r, 30508, (int32_t)zlen);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+
+	/*
+	 * Both old_zb (2 pages in sv[1]) and new_zb (2 pages in slot + sv2[1])
+	 * are charged against the 4-page RLIMIT_MEMLOCK cap.
+	 */
+	struct iovec one_page = { .iov_base = zbuf, .iov_len = page };
+	struct test_ring cow_mr;
+	ring_init(&cow_mr);
+	assert(kqring_register(cow_mr.fd, IORING_REGISTER_BUFFERS, &one_page,
+	    1) == -1 && errno == ENOMEM);
+
+	/* sv[1] still reads the pre-COW 'A' pages from old_zb. */
+	assert(read(sv[1], rbuf, zlen) == (ssize_t)zlen);
+	assert(rbuf[0] == 'A' && rbuf[1] == 'A' && rbuf[zlen - 1] == 'A');
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = expect_cqe(r, 30507, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+
+	/* Draining sv[1] released old_zb's 2-page charge. */
+	assert(kqring_register(cow_mr.fd, IORING_REGISTER_BUFFERS, &one_page,
+	    1) == 0);
+	assert(kqring_register(cow_mr.fd, IORING_UNREGISTER_BUFFERS, NULL,
+	    0) == 0);
+	munmap(cow_mr.br, page);
+	munmap(cow_mr.bufs, NBUFS * BUF_SIZE);
+	munmap(cow_mr.sqes, cow_mr.sqes_len);
+	munmap(cow_mr.ring_map, cow_mr.ring_map_len);
+	close(cow_mr.fd);
+
+	/* sv2[1] reads the refreshed post-COW 'P'..'Q' pages from new_zb. */
+	assert(read(sv2[1], rbuf, zlen) == (ssize_t)zlen);
+	assert(rbuf[0] == 'P' && rbuf[1] == 'A' && rbuf[zlen - 1] == 'Q');
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = expect_cqe(r, 30508, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	close(sv2[0]);
+	close(sv2[1]);
+	close(sv[0]);
+	close(sv[1]);
+	assert(kqring_register(r->fd, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+
+	/*
+	 * RLIMIT_MEMLOCK enforcement across rings and across unread in-flight
+	 * SEND_ZC notifications after slot unregistration.
+	 */
+	rl.rlim_cur = (rlim_t)(3 * page);
+	rl.rlim_max = old_rl.rlim_max;
+	assert(setrlimit(RLIMIT_MEMLOCK, &rl) == 0);
+
+	/* 2 pages on r leaves 1 page of allowance for a second ring. */
+	assert(kqring_register(r->fd, IORING_REGISTER_BUFFERS, &ziov, 1) == 0);
+	struct test_ring mr;
+	ring_init(&mr);
+	assert(kqring_register(mr.fd, IORING_REGISTER_BUFFERS, &ziov, 1) == -1 &&
+	    errno == ENOMEM);
+	assert(kqring_register(mr.fd, IORING_REGISTER_BUFFERS, &one_page,
+	    1) == 0);
+	struct test_ring mr2;
+	ring_init(&mr2);
+	assert(kqring_register(mr2.fd, IORING_REGISTER_BUFFERS, &one_page,
+	    1) == -1 && errno == ENOMEM);
+	munmap(mr2.br, page);
+	munmap(mr2.bufs, NBUFS * BUF_SIZE);
+	munmap(mr2.sqes, mr2.sqes_len);
+	munmap(mr2.ring_map, mr2.ring_map_len);
+	close(mr2.fd);
+	munmap(mr.br, page);
+	munmap(mr.bufs, NBUFS * BUF_SIZE);
+	munmap(mr.sqes, mr.sqes_len);
+	munmap(mr.ring_map, mr.ring_map_len);
+	close(mr.fd);
+	assert(kqring_register(r->fd, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+
+	/*
+	 * Unread zero-copy sends keep their pages charged even after
+	 * IORING_UNREGISTER_BUFFERS; reading the socket returns the charge.
+	 */
+	rl.rlim_cur = (rlim_t)(4 * page);
+	assert(setrlimit(RLIMIT_MEMLOCK, &rl) == 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	for (int iter = 0; iter < 2; iter++) {
+		assert(kqring_register(r->fd, IORING_REGISTER_BUFFERS, &ziov,
+		    1) == 0);
+		sqe = ring_prep(r, IORING_OP_SEND_ZC, sv[0], 30510 + iter);
+		sqe->addr = (uint64_t)(uintptr_t)zbuf;
+		sqe->len = (uint32_t)zlen;
+		sqe->ioprio = IORING_RECVSEND_FIXED_BUF;
+		sqe->buf_index = 0;
+		ring_push_sqe(r);
+		ring_submit(r);
+		assert(ring_cq_ready(r) == 1);
+		c = expect_cqe(r, 30510 + iter, (int32_t)zlen);
+		assert((c.flags & IORING_CQE_F_MORE) != 0);
+		assert(kqring_register(r->fd, IORING_UNREGISTER_BUFFERS, NULL,
+		    0) == 0);
+	}
+	/* 4 pages are still held in sv[1]'s unread receive buffer. */
+	assert(kqring_register(r->fd, IORING_REGISTER_BUFFERS, &ziov, 1) == -1 &&
+	    errno == ENOMEM);
+	/* Draining the first send releases 2 pages and allows re-registration. */
+	assert(read(sv[1], rbuf, zlen) == (ssize_t)zlen);
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = expect_cqe(r, 30510, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	assert(kqring_register(r->fd, IORING_REGISTER_BUFFERS, &ziov, 1) == 0);
+	assert(kqring_register(r->fd, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+	assert(read(sv[1], rbuf, zlen) == (ssize_t)zlen);
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = expect_cqe(r, 30511, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	close(sv[0]);
+	close(sv[1]);
+	assert(setrlimit(RLIMIT_MEMLOCK, &old_rl) == 0);
+
+	/*
+	 * Unread SEND_ZC raced against kldunload: unload must return EBUSY
+	 * promptly without hanging, concurrent SEND_ZC submissions during the
+	 * unload race must succeed, and the ring must keep working afterwards.
+	 */
+	assert(kqring_register(r->fd, IORING_REGISTER_BUFFERS, &ziov, 1) == 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv2) == 0);
+	memset(zbuf, 'U', zlen);
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, sv[0], 30530);
+	sqe->addr = (uint64_t)(uintptr_t)zbuf;
+	sqe->len = (uint32_t)zlen;
+	sqe->ioprio = IORING_RECVSEND_FIXED_BUF | IORING_SEND_ZC_REPORT_USAGE;
+	sqe->buf_index = 0;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 1);
+	c = expect_cqe(r, 30530, (int32_t)zlen);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+
+	/* sv[1] is left unread while zc_unload_racer_thread attempts kldunload. */
+	struct zc_unload_race_ctx uctx = { .done = false, .attempts = 0 };
+	pthread_t uthr;
+	assert(pthread_create(&uthr, NULL, zc_unload_racer_thread, &uctx) == 0);
+	uint64_t uid = 30600;
+	while (!atomic_load_explicit(&uctx.done, memory_order_acquire)) {
+		sqe = ring_prep(r, IORING_OP_SEND_ZC, sv2[0], uid);
+		sqe->addr = (uint64_t)(uintptr_t)zbuf;
+		sqe->len = (uint32_t)page;
+		sqe->ioprio = IORING_RECVSEND_FIXED_BUF;
+		sqe->buf_index = 0;
+		ring_push_sqe(r);
+		ring_submit(r);
+		assert(read(sv2[1], rbuf, page) == (ssize_t)page);
+		assert(ring_wait(r, 2, 2000) == 0);
+		c = expect_cqe(r, uid, (int32_t)page);
+		assert((c.flags & IORING_CQE_F_MORE) != 0);
+		c = expect_cqe(r, uid, 0);
+		assert(c.flags == IORING_CQE_F_NOTIF);
+		uid++;
+	}
+	assert(pthread_join(uthr, NULL) == 0);
+	assert(uctx.attempts == 3);
+
+	/* Ring and true zero-copy SEND_ZC still work after failed kldunload. */
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, sv2[0], 30539);
+	sqe->addr = (uint64_t)(uintptr_t)zbuf;
+	sqe->len = (uint32_t)zlen;
+	sqe->ioprio = IORING_RECVSEND_FIXED_BUF | IORING_SEND_ZC_REPORT_USAGE;
+	sqe->buf_index = 0;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(read(sv2[1], rbuf, zlen) == (ssize_t)zlen);
+	assert(ring_wait(r, 2, 2000) == 0);
+	c = expect_cqe(r, 30539, (int32_t)zlen);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	c = expect_cqe(r, 30539, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+
+	/* Drain sv[1] to release the pinned send that blocked kldunload. */
+	assert(read(sv[1], rbuf, zlen) == (ssize_t)zlen);
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = expect_cqe(r, 30530, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	close(sv2[0]);
+	close(sv2[1]);
+	close(sv[0]);
+	close(sv[1]);
+	assert(kqring_register(r->fd, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+
+	/* Closing a ring while zero-copy mbufs remain unread in peer socket. */
+	struct test_ring zr;
+	ring_init(&zr);
+	assert(kqring_register(zr.fd, IORING_REGISTER_BUFFERS, &ziov, 1) == 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	sqe = ring_prep(&zr, IORING_OP_SEND_ZC, sv[0], 30520);
+	sqe->addr = (uint64_t)(uintptr_t)zbuf;
+	sqe->len = (uint32_t)zlen;
+	sqe->ioprio = IORING_RECVSEND_FIXED_BUF;
+	sqe->buf_index = 0;
+	ring_push_sqe(&zr);
+	ring_submit(&zr);
+	assert(ring_cq_ready(&zr) == 1);
+	munmap(zr.br, page);
+	munmap(zr.bufs, NBUFS * BUF_SIZE);
+	munmap(zr.sqes, zr.sqes_len);
+	munmap(zr.ring_map, zr.ring_map_len);
+	close(zr.fd);
+	munmap(zbuf, zlen);
+	assert(read(sv[1], rbuf, zlen) == (ssize_t)zlen);
+	close(sv[0]);
+	close(sv[1]);
+	free(rbuf);
+	printf("[PASS] SEND_ZC/SENDMSG_ZC notifications (incl. FIXED_BUF ZC), "
+	    "SEND to an address\n");
 }
 
 static void
@@ -4739,7 +5113,7 @@ static void
 test_worker_cancel_and_timeout(void)
 {
 	struct io_uring_sync_cancel_reg sc;
-	struct __kernel_timespec ts = { .tv_nsec = 20000000 }; /* 20 ms */
+	struct __kernel_timespec ts = { .tv_nsec = 2000000 }; /* 2 ms */
 	struct io_uring_sqe *sqe;
 	struct test_ring t;
 	char buf[16];
@@ -4748,51 +5122,66 @@ test_worker_cancel_and_timeout(void)
 	ring_init(&t);
 	assert(pipe(pfd) == 0);
 
-	/* 1. Cancel a sleeping worker pipe READ via IORING_OP_ASYNC_CANCEL. */
-	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 62001);
-	sqe->addr = (uint64_t)(uintptr_t)buf;
-	sqe->len = sizeof(buf);
-	sqe->off = (uint64_t)-1;
-	ring_push_sqe(&t);
-	ring_submit(&t);
-	assert(ring_cq_ready(&t) == 0);
+	/*
+	 * Stress worker cancellation across the dequeue-to-sleep window for
+	 * ASYNC_CANCEL, SYNC_CANCEL, and LINK_TIMEOUT.
+	 */
+	for (int iter = 0; iter < 128; iter++) {
+		uint64_t base = 62000 + (uint64_t)iter * 10;
 
-	sqe = ring_prep(&t, IORING_OP_ASYNC_CANCEL, -1, 62002);
-	sqe->addr = 62001;
-	ring_push_sqe(&t);
-	ring_submit(&t);
-	expect_cancel_pair(&t, 62001, 62002);
+		/* 1. Cancel a worker pipe READ via IORING_OP_ASYNC_CANCEL. */
+		sqe = ring_prep(&t, IORING_OP_READ, pfd[0], base + 1);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		sqe->off = (uint64_t)-1;
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		assert(ring_cq_ready(&t) == 0);
+		for (volatile int spin = 0; spin < (iter & 7) * 64; spin++)
+			;
 
-	/* 2. Cancel a sleeping worker pipe READ via SYNC_CANCEL. */
-	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 62003);
-	sqe->addr = (uint64_t)(uintptr_t)buf;
-	sqe->len = sizeof(buf);
-	sqe->off = (uint64_t)-1;
-	ring_push_sqe(&t);
-	ring_submit(&t);
-	assert(ring_cq_ready(&t) == 0);
+		sqe = ring_prep(&t, IORING_OP_ASYNC_CANCEL, -1, base + 2);
+		sqe->addr = base + 1;
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		expect_cancel_pair(&t, base + 1, base + 2);
 
-	memset(&sc, 0, sizeof(sc));
-	sc.addr = 62003;
-	assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == 0);
-	assert(ring_wait(&t, 1, 2000) == 0);
-	expect_cqe(&t, 62003, -ECANCELED);
+		/* 2. Cancel a worker pipe READ via SYNC_CANCEL. */
+		sqe = ring_prep(&t, IORING_OP_READ, pfd[0], base + 3);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		sqe->off = (uint64_t)-1;
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		assert(ring_cq_ready(&t) == 0);
+		for (volatile int spin = 0; spin < (iter & 7) * 64; spin++)
+			;
 
-	/* 3. Cancel a sleeping worker pipe READ via LINK_TIMEOUT. */
-	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 62004);
-	sqe->flags = IOSQE_IO_LINK;
-	sqe->addr = (uint64_t)(uintptr_t)buf;
-	sqe->len = sizeof(buf);
-	sqe->off = (uint64_t)-1;
-	ring_push_sqe(&t);
-	sqe = ring_prep(&t, IORING_OP_LINK_TIMEOUT, -1, 62005);
-	sqe->addr = (uint64_t)(uintptr_t)&ts;
-	sqe->len = 1;
-	ring_push_sqe(&t);
-	ring_submit(&t);
-	assert(ring_wait(&t, 2, 2000) == 0);
-	expect_cqe(&t, 62005, -ETIME);
-	expect_cqe(&t, 62004, -ECANCELED);
+		memset(&sc, 0, sizeof(sc));
+		sc.addr = base + 3;
+		assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == 0);
+		assert(ring_wait(&t, 1, 2000) == 0);
+		expect_cqe(&t, base + 3, -ECANCELED);
+
+		/* 3. Cancel a worker pipe READ via LINK_TIMEOUT. */
+		if (iter < 16) {
+			sqe = ring_prep(&t, IORING_OP_READ, pfd[0], base + 4);
+			sqe->flags = IOSQE_IO_LINK;
+			sqe->addr = (uint64_t)(uintptr_t)buf;
+			sqe->len = sizeof(buf);
+			sqe->off = (uint64_t)-1;
+			ring_push_sqe(&t);
+			sqe = ring_prep(&t, IORING_OP_LINK_TIMEOUT, -1,
+			    base + 5);
+			sqe->addr = (uint64_t)(uintptr_t)&ts;
+			sqe->len = 1;
+			ring_push_sqe(&t);
+			ring_submit(&t);
+			assert(ring_wait(&t, 2, 2000) == 0);
+			expect_cqe(&t, base + 5, -ETIME);
+			expect_cqe(&t, base + 4, -ECANCELED);
+		}
+	}
 
 	/*
 	 * 4. Verify the pipe is still usable after worker cancellations and
@@ -4807,8 +5196,43 @@ test_worker_cancel_and_timeout(void)
 	assert(submit_one(&t) == 3);
 	assert(memcmp(buf, "ok!", 3) == 0);
 
+	/*
+	 * 5. Detached close with an outstanding worker op across the
+	 * dequeue-to-sleep window.
+	 */
+	for (int iter = 0; iter < 16; iter++) {
+		struct test_ring dc;
+
+		ring_init(&dc);
+		sqe = ring_prep(&dc, IORING_OP_READ, pfd[0], 62900 + iter);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		sqe->off = (uint64_t)-1;
+		ring_push_sqe(&dc);
+		ring_submit(&dc);
+		for (volatile int spin = 0; spin < (iter & 7) * 64; spin++)
+			;
+		munmap(dc.br, (size_t)sysconf(_SC_PAGESIZE));
+		munmap(dc.bufs, NBUFS * BUF_SIZE);
+		munmap(dc.sqes, dc.sqes_len);
+		munmap(dc.ring_map, dc.ring_map_len);
+		close(dc.fd);
+	}
+	assert(write(pfd[1], "dc!", 3) == 3);
+	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 62007);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 3;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 3);
+	assert(memcmp(buf, "dc!", 3) == 0);
+
 	close(pfd[0]);
 	close(pfd[1]);
+	munmap(t.br, (size_t)sysconf(_SC_PAGESIZE));
+	munmap(t.bufs, NBUFS * BUF_SIZE);
+	munmap(t.sqes, t.sqes_len);
+	munmap(t.ring_map, t.ring_map_len);
 	close(t.fd);
 	printf("[PASS] Worker cancellation: ASYNC_CANCEL, SYNC_CANCEL, "
 	    "LINK_TIMEOUT\n");
@@ -5370,6 +5794,36 @@ test_sqe128_cqe32_attach_wq(void)
 	    qmax, 2) == 0);
 	assert(qmax[0] == 2 && qmax[1] == 3);
 
+	/*
+	 * An ATTACH_WQ setup whose params copyout fails must leave the ring
+	 * on its own pool: retried on the same fd without ATTACH_WQ, it must
+	 * not see fd1's pool limits.
+	 */
+	long pgsz = sysconf(_SC_PAGESIZE);
+	struct io_uring_params *pro = mmap(NULL, (size_t)pgsz,
+	    PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+	assert(pro != MAP_FAILED);
+	memset(pro, 0, sizeof(*pro));
+	pro->flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+	    IORING_SETUP_ATTACH_WQ;
+	pro->wq_fd = (uint32_t)fd1;
+	assert(mprotect(pro, (size_t)pgsz, PROT_READ) == 0);
+	int rfd = open("/dev/kqring", O_RDWR | O_CLOEXEC);
+	assert(rfd >= 0);
+	struct kqring_setup_arg rsa = { .entries = 4, .pad = 0, .params = pro };
+	assert(ioctl(rfd, KQRING_IOC_SETUP, &rsa) == -1 && errno == EFAULT);
+	struct io_uring_params pretry;
+	memset(&pretry, 0, sizeof(pretry));
+	pretry.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+	rsa.params = &pretry;
+	assert(ioctl(rfd, KQRING_IOC_SETUP, &rsa) == 0);
+	uint32_t rmax[2] = { 0, 0 };
+	assert(kqring_register(rfd, IORING_REGISTER_IOWQ_MAX_WORKERS,
+	    rmax, 2) == 0);
+	assert(rmax[0] != 2 && rmax[1] != 3);
+	close(rfd);
+	munmap(pro, (size_t)pgsz);
+
 	/* Close fd1 first; r2's attached worker pool must remain functional. */
 	munmap(sqes_raw, sqes_len);
 	munmap(ring_base, ring_len);
@@ -5386,11 +5840,21 @@ test_sqe128_cqe32_attach_wq(void)
 	assert(submit_one(&r2) == 4);
 	assert(memcmp(buf, "wqok", 4) == 0);
 
-	close(pfd[0]);
-	close(pfd[1]);
+	/*
+	 * Close r2 while an attached-pool worker op is in flight on pfd[0]
+	 * (after fd1 was already closed).
+	 */
+	sqe = ring_prep(&r2, IORING_OP_READ, pfd[0], 72011);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 4;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&r2);
+	ring_submit(&r2);
 	munmap(r2.sqes, r2.sqes_len);
 	munmap(r2.ring_map, r2.ring_map_len);
 	close(r2.fd);
+	close(pfd[0]);
+	close(pfd[1]);
 	printf("[PASS] SQE128, CQE32, and ATTACH_WQ: 128B SQEs, 32B CQEs, "
 	    "MSG_RING big_cqe, shared WQ\n");
 }
