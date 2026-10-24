@@ -227,6 +227,7 @@ def main():
                 ("Empty kevent vs 32 NOPs per enter", ns("floor", "kqueue_empty_kevent"), ns("floor", "kqring_nop_batch32")),
                 ("AF_UNIX 256 KiB send, SEND_ZC vs write", ns("send_unix_256k", "plain_write"), ns("send_unix_256k", "kqring_send_zc_fixed")),
                 ("TCP 64 KiB send, SEND_ZC vs write", ns("send_tcp_64k", "plain_write"), ns("send_tcp_64k", "kqring_send_zc_fixed")),
+                ("AF_UNIX 16 KiB send, SEND_ZC vs write", ns("send_unix_16k", "plain_write"), ns("send_unix_16k", "kqring_send_zc_fixed")),
                 ("AF_UNIX 64 B, RECV armed before data", ns("pingpong_unix_64", "kqueue"), ns("pingpong_unix_64", "kqring_recv_armed")),
                 ("File 4 KiB, 32 READs per enter vs pread", ns("file_4k", "pread"), ns("file_4k", "kqring_read_batch32")),
                 ("File 4 KiB READ vs pread", ns("file_4k", "pread"), ns("file_4k", "kqring_read")),
@@ -261,7 +262,7 @@ def main():
         size = int(g.rsplit("_", 1)[1].rstrip("k")) * 1024
         return size / t  # bytes per ns == GB/s
 
-    sizes = [("16 KiB", "16k"), ("64 KiB", "64k"), ("256 KiB", "256k")]
+    sizes = [("16 KiB", "16k"), ("32 KiB", "32k"), ("64 KiB", "64k"), ("256 KiB", "256k")]
     send_series = [("write(2)", "plain_write", P), ("kqring SEND", "kqring_send", K),
                    ("SEND_ZC, registered buffer", "kqring_send_zc_fixed", S1),
                    ("SEND_ZC, unregistered", "kqring_send_zc", S2)]

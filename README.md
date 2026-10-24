@@ -32,9 +32,9 @@ On a 4-core i5-8250U running FreeBSD 15.1, as medians of 5 runs:
 - **Many ready sockets:** 15–16% faster than kqueue, from 16 up to 1,024 connections, because one enter reaps every message.
 - **One connection:** between 4% faster and 7% slower with multishot `RECV`, and 10–12% faster when receiving into one reused buffer.
 - **Cached file reads:** 32 `READ`s per enter cost 29% less than `pread(2)`, served inline from the page cache.
-- **Zero-copy send:** `SEND_ZC` is up to 35% faster than `write(2)` for 256 KiB messages, and 15–25% faster on TCP loopback from 16 KiB up.
-- **Batching, accept and timers:** 32 `NOP`s per enter cost 78 ns each (an empty `kevent` costs 287 ns); multishot `ACCEPT` is 7% faster, and `TIMEOUT` is 41% faster.
-- **Blocking pipes are 5× slower** than kqueue, because their reads go through a worker thread. On an `O_NONBLOCK` pipe, `READ` runs inline and is 9% faster than kqueue.
+- **Zero-copy send:** `SEND_ZC` from a registered buffer is 38% faster than `write(2)` for 256 KiB messages on AF_UNIX and 26% faster on TCP loopback, and 15–16% faster at 64 KiB.
+- **Batching, accept and timers:** 32 `NOP`s per enter cost 78 ns each (an empty `kevent` costs 287 ns); multishot `ACCEPT` is 8% faster, and `TIMEOUT` is 41% faster.
+- **Blocking pipes are 5× slower** than kqueue, because their reads go through a worker thread. On an `O_NONBLOCK` pipe, `READ` runs inline and is 10% faster than kqueue.
 
 See [`BENCHMARK.MD`](BENCHMARK.MD) for the method, every result, and the known gaps.
 
@@ -100,7 +100,7 @@ These Linux-only operations are rejected with `-EOPNOTSUPP` or `-EINVAL`:
 
 - **Native values.** Flags and constants use their FreeBSD values: `O_*`, `AT_*`, `MSG_*`, `SOCK_*`, `POSIX_FADV_*`, `MADV_*`, `idtype_t` and `W*`. CQE errors are negated FreeBSD errnos.
 - **Timeouts.** These complete with `-ETIME`, which the header defines as `ETIMEDOUT`.
-- **Zero-copy send.** `SEND_ZC` and `SENDMSG_ZC` on connected stream sockets (`AF_UNIX` and `TCP`, for transfers of at least `PAGE_SIZE` bytes) attach the buffer's held physical pages (from a registered `IORING_RECVSEND_FIXED_BUF` slot or pinned on the fly from unregistered user buffers / `msg_iov` segments and charged against `RLIMIT_MEMLOCK` and `vm.max_user_wired`) to `EXT_SFBUF` mbufs and defer the `IORING_CQE_F_NOTIF` CQE (`res = 0`) until the network stack frees the mbufs. Smaller or ineligible `SEND_ZC` and `SENDMSG_ZC` requests (or requests that exceed `RLIMIT_MEMLOCK` / `vm.max_user_wired`) copy the data and post the notification CQE immediately (carrying `IORING_NOTIF_USAGE_ZC_COPIED` when `IORING_SEND_ZC_REPORT_USAGE` is set).
+- **Zero-copy send.** `SEND_ZC` and `SENDMSG_ZC` on connected stream sockets (transfers of at least `PAGE_SIZE` bytes; on `AF_UNIX`, a transfer from an unregistered buffer must be at least `kern.kqring.zc_local_min_len` bytes, 32 KiB by default, because below that pinning it costs more than copying) attach the buffer's held physical pages (from a registered `IORING_RECVSEND_FIXED_BUF` slot or pinned on the fly from unregistered user buffers / `msg_iov` segments and charged against `RLIMIT_MEMLOCK` and `vm.max_user_wired`) to `EXT_SFBUF` mbufs and defer the `IORING_CQE_F_NOTIF` CQE (`res = 0`) until the network stack frees the mbufs. Smaller or ineligible `SEND_ZC` and `SENDMSG_ZC` requests (or requests that exceed `RLIMIT_MEMLOCK` / `vm.max_user_wired`) copy the data and post the notification CQE immediately (carrying `IORING_NOTIF_USAGE_ZC_COPIED` when `IORING_SEND_ZC_REPORT_USAGE` is set).
 - **`STATX`.** It fills Linux's `struct statx` from `stat(2)`.
 - **Xattrs.** Names are mapped to `extattr` namespaces: `user.` to user, and `system.` and `trusted.` to system.
 - **`SYNC_FILE_RANGE`.** It syncs the whole file's data.

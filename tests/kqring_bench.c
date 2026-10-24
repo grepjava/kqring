@@ -834,6 +834,20 @@ bench_file(void)
 	}
 	row("file_4k", "kqring_read", now_ns() - t0, FILE_ITERS);
 
+	/* A registered file skips the descriptor-table lookups. */
+	assert(kqring_register(r.fd, IORING_REGISTER_FILES, &fd, 1) == 0);
+	t0 = now_ns();
+	for (int i = 0; i < FILE_ITERS; i++) {
+		struct io_uring_sqe *sqe = ring_prep(&r, IORING_OP_READ, 0, 1);
+		sqe->flags = IOSQE_FIXED_FILE;
+		sqe->addr = (uint64_t)(uintptr_t)buf[0];
+		sqe->len = FILE_BLK;
+		sqe->off = (uint64_t)NEXT_OFF();
+		ring_enter(&r, 1);
+		assert(ring_pop(&r).res == FILE_BLK);
+	}
+	row("file_4k", "kqring_read_fixed", now_ns() - t0, FILE_ITERS);
+
 	t0 = now_ns();
 	for (int i = 0; i < FILE_ITERS / FILE_BATCH; i++) {
 		for (int j = 0; j < FILE_BATCH; j++) {
@@ -861,7 +875,10 @@ bench_file(void)
  * baseline is write(2).  The zero-copy variants rotate through ZC_SLOTS
  * buffers and only reuse one once its IORING_CQE_F_NOTIF has arrived, as
  * an application must.  Registering ZC_SLOTS x 256 KiB needs RLIMIT_MEMLOCK
- * above the 64 KiB default: run under ulimit -l 8192.
+ * above the 64 KiB default: run under ulimit -l 8192.  On AF_UNIX, kqring
+ * copies SEND_ZC from an unregistered buffer below
+ * kern.kqring.zc_local_min_len, because there the copy is cheaper; those
+ * rows measure that.
  * ------------------------------------------------------------------------
  */
 
@@ -872,6 +889,7 @@ bench_file(void)
 
 static char *send_src;			/* ZC_SLOTS x SEND_MAX */
 static char send_dst[SEND_MAX];
+static bool send_may_copy;		/* AF_UNIX below the threshold */
 
 static void
 send_recv_all(int rx, size_t len)
@@ -920,8 +938,9 @@ send_zc_reap(struct ring *r, bool *busy, int *sent, size_t len)
 		struct io_uring_cqe c = ring_pop(r);
 
 		if ((c.flags & IORING_CQE_F_NOTIF) != 0) {
-			/* Never the copy fallback: we are measuring zero-copy. */
-			assert(c.res == 0);
+			/* Zero-copy, unless kqring copies by design here. */
+			assert(c.res == 0 || (send_may_copy &&
+			    c.res == (int32_t)IORING_NOTIF_USAGE_ZC_COPIED));
 			busy[c.user_data] = false;
 		} else {
 			assert(c.res == (int32_t)len);
@@ -958,6 +977,8 @@ send_kqring_zc(const char *group, struct ring *r, int rx, int tx, size_t len,
 		}
 		busy[slot] = true;
 		ring_enter(r, 0);
+		/* The send usually completes inline: reap before waiting. */
+		send_zc_reap(r, busy, &sent, len);
 		while (sent <= i) {
 			ring_enter(r, 1);
 			send_zc_reap(r, busy, &sent, len);
@@ -978,7 +999,8 @@ send_kqring_zc(const char *group, struct ring *r, int rx, int tx, size_t len,
 static void
 send_run(const char *transport, int rx, int tx)
 {
-	static const size_t sizes[] = { 16U << 10, 64U << 10, SEND_MAX };
+	static const size_t sizes[] = { 16U << 10, 32U << 10, 64U << 10,
+	    SEND_MAX };
 	int sz = SEND_SOCKBUF;
 	char group[64];
 	struct ring r;
@@ -1003,6 +1025,7 @@ send_run(const char *transport, int rx, int tx)
 
 		snprintf(group, sizeof(group), "send_%s_%zuk", transport,
 		    sizes[i] >> 10);
+		send_may_copy = strcmp(transport, "unix") == 0;
 		send_plain(group, rx, tx, sizes[i], iters);
 		send_kqring(group, &r, rx, tx, sizes[i], iters);
 		send_kqring_zc(group, &r, rx, tx, sizes[i], iters, true);

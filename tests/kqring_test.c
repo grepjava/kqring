@@ -2406,6 +2406,35 @@ zc_unload_racer_thread(void *arg)
 	return (NULL);
 }
 
+/* kern.kqring.zc_local_min_len: read it, or set it (through sudo -n). */
+static unsigned
+zc_local_min_get(void)
+{
+	unsigned v;
+	size_t len = sizeof(v);
+
+	assert(sysctlbyname("kern.kqring.zc_local_min_len", &v, &len, NULL,
+	    0) == 0);
+	return (v);
+}
+
+static void
+zc_local_min_set(unsigned v)
+{
+	char cmd[128];
+
+	if (geteuid() == 0) {
+		assert(sysctlbyname("kern.kqring.zc_local_min_len", NULL, NULL,
+		    &v, sizeof(v)) == 0);
+	} else {
+		snprintf(cmd, sizeof(cmd),
+		    "sudo -n sysctl -q kern.kqring.zc_local_min_len=%u "
+		    ">/dev/null", v);
+		assert(system(cmd) == 0);
+	}
+	assert(zc_local_min_get() == v);
+}
+
 static void
 test_send_zc(struct test_ring *r)
 {
@@ -2415,6 +2444,15 @@ test_send_zc(struct test_ring *r)
 	struct io_uring_cqe c;
 	char buf[16];
 	int sv[2];
+
+	/*
+	 * AF_UNIX sends from unregistered buffers below
+	 * kern.kqring.zc_local_min_len (32 KiB by default) copy.  Most checks
+	 * below use sends of a few pages, to stay under the default 64 KiB
+	 * RLIMIT_MEMLOCK, so lower it to one page.
+	 */
+	unsigned zc_local_min = zc_local_min_get();
+	zc_local_min_set((unsigned)sysconf(_SC_PAGESIZE));
 
 	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
 	sqe = ring_prep(r, IORING_OP_SEND_ZC, sv[0], 30501);
@@ -3124,8 +3162,73 @@ test_send_zc(struct test_ring *r)
 	close(sv[0]);
 	close(sv[1]);
 	free(rbuf);
+
+	/*
+	 * The AF_UNIX threshold for unregistered buffers: with it at 3 pages,
+	 * a 2-page SEND_ZC copies (its notification comes at once, reporting
+	 * the copy) and a 3-page one is zero-copy (its notification waits for
+	 * the peer to read).  A registered buffer ignores it.
+	 */
+	zc_local_min_set((unsigned)(3 * page));
+	char *tb = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	char *tr = malloc(3 * page);
+	assert(tb != MAP_FAILED && tr != NULL);
+	memset(tb, 't', 3 * page);
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, sv[0], 30570);
+	sqe->addr = (uint64_t)(uintptr_t)tb;
+	sqe->len = (uint32_t)(2 * page);
+	sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	c = expect_cqe(r, 30570, (int32_t)(2 * page));
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	c = expect_cqe(r, 30570, (int32_t)IORING_NOTIF_USAGE_ZC_COPIED);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	assert(read(sv[1], tr, 2 * page) == (ssize_t)(2 * page));
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, sv[0], 30571);
+	sqe->addr = (uint64_t)(uintptr_t)tb;
+	sqe->len = (uint32_t)(3 * page);
+	sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 1);
+	c = expect_cqe(r, 30571, (int32_t)(3 * page));
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	assert(read(sv[1], tr, 3 * page) == (ssize_t)(3 * page));
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = expect_cqe(r, 30571, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+
+	struct test_ring fr;
+	struct iovec tiov = { .iov_base = tb, .iov_len = 3 * page };
+	ring_init(&fr);
+	assert(kqring_register(fr.fd, IORING_REGISTER_BUFFERS, &tiov, 1) == 0);
+	sqe = ring_prep(&fr, IORING_OP_SEND_ZC, sv[0], 30572);
+	sqe->addr = (uint64_t)(uintptr_t)tb;
+	sqe->len = (uint32_t)(2 * page);
+	sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE | IORING_RECVSEND_FIXED_BUF;
+	sqe->buf_index = 0;
+	ring_push_sqe(&fr);
+	ring_submit(&fr);
+	assert(ring_cq_ready(&fr) == 1);
+	c = expect_cqe(&fr, 30572, (int32_t)(2 * page));
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	assert(read(sv[1], tr, 2 * page) == (ssize_t)(2 * page));
+	assert(ring_wait(&fr, 1, 2000) == 0);
+	c = expect_cqe(&fr, 30572, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	close(fr.fd);
+
+	munmap(tb, 3 * page);
+	free(tr);
+	close(sv[0]);
+	close(sv[1]);
+	zc_local_min_set(zc_local_min);
 	printf("[PASS] SEND_ZC/SENDMSG_ZC notifications (incl. FIXED_BUF ZC), "
-	    "SEND to an address\n");
+	    "SEND to an address, AF_UNIX copy threshold\n");
 }
 
 static void

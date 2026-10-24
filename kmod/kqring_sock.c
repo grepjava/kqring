@@ -184,6 +184,26 @@ kqring_uio_init(struct uio *auio, struct iovec *iov, u_int iovcnt,
 }
 
 /*
+ * Whether a receive on so would certainly find nothing: a connected
+ * stream socket with no data, control messages, error or EOF.  The fields
+ * read are the part of struct sockbuf shared by every buffer
+ * implementation (the one kevent(2) reads), so this holds for TCP and
+ * AF_UNIX alike.  Read unlocked, it is only a hint: if data arrives
+ * meanwhile, kqring_sb_arm() sees it under the sockbuf lock once the
+ * upcall is installed and queues the op, so nothing is missed.
+ */
+static bool
+kqring_so_rcv_idle(struct socket *so)
+{
+	return (so->so_type == SOCK_STREAM && !SOLISTENING(so) &&
+	    (so->so_state & SS_ISCONNECTED) != 0 &&
+	    atomic_load_short(&so->so_error) == 0 &&
+	    atomic_load_int(&so->so_rcv.sb_acc) == 0 &&
+	    atomic_load_int(&so->so_rcv.sb_ctl) == 0 &&
+	    (atomic_load_short(&so->so_rcv.sb_state) & SBS_CANTRCVMORE) == 0);
+}
+
+/*
  * Socket receive for RECV, READ_MULTISHOT, and READ / READV on a socket:
  * into the SQE's buffer, its iovec, or a provided buffer
  * (IOSQE_BUFFER_SELECT).  Returns:
@@ -238,6 +258,16 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 		return (kqring_done(op, -error, 0));
 	}
 #endif
+	/*
+	 * Nothing to read: say so without soreceive() or taking a provided
+	 * buffer, as soreceive() would end (EWOULDBLOCK, nothing moved).
+	 * Out-of-band data is not in the receive buffer, so MSG_OOB asks.
+	 */
+	if ((sqe->opcode != IORING_OP_RECV ||
+	    (sqe->msg_flags & MSG_OOB) == 0) && kqring_so_rcv_idle(so)) {
+		fdrop(fp, td);
+		return (EAGAIN);
+	}
 
 	if (buf_select) {
 		sx_xlock(&ctx->bg_sx);
@@ -306,7 +336,8 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
  * Zero-copy send for IORING_OP_SEND_ZC and IORING_OP_SENDMSG_ZC (both
  * registered IORING_RECVSEND_FIXED_BUF buffers and unregistered user
  * buffers / scatter-gather iovecs) on stream sockets (AF_LOCAL and TCP)
- * when the transfer is at least KQRING_ZC_MIN_LEN bytes.  Builds an
+ * when the transfer is at least KQRING_ZC_MIN_LEN bytes, or for an
+ * unregistered buffer on AF_LOCAL, kern.kqring.zc_local_min_len.  Builds an
  * EXT_SFBUF mbuf chain over the held physical pages and submits it via
  * pr_send.  Returns EOPNOTSUPP if the caller should fall back to copying.
  */
@@ -325,6 +356,9 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 	u_int nzbufs = 0;
 	bool fixed = (sqe->ioprio & IORING_RECVSEND_FIXED_BUF) != 0;
 	int dom = so->so_proto->pr_domain->dom_family;
+	size_t min_len = dom == AF_LOCAL && !fixed ?
+	    MAX(atomic_load_int(&kqring_zc_local_min_len), KQRING_ZC_MIN_LEN) :
+	    KQRING_ZC_MIN_LEN;
 	int error = 0, pr_flags;
 
 	*np = 0;
@@ -332,6 +366,8 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 	    (dom != AF_LOCAL &&
 	    !((dom == AF_INET || dom == AF_INET6) &&
 	    so->so_proto->pr_protocol == IPPROTO_TCP)))
+		return (EOPNOTSUPP);
+	if (want < min_len)
 		return (EOPNOTSUPP);
 
 	if (fixed) {
@@ -457,7 +493,7 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 
 	if (error == 0) {
 		send_len = MIN(want, avail);
-		if (send_len < KQRING_ZC_MIN_LEN)
+		if (send_len < min_len)
 			error = EOPNOTSUPP;
 	}
 	if (error == 0 && !fixed) {

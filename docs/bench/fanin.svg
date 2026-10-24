@@ -47,23 +47,23 @@
 <text x="92.0" y="127.0" class="lab" text-anchor="end">16 sockets</text>
 <path d="M102.0,100.0 H584.9 Q588.9,100.0 588.9,104.0 V110.0 Q588.9,114.0 584.9,114.0 H102.0 Z" fill="var(--kqueue)"><title>16 sockets — kqueue + recv: 828 ns</title></path>
 <text x="593.9" y="111" class="val">828</text>
-<path d="M102.0,116.0 H510.5 Q514.5,116.0 514.5,120.0 V126.0 Q514.5,130.0 510.5,130.0 H102.0 Z" fill="var(--s1)"><title>16 sockets — kqring multishot RECV: 702 ns</title></path>
-<text x="519.5" y="127" class="val">702</text>
-<path d="M102.0,132.0 H518.8 Q522.8,132.0 522.8,136.0 V142.0 Q522.8,146.0 518.8,146.0 H102.0 Z" fill="var(--s2)"><title>16 sockets — kqring RECV batch: 716 ns</title></path>
-<text x="527.8" y="143" class="val">716</text>
+<path d="M102.0,116.0 H511.0 Q515.0,116.0 515.0,120.0 V126.0 Q515.0,130.0 511.0,130.0 H102.0 Z" fill="var(--s1)"><title>16 sockets — kqring multishot RECV: 702 ns</title></path>
+<text x="520.0" y="127" class="val">702</text>
+<path d="M102.0,132.0 H519.7 Q523.7,132.0 523.7,136.0 V142.0 Q523.7,146.0 519.7,146.0 H102.0 Z" fill="var(--s2)"><title>16 sockets — kqring RECV batch: 717 ns</title></path>
+<text x="528.7" y="143" class="val">717</text>
 <text x="92.0" y="191.0" class="lab" text-anchor="end">256 sockets</text>
-<path d="M102.0,164.0 H601.4 Q605.4,164.0 605.4,168.0 V174.0 Q605.4,178.0 601.4,178.0 H102.0 Z" fill="var(--kqueue)"><title>256 sockets — kqueue + recv: 856 ns</title></path>
-<text x="610.4" y="175" class="val">856</text>
-<path d="M102.0,180.0 H521.9 Q525.9,180.0 525.9,184.0 V190.0 Q525.9,194.0 521.9,194.0 H102.0 Z" fill="var(--s1)"><title>256 sockets — kqring multishot RECV: 721 ns</title></path>
-<text x="530.9" y="191" class="val">721</text>
-<path d="M102.0,196.0 H529.2 Q533.2,196.0 533.2,200.0 V206.0 Q533.2,210.0 529.2,210.0 H102.0 Z" fill="var(--s2)"><title>256 sockets — kqring RECV batch: 733 ns</title></path>
-<text x="538.2" y="207" class="val">733</text>
+<path d="M102.0,164.0 H603.4 Q607.4,164.0 607.4,168.0 V174.0 Q607.4,178.0 603.4,178.0 H102.0 Z" fill="var(--kqueue)"><title>256 sockets — kqueue + recv: 860 ns</title></path>
+<text x="612.4" y="175" class="val">860</text>
+<path d="M102.0,180.0 H524.5 Q528.5,180.0 528.5,184.0 V190.0 Q528.5,194.0 524.5,194.0 H102.0 Z" fill="var(--s1)"><title>256 sockets — kqring multishot RECV: 725 ns</title></path>
+<text x="533.5" y="191" class="val">725</text>
+<path d="M102.0,196.0 H531.2 Q535.2,196.0 535.2,200.0 V206.0 Q535.2,210.0 531.2,210.0 H102.0 Z" fill="var(--s2)"><title>256 sockets — kqring RECV batch: 737 ns</title></path>
+<text x="540.2" y="207" class="val">737</text>
 <text x="92.0" y="255.0" class="lab" text-anchor="end">1,024 sockets</text>
-<path d="M102.0,228.0 H603.7 Q607.7,228.0 607.7,232.0 V238.0 Q607.7,242.0 603.7,242.0 H102.0 Z" fill="var(--kqueue)"><title>1,024 sockets — kqueue + recv: 860 ns</title></path>
-<text x="612.7" y="239" class="val">860</text>
-<path d="M102.0,244.0 H526.4 Q530.4,244.0 530.4,248.0 V254.0 Q530.4,258.0 526.4,258.0 H102.0 Z" fill="var(--s1)"><title>1,024 sockets — kqring multishot RECV: 728 ns</title></path>
-<text x="535.4" y="255" class="val">728</text>
-<path d="M102.0,260.0 H531.1 Q535.1,260.0 535.1,264.0 V270.0 Q535.1,274.0 531.1,274.0 H102.0 Z" fill="var(--s2)"><title>1,024 sockets — kqring RECV batch: 736 ns</title></path>
-<text x="540.1" y="271" class="val">736</text>
+<path d="M102.0,228.0 H604.1 Q608.1,228.0 608.1,232.0 V238.0 Q608.1,242.0 604.1,242.0 H102.0 Z" fill="var(--kqueue)"><title>1,024 sockets — kqueue + recv: 861 ns</title></path>
+<text x="613.1" y="239" class="val">861</text>
+<path d="M102.0,244.0 H527.5 Q531.5,244.0 531.5,248.0 V254.0 Q531.5,258.0 527.5,258.0 H102.0 Z" fill="var(--s1)"><title>1,024 sockets — kqring multishot RECV: 730 ns</title></path>
+<text x="536.5" y="255" class="val">730</text>
+<path d="M102.0,260.0 H532.9 Q536.9,260.0 536.9,264.0 V270.0 Q536.9,274.0 532.9,274.0 H102.0 Z" fill="var(--s2)"><title>1,024 sockets — kqring RECV batch: 740 ns</title></path>
+<text x="541.9" y="271" class="val">740</text>
 <line x1="102.0" y1="94" x2="102.0" y2="296" class="axis"/>
 </svg>
