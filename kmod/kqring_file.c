@@ -10,6 +10,9 @@
 #include <sys/buf.h>
 #include <geom/geom.h>
 
+static int	kqring_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
+	    bool is_write, bool nowait, bool *punt);
+
 static bool
 kqring_pipe_readable(const struct file *fp)
 {
@@ -358,10 +361,10 @@ kqring_file_bio_try(struct kqring_ctx *ctx, struct kqring_op *op,
  * that cannot block it, as io_uring tries non-blocking I/O before punting
  * to io-wq:
  *
- *  - A pipe with data to read (or room to write), blocking or not.  A
- *    blocking pipe has no per-call non-blocking read, so if another
- *    reader drains it between the check and the read, the issuer waits
- *    in pipe_read() as read(2) would; an empty one goes to a worker.
+ *  - A pipe with data to read (or room to write), blocking or not, read
+ *    or written as if O_NONBLOCK (kqring_pipe_rw_nowait()).  If another
+ *    reader drained it since the check, the read goes to a worker; a
+ *    write that filled it leaves the rest to a worker.
  *  - A positioned read of a regular file that the page cache satisfies.
  *    VOP_READ_PGCACHE grabs resident pages without sleeping and gives up
  *    with EJUSTRETURN otherwise; vn_read() tries it first the same way.
@@ -404,9 +407,11 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	 */
 	if (fp->f_type == DTYPE_PIPE && (is_write ?
 	    !kqring_pipe_will_block(fp, true, 1) : kqring_pipe_readable(fp))) {
+		bool punt;
+
 		fdrop(fp, td);
-		kqring_exec_file_rw(ctx, op, is_write);
-		return (KQRING_RW_DONE);
+		kqring_file_rw(ctx, op, is_write, true, &punt);
+		return (punt ? KQRING_RW_PUNT : KQRING_RW_DONE);
 	}
 	vp = fp->f_vnode;
 	if (flags != 0 && vp != NULL && vp->v_type == VCHR) {
@@ -493,6 +498,43 @@ int
 kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
     bool is_write)
 {
+	bool punt;
+
+	return (kqring_file_rw(ctx, op, is_write, false, &punt));
+}
+
+/*
+ * fo_read() / fo_write() on a pipe as if it were O_NONBLOCK, without
+ * changing the descriptor's flags for anyone else.  pipe_read() and
+ * pipe_write() look at the file only for f_data and f_flag, so a file of
+ * our own sharing the pipe does it.
+ */
+static int
+kqring_pipe_rw_nowait(struct file *fp, struct uio *uio, bool is_write,
+    int flags, struct thread *td)
+{
+	struct file nb;
+
+	memset(&nb, 0, sizeof(nb));
+	nb.f_data = fp->f_data;
+	nb.f_ops = &pipeops;
+	nb.f_cred = fp->f_cred;
+	nb.f_type = fp->f_type;
+	nb.f_flag = fp->f_flag | FNONBLOCK;
+	refcount_init(&nb.f_count, 1);
+	return (is_write ? fo_write(&nb, uio, td->td_ucred, flags, td) :
+	    fo_read(&nb, uio, td->td_ucred, flags, td));
+}
+
+/*
+ * As kqring_exec_file_rw(); with nowait (the issuer, on a pipe), a pipe is
+ * never waited for: *punt is set, with op unchanged, if it would have to,
+ * or with op->done_io set to what a write got in before the pipe filled.
+ */
+static int
+kqring_file_rw(struct kqring_ctx *ctx, struct kqring_op *op, bool is_write,
+    bool nowait, bool *punt)
+{
 	const struct io_uring_sqe *sqe = &op->sqe;
 	struct thread *td = curthread;
 	struct kqring_sel sel;
@@ -505,14 +547,19 @@ kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 	bool buf_select = (sqe->flags & IOSQE_BUFFER_SELECT) != 0;
 	int error, flags;
 
+	*punt = false;
 	error = kqring_rw_fget(op, is_write, &fp, &flags);
 	if (error != 0)
 		return (kqring_done(op, -error, 0));
+	nowait = nowait && fp->f_ops == &pipeops &&
+	    (fp->f_flag & FNONBLOCK) == 0;
 
 	if (buf_select) {
 		struct kqring_bgroup *bg;
 again:
 		if (!is_write && !kqring_pipe_readable(fp)) {
+			if (nowait)
+				goto punt;
 			error = kqring_pipe_wait_read(ctx, fp, op);
 			if (error != 0) {
 				fdrop(fp, td);
@@ -555,6 +602,9 @@ again:
 		aiov.iov_base = (void *)(uintptr_t)sqe->addr;
 		aiov.iov_len = sqe->len;
 	}
+	/* What the issuer wrote before the pipe filled (below). */
+	if (is_write && op->done_io != 0)
+		kqring_iov_skip(&iov, &iovcnt, op->done_io);
 	kqring_uio_init(&auio, iov, iovcnt, is_write ? UIO_WRITE : UIO_READ);
 	ssize_t want = auio.uio_resid;
 	auio.uio_offset = offset;
@@ -570,20 +620,54 @@ again:
 		return (kqring_done(op, 0, 0));
 	}
 	if (!buf_select && !is_write && !kqring_pipe_readable(fp)) {
+		if (nowait)
+			goto punt;
 		error = kqring_pipe_wait_read(ctx, fp, op);
 		if (error != 0) {
 			fdrop(fp, td);
 			return (kqring_done(op, kqring_errno(error), 0));
 		}
 	}
-	if (kqring_pipe_will_block(fp, is_write, (size_t)want))
-		kqring_wq_mark_blocking(ctx, op);
-	error = is_write ? fo_write(fp, &auio, td->td_ucred, flags, td) :
-	    fo_read(fp, &auio, td->td_ucred, flags, td);
+	if (nowait) {
+		error = kqring_pipe_rw_nowait(fp, &auio, is_write, flags, td);
+	} else {
+		if (kqring_pipe_will_block(fp, is_write, (size_t)want))
+			kqring_wq_mark_blocking(ctx, op);
+		error = is_write ? fo_write(fp, &auio, td->td_ucred, flags,
+		    td) : fo_read(fp, &auio, td->td_ucred, flags, td);
+	}
 	bool vnode = fp->f_type == DTYPE_VNODE;
 	fdrop(fp, td);
 
 	size_t done = (size_t)(want - auio.uio_resid);
+	/*
+	 * Someone else drained (or filled) the pipe since the issuer looked.
+	 * A read that got nothing goes to a worker unchanged; a write keeps
+	 * what it got in, and a worker writes the rest, as the blocking
+	 * write(2) would.
+	 */
+	if (nowait && (error == EAGAIN || (error == 0 && is_write &&
+	    auio.uio_resid > 0))) {
+		if (is_write) {
+			op->done_io += done;
+			*punt = true;
+			return (0);
+		}
+		if (done == 0) {
+			if (buf_select) {
+				sx_xlock(&ctx->bg_sx);
+				sel.bg->busy = false;
+				sx_xunlock(&ctx->bg_sx);
+			}
+			*punt = true;
+			return (0);
+		}
+		error = 0;
+	}
+	if (is_write) {
+		done += op->done_io;
+		op->done_io = 0;
+	}
 	/* RWF_DSYNC / RWF_SYNC: as an O_DSYNC / O_SYNC write. */
 	if (is_write && error == 0 && vnode &&
 	    (sqe->rw_flags & (KQRING_RWF_DSYNC | KQRING_RWF_SYNC)) != 0) {
@@ -607,6 +691,10 @@ again:
 		return (kqring_done(op, kqring_errno(error), 0));
 	}
 	return (kqring_done(op, kqring_xfer_res(done), cflags));
+punt:
+	fdrop(fp, td);
+	*punt = true;
+	return (0);
 }
 
 

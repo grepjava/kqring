@@ -61,8 +61,6 @@ liburing's two AddressSanitizer tests (`xfail_*`) aren't built. liburing itself 
 | `waitid` | Expects Linux's result for a `WAITID` cancelled by a link timeout, which reflects an implementation detail of Linux rather than a documented rule. |
 | `resize-rings` | `IORING_REGISTER_RESIZE_RINGS` isn't implemented. |
 
-`poll-mshot-overflow` also fails occasionally, about one run in eight. It writes to a pipe and drains it again within one thread, and expects one CQE for each write. kqring's poller sees readiness through kqueue, which drops an event that has already been drained when the poller looks.
-
 ### Skipped tests
 
 The 12 skips are tests that check for a feature and report its absence:

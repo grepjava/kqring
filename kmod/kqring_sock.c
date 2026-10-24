@@ -742,8 +742,8 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 	return (0);
 }
 
-/* Drop the first `done` bytes of an iovec array (biov[], in place). */
-static void
+/* Drop the first `done` bytes of an iovec array (in place). */
+void
 kqring_iov_skip(struct iovec **iovp, u_int *cntp, size_t done)
 {
 	struct iovec *iov = *iovp;

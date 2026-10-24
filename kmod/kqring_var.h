@@ -267,6 +267,7 @@ struct kqring_op {
 	bool			kp_on;
 	int			kp_revents;
 	u_int			kp_nev;
+	uint32_t		kp_seen[2];	/* read, write: kqring_kp_filt_event() */
 	bool			listening;	/* armed via solisten_upcall_set */
 	bool			in_taskwork;
 	bool			cancelled;	/* no longer armed; under mtx */
@@ -1309,6 +1310,7 @@ bool	kqring_arm_socket_op(struct kqring_ctx *ctx, struct kqring_op *op,
 /* kqring_file.c */
 bool	kqring_pipe_will_block(const struct file *fp, bool is_write,
 	    size_t want);
+void	kqring_iov_skip(struct iovec **iovp, u_int *cntp, size_t done);
 int	kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 	    bool is_write);
 /* kqring_file_rw_inline() results. */

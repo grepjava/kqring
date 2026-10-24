@@ -6886,6 +6886,108 @@ test_kpoll(void)
 	    KPOLL_NPIPES);
 }
 
+/*
+ * Blocking pipes on the issuer: a write bigger than the pipe's room
+ * doesn't wait in the enter for a reader (the rest goes to a worker), and
+ * a multishot poll counts each wakeup even if the pipe is drained before
+ * the poller looks, but not the writer's own writes.
+ */
+static void
+test_pipe_nowait(void)
+{
+	enum { BIG = 256 * 1024 };
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	struct test_ring t;
+	char *out, *in, ch = 0;
+	int p[2], n;
+	size_t got = 0;
+
+	ring_init(&t);
+	assert(pipe(p) == 0);
+	out = malloc(BIG);
+	in = malloc(BIG);
+	assert(out != NULL && in != NULL);
+	for (int i = 0; i < BIG; i++)
+		out[i] = (char)(i * 7 + i / 4096);
+
+	/* 1. WRITE of 256 KiB, no reader yet: the enter returns. */
+	alarm(10);
+	sqe = ring_prep(&t, IORING_OP_WRITE, p[1], 73001);
+	sqe->addr = (uintptr_t)out;
+	sqe->len = BIG;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	while (got < BIG) {
+		ssize_t r = read(p[0], in + got, BIG - got);
+
+		assert(r > 0);
+		got += (size_t)r;
+	}
+	assert(ring_wait(&t, 1, 2000) == 0);
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 73001 && c.res == BIG);
+	assert(memcmp(in, out, BIG) == 0);
+	alarm(0);
+
+	/* 2. Multishot POLLIN, then 8 writes each drained at once: 8 CQEs. */
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, p[0], 73002);
+	sqe->poll32_events = POLLIN;
+	sqe->len = IORING_POLL_ADD_MULTI;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	for (int i = 0; i < 8; i++) {
+		assert(write(p[1], "z", 1) == 1);
+		assert(read(p[0], &ch, 1) == 1);
+	}
+	assert(ring_wait(&t, 8, 2000) == 0);
+	for (int i = 0; i < 8; i++) {
+		c = ring_pop_cqe(&t);
+		assert(c.user_data == 73002 && (c.res & POLLIN) != 0 &&
+		    (c.flags & IORING_CQE_F_MORE) != 0);
+	}
+	usleep(50 * 1000);
+	assert(ring_cq_ready(&t) == 0);
+	sqe = ring_prep(&t, IORING_OP_POLL_REMOVE, -1, 73004);
+	sqe->addr = 73002;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_wait(&t, 2, 2000) == 0);
+	ring_drain_cqes(&t);
+
+	/*
+	 * 3. Multishot POLLOUT: one CQE for the room there is, none for our
+	 * own writes, one more once a read makes room.
+	 */
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, p[1], 73003);
+	sqe->poll32_events = POLLOUT;
+	sqe->len = IORING_POLL_ADD_MULTI;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 73003 && (c.res & POLLOUT) != 0);
+	for (int i = 0; i < 4; i++)
+		assert(write(p[1], "w", 1) == 1);
+	usleep(50 * 1000);
+	n = (int)ring_cq_ready(&t);
+	assert(n == 0);
+	assert(read(p[0], in, 4) == 4);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 73003 && (c.res & POLLOUT) != 0 &&
+	    (c.flags & IORING_CQE_F_MORE) != 0);
+
+	close(t.fd);
+	close(p[0]);
+	close(p[1]);
+	free(out);
+	free(in);
+	printf("[PASS] Blocking pipe: 256 KiB WRITE without a reader, "
+	    "poll wakeups counted when drained, none for own writes\n");
+}
+
 static void
 test_sqe128_cqe32_attach_wq(void)
 {
@@ -7654,6 +7756,7 @@ main(int argc, char **argv)
 		test_splice_and_tee();
 		test_nonsock_poll();
 		test_kpoll();
+		test_pipe_nowait();
 		test_sqe128_cqe32_attach_wq();
 		test_registered_rings();
 		test_sqpoll_and_iopoll();

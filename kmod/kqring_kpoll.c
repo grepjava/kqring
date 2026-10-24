@@ -12,10 +12,11 @@
  * descriptor) on a kqueue the ring owns but that has no descriptor of its
  * own, and one kthread per ring waits in kevent(2) on it.  As io_uring's
  * poll wait queue entries do, a knote catches every wakeup of the file
- * (EV_CLEAR: a write, then a read before the poller looks, still counts),
- * any number of requests cost no threads, and a multishot request gets a
- * CQE per event.  The poller only records events and queues the request
- * as taskwork; kqring_kpoll_deliver() posts the CQEs.
+ * (counted as it happens, so a write and then a read before the poller
+ * looks still counts: see kqring_kp_filt_event()), any number of requests
+ * cost no threads, and a multishot request gets a CQE per wakeup.  The
+ * poller only records events and queues the request as taskwork;
+ * kqring_kpoll_deliver() posts the CQEs.
  *
  * A request on a fixed file (no descriptor to register), one whose file
  * has no kqfilter, or a second one on the same descriptor and filter (a
@@ -25,6 +26,7 @@
 
 #include "kqring_var.h"
 
+#include <sys/eventvar.h>
 #include <sys/syscallsubr.h>
 
 #define	KQRING_KP_NEVENTS	32
@@ -60,6 +62,171 @@ kqring_kp_copyout(void *arg, struct kevent *kevp, int count)
 }
 
 #define	KQRING_KP_BUCKET(ctx, fd)		(&(ctx)->kp_ops[(u_int)(fd) % KQRING_KP_HASH])
+
+/*
+ * Counting wakeups.  kqueue_scan() asks the filter again before it reports
+ * a knote and drops the event if the file is no longer ready, so a pipe
+ * written and drained again before the poller looks would post nothing,
+ * where io_uring posts a CQE for each wakeup.  Each multishot request's
+ * knotes therefore get a copy of their filterops whose f_event counts
+ * wakeups as they happen, in the knote's kevent ext[2] and ext[3], which
+ * filters leave alone:
+ *
+ *   ext[2]  wakeups so far (the poller takes the difference, kp_seen[])
+ *   ext[3]  low half: the filter's kn_data when last asked, more if at
+ *           EOF, or ~0 if the file wasn't ready; high half: the low half of ext[2] at the
+ *           last scan
+ *
+ * A wakeup is f_event called from knote(), which holds the kq lock;
+ * kqueue_scan() and kqueue_register() call it without.  All three hold
+ * the knlist lock, which guards kn_kevent.  A pipe's knotes all hang on
+ * one list and every read or write asks them all, so only a wakeup that
+ * makes the file ready, or readier (more to read, more room to write),
+ * counts and activates the knote, as io_uring's poll sees only the
+ * wakeups meant for it.  A scan reports the knote while the file is
+ * ready or wakeups came since the last one.
+ */
+static struct file *kqring_kp_getfp(struct kqring_ctx *ctx);
+
+struct kqring_kp_fops {
+	struct filterops	fo;
+	const struct filterops	*orig;
+};
+
+/* One per filterops seen (pipe read and write, eventfd, tty, ...). */
+static struct kqring_kp_fops kqring_kp_fops[16];
+static struct mtx kqring_kp_fops_mtx;
+MTX_SYSINIT(kqring_kp_fops, &kqring_kp_fops_mtx, "kqring kpoll fops",
+    MTX_DEF);
+
+#define	KQRING_KP_NOTREADY	UINT32_MAX
+#define	KQRING_KP_EOF		((uint32_t)INT32_MAX + 1)	/* above any kn_data */
+
+static int
+kqring_kp_filt_event(struct knote *kn, long hint)
+{
+	const struct kqring_kp_fops *w = __containerof(kn->kn_fop,
+	    struct kqring_kp_fops, fo);
+	uint64_t *ext = kn->kn_kevent.ext;
+	uint32_t last, prev;
+	bool pending;
+	int ready;
+
+	ready = w->orig->f_event(kn, hint);
+	if (!ready)
+		last = KQRING_KP_NOTREADY;
+	else if ((kn->kn_flags & EV_EOF) != 0)
+		last = KQRING_KP_EOF;
+	else
+		last = (uint32_t)MIN(MAX(kn->kn_data, 0), INT32_MAX);
+	prev = (uint32_t)ext[3];
+	if (mtx_owned(&kn->kn_kq->kq_lock)) {
+		ext[3] = (ext[3] & ~(uint64_t)UINT32_MAX) | last;
+		if (!ready || (prev != KQRING_KP_NOTREADY && last <= prev))
+			return (0);
+		ext[2]++;
+		return (1);
+	}
+	pending = (uint32_t)ext[2] != (uint32_t)(ext[3] >> 32);
+	ext[3] = (uint64_t)(uint32_t)ext[2] << 32 | last;
+	return (ready || pending);
+}
+
+static const struct filterops *
+kqring_kp_fops_get(const struct filterops *orig)
+{
+	struct kqring_kp_fops *w = NULL;
+
+	mtx_lock(&kqring_kp_fops_mtx);
+	for (u_int i = 0; i < nitems(kqring_kp_fops); i++) {
+		if (kqring_kp_fops[i].orig == orig) {
+			w = &kqring_kp_fops[i];
+			break;
+		}
+		if (kqring_kp_fops[i].orig == NULL) {
+			w = &kqring_kp_fops[i];
+			w->fo = *orig;
+			w->fo.f_event = kqring_kp_filt_event;
+			w->orig = orig;
+			break;
+		}
+	}
+	mtx_unlock(&kqring_kp_fops_mtx);
+	return (w != NULL ? &w->fo : NULL);
+}
+
+static bool
+kqring_kp_fops_ours(const struct filterops *fo)
+{
+	return (fo >= &kqring_kp_fops[0].fo &&
+	    fo <= &kqring_kp_fops[nitems(kqring_kp_fops) - 1].fo);
+}
+
+/* The knote kev registered on kq, under the kq lock. */
+static struct knote *
+kqring_kp_knote(struct kqueue *kq, const struct kevent *kev)
+{
+	struct knote *kn;
+
+	mtx_assert(&kq->kq_lock, MA_OWNED);
+	if (kev->ident >= (uintptr_t)kq->kq_knlistsize)
+		return (NULL);
+	SLIST_FOREACH(kn, &kq->kq_knlist[kev->ident], kn_link) {
+		if (kn->kn_filter == kev->filter &&
+		    kn->kn_kevent.udata == kev->udata)
+			return (kn);
+	}
+	return (NULL);
+}
+
+/*
+ * Give the knotes just registered for kev[0..n) the counting filterops.
+ * Every caller of f_event or f_detach holds the kq lock or has the knote
+ * in flux (entered under the kq lock), so the swap is made under the kq
+ * lock on a knote not in flux.  If that can't be had, the knote keeps its
+ * filterops and only misses wakeups drained before the poller looks.
+ */
+static void
+kqring_kp_wrap(struct kqring_ctx *ctx, const struct kevent *kev, int n)
+{
+	const struct filterops *orig, *fo;
+	struct kqueue *kq;
+	struct knote *kn;
+	struct file *fp;
+
+	if ((fp = kqring_kp_getfp(ctx)) == NULL)
+		return;
+	kq = fp->f_data;
+	for (int i = 0; i < n; i++) {
+		mtx_lock(&kq->kq_lock);
+		kn = kqring_kp_knote(kq, &kev[i]);
+		orig = kn != NULL ? kn->kn_fop : NULL;
+		mtx_unlock(&kq->kq_lock);
+		if (orig == NULL || kqring_kp_fops_ours(orig) ||
+		    orig->f_event == NULL)
+			continue;
+		if ((fo = kqring_kp_fops_get(orig)) == NULL)
+			continue;
+		for (int tries = 0; tries < 100; tries++) {
+			mtx_lock(&kq->kq_lock);
+			kn = kqring_kp_knote(kq, &kev[i]);
+			if (kn == NULL || kn->kn_fop != orig) {
+				mtx_unlock(&kq->kq_lock);
+				break;
+			}
+			if (kn->kn_influx == 0) {
+				kn->kn_kevent.ext[2] = 0;
+				kn->kn_kevent.ext[3] = KQRING_KP_NOTREADY;
+				kn->kn_fop = fo;
+				mtx_unlock(&kq->kq_lock);
+				break;
+			}
+			mtx_unlock(&kq->kq_lock);
+			kern_yield(PRI_USER);
+		}
+	}
+	fdrop(fp, curthread);
+}
 
 /* A reference to the ring's kqueue, or NULL once it is closed. */
 static struct file *
@@ -132,8 +299,13 @@ kqring_kp_event(struct kqring_ctx *ctx, const struct kevent *kev)
 			break;
 	}
 	if (op != NULL && op->kp_on && !op->cancelled) {
+		/* The wakeups kqring_kp_filt_event() counted, or one. */
+		int f = kev->filter == EVFILT_READ ? 0 : 1;
+		uint32_t nev = (uint32_t)kev->ext[2] - op->kp_seen[f];
+
+		op->kp_seen[f] = (uint32_t)kev->ext[2];
 		op->kp_revents |= kqring_kp_revents(kev);
-		op->kp_nev++;
+		op->kp_nev += nev != 0 ? MIN(nev, 1024) : 1;
 		kqring_taskwork_add_locked(ctx, op);
 	}
 	mtx_unlock(&ctx->mtx);
@@ -331,6 +503,7 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	op->kp_data = fp->f_data;
 	op->kp_revents = 0;
 	op->kp_nev = 0;
+	op->kp_seen[0] = op->kp_seen[1] = 0;
 	op->kp_on = true;
 	op->cancelled = false;
 	TAILQ_INSERT_TAIL(KQRING_KP_BUCKET(ctx, op->kp_fd), op, kp_link);
@@ -344,8 +517,11 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	n = kqring_kp_kevents(op, kev, EV_ADD | (!multi ? EV_ONESHOT : 0) |
 	    (!level ? EV_CLEAR : 0));
 	error = kqring_kp_change(ctx, kev, n);
-	if (error == 0)
+	if (error == 0) {
+		if (multi)
+			kqring_kp_wrap(ctx, kev, n);
 		return (0);
+	}
 	mtx_lock(&ctx->mtx);
 	kqring_op_unarm_locked(ctx, op);
 	mtx_unlock(&ctx->mtx);
