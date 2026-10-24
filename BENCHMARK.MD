@@ -14,6 +14,7 @@ How `kqring` compares with FreeBSD's `kqueue(2)` on the same workloads. Where kq
 - **Timers are faster, accept is even.** A 1 µs `TIMEOUT` completes 43% faster than a 1 µs `EVFILT_TIMER`. A multishot `ACCEPT` is 1% faster than kqueue plus `accept(2)`; see the note under [Accept](#accept-a-tcp-loopback-connection-set-up-and-torn-down).
 - **Disk devices go straight to the driver.** 4 KiB random reads on an md(4) disk cost 41% less than through a worker, and 32 in flight cost 975 ns each, 78% less than `pread(2)`.
 - **Pipes: fast when non-blocking, 5× slower when blocking.** A `READ` on an `O_NONBLOCK` pipe runs inline and is 19% faster than kqueue. On a blocking pipe it still goes through a worker thread, at about 4.4 µs per round trip; see [Known gaps](#known-gaps).
+- **Rings scale with threads.** With one ring per thread, single-`NOP` enters reach 12.5 M/s on 8 threads (6.5 M/s before this build) and ping-pong stays 17–29% ahead of kqueue at every thread count; see [Multi-threaded scaling](#multi-threaded-scaling-one-ring-per-thread).
 - **Arming still costs.** A `RECV` submitted before its data arrives costs 32–39% more than kqueue, because it takes three syscalls (submit, `write`, wait) and installs and removes a socket upcall each time. Use multishot for steady-state receive.
 
 ## What changed in this build
@@ -218,6 +219,26 @@ With one request per enter, kqring pays one sleep and wake-up more than `pread(2
 
 Both are dominated by timer-interrupt scheduling, not by the API.
 
+### Multi-threaded scaling: one ring per thread
+
+[`tests/kqring_mt_bench.c`](tests/kqring_mt_bench.c) runs each workload on 1, 2, 4 and 8 threads, each pinned to its own CPU (CPUs 2n and 2n+1 are the two hyperthreads of one core) with its own ring, kqueue, socket pair or file offset. That's the thread-per-core model `SINGLE_ISSUER` rings are made for. Figures are millions of operations per second for all threads together, the median of 5 runs of 2 s each, with the module reloaded before each run.
+
+| Workload | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| `kevent(2)`, nothing to do | 3.49 | 5.97 | 11.93 | 23.86 |
+| kqring `NOP`, one per enter | 3.05 | 4.45 | 8.91 | 12.49 |
+| kqring `NOP`, 32 per enter | 14.80 | 15.18 | 25.97 | 41.34 |
+| AF_UNIX ping-pong, 64 B, kqueue | 0.86 | 1.40 | 2.55 | 3.95 |
+| AF_UNIX ping-pong, 64 B, kqring `RECV` into one buffer | 1.11 | 1.69 | 2.98 | 4.61 |
+| 4 KiB cached reads of one shared file, `pread(2)` | 0.90 | 1.74 | 2.42 | 3.37 |
+| the same, kqring `READ`, one per enter | 0.82 | 1.55 | 2.25 | 2.68 |
+| the same, kqring `READ`, 32 per enter | 1.33 | 1.83 | 2.40 | 2.65 |
+
+- **Enter scales.** In the first run of this benchmark, one `NOP` per enter reached only 6.5 M/s on 8 threads, while `kevent(2)` reached 23.8 M/s. DTrace showed why: a module's system calls are counted in their `sysent` entry so that unloading can wait for them, and that is two atomic compare-and-swaps per call on one word that every CPU shares. `kevent(2)`, compiled into the kernel, isn't counted. kqring now counts its enter calls per CPU instead (see `kqring_sys_enter()`), and the same loop reaches 12–19 M/s on 8 threads. Per-thread cost is flat from 2 to 4 threads.
+- **Ping-pong stays ahead of kqueue on every thread count**, by 29% on 1 thread and 17% on 8: kqring does more work per message in the kernel, which costs more once two threads share a core.
+- **What's left is per-request work, not sharing.** At 8 threads, two threads share each core, and DTrace shows the time in submitting, completing and clearing requests, not in any lock. Runs on 8 threads vary more (the single-`NOP` row by up to 43%), because this is a 15 W laptop CPU whose all-core clock moves with load.
+- **Reads of one shared file are bound by the file's page cache**, for `pread(2)` too. Batching stops helping past 4 threads.
+
 ## Known gaps
 
 - **Blocking pipes still go through a worker thread.** FreeBSD's `pipe_read()` decides whether to block from the descriptor's `O_NONBLOCK` flag, and has no per-call non-blocking read. kqring can't safely read a blocking pipe inline: another reader could drain it between a readiness check and the read, and the ring owner would then block. A worker round trip costs about 4.4 µs (the `IOSQE_ASYNC` floor row). Applications can set `O_NONBLOCK` on the pipe to get the inline path. A `READ` on an empty non-blocking pipe then completes with `-EAGAIN`, as `read(2)` would, so wait for data with `POLL_ADD` first.
@@ -239,6 +260,7 @@ sudo kldload ./kmod/kqring.ko
 ulimit -l 8192                    # the send group registers 2 MiB of buffers
 ./tests/kqring_bench > bench.1.out           # all groups
 ./tests/kqring_bench fanin send   # selected groups: floor pingpong fanin accept pipe file send timer disk
+./tests/kqring_mt_bench 2 > mt.1.out         # multi-threaded scaling, 2 s per run
 sudo kldunload kqring
 ```
 
