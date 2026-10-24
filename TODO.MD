@@ -29,26 +29,25 @@ This document tracks the phased implementation of genuine zero-copy transmit pat
 
 ---
 
-## Phase B — Arbitrary User-Buffer `IORING_OP_SEND_ZC` / `IORING_OP_SENDMSG_ZC` (Planned)
+## Phase B — Arbitrary User-Buffer `IORING_OP_SEND_ZC` / `IORING_OP_SENDMSG_ZC` (Implemented)
 
-**Target:** Zero-copy sends from unregistered application buffers above a copy-vs-pin threshold (`>= 4 KiB`).
+**Target:** Zero-copy sends from unregistered application buffers and scatter/gather `msghdr.msg_iov` arrays above a copy-vs-pin threshold (`>= 4 KiB`), plus `IORING_RECVSEND_FIXED_BUF` on `IORING_OP_SENDMSG_ZC`.
 
 ### Design
-1. **Per-Request Page Holding:**
-   - For `IORING_OP_SEND_ZC` and `IORING_OP_SENDMSG_ZC` without `IORING_RECVSEND_FIXED_BUF` where total payload length is `>= 4096` bytes, call `vm_fault_quick_hold_pages(..., VM_PROT_READ, ...)` per request and attach the held pages to `struct kqring_zc_notif`.
-   - Payloads `< 4096` bytes continue to use the copy path (`IORING_NOTIF_USAGE_ZC_COPIED`) because page-hold + deferred notification overhead exceeds copy cost for small buffers.
+1. **Per-Request Page Holding & Accounting:**
+   - For `IORING_OP_SEND_ZC` and `IORING_OP_SENDMSG_ZC` without `IORING_RECVSEND_FIXED_BUF` where the transfer length is `>= KQRING_ZC_MIN_LEN` (`4096` bytes / `PAGE_SIZE`), pin and hold the backing physical pages per non-empty iovec segment via `vm_fault_quick_hold_pages(..., VM_PROT_READ, ...)` and charge them to the user's `struct kqring_pin_acct` (`RLIMIT_MEMLOCK` and `vm.max_user_wired`).
+   - Payloads `< 4096` bytes (or sends where `RLIMIT_MEMLOCK` / `vm.max_user_wired` is exhausted) fall back to the copy path (`IORING_NOTIF_USAGE_ZC_COPIED` when `IORING_SEND_ZC_REPORT_USAGE` is set).
 2. **Scatter/Gather (`IORING_OP_SENDMSG_ZC`):**
-   - Walk the `msghdr.msg_iov` segments, coalesce or chain `EXT_SFBUF` mbufs across iovecs, and release all held `vm_page_t` arrays inside `kqring_zc_rele()` when the last mbuf completes.
+   - Supports both `IORING_RECVSEND_FIXED_BUF` (all `msg_iov` segments validated within `sqe->buf_index`) and unregistered `msg_iov` arrays (`struct kqring_zc_notif` tracks either a single `zbuf` or a `zbufs[]` array across segments).
+   - Walks the `msghdr.msg_iov` segments, builds a single `EXT_SFBUF` mbuf chain across all segments (`M_EXT | M_RDONLY`), submits via `pr_send`, and releases all held `struct kqring_zc_buf` references inside `kqring_zc_rele()` when the final mbuf reference drops.
 
 ---
 
-## Phase C — `vn_sendfile()` / VM-Object Zero-Copy in `IORING_OP_SPLICE` (Planned)
+## Phase C — Zero-Copy `IORING_OP_SPLICE` (N/A — Not Planned)
 
-**Target:** Zero-copy file and POSIX shared memory (`shm_open(2)`) to socket transfers via `IORING_OP_SPLICE`.
+**Status:** N/A (not applicable to `io_uring` `SPLICE` semantics).
 
-### Design
-1. **Direct `vn_sendfile()` / `shm` Dispatch:**
-   - When `IORING_OP_SPLICE` splices directly from a `DTYPE_VNODE` (regular file) or `DTYPE_SHM` (`shm_open(2)`) descriptor to a connected stream socket (`DTYPE_SOCKET`) without an intermediate pipe, bypass the kernel staging buffer and invoke FreeBSD's `sendfile(2)` / VM-object page-wiring pipeline (`vn_sendfile` or shared-memory pager page lookup).
-2. **Pipe-Mediated Splice Page Stealing (Optional Extension):**
-   - When splicing file/shm -> pipe -> socket, reference-count the VM pages inside the pipe reservation or `kqring` splice context so the second splice leg (`pipe -> socket`) emits `EXT_SFBUF` mbufs without copying through pipekva.
+### Rationale
+1. **ABI Constraint:** `io_uring` `IORING_OP_SPLICE` requires at least one endpoint to be a pipe (`DTYPE_PIPE`), returning `-EINVAL` for direct `file -> socket` transfers.
+2. **Existing Zero-Copy Alternatives:** Applications transferring file or `shm_open(2)` data to sockets on FreeBSD either call native `sendfile(2)` directly or pair `IORING_OP_READ_FIXED` with Phase A `IORING_OP_SEND_ZC | IORING_RECVSEND_FIXED_BUF`.
 
