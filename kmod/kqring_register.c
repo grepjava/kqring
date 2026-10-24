@@ -318,9 +318,10 @@ kqring_cancel_flags_ok(uint32_t flags)
 }
 
 /*
- * IORING_REGISTER_SYNC_CANCEL: ASYNC_CANCEL without an SQE.  kqring
- * cancels armed requests at once, so there is never anything to wait for
- * and the timeout does not matter.
+ * IORING_REGISTER_SYNC_CANCEL: ASYNC_CANCEL without an SQE, which returns
+ * once the requests it cancelled have completed (a request running on a
+ * worker, or disk I/O, completes when that returns), or ETIME after
+ * sc.timeout (both fields -1: no timeout), as in io_uring.
  */
 static int
 kqring_sync_cancel(struct kqring_ctx *ctx,
@@ -354,9 +355,25 @@ kqring_sync_cancel(struct kqring_ctx *ctx,
 	res = kqring_cancel(ctx, &sqe);
 	/* Issue the link successors that cancellation released. */
 	kqring_flush_ready(ctx);
-	if (res < 0)
+	if (res < 0 && res != -EALREADY)
 		return (-res);
-	*resp = res;
+	if (sc.timeout.tv_sec == -1 && sc.timeout.tv_nsec == -1) {
+		error = kqring_cancel_wait(ctx, &sqe, false, 0);
+	} else {
+		struct timespec ts = {
+			.tv_sec = sc.timeout.tv_sec,
+			.tv_nsec = sc.timeout.tv_nsec,
+		};
+
+		if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000)
+			return (EINVAL);
+		error = kqring_cancel_wait(ctx, &sqe, true,
+		    kqring_ts_to_sbt(&ts));
+	}
+	kqring_flush_ready(ctx);
+	if (error != 0)
+		return (error);
+	*resp = res > 0 ? res : 0;
 	return (0);
 }
 

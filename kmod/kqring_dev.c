@@ -179,6 +179,8 @@ kqring_fork(struct filedesc *fdp __unused, struct file *fp, struct file **fp1,
 static void
 kqring_rmem_free(struct kqring_rmem *m)
 {
+	kqring_mem_uncharge(m->uip, m->charged, m->ring_pages != NULL ||
+	    m->sqes_pages != NULL);
 	if (m->ring_pages != NULL)
 		kqring_unpin_shm(m->ring_kva, m->ring_len, m->ring_pages);
 	else
@@ -200,10 +202,16 @@ static int
 kqring_rmem_alloc(struct thread *td, const struct io_uring_params *p,
     size_t ring_bytes, size_t sqes_bytes, struct kqring_rmem *m)
 {
+	size_t charge = round_page(ring_bytes) + round_page(sqes_bytes);
+	bool nommap = (p->flags & IORING_SETUP_NO_MMAP) != 0;
+	struct uidinfo *uip;
 	int error;
 
 	memset(m, 0, sizeof(*m));
-	if ((p->flags & IORING_SETUP_NO_MMAP) != 0) {
+	error = kqring_mem_charge(td->td_ucred, charge, nommap, &uip);
+	if (error != 0)
+		return (error);
+	if (nommap) {
 		error = kqring_pin_shm(td, p->cq_off.user_addr, ring_bytes,
 		    &m->ring_kva, &m->ring_len, &m->ring_pages);
 		if (error == 0)
@@ -219,9 +227,14 @@ kqring_rmem_alloc(struct thread *td, const struct io_uring_params *p,
 			error = kqring_alloc_shm(sqes_bytes, &m->sqes_obj,
 			    &m->sqes_kva, &m->sqes_len);
 	}
-	if (error != 0)
+	if (error != 0) {
 		kqring_rmem_free(m);
-	return (error);
+		kqring_mem_uncharge(uip, charge, nommap);
+		return (error);
+	}
+	m->uip = uip;
+	m->charged = charge;
+	return (0);
 }
 
 static uint32_t
@@ -316,13 +329,13 @@ kqring_ring_install(struct kqring_ctx *ctx, const struct kqring_rmem *m,
 	ctx->shm->cq_ring_entries = cq_entries;
 }
 
-/* The rings' offsets, as io_uring_setup(2) returns them in p. */
+/* Rings' sizes and offsets, as io_uring_setup(2) returns them in p. */
 static void
-kqring_ring_offsets(const struct kqring_ctx *ctx,
+kqring_ring_offsets(uint32_t flags, uint32_t sq_entries, uint32_t cq_entries,
     const struct kqring_layout *l, struct io_uring_params *p)
 {
-	p->sq_entries = ctx->sq_entries;
-	p->cq_entries = ctx->cq_entries;
+	p->sq_entries = sq_entries;
+	p->cq_entries = cq_entries;
 	p->sq_off.head = offsetof(struct kqring_shm_header, sq_head);
 	p->sq_off.tail = offsetof(struct kqring_shm_header, sq_tail);
 	p->sq_off.ring_mask = offsetof(struct kqring_shm_header, sq_ring_mask);
@@ -330,7 +343,8 @@ kqring_ring_offsets(const struct kqring_ctx *ctx,
 	    sq_ring_entries);
 	p->sq_off.flags = offsetof(struct kqring_shm_header, sq_flags);
 	p->sq_off.dropped = offsetof(struct kqring_shm_header, sq_dropped);
-	p->sq_off.array = ctx->sq_array != NULL ? (uint32_t)l->array_off : 0;
+	p->sq_off.array = (flags & IORING_SETUP_NO_SQARRAY) == 0 ?
+	    (uint32_t)l->array_off : 0;
 
 	p->cq_off.head = offsetof(struct kqring_shm_header, cq_head);
 	p->cq_off.tail = offsetof(struct kqring_shm_header, cq_tail);
@@ -349,7 +363,8 @@ kqring_ring_offsets(const struct kqring_ctx *ctx,
  * rings, where the issuer (the caller, holding sq_sx) is the only one to
  * post CQEs or read SQEs; everyone else looks at the rings under mtx,
  * which the swap holds.  Mappings of the old rings keep their memory
- * until they are unmapped.
+ * until they are unmapped.  The new offsets are copied out before the
+ * swap, so that a failure leaves the ring as it was.
  */
 int
 kqring_resize_rings(struct kqring_ctx *ctx,
@@ -390,6 +405,13 @@ kqring_resize_rings(struct kqring_ctx *ctx,
 	error = kqring_rmem_alloc(td, &p, l.ring_bytes, l.sqes_bytes, &m);
 	if (error != 0)
 		return (error);
+
+	kqring_ring_offsets(p.flags, sq_entries, cq_entries, &l, &p);
+	error = copyout(&p, ra->arg, sizeof(p));
+	if (error != 0) {
+		kqring_rmem_free(&m);
+		return (error);
+	}
 
 	nshm = (struct kqring_shm_header *)m.ring_kva;
 	narray = (ctx->flags & IORING_SETUP_NO_SQARRAY) != 0 ? NULL :
@@ -444,9 +466,7 @@ kqring_resize_rings(struct kqring_ctx *ctx,
 	kqring_ring_install(ctx, &m, &l, sq_entries, cq_entries);
 	mtx_unlock(&ctx->mtx);
 	kqring_rmem_free(&old);
-
-	kqring_ring_offsets(ctx, &l, &p);
-	return (copyout(&p, ra->arg, sizeof(p)));
+	return (0);
 }
 
 static void
@@ -874,7 +894,7 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	    IORING_FEAT_RSRC_TAGS | IORING_FEAT_REG_REG_RING |
 	    IORING_FEAT_RECVSEND_BUNDLE | IORING_FEAT_MIN_TIMEOUT;
 
-	kqring_ring_offsets(ctx, &l, &p);
+	kqring_ring_offsets(p.flags, sq_entries, cq_entries, &l, &p);
 
 	error = copyout(&p, uarg->params, sizeof(p));
 	/*
@@ -1060,8 +1080,29 @@ kqring_enter_wait(struct kqring_ctx *ctx, uint32_t min_complete,
 	    kqring_wait_cqes(ctx, 1, has_timeout, sbt, lock));
 }
 
+static int kqring_ioc_enter_body(struct kqring_ctx *ctx,
+    struct kqring_enter_arg *ea, struct thread *td);
+
+/*
+ * An enter, then, if it woke pollers of the ring, their completions on
+ * the process's other rings (kqring_kpoll_run()).
+ */
 static int
 kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
+    struct thread *td)
+{
+	int error;
+
+	error = kqring_ioc_enter_body(ctx, ea, td);
+	if (__predict_false(ctx->woke_pollers)) {
+		ctx->woke_pollers = false;
+		kqring_kpoll_run(td);
+	}
+	return (error);
+}
+
+static int
+kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
     struct thread *td)
 {
 	struct kqring_shm_header *shm = ctx->shm;
@@ -1182,6 +1223,23 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	kqring_run_taskwork(ctx);
 	kqring_run_checks(ctx);
 	kqring_flush_overflow(ctx);
+	/*
+	 * NODROP: SQEs left unsubmitted because the CQ overflows fail the
+	 * enter with EBUSY, as io_uring_enter(2) did; a dropped CQE fails
+	 * the next enter that reaps with EOVERFLOW (Linux's EBADR), once.
+	 */
+	if (submitted == 0 && ea->to_submit > 0 &&
+	    ctx->nocq >= KQRING_OCQ_BUSY &&
+	    atomic_load_acq_32(&shm->sq_tail) != shm->sq_head) {
+		kqring_enter_unlock(ctx, lock);
+		return (EBUSY);
+	}
+	if (submitted == 0 && ctx->cq_dropped &&
+	    (ea->flags & IORING_ENTER_GETEVENTS) != 0) {
+		ctx->cq_dropped = false;
+		kqring_enter_unlock(ctx, lock);
+		return (EOVERFLOW);
+	}
 	kqring_enter_unlock(ctx, lock);
 
 	if (!wait) {
@@ -1672,18 +1730,6 @@ kqring_sys_setup(struct thread *td, struct kqring_setup_args *uap)
  */
 DPCPU_DEFINE_STATIC(u_int, kqring_sys_busy);
 
-/* KQRING_TDA, counted as enter calls are for unload. */
-static void
-kqring_ast(struct thread *td, int asts __unused)
-{
-	u_int *busy = DPCPU_ID_PTR(PCPU_GET(cpuid), kqring_sys_busy);
-
-	atomic_add_acq_int(busy, 1);
-	if (!kqring_unloading)
-		kqring_kpoll_ast(td);
-	atomic_subtract_rel_int(busy, 1);
-}
-
 static int
 kqring_sys_enter(struct thread *td, struct kqring_enter_args *uap)
 {
@@ -1796,10 +1842,98 @@ kqring_sys_register_all(void)
 	}
 }
 
-/* Waits for the system calls in progress, as destroy_dev() for ioctls. */
-static void
+/*
+ * After deregistration a thread that took one of these calls' sysent
+ * entries before can still be about to enter kqring's code, or just
+ * leaving it, a few instructions outside kqring_sys_busy.  Such a thread's
+ * current system call (td_sa.code) is that call until it next returns to
+ * user space, through ast(), which clears td_ast.  So mark each thread
+ * whose current call is one of ours with an AST (TDA_AST, which only makes
+ * ast() run) and wait until each has cleared it or is gone: then none can
+ * be in the module.  A thread that doesn't return to user space within
+ * 10 s (its process is stopped) fails the unload with EBUSY.
+ */
+static int
+kqring_sys_drain_threads(const int *nums)
+{
+	struct kqring_drain { pid_t pid; lwpid_t tid; } *w = NULL;
+	struct proc *p;
+	struct thread *td;
+	int n, max = 0, error = 0;
+
+again:
+	n = 0;
+	sx_slock(&allproc_lock);
+	FOREACH_PROC_IN_SYSTEM(p) {
+		PROC_LOCK(p);
+		FOREACH_THREAD_IN_PROC(p, td) {
+			bool ours = false;
+
+			for (int i = 0; i < KQRING_NSYS; i++)
+				ours |= nums[i] != NO_SYSCALL &&
+				    td->td_sa.code == (u_int)nums[i];
+			if (!ours || td == curthread)
+				continue;
+			if (n < max) {
+				thread_lock(td);
+				ast_sched_locked(td, TDA_AST);
+				thread_unlock(td);
+				w[n].pid = p->p_pid;
+				w[n].tid = td->td_tid;
+			}
+			n++;
+		}
+		PROC_UNLOCK(p);
+	}
+	sx_sunlock(&allproc_lock);
+	if (n > max) {
+		free(w, M_KQRING);
+		max = n + 64;
+		w = malloc(max * sizeof(*w), M_KQRING, M_WAITOK);
+		goto again;
+	}
+	for (int ticks_left = 10 * hz;; ticks_left--) {
+		int left = 0;
+
+		for (int i = 0; i < n; i++) {
+			bool pending;
+
+			if (w[i].tid == 0)
+				continue;
+			td = tdfind(w[i].tid, w[i].pid);
+			if (td == NULL) {
+				w[i].tid = 0;
+				continue;
+			}
+			thread_lock(td);
+			pending = (td->td_ast & TDAI(TDA_AST)) != 0;
+			thread_unlock(td);
+			PROC_UNLOCK(td->td_proc);
+			if (pending)
+				left++;
+			else
+				w[i].tid = 0;
+		}
+		if (left == 0)
+			break;
+		if (ticks_left == 0) {
+			error = EBUSY;
+			break;
+		}
+		pause("kqsysdr", 1);
+	}
+	free(w, M_KQRING);
+	return (error);
+}
+
+/*
+ * Waits for the system calls in progress, as destroy_dev() for ioctls;
+ * EBUSY (all deregistered) if some thread may not have left them.
+ */
+static int
 kqring_sys_deregister_all(void)
 {
+	int nums[KQRING_NSYS];
 	u_int cpu, n;
 
 	/*
@@ -1810,6 +1944,7 @@ kqring_sys_deregister_all(void)
 		atomic_store_rel_32(
 		    &sysent[kqring_sysnum[KQRING_SYS_ENTER]].sy_thrcnt, 0);
 	for (int i = 0; i < KQRING_NSYS; i++) {
+		nums[i] = kqring_sysnum[i];
 		if (kqring_sysnum[i] != NO_SYSCALL)
 			(void)kern_syscall_deregister(sysent, kqring_sysnum[i],
 			    &kqring_old_sysent[i]);
@@ -1829,11 +1964,10 @@ kqring_sys_deregister_all(void)
 			pause("kqsysdr", 1);
 	} while (n != 0);
 	/*
-	 * A call can be between the sysent dispatch and its count, or
-	 * between the count and its return, for a few instructions: if it
-	 * was preempted there, let it run on before the module goes.
+	 * And for any thread between the sysent dispatch and its count, or
+	 * between the count and its return.
 	 */
-	pause("kqsysun", hz);
+	return (kqring_sys_drain_threads(nums));
 }
 
 /* The object (with a reference) that a mapping at *offset shows. */
@@ -1962,7 +2096,6 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			return (ENOMEM);
 		}
 		kqring_sys_register_all();
-		ast_register(KQRING_TDA, ASTR_ASTF_REQUIRED, 0, kqring_ast);
 		printf("kqring: loaded (/dev/kqring)\n");
 		return (0);
 
@@ -1996,12 +2129,16 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 		}
 		mtx_unlock(&kqring_proc_mtx);
 		/*
-		 * The system calls go first, waiting for those in progress
-		 * (and for kqring_ast() calls, counted with them): after
-		 * destroy_dev() their rings would be gone.
+		 * The system calls go first, waiting for those in progress:
+		 * after destroy_dev() their rings would be gone.
 		 */
-		ast_deregister(KQRING_TDA);
-		kqring_sys_deregister_all();
+		if (kqring_sys_deregister_all() != 0) {
+			kqring_sys_register_all();
+			mtx_lock(&kqring_proc_mtx);
+			kqring_unloading = false;
+			mtx_unlock(&kqring_proc_mtx);
+			return (EBUSY);
+		}
 		/*
 		 * No ring is open, and destroy_dev() waits for opens in
 		 * progress.  EVENTHANDLER_DEREGISTER() waits for running

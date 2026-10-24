@@ -839,6 +839,7 @@ kqring_bgroup_free(struct kqring_ctx *ctx, struct kqring_bgroup *bg)
 	if (bg->ring_obj != NULL) {
 		/* Mappings userspace still has keep their own reference. */
 		ctx->ring_mem -= bg->ring_alloc_len;
+		kqring_mem_uncharge(bg->ring_uip, bg->ring_alloc_len, false);
 		kqring_free_shm(bg->ring_obj, bg->ring_kva_base,
 		    bg->ring_alloc_len);
 	}
@@ -1099,8 +1100,15 @@ kqring_pbuf_register(struct kqring_ctx *ctx,
 	bg->ring_entries = reg.ring_entries;
 	bg->ring_mask = reg.ring_entries - 1;
 	if ((reg.flags & IOU_PBUF_RING_MMAP) != 0) {
-		error = kqring_alloc_shm(bytes, &bg->ring_obj,
-		    &bg->ring_kva_base, &bg->ring_alloc_len);
+		error = kqring_mem_charge(curthread->td_ucred, bytes, false,
+		    &bg->ring_uip);
+		if (error == 0) {
+			error = kqring_alloc_shm(bytes, &bg->ring_obj,
+			    &bg->ring_kva_base, &bg->ring_alloc_len);
+			if (error != 0)
+				kqring_mem_uncharge(bg->ring_uip, bytes,
+				    false);
+		}
 		if (error != 0) {
 			sx_xunlock(&ctx->bg_sx);
 			free(bg, M_KQRING);

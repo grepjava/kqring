@@ -6252,6 +6252,7 @@ test_worker_cancel_and_timeout(void)
 
 		memset(&sc, 0, sizeof(sc));
 		sc.addr = base + 3;
+		sc.timeout.tv_sec = sc.timeout.tv_nsec = -1;
 		assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == 0);
 		assert(ring_wait(&t, 1, 2000) == 0);
 		expect_cqe(&t, base + 3, -ECANCELED);
@@ -7260,6 +7261,27 @@ test_resize_rings(void)
 	assert(reg(&t, IORING_REGISTER_RESIZE_RINGS, &p, 1) == -EINVAL);
 	for (int i = 0; i < 4; i++)
 		expect_cqe(&t, 76010 + i, 0);
+
+	/* Parameters that can't be written back: EFAULT, nothing changed. */
+	long page = sysconf(_SC_PAGESIZE);
+	struct io_uring_params *rp = mmap(NULL, page, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+
+	assert(rp != MAP_FAILED);
+	rp->sq_entries = 8;
+	rp->cq_entries = 16;
+	rp->flags = IORING_SETUP_CQSIZE;
+	assert(mprotect(rp, page, PROT_READ) == 0);
+	assert(reg(&t, IORING_REGISTER_RESIZE_RINGS, rp, 1) == -EFAULT);
+	/* Still the 4-entry rings the old mapping shows. */
+	for (int i = 0; i < 4; i++) {
+		(void)ring_prep(&t, IORING_OP_NOP, -1, 76020 + i);
+		ring_push_sqe(&t);
+	}
+	ring_submit(&t);
+	for (int i = 0; i < 4; i++)
+		expect_cqe(&t, 76020 + i, 0);
+	munmap(rp, page);
 	close(t.fd);
 
 	/* Not DEFER_TASKRUN: EINVAL. */
@@ -7275,11 +7297,11 @@ test_resize_rings(void)
 }
 
 /*
- * A thread that wakes a file one of its rings polls sees the CQE when its
- * system call returns (on a ring without DEFER_TASKRUN), as with io_uring's
- * task_work: here a write(2) to a pipe, and a NOP on a ring whose
- * descriptor another ring polls.  A ring polling its own descriptor
- * doesn't loop.
+ * An enter whose CQE wakes a poll on its ring by another of the process's
+ * rings (without DEFER_TASKRUN) leaves that poll's CQE posted when it
+ * returns, as io_uring's poll task_work does; a write(2) to a polled pipe
+ * gets its CQE from the poller.  A ring polling its own descriptor doesn't
+ * loop.
  */
 static void
 test_poll_same_thread(void)
@@ -7296,7 +7318,7 @@ test_poll_same_thread(void)
 	ring_init(&t2);
 	assert(pipe(p) == 0);
 
-	/* 1. write(2) to a polled pipe: the CQE is there when it returns. */
+	/* 1. write(2) to a polled pipe: the CQE comes. */
 	for (int round = 0; round < 50; round++) {
 		sqe = ring_prep(&t, IORING_OP_POLL_ADD, p[0], 77000 + round);
 		sqe->poll32_events = POLLIN;
@@ -7304,7 +7326,7 @@ test_poll_same_thread(void)
 		ring_submit(&t);
 		assert(ring_cq_ready(&t) == 0);
 		assert(write(p[1], "q", 1) == 1);
-		assert(ring_cq_ready(&t) == 1);
+		assert(ring_wait(&t, 1, 2000) == 0);
 		c = ring_pop_cqe(&t);
 		assert(c.user_data == 77000 + (uint64_t)round &&
 		    (c.res & POLLIN) != 0);
@@ -7343,8 +7365,133 @@ test_poll_same_thread(void)
 	close(t2.fd);
 	close(p[0]);
 	close(p[1]);
-	printf("[PASS] Poll CQE posted before the waking thread's system "
-	    "call returns; self-poll doesn't loop\n");
+	printf("[PASS] Poll on another ring: CQE posted before the waking "
+	    "enter returns; self-poll doesn't loop\n");
+}
+
+/*
+ * NODROP backpressure: once many CQEs wait in the kernel, enters submit
+ * nothing and fail with EBUSY, and a multishot request whose CQE would
+ * overflow ends instead; reaping the CQEs lifts it.
+ */
+static void
+test_cq_backpressure(void)
+{
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	int sv[2], rounds = 0, r;
+	unsigned total = 0;
+	bool ended = false;
+
+	ring_init(&t);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+	/* 1. A multishot RECV while the CQ is full ends at once. */
+	sqe = ring_prep(&t, IORING_OP_RECV, sv[0], 78000);
+	sqe->ioprio = IORING_RECV_MULTISHOT;
+	sqe->flags = IOSQE_BUFFER_SELECT;
+	sqe->buf_group = 0;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	for (int i = 0; i < CQ_ENTRIES; i++) {
+		(void)ring_prep(&t, IORING_OP_NOP, -1, 78001);
+		ring_push_sqe(&t);
+		if (ring_pending(&t) == SQ_ENTRIES)
+			ring_submit(&t);
+	}
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == CQ_ENTRIES);
+	assert(write(sv[1], "multi", 5) == 5);
+	assert(kqring_enter(t.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) ==
+	    0);
+
+	/* 2. NOPs until the enter says EBUSY. */
+	for (;;) {
+		while (ring_pending(&t) < SQ_ENTRIES) {
+			(void)ring_prep(&t, IORING_OP_NOP, -1, 78002);
+			ring_push_sqe(&t);
+		}
+		r = kqring_enter(t.fd, SQ_ENTRIES, 0, 0, NULL, 0);
+		if (r == -1) {
+			assert(errno == EBUSY);
+			break;
+		}
+		assert(r == SQ_ENTRIES);
+		assert(++rounds < 16384 / SQ_ENTRIES + 4);
+	}
+	assert(rounds >= 16384 / SQ_ENTRIES - 4);
+
+	/* 3. Reaping lifts it; the multishot RECV's last CQE had no MORE. */
+	for (int spins = 0; spins < 100000; spins++) {
+		unsigned h = atomic_load(t.cq_khead), tl = atomic_load(t.cq_ktail);
+
+		for (; h != tl; h++) {
+			struct io_uring_cqe *c = &t.cqes[h & t.cq_mask];
+
+			if (c->user_data == 78000) {
+				assert(c->res == 5 &&
+				    (c->flags & IORING_CQE_F_MORE) == 0);
+				ended = true;
+			}
+			total++;
+		}
+		atomic_store(t.cq_khead, h);
+		if ((atomic_load(t.sq_kflags) & IORING_SQ_CQ_OVERFLOW) == 0)
+			break;
+		assert(kqring_enter(t.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL,
+		    0) >= 0);
+	}
+	assert(ended && (atomic_load(t.sq_kflags) & IORING_SQ_CQ_OVERFLOW) ==
+	    0);
+	/* Every CQE arrived: the NOPs, each round's, the RECV's. */
+	assert(total == (unsigned)(CQ_ENTRIES + 1 + rounds * SQ_ENTRIES));
+	r = kqring_enter(t.fd, SQ_ENTRIES, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+	assert(r == SQ_ENTRIES);
+	ring_drain_cqes(&t);
+	close(sv[0]);
+	close(sv[1]);
+	close(t.fd);
+	printf("[PASS] NODROP: EBUSY while %u CQEs overflowed, multishot ends "
+	    "on a full CQ, nothing dropped\n", total);
+}
+
+/*
+ * REGISTER_SYNC_CANCEL returns once a request running on a worker has
+ * stopped, its CQE posted; a zero timeout gives ETIME while it runs.
+ */
+static void
+test_sync_cancel_worker(void)
+{
+	struct io_uring_sync_cancel_reg sc;
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	char buf[8];
+	int p[2];
+
+	ring_init(&t);
+	assert(pipe(p) == 0);
+	sqe = ring_prep(&t, IORING_OP_READ, p[0], 79000);
+	sqe->addr = (uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->off = (uint64_t)-1;
+	sqe->flags = IOSQE_ASYNC;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	usleep(20 * 1000);
+	assert(ring_cq_ready(&t) == 0);
+	memset(&sc, 0, sizeof(sc));
+	sc.addr = 79000;
+	sc.timeout.tv_sec = -1;
+	sc.timeout.tv_nsec = -1;
+	assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == 0);
+	assert(ring_cq_ready(&t) == 1);
+	expect_cqe(&t, 79000, -ECANCELED);
+	assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == -ENOENT);
+	close(p[0]);
+	close(p[1]);
+	close(t.fd);
+	printf("[PASS] SYNC_CANCEL waits for the worker running the "
+	    "request\n");
 }
 
 static void
@@ -8120,6 +8267,8 @@ main(int argc, char **argv)
 		test_no_mmap();
 		test_resize_rings();
 		test_poll_same_thread();
+		test_cq_backpressure();
+		test_sync_cancel_worker();
 		test_sqe128_cqe32_attach_wq();
 		test_registered_rings();
 		test_sqpoll_and_iopoll();

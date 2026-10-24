@@ -11,6 +11,111 @@
  * ============================================================================
  */
 
+/*
+ * Ring memory (the SQ and CQ rings, SQEs and IOU_PBUF_RING_MMAP rings, all
+ * wired, and the pages IORING_SETUP_NO_MMAP holds) is charged to the user
+ * whose credentials made it (real uid): at most kern.kqring.user_ring_mem
+ * bytes per user over all their rings (0: no limit; by default 1/16 of
+ * physical memory), so that many rings can't wire unbounded memory.  The
+ * pages NO_MMAP holds are the user's memory wired on their behalf, and
+ * also count in vm.max_user_wired as mlock(2)'d pages do.
+ */
+struct kqring_mem_acct {
+	LIST_ENTRY(kqring_mem_acct) link;
+	struct uidinfo		*uip;
+	u_long			bytes;
+};
+
+static LIST_HEAD(, kqring_mem_acct) kqring_mem_list =
+    LIST_HEAD_INITIALIZER(kqring_mem_list);
+static struct mtx kqring_mem_mtx;
+MTX_SYSINIT(kqring_mem, &kqring_mem_mtx, "kqring ring mem", MTX_DEF);
+static u_long kqring_user_ring_mem;
+SYSCTL_ULONG(_kern_kqring, OID_AUTO, user_ring_mem, CTLFLAG_RW,
+    &kqring_user_ring_mem, 0,
+    "Ring memory one user's rings may hold, in bytes (0: no limit)");
+
+static void
+kqring_mem_init(void *arg __unused)
+{
+	kqring_user_ring_mem = ptoa((u_long)physmem) / 16;
+}
+SYSINIT(kqring_mem, SI_SUB_KLD, SI_ORDER_ANY, kqring_mem_init, NULL);
+
+int
+kqring_mem_charge(struct ucred *cred, size_t bytes, bool user_wired,
+    struct uidinfo **uipp)
+{
+	struct uidinfo *uip = cred->cr_ruidinfo;
+	struct kqring_mem_acct *acct, *alloc_acct;
+	u_long limit = kqring_user_ring_mem, npages = atop(round_page(bytes));
+	u_long wired;
+
+	bytes = round_page(bytes);
+	if (user_wired) {
+		wired = atomic_load_long(&vm_user_wire_count);
+		do {
+			if (npages > vm_page_max_user_wired ||
+			    wired > vm_page_max_user_wired - npages)
+				return (ENOMEM);
+		} while (!atomic_fcmpset_long(&vm_user_wire_count, &wired,
+		    wired + npages));
+	}
+	alloc_acct = malloc(sizeof(*alloc_acct), M_KQRING, M_WAITOK | M_ZERO);
+	mtx_lock(&kqring_mem_mtx);
+	LIST_FOREACH(acct, &kqring_mem_list, link) {
+		if (acct->uip == uip)
+			break;
+	}
+	if (limit != 0 && (bytes > limit || (acct != NULL &&
+	    acct->bytes > limit - bytes))) {
+		mtx_unlock(&kqring_mem_mtx);
+		free(alloc_acct, M_KQRING);
+		if (user_wired)
+			atomic_subtract_long(&vm_user_wire_count, npages);
+		return (ENOMEM);
+	}
+	if (acct == NULL) {
+		acct = alloc_acct;
+		alloc_acct = NULL;
+		acct->uip = uip;
+		LIST_INSERT_HEAD(&kqring_mem_list, acct, link);
+	}
+	acct->bytes += bytes;
+	uihold(uip);
+	mtx_unlock(&kqring_mem_mtx);
+	free(alloc_acct, M_KQRING);
+	*uipp = uip;
+	return (0);
+}
+
+void
+kqring_mem_uncharge(struct uidinfo *uip, size_t bytes, bool user_wired)
+{
+	struct kqring_mem_acct *acct;
+
+	if (uip == NULL)
+		return;
+	bytes = round_page(bytes);
+	if (user_wired)
+		atomic_subtract_long(&vm_user_wire_count, atop(bytes));
+	mtx_lock(&kqring_mem_mtx);
+	LIST_FOREACH(acct, &kqring_mem_list, link) {
+		if (acct->uip == uip)
+			break;
+	}
+	KASSERT(acct != NULL && acct->bytes >= bytes,
+	    ("kqring: ring memory uncharge underflow"));
+	acct->bytes -= bytes;
+	if (acct->bytes == 0)
+		LIST_REMOVE(acct, link);
+	else
+		acct = NULL;
+	mtx_unlock(&kqring_mem_mtx);
+	free(acct, M_KQRING);
+	uifree(uip);
+}
+
 int
 kqring_alloc_shm(size_t bytes, vm_object_t *obj_out, vm_offset_t *kva_out,
     size_t *alloc_len_out)
@@ -195,8 +300,8 @@ kqring_flush_overflow(struct kqring_ctx *ctx)
 /*
  * Post a CQE.  When the CQ ring is full it is queued in the kernel (in
  * order, behind earlier overflow) and IORING_SQ_CQ_OVERFLOW is set; only
- * beyond KQRING_MAX_OVERFLOW queued CQEs is one dropped and counted in
- * cq_overflow.  Never called with ctx->mtx held.  TIMEOUT completions use
+ * beyond KQRING_MAX_OVERFLOW queued CQEs is one dropped, counted in
+ * cq_overflow and reported (ctx->cq_dropped).  Never called with ctx->mtx held.  TIMEOUT completions use
  * this directly; everything else goes through kqring_post_cqe(), which also
  * advances the sequence that completion-count TIMEOUTs wait on.
  */
@@ -219,6 +324,7 @@ kqring_post_cqe_extra(struct kqring_ctx *ctx, uint64_t user_data,
 
 	if (ctx->nocq >= KQRING_MAX_OVERFLOW) {
 		atomic_add_32(&ctx->shm->cq_overflow, 1);
+		ctx->cq_dropped = true;
 		return;
 	}
 	ocqe = malloc(sizeof(*ocqe), M_KQRING, M_WAITOK | M_ZERO);
@@ -689,6 +795,14 @@ kqring_op_attempt(struct kqring_ctx *ctx, struct kqring_op *op,
 		}
 		if (rc != 0 || (op->cflags & IORING_CQE_F_MORE) == 0)
 			return (rc);
+		/*
+		 * As io_uring: a multishot request whose CQE would overflow
+		 * the CQ ends with it instead (no F_MORE).
+		 */
+		if (kqring_cq_full(ctx)) {
+			op->cflags &= ~IORING_CQE_F_MORE;
+			return (0);
+		}
 		kqring_post_cqe(ctx, op->sqe.user_data, op->res, op->cflags);
 		if (!more)
 			return (EAGAIN);
@@ -2268,7 +2382,12 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 				mtx_lock(&ctx->mtx);
 				continue;
 			}
-			if (STAILQ_EMPTY(&ctx->rcq))
+			/*
+			 * MSG_RING CQEs wait while the CQ overflows (see
+			 * KQRING_OCQ_BUSY); senders then see EOVERFLOW.
+			 */
+			if (STAILQ_EMPTY(&ctx->rcq) ||
+			    ctx->nocq >= KQRING_OCQ_BUSY)
 				break;
 			kqring_post_remote_locked(ctx);
 		}
@@ -2294,6 +2413,9 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 	tail = atomic_load_acq_32(&shm->sq_tail);
 	avail = MIN(tail - head, ctx->sq_entries);
 	max_submit = MIN(max_submit, avail);
+	/* Backpressure: see KQRING_OCQ_BUSY. */
+	if (ctx->nocq >= KQRING_OCQ_BUSY)
+		max_submit = 0;
 	/* CQEs posted inline here are not "async" (EVENTFD_ASYNC). */
 	ctx->submitting = true;
 	while (consumed < max_submit) {

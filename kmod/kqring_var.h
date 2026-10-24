@@ -122,8 +122,19 @@ MALLOC_DECLARE(M_SELFD);
 #define KQRING_MAX_SQ_ENTRIES	32768U	/* IORING_MAX_ENTRIES */
 #define KQRING_MAX_CQ_ENTRIES	65536U	/* IORING_MAX_CQ_ENTRIES */
 #define KQRING_MAX_PBUF_ENTRIES	32768U
-/* CQEs held in the kernel while the CQ ring is full (IORING_FEAT_NODROP). */
-#define KQRING_MAX_OVERFLOW	16384U
+/*
+ * CQEs held in the kernel while the CQ ring is full (IORING_FEAT_NODROP).
+ * From KQRING_OCQ_BUSY on, enters submit nothing (EBUSY) and multishot
+ * requests end rather than post more, so what is still to come is at most
+ * a few CQEs per live request plus queued MSG_RING CQEs; KQRING_MAX_
+ * OVERFLOW leaves room for all of them.  Only past it (for instance
+ * resource tags from unregistering many tagged slots at once) is a CQE
+ * dropped: counted in cq_overflow and reported as EOVERFLOW (Linux's
+ * EBADR, which FreeBSD lacks) by the next enter that waits.
+ */
+#define KQRING_OCQ_BUSY		16384U
+#define KQRING_MAX_OVERFLOW	(KQRING_OCQ_BUSY + 3 * KQRING_MAX_REQS + \
+	KQRING_MAX_REMOTE)
 /* MSG_RING CQEs queued for a ring's owner and not yet posted. */
 #define KQRING_MAX_REMOTE	16384U
 /*
@@ -132,8 +143,12 @@ MALLOC_DECLARE(M_SELFD);
  * have not completed; past it submission fails with -ENOMEM.
  */
 #define KQRING_MAX_ARG_BYTES	(32U * 1024 * 1024)
-/* Live requests (armed, ready, deferred, or linked) per ring. */
-#define KQRING_MAX_REQS		32768U
+/*
+ * Live requests (armed, ready, deferred, or linked) per ring: room for a
+ * full CQ's worth of requests armed several times over (liburing's poll
+ * test arms 65,536), where io_uring has no fixed limit.
+ */
+#define KQRING_MAX_REQS		131072U
 /* Registered resources, with io_uring's limits. */
 #define KQRING_MAX_FILES	(1U << 20)	/* also RLIMIT_NOFILE */
 #define KQRING_MAX_BUFS		(1U << 14)
@@ -240,6 +255,8 @@ struct kqring_rmem {
 	vm_offset_t		sqes_kva;
 	size_t			sqes_len;
 	vm_page_t		*sqes_pages;
+	struct uidinfo		*uip;		/* charged (kqring_mem_charge) */
+	size_t			charged;
 };
 
 /*
@@ -531,6 +548,7 @@ struct kqring_bgroup {
 	vm_object_t		ring_obj;
 	vm_offset_t		ring_kva_base;
 	size_t			ring_alloc_len;
+	struct uidinfo		*ring_uip;	/* charged for ring_obj */
 	uint32_t		ring_entries;
 	uint32_t		ring_mask;
 	uint16_t		head;		/* kernel consumer index */
@@ -674,6 +692,10 @@ struct kqring_ctx {
 	 */
 	struct file		*kp_fp;
 	struct thread		*kp_td;
+	/* Pollers of the ring or its eventfd were woken (a hint, any lock). */
+	bool			woke_pollers;
+	/* A CQE was dropped (KQRING_MAX_OVERFLOW); the issuer reports it. */
+	bool			cq_dropped;
 	bool			kp_running;
 	uint64_t		kp_next_id;
 	TAILQ_HEAD(, kqring_op)	kp_ops[KQRING_KP_HASH];
@@ -916,11 +938,17 @@ kqring_evfd_signal_locked(struct kqring_ctx *ctx)
 	    (atomic_load_32(&ctx->shm->cq_flags) &
 	    IORING_CQ_EVENTFD_DISABLED) == 0)
 		eventfd_signal(ctx->evfd);
-	/* And whoever polls the ring descriptor itself. */
+	/*
+	 * And whoever polls the ring descriptor itself; an enter that did
+	 * this runs kqring_kpoll_run() before it returns.
+	 */
 	if (ctx->pollers) {
 		selwakeuppri(&ctx->rsel, PZERO);
 		KNOTE_LOCKED(&ctx->rsel.si_note, 0);
+		ctx->woke_pollers = true;
 	}
+	if (ctx->evfd != NULL)
+		ctx->woke_pollers = true;
 }
 
 /* No room for another CQE in the CQ ring (it would overflow). */
@@ -1178,6 +1206,10 @@ int	kqring_reg_ring_fget(struct thread *td, uint32_t slot, bool is_enter,
 int	kqring_alloc_shm(size_t bytes, vm_object_t *obj_out,
 	    vm_offset_t *kva_out, size_t *alloc_len_out);
 void	kqring_free_shm(vm_object_t obj, vm_offset_t kva, size_t alloc_len);
+int	kqring_mem_charge(struct ucred *cred, size_t bytes, bool user_wired,
+	    struct uidinfo **uipp);
+void	kqring_mem_uncharge(struct uidinfo *uip, size_t bytes,
+	    bool user_wired);
 int	kqring_resize_rings(struct kqring_ctx *ctx,
 	    const struct kqring_register_arg *ra, struct thread *td);
 int	kqring_ring_fds_insert(struct thread *td, struct file *fp,
@@ -1399,6 +1431,8 @@ int32_t	kqring_timeout_remove(struct kqring_ctx *ctx,
 	    const struct kqring_op *rop, struct kqring_op **gonep);
 void	kqring_check_timeouts(struct kqring_ctx *ctx);
 int32_t	kqring_cancel(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe);
+int	kqring_cancel_wait(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe,
+	    bool has_timeout, sbintime_t sbt);
 int32_t	kqring_poll_remove(struct kqring_ctx *ctx,
 	    const struct io_uring_sqe *sqe);
 void	kqring_check_futexes(struct kqring_ctx *ctx);
@@ -1464,9 +1498,7 @@ void	kqring_worker_rele(void);
 /* kqring_kpoll.c */
 #define	KQRING_KP_READ	0x01
 #define	KQRING_KP_WRITE	0x02
-/* The return-to-user hook kqring_kpoll_ast() runs from (subr_trap.c). */
-#define	KQRING_TDA	TDA_MOD1
-void	kqring_kpoll_ast(struct thread *td);
+void	kqring_kpoll_run(struct thread *td);
 int	kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	    const struct file *fp);
 void	kqring_kpoll_disarm_locked(struct kqring_ctx *ctx,

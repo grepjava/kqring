@@ -639,13 +639,11 @@ kqring_check_timeouts(struct kqring_ctx *ctx)
  * number, never compared with a descriptor.
  */
 static bool
-kqring_cancel_match(const struct kqring_op *op, const struct io_uring_sqe *sqe,
-    const struct file *cfp)
+kqring_cancel_match_req(const struct kqring_op *op,
+    const struct io_uring_sqe *sqe, const struct file *cfp)
 {
 	uint32_t cflags = sqe->cancel_flags;
 
-	if (op->cancelled)
-		return (false);
 	if ((cflags & IORING_ASYNC_CANCEL_ANY) != 0)
 		return (true);
 	if ((cflags & IORING_ASYNC_CANCEL_FD) != 0) {
@@ -662,6 +660,14 @@ kqring_cancel_match(const struct kqring_op *op, const struct io_uring_sqe *sqe,
 	    op->sqe.user_data != sqe->addr)
 		return (false);
 	return (true);
+}
+
+/* ... among those not cancelled yet. */
+static bool
+kqring_cancel_match(const struct kqring_op *op, const struct io_uring_sqe *sqe,
+    const struct file *cfp)
+{
+	return (!op->cancelled && kqring_cancel_match_req(op, sqe, cfp));
 }
 
 /*
@@ -712,6 +718,66 @@ kqring_cancel(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
 	if (n == 0)
 		return (running ? -EALREADY : -ENOENT);
 	return (all ? n : 0);
+}
+
+/*
+ * IORING_REGISTER_SYNC_CANCEL's wait (the caller is the issuer, holding
+ * sq_sx): until no request the cancellation matched is still running,
+ * on a worker (a retired op, whose CQE waits for the worker's return) or
+ * as disk I/O, as io_uring waits for the cancelled requests to complete.
+ * The taskwork that completes them is run here.  ETIME once the timeout
+ * (has_timeout) passes, EINTR on a signal.
+ */
+int
+kqring_cancel_wait(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe,
+    bool has_timeout, sbintime_t sbt)
+{
+	sbintime_t deadline = has_timeout ? kqring_deadline(sbt) : 0;
+	struct file *cfp = NULL;
+	struct kqring_op *op;
+	int error;
+
+	sx_assert(&ctx->sq_sx, SA_XLOCKED);
+	if ((sqe->cancel_flags & IORING_ASYNC_CANCEL_FD_FIXED) != 0 &&
+	    ctx->files != NULL && (uint32_t)sqe->fd < ctx->nfiles &&
+	    ctx->files[sqe->fd] != NULL)
+		cfp = ctx->files[sqe->fd]->fp;
+	for (;;) {
+		kqring_run_taskwork(ctx);
+		mtx_lock(&ctx->mtx);
+		TAILQ_FOREACH(op, &ctx->retired_ops, active_link) {
+			if (kqring_cancel_match_req(op, sqe, cfp))
+				break;
+		}
+		if (op == NULL) {
+			TAILQ_FOREACH(op, &ctx->active_ops, active_link) {
+				if (op->bio && kqring_cancel_match_req(op, sqe,
+				    cfp))
+					break;
+			}
+		}
+		if (op == NULL || ctx->closing) {
+			mtx_unlock(&ctx->mtx);
+			return (ctx->closing ? EBADF : 0);
+		}
+		if (has_timeout && kqring_until(deadline) == 0) {
+			mtx_unlock(&ctx->mtx);
+			return (ETIME);
+		}
+		/* Woken by the taskwork the worker or the disk queues. */
+		if (TAILQ_EMPTY(&ctx->taskwork_ops)) {
+			ctx->sleeping++;
+			error = msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, PCATCH,
+			    "kqscan", has_timeout ? MIN(kqring_until(deadline),
+			    SBT_1S) : SBT_1S, 0, 0);
+			ctx->sleeping--;
+			if (error == EINTR || error == ERESTART) {
+				mtx_unlock(&ctx->mtx);
+				return (EINTR);
+			}
+		}
+		mtx_unlock(&ctx->mtx);
+	}
 }
 
 /* POLL_REMOVE: cancel an armed POLL_ADD, or update its events/user_data. */

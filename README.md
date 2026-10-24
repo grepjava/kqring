@@ -155,8 +155,10 @@ Except for the thread scaling, these are single-threaded loopback measurements. 
 - **Worker cancellation and CQE ordering.** Cancel (`ASYNC_CANCEL`, `POLL_REMOVE`) and `LINK_TIMEOUT` request an interrupt without waiting for running worker I/O.
   - The cancel, remove or timeout CQE can therefore arrive **before** the target's `-ECANCELED` CQE; Linux posts the target's CQE first.
   - A cancellation CQE doesn't promise the I/O had no side effects. Wait for the target request's own CQE before freeing its buffers or state.
+  - `IORING_REGISTER_SYNC_CANCEL` does wait: it returns once the requests it cancelled have stopped, or `ETIME` after its timeout, as on Linux.
   - Ring close detaches running workers without waiting. Final cleanup waits until the last worker returns, and module unload drains any that remain.
-- **`SYNC_CANCEL` and `CLOCK`.** `SYNC_CANCEL` accepts the cancellation but doesn't wait for the target's CQE, and ignores its timeout. `CLOCK` is recorded, but timeouts are relative, so it has no effect.
+- **`CLOCK`** is recorded, but timeouts are relative, so it has no effect.
+- **Completion overflow.** Completions that don't fit the CQ wait in the kernel (`IORING_FEAT_NODROP`). Once 16,384 are waiting, enters submit nothing and fail with `EBUSY`, and multishot requests end rather than post more, as on Linux; reaping lifts it. A completion is dropped only past a much larger bound, and the next enter that reaps then fails once with `EOVERFLOW` (Linux's `EBADR`, which FreeBSD lacks).
 - **`execve(2)` disables open rings.** Any ring owned by the calling process is torn down:
   - its worker pool and `SQPOLL` thread are stopped;
   - in-flight requests are freed without posting `-ECANCELED` CQEs;
@@ -182,10 +184,11 @@ Except for the thread scaling, these are single-threaded loopback measurements. 
 - **Eventfd** is signalled once per enter that posted CQEs, and when work is queued for an idle ring. A multishot `POLL_ADD` on the ring's own registered eventfd ends after its first CQE; Linux ends it only when the wakeup came from the ring's own signal.
 
 **Polling**
-- **Wakeups from other processes are seen by a kernel thread.** A `POLL_ADD` on a non-socket file woken by a thread of the ring's own process gets its CQE before that thread's system call returns, as on Linux; on a `DEFER_TASKRUN` ring, at the owner's next enter. A wakeup from another process, or from a kernel thread, is reported by the ring's poller thread a moment later. Each wakeup gets its CQE, even if the file is drained again before the poller looks.
+- **Most poll wakeups are seen by a kernel thread.** A `POLL_ADD` on another of the process's rings (or its eventfd) gets its CQE before the waking enter returns, as on Linux; on a `DEFER_TASKRUN` ring, at the owner's next enter. Any other wakeup of a non-socket file, such as a `write(2)` to a polled pipe, is reported by the ring's poller thread a moment later, where Linux posts it before the waker's system call returns. Each wakeup gets its CQE, even if the file is drained again before the poller looks.
 
 **Module**
-- **`kldunload` waits for open rings.** Unloading fails with `EBUSY` while any ring descriptor is open, and no ring can be opened while an unload is in progress.
+- **`kldunload` waits for open rings.** Unloading fails with `EBUSY` while any ring descriptor is open, and no ring can be opened while an unload is in progress. It also waits for every thread that called into kqring to get back to user space, and fails with `EBUSY` if one doesn't within 10 s (its process is stopped).
+- **Ring memory is limited per user.** Rings, mmap'd buffer rings and `NO_MMAP` ring pages are wired memory, charged to the user who made them: at most `sysctl kern.kqring.user_ring_mem` bytes over all their rings (1/16 of physical memory by default, 0 for no limit). Past it, setup fails with `ENOMEM`.
 
 ---
 
@@ -232,7 +235,7 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
   - [`kqring_rsrc.c`](kmod/kqring_rsrc.c) — fixed files, registered buffers, provided buffers and buffer rings, resource tags and personalities.
   - [`kqring_register.c`](kmod/kqring_register.c) — `io_uring_register` operations.
   - [`kqring_zc.c`](kmod/kqring_zc.c) — zero-copy send: page holding, `RLIMIT_MEMLOCK` accounting and mbuf construction.
-- [`tests/kqring_test.c`](tests/kqring_test.c) — functional test suite: 81 test groups covering every supported opcode, registration, setup flags and the lifetime rules above.
+- [`tests/kqring_test.c`](tests/kqring_test.c) — functional test suite: 83 test groups covering every supported opcode, registration, setup flags and the lifetime rules above.
 - [`tests/kqring_bench.c`](tests/kqring_bench.c) — benchmarks against `kqueue(2)` and plain system calls; [`tests/bench_report.py`](tests/bench_report.py) turns runs into the tables and charts in [`BENCHMARK.MD`](BENCHMARK.MD).
 
 ## Further reading
