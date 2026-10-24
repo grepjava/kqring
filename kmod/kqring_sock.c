@@ -204,13 +204,13 @@ kqring_recv_pick_buf(struct kqring_ctx *ctx, const struct kqring_op *op,
 	bool readable;
 	int error;
 
-	if (kqring_buf_none(ctx, op->sqe.buf_group))
-		return (ENOBUFS);
 	error = kqring_so_readable(so, &readable);
 	if (error != 0)
 		return (error);
+	/* kqring_buf_select() itself fails ENOBUFS on an empty group. */
 	if (!readable)
-		return (EAGAIN);
+		return (kqring_buf_none(ctx, op->sqe.buf_group) ? ENOBUFS :
+		    EAGAIN);
 	return (kqring_buf_select(ctx, op->sqe.buf_group, len, iov, nmax,
 	    sel));
 }
@@ -354,20 +354,20 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	 * buffer, as soreceive() would end (EWOULDBLOCK, nothing moved).
 	 * Out-of-band data is not in the receive buffer, so MSG_OOB asks.
 	 */
-	if (buf_select) {
-		bool none;
+	if ((sqe->opcode != IORING_OP_RECV ||
+	    (sqe->msg_flags & MSG_OOB) == 0) && kqring_so_rcv_idle(so)) {
+		bool none = false;
 
-		/* As kqring_recv_pick_buf() would, data or not. */
-		sx_xlock(&ctx->bg_sx);
-		none = kqring_buf_none(ctx, sqe->buf_group);
-		sx_xunlock(&ctx->bg_sx);
+		/* An empty group fails even so, as kqring_recv_pick_buf(). */
+		if (buf_select) {
+			sx_slock(&ctx->bg_sx);
+			none = kqring_buf_none(ctx, sqe->buf_group);
+			sx_sunlock(&ctx->bg_sx);
+		}
 		if (none) {
 			kqring_put_sock(op, fp, ENOBUFS);
 			return (kqring_done(op, -ENOBUFS, 0));
 		}
-	}
-	if ((sqe->opcode != IORING_OP_RECV ||
-	    (sqe->msg_flags & MSG_OOB) == 0) && kqring_so_rcv_idle(so)) {
 		kqring_put_sock(op, fp, EAGAIN);
 		return (EAGAIN);
 	}
@@ -419,7 +419,8 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (buf_select) {
 		if (n > 0)
 			cqe_flags |= kqring_buf_commit(ctx, &sel, n);
-		drained = kqring_buf_none(ctx, sqe->buf_group);
+		if (multishot)
+			drained = kqring_buf_drained(&sel);
 		sx_xunlock(&ctx->bg_sx);
 	}
 	if (multishot && n > 0) {
@@ -884,7 +885,7 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 		 * As io_uring: a bundle goes on (IORING_CQE_F_MORE) while the
 		 * group has buffers; the batch that empties it ends it.
 		 */
-		if (error == 0 && !kqring_buf_none(ctx, sqe->buf_group))
+		if (error == 0 && !kqring_buf_drained(&sel))
 			cqe_flags |= IORING_CQE_F_MORE;
 		sx_xunlock(&ctx->bg_sx);
 		fdrop(fp, td);
@@ -1101,7 +1102,7 @@ kqring_exec_recvmsg_multi(struct kqring_ctx *ctx, struct kqring_op *op,
 	rc = kqring_done(op, kqring_xfer_res(n),
 	    kqring_buf_commit(ctx, &sel, n) | IORING_CQE_F_MORE);
 	/* Out of buffers: go again, to end with ENOBUFS. */
-	*more_out = kqring_buf_none(ctx, sqe->buf_group) ||
+	*more_out = kqring_buf_drained(&sel) ||
 	    kqring_so_rcv_pending(so, true);
 	return (rc);
 }

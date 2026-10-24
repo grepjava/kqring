@@ -112,6 +112,7 @@ kqring_buf_select(struct kqring_ctx *ctx, uint16_t bgid, size_t max,
 		error = kqring_bring_tail(bg, &tail);
 		if (error != 0)
 			return (error);
+		sel->tail = tail;
 		/* A buffer consumed in parts is used one at a time. */
 		if ((bg->ring_flags & IOU_PBUF_RING_INC) != 0)
 			nmax = 1;
@@ -165,7 +166,7 @@ kqring_buf_select(struct kqring_ctx *ctx, uint16_t bgid, size_t max,
  * it is empty), so that a receive selecting from it fails ENOBUFS whether
  * or not data is waiting, as io_uring selects before it receives.  A group
  * reserved by another transfer may get its buffers back: not "none".
- * Under ctx->bg_sx.
+ * Under ctx->bg_sx (shared is enough).
  */
 bool
 kqring_buf_none(struct kqring_ctx *ctx, uint16_t bgid)
@@ -173,7 +174,7 @@ kqring_buf_none(struct kqring_ctx *ctx, uint16_t bgid)
 	struct kqring_bgroup *bg;
 	uint16_t tail;
 
-	sx_assert(&ctx->bg_sx, SA_XLOCKED);
+	sx_assert(&ctx->bg_sx, SA_LOCKED);
 	bg = kqring_bgroup_find(ctx, bgid);
 	if (bg == NULL)
 		return (true);
@@ -183,6 +184,23 @@ kqring_buf_none(struct kqring_ctx *ctx, uint16_t bgid)
 		return (STAILQ_EMPTY(&bg->bufs));
 	/* A fault is reported by the selection that follows. */
 	return (kqring_bring_tail(bg, &tail) == 0 && tail == bg->head);
+}
+
+/*
+ * Whether committing sel left its group empty, going by the ring tail
+ * read at selection: buffers added since then make it a false alarm,
+ * which only costs a retry.  Under ctx->bg_sx.
+ */
+bool
+kqring_buf_drained(const struct kqring_sel *sel)
+{
+	const struct kqring_bgroup *bg = sel->bg;
+
+	if (bg->busy)
+		return (false);
+	if (!bg->is_ring)
+		return (STAILQ_EMPTY(&bg->bufs));
+	return (bg->head == sel->tail);
 }
 
 /*

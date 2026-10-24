@@ -537,6 +537,7 @@ struct kqring_sel {
 	struct kqring_bgroup	*bg;
 	u_int			nbufs;
 	uint16_t		bid;		/* first buffer */
+	uint16_t		tail;		/* the ring's tail then */
 	uint64_t		addr0;		/* its address */
 	uint32_t		len0;		/* and full length */
 	uint32_t		lens[KQRING_MAX_BUNDLE]; /* lengths used */
@@ -1179,6 +1180,7 @@ struct kqring_bgroup *kqring_bgroup_find(struct kqring_ctx *ctx, uint16_t bgid);
 int	kqring_buf_select(struct kqring_ctx *ctx, uint16_t bgid, size_t max,
 	    struct iovec *iov, u_int nmax, struct kqring_sel *sel);
 bool	kqring_buf_none(struct kqring_ctx *ctx, uint16_t bgid);
+bool	kqring_buf_drained(const struct kqring_sel *sel);
 uint32_t kqring_buf_commit(struct kqring_ctx *ctx,
 	    const struct kqring_sel *sel, size_t done);
 void	kqring_rsrc_put(struct kqring_ctx *ctx, struct kqring_rsrc *r);
