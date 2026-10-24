@@ -369,9 +369,10 @@ static LIST_HEAD(, kqring_pin_acct) kqring_pin_list =
     LIST_HEAD_INITIALIZER(kqring_pin_list);
 
 /*
- * Pinned physical pages backing a registered buffer (up to
- * KQRING_MAX_ZC_BUF_LEN) for zero-copy SEND_ZC + IORING_RECVSEND_FIXED_BUF,
- * refcounted across the buffer table slot and in-flight EXT_SFBUF mbufs.
+ * Pinned physical pages backing a registered buffer or an in-flight
+ * unregistered zero-copy send (up to KQRING_MAX_ZC_BUF_LEN) for
+ * SEND_ZC / SENDMSG_ZC, refcounted across the buffer table slot (if any)
+ * and in-flight EXT_SFBUF mbufs.
  */
 struct kqring_zc_buf {
 	volatile u_int		refs;
@@ -390,6 +391,8 @@ struct kqring_zc_notif {
 	TAILQ_ENTRY(kqring_zc_notif) link;
 	struct kqring_ctx	*ctx;
 	struct kqring_zc_buf	*zbuf;
+	struct kqring_zc_buf	**zbufs;
+	u_int			nzbufs;
 	struct kqring_rcqe	*rcqe;
 	volatile u_int		refs;
 	bool			on_ctx;
@@ -1498,24 +1501,30 @@ kqring_pin_uncharge(struct kqring_pin_acct *acct, size_t npages)
 
 static int
 kqring_zc_buf_alloc(struct thread *td, vm_offset_t start, size_t len,
-    size_t discount_pages, struct kqring_zc_buf **zbp)
+    vm_prot_t prot, size_t discount_pages, struct kqring_zc_buf **zbp)
 {
+	vm_map_t map = &td->td_proc->p_vmspace->vm_map;
 	struct kqring_pin_acct *acct;
 	struct kqring_zc_buf *zb;
-	vm_offset_t page_base = trunc_page(start);
-	vm_offset_t page_end = round_page(start + len);
-	size_t npages = atop(page_end - page_base);
+	vm_offset_t page_base, page_end;
+	size_t npages;
 	int error, held;
 
+	if (start == 0 || len == 0 || start + len < start ||
+	    start + len > vm_map_max(map))
+		return (EFAULT);
 	if (len > KQRING_MAX_ZC_BUF_LEN)
 		return (ENOMEM);
+	page_base = trunc_page(start);
+	page_end = round_page(start + len);
+	npages = atop(page_end - page_base);
 	error = kqring_pin_charge(td, npages, discount_pages, &acct);
 	if (error != 0)
 		return (error);
 	zb = malloc(sizeof(*zb) + npages * sizeof(vm_page_t), M_KQRING,
 	    M_WAITOK | M_ZERO);
-	held = vm_fault_quick_hold_pages(&td->td_proc->p_vmspace->vm_map,
-	    start, len, VM_PROT_READ | VM_PROT_WRITE, zb->pages, (int)npages);
+	held = vm_fault_quick_hold_pages(map, start, len, prot, zb->pages,
+	    (int)npages);
 	if (held < 0) {
 		free(zb, M_KQRING);
 		kqring_pin_uncharge(acct, npages);
@@ -1541,6 +1550,24 @@ kqring_zc_buf_rele(struct kqring_zc_buf *zb)
 	}
 }
 
+static void
+kqring_zc_notif_free_bufs(struct kqring_zc_notif *zc)
+{
+	if (zc->zbuf != NULL) {
+		kqring_zc_buf_rele(zc->zbuf);
+		zc->zbuf = NULL;
+	}
+	if (zc->zbufs != NULL) {
+		for (u_int i = 0; i < zc->nzbufs; i++) {
+			if (zc->zbufs[i] != NULL)
+				kqring_zc_buf_rele(zc->zbufs[i]);
+		}
+		free(zc->zbufs, M_KQRING);
+		zc->zbufs = NULL;
+		zc->nzbufs = 0;
+	}
+}
+
 static int
 kqring_zc_refresh_cow(struct kqring_ctx *ctx, struct kqring_rsrc *r,
     struct thread *td)
@@ -1556,7 +1583,7 @@ kqring_zc_refresh_cow(struct kqring_ctx *ctx, struct kqring_rsrc *r,
 	    old_zb->acct->uip == td->td_ucred->cr_ruidinfo)
 		discount_pages = (size_t)old_zb->npages;
 	error = kqring_zc_buf_alloc(td, (vm_offset_t)r->addr, r->len,
-	    discount_pages, &new_zb);
+	    VM_PROT_READ | VM_PROT_WRITE, discount_pages, &new_zb);
 	if (error != 0)
 		return (error == ENOMEM ? EOPNOTSUPP : error);
 	r->zbuf = new_zb;
@@ -1606,7 +1633,7 @@ kqring_zc_rele(struct kqring_zc_notif *zc, bool in_issuer)
 		    rcqe->cqe.flags);
 	if (rcqe != NULL)
 		free(rcqe, M_KQRING);
-	kqring_zc_buf_rele(zc->zbuf);
+	kqring_zc_notif_free_bufs(zc);
 	free(zc, M_KQRING);
 	kqring_zc_rele_hold();
 }
@@ -1942,7 +1969,8 @@ kqring_bufs_set(struct kqring_ctx *ctx, uint32_t slot,
 		    old->zbuf->acct->uip == td->td_ucred->cr_ruidinfo)
 			discount_pages = (size_t)old->zbuf->npages;
 		error = kqring_zc_buf_alloc(td, (vm_offset_t)iov->iov_base,
-		    iov->iov_len, discount_pages, &zb);
+		    iov->iov_len, VM_PROT_READ | VM_PROT_WRITE, discount_pages,
+		    &zb);
 		if (error != 0)
 			return (error);
 		r = malloc(sizeof(*r), M_KQRING, M_WAITOK | M_ZERO);
@@ -1966,6 +1994,12 @@ kqring_buf_within(const struct kqring_rsrc *r, uint64_t addr, uint64_t len)
 	return (addr >= r->addr && len <= r->len &&
 	    addr - r->addr <= r->len - len);
 }
+
+struct kqring_msg_args {
+	struct msghdr	msg;		/* msg_iov -> iov[] */
+	uint8_t		name[SOCK_MAXADDRLEN];	/* SENDMSG: msg_name */
+	struct iovec	iov[];		/* then SENDMSG control data */
+};
 
 /*
  * Take the fixed file and registered buffer a request names.  As in
@@ -2002,6 +2036,7 @@ kqring_req_resources(struct kqring_ctx *ctx, struct kqring_op *op)
 	case IORING_OP_WRITEV_FIXED:
 		break;
 	case IORING_OP_SEND_ZC:
+	case IORING_OP_SENDMSG_ZC:
 		if ((sqe->ioprio & IORING_RECVSEND_FIXED_BUF) != 0)
 			break;
 		return (0);
@@ -2014,6 +2049,17 @@ kqring_req_resources(struct kqring_ctx *ctx, struct kqring_op *op)
 			return (EFAULT);
 		r->refs++;
 		op->fbuf = r;
+	}
+	if (sqe->opcode == IORING_OP_SENDMSG_ZC) {
+		const struct kqring_msg_args *ma = op->args;
+
+		for (int i = 0; i < ma->msg.msg_iovlen; i++) {
+			if (!kqring_buf_within(op->fbuf,
+			    (uintptr_t)ma->msg.msg_iov[i].iov_base,
+			    ma->msg.msg_iov[i].iov_len))
+				return (EFAULT);
+		}
+		return (0);
 	}
 	if (kqring_op_readv(sqe->opcode) || kqring_op_writev(sqe->opcode)) {
 		for (uint32_t i = 0; i < sqe->len; i++) {
@@ -2180,11 +2226,6 @@ kqring_done(struct kqring_op *op, int32_t res, uint32_t cflags)
  *   xattr ops:			struct kqring_xattr_args
  *   FUTEX_WAIT(V):		struct kqring_fwait[op->nfwait]
  */
-struct kqring_msg_args {
-	struct msghdr	msg;		/* msg_iov -> iov[] */
-	uint8_t		name[SOCK_MAXADDRLEN];	/* SENDMSG: msg_name */
-	struct iovec	iov[];		/* then SENDMSG control data */
-};
 
 /*
  * RECVMSG with a provided buffer: the msghdr has at most one iovec, whose
@@ -2572,24 +2613,27 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 }
 
 /*
- * Phase A zero-copy send for IORING_OP_SEND_ZC + IORING_RECVSEND_FIXED_BUF
- * on stream sockets (AF_LOCAL and TCP) when the transfer is at least
- * KQRING_ZC_MIN_LEN bytes.  Builds an EXT_SFBUF mbuf chain over the
- * registered buffer's held physical pages and submits it via pr_send.
- * Returns EOPNOTSUPP if the caller should fall back to copying.
+ * Zero-copy send for IORING_OP_SEND_ZC and IORING_OP_SENDMSG_ZC (both
+ * registered IORING_RECVSEND_FIXED_BUF buffers and unregistered user
+ * buffers / scatter-gather iovecs) on stream sockets (AF_LOCAL and TCP)
+ * when the transfer is at least KQRING_ZC_MIN_LEN bytes.  Builds an
+ * EXT_SFBUF mbuf chain over the held physical pages and submits it via
+ * pr_send.  Returns EOPNOTSUPP if the caller should fall back to copying.
  */
 static int
-kqring_send_zc_fixed(struct kqring_ctx *ctx, struct kqring_op *op,
-    struct socket *so, size_t want, int flags, struct thread *td,
-    size_t *np)
+kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
+    struct socket *so, const struct iovec *iov, u_int iovcnt, size_t want,
+    int flags, struct thread *td, size_t *np)
 {
 	const struct io_uring_sqe *sqe = &op->sqe;
-	struct kqring_zc_buf *zbuf;
+	struct kqring_zc_buf *zbuf = NULL;
 	struct kqring_zc_notif *zc;
 	struct kqring_rcqe *rcqe;
 	struct mbuf *top = NULL, *mtail = NULL;
 	vm_offset_t cur;
-	size_t avail = 0, send_len, rem;
+	size_t avail = 0, send_len = 0, rem;
+	u_int nzbufs = 0;
+	bool fixed = (sqe->ioprio & IORING_RECVSEND_FIXED_BUF) != 0;
 	int dom = so->so_proto->pr_domain->dom_family;
 	int error = 0, pr_flags;
 
@@ -2600,10 +2644,14 @@ kqring_send_zc_fixed(struct kqring_ctx *ctx, struct kqring_op *op,
 	    so->so_proto->pr_protocol == IPPROTO_TCP)))
 		return (EOPNOTSUPP);
 
-	error = kqring_zc_refresh_cow(ctx, op->fbuf, td);
-	if (error != 0)
-		return (error);
-	zbuf = op->fbuf->zbuf;
+	if (fixed) {
+		if (op->fbuf == NULL || op->fbuf->zbuf == NULL)
+			return (EOPNOTSUPP);
+		error = kqring_zc_refresh_cow(ctx, op->fbuf, td);
+		if (error != 0)
+			return (error);
+		zbuf = op->fbuf->zbuf;
+	}
 
 	zc = malloc(sizeof(*zc), M_KQRING, M_WAITOK | M_ZERO);
 	rcqe = malloc(sizeof(*rcqe), M_KQRING, M_WAITOK | M_ZERO);
@@ -2618,7 +2666,7 @@ kqring_send_zc_fixed(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (dom == AF_LOCAL) {
 		struct socket *so2;
 		struct sockbuf *sb;
-		u_int sb_space = 0, mb_space = 0, max_pages;
+		u_int sb_space = 0, mb_space = 0, max_pages = 0;
 
 		SOCK_RECVBUF_LOCK(so);
 		if (SOLISTENING(so)) {
@@ -2666,6 +2714,31 @@ kqring_send_zc_fixed(struct kqring_ctx *ctx, struct kqring_op *op,
 		}
 		SOCK_RECVBUF_UNLOCK(so2);
 		sorele(so2);
+
+		if (error == 0) {
+			size_t capped = 0, rem_cap = MIN(want, avail);
+			u_int mbs = 0;
+
+			for (u_int i = 0; i < iovcnt && rem_cap > 0 &&
+			    mbs < max_pages; i++) {
+				vm_offset_t c = (vm_offset_t)iov[i].iov_base;
+				size_t srem = MIN(iov[i].iov_len, rem_cap);
+
+				while (srem > 0 && mbs < max_pages) {
+					size_t chunk = MIN((size_t)PAGE_SIZE -
+					    (c & PAGE_MASK), srem);
+
+					capped += chunk;
+					c += chunk;
+					srem -= chunk;
+					rem_cap -= chunk;
+					mbs++;
+				}
+			}
+			avail = capped;
+			if (avail == 0)
+				error = EWOULDBLOCK;
+		}
 	} else {
 		long space;
 
@@ -2697,8 +2770,48 @@ kqring_send_zc_fixed(struct kqring_ctx *ctx, struct kqring_op *op,
 		if (send_len < KQRING_ZC_MIN_LEN)
 			error = EOPNOTSUPP;
 	}
+	if (error == 0 && !fixed) {
+		size_t rem_cnt = send_len, rem_pin = send_len;
+		u_int k = 0;
+
+		for (u_int i = 0; i < iovcnt && rem_cnt > 0; i++) {
+			if (iov[i].iov_len == 0)
+				continue;
+			nzbufs++;
+			if (iov[i].iov_len >= rem_cnt)
+				break;
+			rem_cnt -= iov[i].iov_len;
+		}
+		if (nzbufs > 1) {
+			zc->zbufs = malloc(nzbufs * sizeof(*zc->zbufs),
+			    M_KQRING, M_WAITOK | M_ZERO);
+			zc->nzbufs = nzbufs;
+		}
+		for (u_int i = 0; i < iovcnt && rem_pin > 0; i++) {
+			size_t seg_len = MIN(iov[i].iov_len, rem_pin);
+			struct kqring_zc_buf *zb = NULL;
+
+			if (seg_len == 0)
+				continue;
+			error = kqring_zc_buf_alloc(td,
+			    (vm_offset_t)iov[i].iov_base, seg_len,
+			    VM_PROT_READ, 0, &zb);
+			if (error != 0) {
+				if (error == ENOMEM || k > 0)
+					error = EOPNOTSUPP;
+				break;
+			}
+			if (nzbufs == 1)
+				zc->zbuf = zb;
+			else
+				zc->zbufs[k] = zb;
+			k++;
+			rem_pin -= seg_len;
+		}
+	}
 	if (error != 0) {
 		SOCK_IO_SEND_UNLOCK(so);
+		kqring_zc_notif_free_bufs(zc);
 		free(rcqe, M_KQRING);
 		free(zc, M_KQRING);
 		return (error);
@@ -2706,6 +2819,7 @@ kqring_send_zc_fixed(struct kqring_ctx *ctx, struct kqring_op *op,
 
 	if (!kqring_zc_hold()) {
 		SOCK_IO_SEND_UNLOCK(so);
+		kqring_zc_notif_free_bufs(zc);
 		free(rcqe, M_KQRING);
 		free(zc, M_KQRING);
 		return (EOPNOTSUPP);
@@ -2716,9 +2830,11 @@ kqring_send_zc_fixed(struct kqring_ctx *ctx, struct kqring_op *op,
 	rcqe->cqe.flags = IORING_CQE_F_NOTIF;
 
 	refcount_init(&zc->refs, 1);
-	refcount_acquire(&zbuf->refs);
+	if (fixed) {
+		refcount_acquire(&zbuf->refs);
+		zc->zbuf = zbuf;
+	}
 	zc->ctx = ctx;
-	zc->zbuf = zbuf;
 	zc->rcqe = rcqe;
 
 	mtx_lock(&kqring_zc_mtx);
@@ -2732,39 +2848,50 @@ kqring_send_zc_fixed(struct kqring_ctx *ctx, struct kqring_op *op,
 	mtx_unlock(&ctx->mtx);
 	mtx_unlock(&kqring_zc_mtx);
 
-	cur = (vm_offset_t)sqe->addr + op->done_io;
 	rem = send_len;
-	while (rem > 0) {
-		size_t pg_idx = (cur - zbuf->page_base) >> PAGE_SHIFT;
-		size_t pg_off = cur & PAGE_MASK;
-		size_t chunk = MIN((size_t)PAGE_SIZE - pg_off, rem);
-		struct sf_buf *sf;
-		struct mbuf *m0;
+	for (u_int i = 0, k = 0; i < iovcnt && rem > 0; i++) {
+		size_t seg_rem = MIN(iov[i].iov_len, rem);
+		struct kqring_zc_buf *seg_zb;
 
-		KASSERT(pg_idx < (size_t)zbuf->npages,
-		    ("kqring: zc page index out of bounds"));
-		sf = sf_buf_alloc(zbuf->pages[pg_idx], SFB_DEFAULT);
-		m0 = m_get(M_WAITOK, MT_DATA);
-		refcount_acquire(&zc->refs);
-		m0->m_ext.ext_buf = (char *)sf_buf_kva(sf);
-		m0->m_ext.ext_size = PAGE_SIZE;
-		m0->m_ext.ext_arg1 = zc;
-		m0->m_ext.ext_arg2 = sf;
-		m0->m_ext.ext_type = EXT_SFBUF;
-		m0->m_ext.ext_flags = EXT_FLAG_EMBREF;
-		m0->m_ext.ext_free = kqring_zc_mext_free;
-		m0->m_ext.ext_count = 1;
-		m0->m_flags |= (M_EXT | M_RDONLY);
-		m0->m_data = (char *)sf_buf_kva(sf) + pg_off;
-		m0->m_len = (int)chunk;
+		if (seg_rem == 0)
+			continue;
+		seg_zb = fixed ? zbuf :
+		    (nzbufs == 1 ? zc->zbuf : zc->zbufs[k]);
+		k++;
+		cur = (vm_offset_t)iov[i].iov_base;
+		while (seg_rem > 0) {
+			size_t pg_idx = (cur - seg_zb->page_base) >> PAGE_SHIFT;
+			size_t pg_off = cur & PAGE_MASK;
+			size_t chunk = MIN((size_t)PAGE_SIZE - pg_off, seg_rem);
+			struct sf_buf *sf;
+			struct mbuf *m0;
 
-		if (mtail != NULL)
-			mtail->m_next = m0;
-		else
-			top = m0;
-		mtail = m0;
-		cur += chunk;
-		rem -= chunk;
+			KASSERT(pg_idx < (size_t)seg_zb->npages,
+			    ("kqring: zc page index out of bounds"));
+			sf = sf_buf_alloc(seg_zb->pages[pg_idx], SFB_DEFAULT);
+			m0 = m_get(M_WAITOK, MT_DATA);
+			refcount_acquire(&zc->refs);
+			m0->m_ext.ext_buf = (char *)sf_buf_kva(sf);
+			m0->m_ext.ext_size = PAGE_SIZE;
+			m0->m_ext.ext_arg1 = zc;
+			m0->m_ext.ext_arg2 = sf;
+			m0->m_ext.ext_type = EXT_SFBUF;
+			m0->m_ext.ext_flags = EXT_FLAG_EMBREF;
+			m0->m_ext.ext_free = kqring_zc_mext_free;
+			m0->m_ext.ext_count = 1;
+			m0->m_flags |= (M_EXT | M_RDONLY);
+			m0->m_data = (char *)sf_buf_kva(sf) + pg_off;
+			m0->m_len = (int)chunk;
+
+			if (mtail != NULL)
+				mtail->m_next = m0;
+			else
+				top = m0;
+			mtail = m0;
+			cur += chunk;
+			seg_rem -= chunk;
+			rem -= chunk;
+		}
 	}
 
 	pr_flags = (flags & MSG_MORETOCOME) != 0 ? PRUS_MORETOCOME : 0;
@@ -2861,14 +2988,12 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 	    kqring_so_stream(so);
 	flags &= ~MSG_WAITALL;
 	if (sqe->opcode == IORING_OP_SEND_ZC &&
-	    (sqe->ioprio & IORING_RECVSEND_FIXED_BUF) != 0 &&
-	    op->fbuf != NULL && op->fbuf->zbuf != NULL &&
 	    to == NULL && !waitall &&
 	    (sqe->msg_flags & (MSG_OOB | MSG_EOR | MSG_EOF |
 	    MSG_DONTROUTE)) == 0 &&
 	    want >= (ssize_t)KQRING_ZC_MIN_LEN) {
-		error = kqring_send_zc_fixed(ctx, op, so, (size_t)want, flags,
-		    td, &n);
+		error = kqring_send_zc_iov(ctx, op, so, iov, iovcnt,
+		    (size_t)want, flags, td, &n);
 		if (error != EOPNOTSUPP) {
 			fdrop(fp, td);
 			if ((rc = kqring_xfer_end(op, error, n)) >= 0)
@@ -3218,7 +3343,8 @@ kqring_sendit(struct thread *td, struct socket *so, struct msghdr *mp,
 
 /* SENDMSG / SENDMSG_ZC: kqring_sendit() on the kernel copy of the msghdr. */
 static int
-kqring_exec_sendmsg(struct kqring_op *op, struct socket *expect)
+kqring_exec_sendmsg(struct kqring_ctx *ctx, struct kqring_op *op,
+    struct socket *expect)
 {
 	const struct io_uring_sqe *sqe = &op->sqe;
 	struct kqring_msg_args *ma = op->args;
@@ -3247,6 +3373,26 @@ kqring_exec_sendmsg(struct kqring_op *op, struct socket *expect)
 
 	msg = ma->msg;
 	size_t want = kqring_iov_len(msg.msg_iov, msg.msg_iovlen);
+	flags = ((int)sqe->msg_flags & ~MSG_WAITALL) | MSG_DONTWAIT |
+	    MSG_NOSIGNAL;
+	if (sqe->opcode == IORING_OP_SENDMSG_ZC &&
+	    msg.msg_name == NULL && msg.msg_controllen == 0 && !waitall &&
+	    (sqe->msg_flags & (MSG_OOB | MSG_EOR | MSG_EOF |
+	    MSG_DONTROUTE)) == 0 &&
+	    want >= KQRING_ZC_MIN_LEN) {
+#ifdef KQRING_MAC
+		error = mac_socket_check_send(td->td_ucred, so);
+		if (error == 0)
+#endif
+			error = kqring_send_zc_iov(ctx, op, so, msg.msg_iov,
+			    (u_int)msg.msg_iovlen, want, flags, td, &n);
+		if (error != EOPNOTSUPP) {
+			fdrop(fp, td);
+			if ((rc = kqring_xfer_end(op, error, n)) >= 0)
+				return (rc);
+			return (kqring_done(op, kqring_xfer_res(n), 0));
+		}
+	}
 	if (msg.msg_controllen != 0) {
 		/* kqring_sendit() consumes the mbuf: rebuild it each attempt. */
 		control = m_get2(msg.msg_controllen, M_WAITOK, MT_CONTROL, 0);
@@ -3254,8 +3400,6 @@ kqring_exec_sendmsg(struct kqring_op *op, struct socket *expect)
 		bcopy(msg.msg_control, mtod(control, void *),
 		    msg.msg_controllen);
 	}
-	flags = ((int)sqe->msg_flags & ~MSG_WAITALL) | MSG_DONTWAIT |
-	    MSG_NOSIGNAL;
 	error = kqring_sendit(td, so, &msg, flags, control, &n);
 	fdrop(fp, td);
 
@@ -5561,7 +5705,7 @@ kqring_op_attempt(struct kqring_ctx *ctx, struct kqring_op *op,
 			break;
 		case IORING_OP_SENDMSG:
 		case IORING_OP_SENDMSG_ZC:
-			rc = kqring_exec_sendmsg(op, expect);
+			rc = kqring_exec_sendmsg(ctx, op, expect);
 			break;
 		case IORING_OP_CONNECT:
 			rc = kqring_exec_connect(op, expect);
@@ -7042,8 +7186,9 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		if (sqe->opcode == IORING_OP_SEND_ZC ||
 		    sqe->opcode == IORING_OP_SENDMSG_ZC)
 			ioprio_ok |= IORING_SEND_ZC_REPORT_USAGE;
-		/* A registered buffer (buf_index) holds SEND_ZC's data. */
-		if (sqe->opcode == IORING_OP_SEND_ZC)
+		/* A registered buffer (buf_index) may hold SEND(_MSG)_ZC data. */
+		if (sqe->opcode == IORING_OP_SEND_ZC ||
+		    sqe->opcode == IORING_OP_SENDMSG_ZC)
 			ioprio_ok |= IORING_RECVSEND_FIXED_BUF;
 		/* SEND may take its data from provided buffers. */
 		if (sqe->opcode == IORING_OP_SEND) {
@@ -7445,8 +7590,8 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 
 	/*
 	 * SEND_ZC / SENDMSG_ZC: IORING_CQE_F_MORE announces the notification
-	 * CQE that the buffer may be reused.  kqring copies the data, so
-	 * that is right away.
+	 * CQE that the buffer may be reused (deferred until EXT_SFBUF mbufs
+	 * are freed on the zero-copy path, or posted immediately when copied).
 	 */
 	zc = op->sqe.opcode == IORING_OP_SEND_ZC ||
 	    op->sqe.opcode == IORING_OP_SENDMSG_ZC;

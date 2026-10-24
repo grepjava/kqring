@@ -2782,6 +2782,157 @@ test_send_zc(struct test_ring *r)
 	close(sv[1]);
 	assert(kqring_register(r->fd, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
 
+	/*
+	 * Phase B: unregistered user-buffer zero-copy SEND_ZC and
+	 * scatter/gather SENDMSG_ZC (both unregistered and FIXED_BUF).
+	 */
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	memset(zbuf, 'B', zlen);
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, sv[0], 30540);
+	sqe->addr = (uint64_t)(uintptr_t)zbuf;
+	sqe->len = (uint32_t)zlen;
+	sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 1);
+	c = expect_cqe(r, 30540, (int32_t)zlen);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	/* Mutate unregistered buffer in-flight before peer reads. */
+	zbuf[0] = 'M';
+	zbuf[zlen - 1] = 'N';
+	assert(read(sv[1], rbuf, zlen) == (ssize_t)zlen);
+	assert(rbuf[0] == 'M' && rbuf[1] == 'B' && rbuf[zlen - 1] == 'N');
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = expect_cqe(r, 30540, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+
+	/* Read-only (PROT_READ) unregistered buffer works with SEND_ZC. */
+	assert(mprotect(zbuf, zlen, PROT_READ) == 0);
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, sv[0], 30541);
+	sqe->addr = (uint64_t)(uintptr_t)zbuf;
+	sqe->len = (uint32_t)zlen;
+	sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 1);
+	c = expect_cqe(r, 30541, (int32_t)zlen);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	assert(read(sv[1], rbuf, zlen) == (ssize_t)zlen);
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = expect_cqe(r, 30541, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	assert(mprotect(zbuf, zlen, PROT_READ | PROT_WRITE) == 0);
+
+	/* Below PAGE_SIZE threshold falls back to copy (ZC_COPIED). */
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, sv[0], 30542);
+	sqe->addr = (uint64_t)(uintptr_t)zbuf;
+	sqe->len = (uint32_t)(page - 1);
+	sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	c = expect_cqe(r, 30542, (int32_t)(page - 1));
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	c = expect_cqe(r, 30542, (int32_t)IORING_NOTIF_USAGE_ZC_COPIED);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	assert(read(sv[1], rbuf, page - 1) == (ssize_t)(page - 1));
+
+	/* RLIMIT_MEMLOCK exhaustion on unregistered SEND_ZC falls back to copy. */
+	rl.rlim_cur = (rlim_t)page;
+	rl.rlim_max = old_rl.rlim_max;
+	assert(setrlimit(RLIMIT_MEMLOCK, &rl) == 0);
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, sv[0], 30543);
+	sqe->addr = (uint64_t)(uintptr_t)zbuf;
+	sqe->len = (uint32_t)zlen;
+	sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	c = expect_cqe(r, 30543, (int32_t)zlen);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	c = expect_cqe(r, 30543, (int32_t)IORING_NOTIF_USAGE_ZC_COPIED);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	assert(read(sv[1], rbuf, zlen) == (ssize_t)zlen);
+	assert(setrlimit(RLIMIT_MEMLOCK, &old_rl) == 0);
+
+	/*
+	 * Scatter/gather SENDMSG_ZC across two separate unregistered buffers
+	 * (1 page each, total 2 pages): zero-copy over both segments.
+	 */
+	char *zbuf2 = mmap(NULL, page, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(zbuf2 != MAP_FAILED);
+	memset(zbuf, '1', page);
+	memset(zbuf2, '2', page);
+	struct iovec sgiov[2] = {
+		{ .iov_base = zbuf, .iov_len = page },
+		{ .iov_base = zbuf2, .iov_len = page },
+	};
+	struct msghdr sgmsg = { .msg_iov = sgiov, .msg_iovlen = 2 };
+	sqe = ring_prep(r, IORING_OP_SENDMSG_ZC, sv[0], 30544);
+	sqe->addr = (uint64_t)(uintptr_t)&sgmsg;
+	sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 1);
+	c = expect_cqe(r, 30544, (int32_t)zlen);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	/* Mutate both segments while unread in sv[1] to prove zero-copy. */
+	zbuf[0] = 'X';
+	zbuf2[page - 1] = 'W';
+	assert(read(sv[1], rbuf, zlen) == (ssize_t)zlen);
+	assert(rbuf[0] == 'X' && rbuf[1] == '1' &&
+	    rbuf[page] == '2' && rbuf[zlen - 1] == 'W');
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = expect_cqe(r, 30544, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+
+	/* SENDMSG_ZC + IORING_RECVSEND_FIXED_BUF across two slices in slot 0. */
+	assert(kqring_register(r->fd, IORING_REGISTER_BUFFERS, &ziov, 1) == 0);
+	memset(zbuf, 'F', page);
+	memset(zbuf + page, 'G', page);
+	struct iovec fgiov[2] = {
+		{ .iov_base = zbuf, .iov_len = page },
+		{ .iov_base = zbuf + page, .iov_len = page },
+	};
+	struct msghdr fgmsg = { .msg_iov = fgiov, .msg_iovlen = 2 };
+	sqe = ring_prep(r, IORING_OP_SENDMSG_ZC, sv[0], 30545);
+	sqe->addr = (uint64_t)(uintptr_t)&fgmsg;
+	sqe->ioprio = IORING_RECVSEND_FIXED_BUF | IORING_SEND_ZC_REPORT_USAGE;
+	sqe->buf_index = 0;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 1);
+	c = expect_cqe(r, 30545, (int32_t)zlen);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	assert(read(sv[1], rbuf, zlen) == (ssize_t)zlen);
+	assert(rbuf[0] == 'F' && rbuf[page] == 'G');
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = expect_cqe(r, 30545, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+
+	/* Out-of-bounds iovec with SENDMSG_ZC + FIXED_BUF fails -EFAULT. */
+	struct iovec badiov[2] = {
+		{ .iov_base = zbuf, .iov_len = page },
+		{ .iov_base = zbuf2, .iov_len = page },
+	};
+	struct msghdr badmsg = { .msg_iov = badiov, .msg_iovlen = 2 };
+	sqe = ring_prep(r, IORING_OP_SENDMSG_ZC, sv[0], 30546);
+	sqe->addr = (uint64_t)(uintptr_t)&badmsg;
+	sqe->ioprio = IORING_RECVSEND_FIXED_BUF;
+	sqe->buf_index = 0;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	c = expect_cqe(r, 30546, -EFAULT);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	c = expect_cqe(r, 30546, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	assert(kqring_register(r->fd, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+	munmap(zbuf2, page);
+	close(sv[0]);
+	close(sv[1]);
+
 	/* Closing a ring while zero-copy mbufs remain unread in peer socket. */
 	struct test_ring zr;
 	ring_init(&zr);
