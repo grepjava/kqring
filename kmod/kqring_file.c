@@ -6,6 +6,10 @@
 
 #include "kqring_var.h"
 
+#include <sys/bio.h>
+#include <sys/buf.h>
+#include <geom/geom.h>
+
 static bool
 kqring_pipe_readable(const struct file *fp)
 {
@@ -125,6 +129,214 @@ kqring_rw_fget(struct kqring_op *op, bool is_write, struct file **fpp,
 	return (0);
 }
 
+/* ============================================================================
+ * Disk devices: block I/O without a worker
+ * ============================================================================
+ *
+ * A positioned READ / WRITE (plain, vectored or _FIXED) on a disk device
+ * (/dev/ada0, nda0, md0, ... or a GEOM partition) is sent to the driver
+ * as bios over the user's held pages, as aio(4) does (aio_qbio()), and
+ * completes from the bio callback: no worker thread, and any number in
+ * flight.  Like io_uring's block requests, bios in flight cannot be
+ * cancelled (ASYNC_CANCEL finds them -EALREADY), and ring teardown waits
+ * for them.  Anything the driver path cannot take (unaligned lengths,
+ * transfers over maxphys or the device's limit, drivers without unmapped
+ * I/O) runs on a worker as before.
+ */
+
+static void
+kqring_bio_pages_free(struct bio *bp)
+{
+	vm_page_unhold_pages(bp->bio_ma, bp->bio_ma_n);
+	free(bp->bio_ma, M_KQRING);
+	g_destroy_bio(bp);
+}
+
+/*
+ * A bio finished (from the driver or GEOM, in any thread).  The last one
+ * queues the request as taskwork; the owner posts its CQE.
+ */
+static void
+kqring_bio_done(struct bio *bp)
+{
+	struct kqring_op *op = bp->bio_caller1;
+	struct kqring_ctx *ctx = op->ctx;
+	int error;
+
+	if ((bp->bio_flags & BIO_ERROR) != 0)
+		atomic_store_int(&op->bio_errno, bp->bio_error);
+	atomic_add_long(&op->bio_bytes, (u_long)(bp->bio_bcount -
+	    bp->bio_resid));
+	kqring_bio_pages_free(bp);
+	if (!refcount_release(&op->bio_refs))
+		return;
+
+	error = atomic_load_int(&op->bio_errno);
+	mtx_lock(&ctx->mtx);
+	op->res = error != 0 ? kqring_errno(error) :
+	    kqring_xfer_res(atomic_load_long(&op->bio_bytes));
+	op->cflags = 0;
+	op->bio_done = true;
+	ctx->bio_held -= op->bio_len;
+	kqring_taskwork_add_locked(ctx, op);
+	/* After this, op and ctx may be freed by a teardown waiting here. */
+	if (--ctx->nbio == 0 && ctx->closing)
+		wakeup(&ctx->nbio);
+	mtx_unlock(&ctx->mtx);
+}
+
+/*
+ * Send op to fp's disk driver if it can go there.  Returns true if it was
+ * sent (op is armed and completes from kqring_bio_done()), false if it
+ * must run some other way; op is unchanged then.
+ */
+static bool
+kqring_file_bio(struct kqring_ctx *ctx, struct kqring_op *op,
+    struct file *fp, bool is_write)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct bio *bios[KQRING_BIO_MAX_IOV];
+	struct iovec aiov, *iov = &aiov;
+	struct vnode *vp = fp->f_vnode;
+	struct cdevsw *csw;
+	struct cdev *dev;
+	off_t offset = (off_t)sqe->off;
+	size_t total = 0;
+	u_int iovcnt = 1, bsize, i, n = 0;
+	vm_prot_t prot;
+	int ref;
+
+	if (fp->f_type != DTYPE_VNODE || vp == NULL || vp->v_type != VCHR ||
+	    offset < 0 || (sqe->flags & IOSQE_BUFFER_SELECT) != 0)
+		return (false);
+	bsize = vp->v_bufobj.bo_bsize;
+	if (bsize == 0)
+		return (false);
+	if (kqring_op_readv(sqe->opcode) || kqring_op_writev(sqe->opcode)) {
+		iov = op->args;
+		iovcnt = sqe->len;
+	} else {
+		aiov.iov_base = (void *)(uintptr_t)sqe->addr;
+		aiov.iov_len = sqe->len;
+	}
+	if (iovcnt == 0 || iovcnt > KQRING_BIO_MAX_IOV)
+		return (false);
+	for (i = 0; i < iovcnt; i++) {
+		if (iov[i].iov_len == 0 || iov[i].iov_len % bsize != 0 ||
+		    iov[i].iov_len > maxphys)
+			return (false);
+		total += iov[i].iov_len;
+	}
+	if (total > INT32_MAX || offset > OFF_MAX - (off_t)total)
+		return (false);
+
+	csw = devvn_refthread(vp, &dev, &ref);
+	if (csw == NULL)
+		return (false);
+	if ((csw->d_flags & D_DISK) == 0 || total > (size_t)dev->si_iosize_max ||
+	    (dev->si_flags & SI_UNMAPPED) == 0 || !unmapped_buf_allowed) {
+		dev_relthread(dev, ref);
+		return (false);
+	}
+	mtx_lock(&ctx->mtx);
+	if (ctx->bio_held + total > KQRING_BIO_MAX_HELD) {
+		mtx_unlock(&ctx->mtx);
+		dev_relthread(dev, ref);
+		return (false);
+	}
+	ctx->bio_held += total;
+	mtx_unlock(&ctx->mtx);
+
+	/* A read from the disk writes the user's pages. */
+	prot = is_write ? VM_PROT_READ : VM_PROT_READ | VM_PROT_WRITE;
+	for (n = 0; n < iovcnt; n++) {
+		struct bio *bp;
+		vm_offset_t va = (vm_offset_t)iov[n].iov_base;
+		size_t len = iov[n].iov_len;
+		int maxpages = (int)atop(round_page(len)) + 1;
+		vm_page_t *pages;
+		int npages;
+
+		pages = malloc(sizeof(*pages) * maxpages, M_KQRING, M_WAITOK);
+		npages = vm_fault_quick_hold_pages(
+		    &curproc->p_vmspace->vm_map, va, len, prot, pages,
+		    maxpages);
+		if (npages < 0) {
+			free(pages, M_KQRING);
+			break;
+		}
+		bp = g_alloc_bio();
+		bp->bio_cmd = is_write ? BIO_WRITE : BIO_READ;
+		bp->bio_offset = offset;
+		bp->bio_length = len;
+		bp->bio_bcount = len;
+		bp->bio_dev = dev;
+		bp->bio_done = kqring_bio_done;
+		bp->bio_caller1 = op;
+		bp->bio_ma = pages;
+		bp->bio_ma_n = npages;
+		bp->bio_ma_offset = va & PAGE_MASK;
+		bp->bio_data = unmapped_buf;
+		bp->bio_flags |= BIO_UNMAPPED;
+		bios[n] = bp;
+		offset += len;
+	}
+	if (n < iovcnt) {
+		/* A buffer could not be held: the worker reports EFAULT. */
+		while (n > 0)
+			kqring_bio_pages_free(bios[--n]);
+		mtx_lock(&ctx->mtx);
+		ctx->bio_held -= total;
+		mtx_unlock(&ctx->mtx);
+		dev_relthread(dev, ref);
+		return (false);
+	}
+
+	if (!fhold(fp)) {
+		while (n > 0)
+			kqring_bio_pages_free(bios[--n]);
+		mtx_lock(&ctx->mtx);
+		ctx->bio_held -= total;
+		mtx_unlock(&ctx->mtx);
+		dev_relthread(dev, ref);
+		return (false);
+	}
+	op->bio_fp = fp;
+	op->bio = true;
+	op->bio_done = false;
+	op->bio_errno = 0;
+	op->bio_bytes = 0;
+	op->bio_len = total;
+	refcount_init(&op->bio_refs, iovcnt);
+	mtx_lock(&ctx->mtx);
+	ctx->nbio++;
+	kqring_op_arm_locked(ctx, op);
+	mtx_unlock(&ctx->mtx);
+	for (i = 0; i < iovcnt; i++)
+		csw->d_strategy(bios[i]);
+	dev_relthread(dev, ref);
+	return (true);
+}
+
+/*
+ * kqring_file_bio() for a request that does not first try the inline
+ * paths (IORING_SETUP_IOPOLL rings).
+ */
+bool
+kqring_file_bio_try(struct kqring_ctx *ctx, struct kqring_op *op,
+    bool is_write)
+{
+	struct file *fp;
+	bool sent;
+	int flags;
+
+	if (kqring_rw_fget(op, is_write, &fp, &flags) != 0)
+		return (false);
+	sent = flags != 0 && kqring_file_bio(ctx, op, fp, is_write);
+	fdrop(fp, curthread);
+	return (sent);
+}
+
 /*
  * READ / WRITE on a descriptor that is not a socket, on the issuer when
  * that cannot block it, as io_uring tries non-blocking I/O before punting
@@ -140,12 +352,16 @@ kqring_rw_fget(struct kqring_op *op, bool is_write, struct file **fpp,
  *    A destination that is not mapped yet, or a contended range, also
  *    goes to the worker.
  *
- * Returns true with op->res set if the request completed.  Otherwise op is
- * unchanged and goes to a worker; a read that copied only part of a range
- * (a page was not resident) is redone there in full, so the result is the
- * same as if it had never been tried.
+ * A positioned read or write of a disk device goes to its driver instead
+ * (kqring_file_bio()).
+ *
+ * Returns KQRING_RW_DONE with op->res set if the request completed, or
+ * KQRING_RW_BIO if it was sent to a disk driver.  Otherwise
+ * (KQRING_RW_PUNT) op is unchanged and goes to a worker; a read that
+ * copied only part of a range (a page was not resident) is redone there in
+ * full, so the result is the same as if it had never been tried.
  */
-bool
+int
 kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
     bool is_write)
 {
@@ -163,19 +379,25 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	int error, flags, save;
 
 	if (kqring_rw_fget(op, is_write, &fp, &flags) != 0)
-		return (false);		/* the worker reports the error */
+		return (KQRING_RW_PUNT);	/* the worker reports the error */
 	if (fp->f_type == DTYPE_PIPE && (fp->f_flag & FNONBLOCK) != 0) {
 		fdrop(fp, td);
 		kqring_exec_file_rw(ctx, op, is_write);
-		return (true);
+		return (KQRING_RW_DONE);
 	}
 	vp = fp->f_vnode;
+	if (flags != 0 && vp != NULL && vp->v_type == VCHR) {
+		bool sent = kqring_file_bio(ctx, op, fp, is_write);
+
+		fdrop(fp, td);
+		return (sent ? KQRING_RW_BIO : KQRING_RW_PUNT);
+	}
 	if (is_write || flags == 0 || (sqe->flags & IOSQE_BUFFER_SELECT) != 0 ||
 	    fp->f_type != DTYPE_VNODE || vp->v_type != VREG ||
 	    (fp->f_flag & O_DIRECT) != 0 || mac_vnode_check_read_enabled() ||
 	    (vn_irflag_read(vp) & (VIRF_DOOMED | VIRF_PGREAD)) != VIRF_PGREAD) {
 		fdrop(fp, td);
-		return (false);
+		return (KQRING_RW_PUNT);
 	}
 	if (kqring_op_readv(sqe->opcode)) {
 		iov = op->args;
@@ -189,7 +411,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	want = auio.uio_resid;
 	if (want == 0 || auio.uio_offset > OFF_MAX - want) {
 		fdrop(fp, td);
-		return (false);
+		return (KQRING_RW_PUNT);
 	}
 	/*
 	 * As vn_io_fault() does for read(2): hold the range against writers
@@ -202,7 +424,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	rl = vn_rangelock_tryrlock(vp, auio.uio_offset, auio.uio_offset + want);
 	if (rl == NULL) {
 		fdrop(fp, td);
-		return (false);
+		return (KQRING_RW_PUNT);
 	}
 	save = vm_fault_disable_pagefaults();
 	error = VOP_READ_PGCACHE(vp, &auio, 0, fp->f_cred);
@@ -211,7 +433,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	done = (size_t)(want - auio.uio_resid);
 	if (error == EFAULT) {
 		fdrop(fp, td);
-		return (false);
+		return (KQRING_RW_PUNT);
 	}
 	if (error == EJUSTRETURN) {
 		/*
@@ -223,7 +445,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 		if (done == 0 || obj == NULL || auio.uio_offset <
 		    (off_t)atomic_load_64(&obj->un_pager.vnp.vnp_size)) {
 			fdrop(fp, td);
-			return (false);
+			return (KQRING_RW_PUNT);
 		}
 		error = 0;
 	}
@@ -234,7 +456,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 		kqring_done(op, kqring_errno(error), 0);
 	else
 		kqring_done(op, kqring_xfer_res(done), 0);
-	return (true);
+	return (KQRING_RW_DONE);
 }
 
 /*

@@ -147,6 +147,13 @@ MALLOC_DECLARE(M_SELFD);
  */
 #define KQRING_ZC_LOCAL_MIN_LEN	(32U * 1024)
 #define KQRING_MAX_ZC_BUF_LEN	(16U * 1024 * 1024)
+/*
+ * Disk-device I/O sent straight to the driver (kqring_file_bio()): at most
+ * this many iovecs per request, and this much user memory held per ring
+ * by requests in flight; beyond either, the request runs on a worker.
+ */
+#define KQRING_BIO_MAX_IOV	16
+#define KQRING_BIO_MAX_HELD	(64UL * 1024 * 1024)
 #define KQRING_MAX_ZC_PAGES	16384U
 #define KQRING_MAX_PERSONALITIES 1024U
 /* Buffers handed over with PROVIDE_BUFFERS and not yet used, per group. */
@@ -293,6 +300,18 @@ struct kqring_op {
 	struct kqring_zc_notif	*zc_notif;
 	struct ucred		*cred;
 	struct file		*sock_fp;	/* socket held while retried */
+	/*
+	 * Block I/O on a disk device, sent straight to its driver
+	 * (kqring_file_bio()): bios in flight, and their summed results
+	 * (updated by the completions, which may run concurrently).
+	 */
+	struct file		*bio_fp;	/* the device, held until free */
+	bool			bio;		/* sent as bios; not cancelable */
+	bool			bio_done;	/* all bios done; res is set */
+	u_int			bio_refs;	/* bios not yet completed */
+	int			bio_errno;
+	u_long			bio_bytes;
+	size_t			bio_len;	/* bytes held in user pages */
 	/*
 	 * Not cleared when the op is reused (kqring_op_alloc()): the
 	 * callout is initialized once timer_init is set, and the SQE copied
@@ -663,6 +682,12 @@ struct kqring_ctx {
 	 * never calls the so_snd upcall; the wait loop polls them.
 	 */
 	int			npolled;
+	/*
+	 * kqring_file_bio() requests in flight and the user memory they
+	 * hold, under mtx.  Teardown waits for nbio to reach 0.
+	 */
+	uint32_t		nbio;
+	size_t			bio_held;
 	int			wakeup_chan;
 	bool			sleeping;	/* owner in msleep; under mtx */
 	/*
@@ -755,6 +780,14 @@ static inline bool
 kqring_op_writev(uint8_t opcode)
 {
 	return (opcode == IORING_OP_WRITEV || opcode == IORING_OP_WRITEV_FIXED);
+}
+
+/* READ / WRITE and their vectored and _FIXED forms: whether a write. */
+static inline bool
+kqring_op_is_write(uint8_t opcode)
+{
+	return (opcode == IORING_OP_WRITE || opcode == IORING_OP_WRITEV ||
+	    opcode == IORING_OP_WRITE_FIXED || opcode == IORING_OP_WRITEV_FIXED);
 }
 
 static inline struct kqring_bgroup_list *
@@ -1113,7 +1146,13 @@ bool	kqring_pipe_will_block(const struct file *fp, bool is_write,
 	    size_t want);
 int	kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 	    bool is_write);
-bool	kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
+/* kqring_file_rw_inline() results. */
+#define	KQRING_RW_PUNT	0	/* not run: give it to a worker */
+#define	KQRING_RW_DONE	1	/* completed; op->res is set */
+#define	KQRING_RW_BIO	2	/* sent to the disk driver; op is armed */
+int	kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
+	    bool is_write);
+bool	kqring_file_bio_try(struct kqring_ctx *ctx, struct kqring_op *op,
 	    bool is_write);
 int	kqring_exec_read_multishot(struct kqring_ctx *ctx, struct kqring_op *op,
 	    struct socket *expect, bool *more_out);

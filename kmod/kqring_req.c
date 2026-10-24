@@ -393,6 +393,10 @@ kqring_op_free(struct kqring_op *op)
 		fdrop(op->sock_fp, curthread);
 		op->sock_fp = NULL;
 	}
+	if (op->bio_fp != NULL) {
+		fdrop(op->bio_fp, curthread);
+		op->bio_fp = NULL;
+	}
 	if (op->args != NULL) {
 		struct kqring_fwait *fw = op->args;
 
@@ -1783,11 +1787,13 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 				    kqring_op_wq_type(op));
 				break;
 			}
+			if (kqring_file_bio_try(ctx, op,
+			    kqring_op_is_write(sqe->opcode))) {
+				armed = true;
+				break;
+			}
 			kqring_exec_file_rw(ctx, op,
-			    sqe->opcode == IORING_OP_WRITE ||
-			    sqe->opcode == IORING_OP_WRITEV ||
-			    sqe->opcode == IORING_OP_WRITE_FIXED ||
-			    sqe->opcode == IORING_OP_WRITEV_FIXED);
+			    kqring_op_is_write(sqe->opcode));
 			kqring_req_complete(ctx, op, op->res, op->cflags);
 			return;
 		}
@@ -1798,18 +1804,21 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 		 * unless they can complete here without blocking.
 		 */
 		if (!kqring_op_is_socket(op)) {
-			if ((sqe->flags & IOSQE_ASYNC) == 0 &&
-			    kqring_file_rw_inline(ctx, op,
-			    sqe->opcode == IORING_OP_WRITE ||
-			    sqe->opcode == IORING_OP_WRITEV ||
-			    sqe->opcode == IORING_OP_WRITE_FIXED ||
-			    sqe->opcode == IORING_OP_WRITEV_FIXED)) {
+			int rw = KQRING_RW_PUNT;
+
+			if ((sqe->flags & IOSQE_ASYNC) == 0)
+				rw = kqring_file_rw_inline(ctx, op,
+				    kqring_op_is_write(sqe->opcode));
+			if (rw == KQRING_RW_DONE) {
 				kqring_req_complete(ctx, op, op->res,
 				    op->cflags);
 				return;
 			}
-			armed = kqring_wq_enqueue(ctx, op,
-			    kqring_op_wq_type(op));
+			if (rw == KQRING_RW_BIO)
+				armed = true;
+			else
+				armed = kqring_wq_enqueue(ctx, op,
+				    kqring_op_wq_type(op));
 			break;
 		}
 		op->sock_rw = true;
@@ -1989,7 +1998,8 @@ kqring_taskwork_run_one(struct kqring_ctx *ctx, struct kqring_op *op)
 		    op->wq_cancel_flags);
 		return;
 	}
-	if (op->wq_done) {
+	/* A worker, or the last of a disk request's bios, finished. */
+	if (op->wq_done || op->bio_done) {
 		int32_t res = op->res;
 
 		if (op->wq_fp != NULL) {

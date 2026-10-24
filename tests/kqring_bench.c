@@ -18,6 +18,7 @@
  * usage: kqring_bench [group ...]	(default: all groups)
  */
 
+#include <sys/param.h>
 #include <sys/types.h>
 #include <sys/event.h>
 #include <sys/mman.h>
@@ -1096,6 +1097,102 @@ bench_timer(void)
 	ring_fini(&r);
 }
 
+/* ------------------------------------------------------------------------
+ * disk: 4 KiB random reads and writes on a disk device, which kqring sends
+ * to the driver as bios.  IOSQE_ASYNC rows force the worker path instead.
+ * Needs a scratch device the benchmark may overwrite, named by
+ * KQRING_BENCH_DISK (for example an md(4) malloc disk); skipped otherwise.
+ * ------------------------------------------------------------------------
+ */
+
+#define DISK_ITERS	100000
+#define DISK_BATCH	32
+#define DISK_BLK	4096
+
+static void
+disk_ring(const char *group, const char *variant, struct ring *r, int fd,
+    uint8_t opcode, uint8_t sqe_flags, int batch, off_t blocks)
+{
+	static char buf[DISK_BATCH][DISK_BLK] __attribute__((aligned(4096)));
+	uint32_t seed = 4321;
+	uint64_t t0 = now_ns();
+
+	for (int i = 0; i < DISK_ITERS / batch; i++) {
+		for (int j = 0; j < batch; j++) {
+			struct io_uring_sqe *sqe = ring_prep(r, opcode, fd, 1);
+
+			seed = seed * 1103515245U + 12345U;
+			sqe->flags = sqe_flags;
+			sqe->addr = (uint64_t)(uintptr_t)buf[j];
+			sqe->len = DISK_BLK;
+			sqe->off = (uint64_t)((seed >> 8) % blocks) * DISK_BLK;
+		}
+		ring_enter(r, (unsigned)batch);
+		for (int j = 0; j < batch; j++) {
+			while (ring_ready(r) == 0)
+				ring_enter(r, 1);
+			assert(ring_pop(r).res == DISK_BLK);
+		}
+	}
+	row(group, variant, now_ns() - t0, (DISK_ITERS / batch) * batch);
+}
+
+static void
+bench_disk(void)
+{
+	static char buf[DISK_BLK] __attribute__((aligned(4096)));
+	const char *path = getenv("KQRING_BENCH_DISK");
+	uint32_t seed = 4321;
+	struct ring r;
+	off_t size, blocks;
+	uint64_t t0;
+	int fd;
+
+	if (path == NULL) {
+		fprintf(stderr, "disk: KQRING_BENCH_DISK not set, skipped\n");
+		return;
+	}
+	fd = open(path, O_RDWR);
+	assert(fd >= 0);
+	size = lseek(fd, 0, SEEK_END);
+	assert(size >= DISK_BLK);
+	blocks = MIN(size, (off_t)64 << 20) / DISK_BLK;
+
+	t0 = now_ns();
+	for (int i = 0; i < DISK_ITERS; i++) {
+		seed = seed * 1103515245U + 12345U;
+		assert(pread(fd, buf, DISK_BLK,
+		    (off_t)((seed >> 8) % blocks) * DISK_BLK) == DISK_BLK);
+	}
+	row("disk_read_4k", "pread", now_ns() - t0, DISK_ITERS);
+	ring_init(&r);
+	disk_ring("disk_read_4k", "kqring_read", &r, fd, IORING_OP_READ, 0, 1,
+	    blocks);
+	disk_ring("disk_read_4k", "kqring_read_worker", &r, fd,
+	    IORING_OP_READ, IOSQE_ASYNC, 1, blocks);
+	disk_ring("disk_read_4k", "kqring_read_batch32", &r, fd,
+	    IORING_OP_READ, 0, DISK_BATCH, blocks);
+	disk_ring("disk_read_4k", "kqring_read_worker_batch32", &r, fd,
+	    IORING_OP_READ, IOSQE_ASYNC, DISK_BATCH, blocks);
+
+	seed = 4321;
+	t0 = now_ns();
+	for (int i = 0; i < DISK_ITERS; i++) {
+		seed = seed * 1103515245U + 12345U;
+		assert(pwrite(fd, buf, DISK_BLK,
+		    (off_t)((seed >> 8) % blocks) * DISK_BLK) == DISK_BLK);
+	}
+	row("disk_write_4k", "pwrite", now_ns() - t0, DISK_ITERS);
+	disk_ring("disk_write_4k", "kqring_write", &r, fd, IORING_OP_WRITE, 0,
+	    1, blocks);
+	disk_ring("disk_write_4k", "kqring_write_worker", &r, fd,
+	    IORING_OP_WRITE, IOSQE_ASYNC, 1, blocks);
+	disk_ring("disk_write_4k", "kqring_write_batch32", &r, fd,
+	    IORING_OP_WRITE, 0, DISK_BATCH, blocks);
+	ring_fini(&r);
+	close(fd);
+}
+
 static const struct {
 	const char	*name;
 	void		(*fn)(void);
@@ -1108,6 +1205,7 @@ static const struct {
 	{ "file",	bench_file },
 	{ "send",	bench_send },
 	{ "timer",	bench_timer },
+	{ "disk",	bench_disk },
 };
 
 int

@@ -5531,6 +5531,157 @@ prep_pread(struct test_ring *r, int fd, void *buf, size_t len, off_t off,
 	ring_push_sqe(r);
 }
 
+/* Prepare a positioned READ / WRITE (plain, V or _FIXED) on fd. */
+static struct io_uring_sqe *
+prep_rw(struct test_ring *r, uint8_t opcode, int fd, void *addr,
+    uint32_t len, off_t off, uint64_t ud)
+{
+	struct io_uring_sqe *sqe = ring_prep(r, opcode, fd, ud);
+
+	sqe->addr = (uint64_t)(uintptr_t)addr;
+	sqe->len = len;
+	sqe->off = (uint64_t)off;
+	ring_push_sqe(r);
+	return (sqe);
+}
+
+/* Submit everything pending, wait for `n` CQEs, and pop the first. */
+static struct io_uring_cqe
+submit_wait(struct test_ring *r, unsigned n)
+{
+	assert(ring_wait(r, n, 5000) == 0);
+	assert(ring_cq_ready(r) >= n);
+	return (ring_pop_cqe(r));
+}
+
+/*
+ * READ / WRITE on a disk device go straight to its driver as bios, with no
+ * worker thread (kqring_file_bio()).  Needs a scratch disk the test may
+ * overwrite, named by KQRING_TEST_DISK (for example an md(4) malloc disk:
+ * mdconfig -a -t malloc -s 64m, then chown it to the test user).
+ */
+#define DISK_IOS	64
+static void
+test_disk_bio(void)
+{
+	const char *path = getenv("KQRING_TEST_DISK");
+	static char wbuf[DISK_IOS][4096] __attribute__((aligned(4096)));
+	static char rbuf[DISK_IOS][4096] __attribute__((aligned(4096)));
+	static char fixed[2 * 4096] __attribute__((aligned(4096)));
+	struct iovec iov[2];
+	struct io_uring_cqe c;
+	struct test_ring t;
+	int fd, i, seen;
+
+	if (path == NULL) {
+		printf("[SKIP] disk bio path: KQRING_TEST_DISK not set\n");
+		return;
+	}
+	fd = open(path, O_RDWR);
+	assert(fd >= 0);
+	ring_init(&t);
+
+	/* Writes and reads through the driver, many in flight at once. */
+	for (i = 0; i < DISK_IOS; i++) {
+		memset(wbuf[i], 'a' + i % 26, sizeof(wbuf[i]));
+		wbuf[i][0] = (char)i;
+		prep_rw(&t, IORING_OP_WRITE, fd, wbuf[i], 4096,
+		    (off_t)i * 4096, 50000 + i);
+	}
+	for (seen = 0; seen < DISK_IOS; seen++) {
+		c = submit_wait(&t, 1);
+		assert(c.user_data >= 50000 && c.user_data < 50000 + DISK_IOS);
+		assert(c.res == 4096);
+	}
+	for (i = 0; i < DISK_IOS; i++)
+		prep_rw(&t, IORING_OP_READ, fd, rbuf[i], 4096,
+		    (off_t)i * 4096, 51000 + i);
+	for (seen = 0; seen < DISK_IOS; seen++) {
+		c = submit_wait(&t, 1);
+		assert(c.res == 4096);
+	}
+	assert(memcmp(wbuf, rbuf, sizeof(wbuf)) == 0);
+
+	/* READV across two iovecs (one unaligned in memory) in one request. */
+	memset(rbuf, 0, sizeof(rbuf));
+	iov[0].iov_base = rbuf[0];
+	iov[0].iov_len = 4096;
+	iov[1].iov_base = rbuf[2] + 512;
+	iov[1].iov_len = 1024;
+	prep_rw(&t, IORING_OP_READV, fd, iov, 2, 0, 52000);
+	c = submit_wait(&t, 1);
+	assert(c.user_data == 52000 && c.res == 4096 + 1024);
+	assert(memcmp(rbuf[0], wbuf[0], 4096) == 0);
+	assert(memcmp(rbuf[2] + 512, wbuf[1], 1024) == 0);
+
+	/* WRITE_FIXED / READ_FIXED from a registered buffer. */
+	struct iovec reg_iov = { fixed, sizeof(fixed) };
+	assert(reg(&t, IORING_REGISTER_BUFFERS, &reg_iov, 1) == 0);
+	memset(fixed, 'F', 4096);
+	prep_rw(&t, IORING_OP_WRITE_FIXED, fd, fixed, 4096, 8 * 4096,
+	    52001)->buf_index = 0;
+	c = submit_wait(&t, 1);
+	assert(c.user_data == 52001 && c.res == 4096);
+	prep_rw(&t, IORING_OP_READ_FIXED, fd, fixed + 4096, 4096, 8 * 4096,
+	    52002)->buf_index = 0;
+	c = submit_wait(&t, 1);
+	assert(c.user_data == 52002 && c.res == 4096);
+	assert(memcmp(fixed, fixed + 4096, 4096) == 0);
+
+	/*
+	 * What the driver cannot take runs on a worker, as before: a length
+	 * that is not a whole number of sectors fails as pread(2) would.
+	 */
+	prep_rw(&t, IORING_OP_READ, fd, rbuf[0], 100, 0, 52003);
+	c = submit_wait(&t, 1);
+	assert(c.user_data == 52003 && c.res == -EINVAL);
+	assert(pread(fd, rbuf[0], 100, 0) == -1 && errno == EINVAL);
+	/* So does IOSQE_ASYNC, with the same result. */
+	prep_rw(&t, IORING_OP_READ, fd, rbuf[1], 4096, 4096,
+	    52004)->flags = IOSQE_ASYNC;
+	c = submit_wait(&t, 1);
+	assert(c.user_data == 52004 && c.res == 4096);
+	assert(memcmp(rbuf[1], wbuf[1], 4096) == 0);
+	/* Past the end of the device: a short read (0 bytes), as pread(2). */
+	off_t size = lseek(fd, 0, SEEK_END);
+	assert(size > 0);
+	prep_rw(&t, IORING_OP_READ, fd, rbuf[0], 4096, size, 52005);
+	c = submit_wait(&t, 1);
+	assert(c.user_data == 52005 && c.res == pread(fd, rbuf[1], 4096, size));
+
+	/*
+	 * Disk I/O in flight cannot be cancelled: the cancel finds it
+	 * -EALREADY (or -ENOENT if it already finished), and the read still
+	 * completes in full.
+	 */
+	prep_rw(&t, IORING_OP_READ, fd, rbuf[0], 4096, 0, 52006);
+	struct io_uring_sqe *sqe = ring_prep(&t, IORING_OP_ASYNC_CANCEL, -1,
+	    52007);
+	sqe->addr = 52006;
+	ring_push_sqe(&t);
+	int got = 0;
+	ring_submit(&t);
+	while (got < 2) {
+		c = submit_wait(&t, 1);
+		if (c.user_data == 52006)
+			assert(c.res == 4096);
+		else
+			assert(c.user_data == 52007 &&
+			    (c.res == -EALREADY || c.res == -ENOENT));
+		got++;
+	}
+
+	/* Closing the ring with bios in flight waits for them. */
+	for (i = 0; i < DISK_IOS; i++)
+		prep_rw(&t, IORING_OP_READ, fd, rbuf[i], 4096,
+		    (off_t)i * 4096, 53000 + i);
+	ring_submit(&t);
+	close(t.fd);
+	close(fd);
+	printf("[PASS] disk READ / WRITE (plain, V, FIXED) through bios, "
+	    "fallbacks, no cancel in flight, close with I/O in flight\n");
+}
+
 /*
  * Reads that cannot block complete on the issuer, without a worker: a
  * positioned read of a regular file from the page cache, and READ / WRITE
@@ -7057,6 +7208,7 @@ main(int argc, char **argv)
 		test_iowq_register();
 		test_worker_nonblocking_pipe();
 		test_inline_file_pipe();
+		test_disk_bio();
 		test_worker_buffer_reservation();
 		test_worker_cancel_and_timeout();
 		test_worker_max_workers();

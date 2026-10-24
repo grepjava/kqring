@@ -85,6 +85,7 @@ Compared with `kqueue(2)`, or the plain system call where kqueue has no role, on
 - **Cached file reads:** 32 `READ`s per enter cost 27% less than `pread(2)`, served inline from the page cache. One `READ` per enter costs 16% more.
 - **Zero-copy send:** `SEND_ZC` from a registered buffer is 37% faster than `write(2)` for 256 KiB messages on AF_UNIX and 23% faster on TCP loopback, and 15–17% faster at 64 KiB.
 - **Batching and timers:** 32 `NOP`s per enter cost 77 ns each, and a single `NOP` enter 345 ns (an empty `kevent` costs 287 ns). `TIMEOUT` is 43% faster; multishot `ACCEPT` is on par with kqueue.
+- **Disk devices:** 4 KiB random reads on an md(4) disk cost 41% less than through a worker, and 32 per enter run 4.5× faster than `pread(2)`.
 - **Pipes:** on an `O_NONBLOCK` pipe, `READ` runs inline and is 19% faster than kqueue. On a blocking pipe it goes through a worker thread and is 5× slower.
 
 These are single-threaded loopback measurements. See [`BENCHMARK.MD`](BENCHMARK.MD) for the method, every result, and the known gaps.
@@ -96,6 +97,7 @@ These are single-threaded loopback measurements. See [`BENCHMARK.MD`](BENCHMARK.
 **How requests run.**
 - **Sockets** are tried inline in `kqring_enter()` (unless `IOSQE_ASYNC` is set); if the socket isn't ready, the request waits on a socket upcall.
 - **Also inline:** positioned file reads that the page cache satisfies, and any `READ` or `WRITE` on an `O_NONBLOCK` pipe.
+- **Straight to the disk driver:** positioned `READ` and `WRITE` (plain, vectored and `_FIXED`) on a disk device (`/dev/ada0`, `nda0`, `md0`, GEOM partitions) go to the driver as bios over the held user pages, as `aio(4)` does, with no worker thread and any number in flight. Lengths must be whole sectors; anything else runs on a worker. In-flight disk I/O can't be cancelled (`ASYNC_CANCEL` returns `-EALREADY`, as io_uring does for running block I/O).
 - **On workers:** other file, pipe and VFS requests, `WAITID` and `IOSQE_ASYNC` requests run on per-ring kernel worker threads (`IO_WQ_BOUND` and `IO_WQ_UNBOUND`, `IORING_FEAT_NATIVE_WORKERS`). These live in the ring owner's process, sharing its address space and descriptor table, and hand completions back to the owner.
 - **On the owner's path:** futexes and timers.
 - **With `IORING_SETUP_SQPOLL`:** a kernel thread in the process consumes SQEs, so the owner need not enter the ring to submit.

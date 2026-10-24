@@ -12,6 +12,7 @@ How `kqring` compares with FreeBSD's `kqueue(2)` on the same workloads. Where kq
 - **Zero-copy send pays off from 64 KiB.** `SEND_ZC` from a registered buffer is 37% faster than `write(2)` for 256 KiB messages on AF_UNIX and 23% faster on TCP loopback, and 15–17% faster at 64 KiB. At 16–32 KiB it ranges from 5% faster to 13% slower than `write(2)`. On AF_UNIX, kqring copies small sends from unregistered buffers itself, because that's cheaper there.
 - **Batching is where kqring shines.** 32 `NOP`s per enter cost 77 ns each, against 287 ns for an empty `kevent(2)` and 345 ns for a single `NOP` enter.
 - **Timers are faster, accept is even.** A 1 µs `TIMEOUT` completes 43% faster than a 1 µs `EVFILT_TIMER`. A multishot `ACCEPT` is 1% faster than kqueue plus `accept(2)`; see the note under [Accept](#accept-a-tcp-loopback-connection-set-up-and-torn-down).
+- **Disk devices go straight to the driver.** 4 KiB random reads on an md(4) disk cost 41% less than through a worker, and 32 in flight cost 975 ns each, 78% less than `pread(2)`.
 - **Pipes: fast when non-blocking, 5× slower when blocking.** A `READ` on an `O_NONBLOCK` pipe runs inline and is 19% faster than kqueue. On a blocking pipe it still goes through a worker thread, at about 4.4 µs per round trip; see [Known gaps](#known-gaps).
 - **Arming still costs.** A `RECV` submitted before its data arrives costs 32–39% more than kqueue, because it takes three syscalls (submit, `write`, wait) and installs and removes a socket upcall each time. Use multishot for steady-state receive.
 
@@ -194,6 +195,20 @@ Before inline reads, these were 5,540 ns and 4,696 ns, because every read made a
 
 A registered file saves almost nothing, so the descriptor lookups a `READ` makes aren't where the single-read gap comes from. It is the fixed cost of an enter, shown by the `NOP` row (345 ns against 287 ns for an empty `kevent`), plus the SQE and CQE.
 
+### Disk device: 4 KiB random reads and writes
+
+A positioned `READ` or `WRITE` on a disk device goes straight to the driver as a bio over the held user pages, as `aio(4)` does, and completes from the bio callback. Before this build, every one went through a worker thread; the `IOSQE_ASYNC` rows force that path. The device is a 64 MiB md(4) malloc disk, so these rows measure the I/O path itself, not media latency: md serves every bio from its own thread, so even `pread(2)` includes a hand-off. They are the median of 3 runs of the `disk` group, which runs only when `KQRING_BENCH_DISK` names a scratch device.
+
+| Variant | Read | vs `pread` | Write | vs `pwrite` |
+|---|---:|---:|---:|---:|
+| `pread(2)` / `pwrite(2)` | 4,371 | | 5,504 | |
+| kqring, one per enter, through a worker (before) | 8,368 | +91% | 9,589 | +74% |
+| kqring, one per enter, to the driver | 4,908 | +12% | 6,124 | +11% |
+| kqring, 32 per enter, through workers (before) | 7,705 | +76% | | |
+| kqring, 32 per enter, to the driver | **975** | **−78%** | **2,301** | **−58%** |
+
+With one request per enter, kqring pays one sleep and wake-up more than `pread(2)`, since the owner waits in `kqring_enter()` for the bio callback's taskwork. With 32 in flight, the driver gets them all at once, which `pread(2)` can't do from one thread.
+
 ### Timer: a 1 µs one-shot timer, armed and fired
 
 | Variant | ns/op | vs kqueue |
@@ -206,7 +221,7 @@ Both are dominated by timer-interrupt scheduling, not by the API.
 ## Known gaps
 
 - **Blocking pipes still go through a worker thread.** FreeBSD's `pipe_read()` decides whether to block from the descriptor's `O_NONBLOCK` flag, and has no per-call non-blocking read. kqring can't safely read a blocking pipe inline: another reader could drain it between a readiness check and the read, and the ring owner would then block. A worker round trip costs about 4.4 µs (the `IOSQE_ASYNC` floor row). Applications can set `O_NONBLOCK` on the pipe to get the inline path. A `READ` on an empty non-blocking pipe then completes with `-EAGAIN`, as `read(2)` would, so wait for data with `POLL_ADD` first.
-- **Page-cache misses, and filesystems without the page-cache read path, go through a worker.** This covers reads that need the disk, ZFS (which caches in the ARC, not the page cache), `O_DIRECT`, and reads using the file position (`off` = −1). It also covers reads into a buffer that isn't mapped yet: the inline copy runs with page faults disabled, so the buffer's first use goes through the worker.
+- **Page-cache misses, and filesystems without the page-cache read path, go through a worker.** This covers file reads that need the disk, ZFS (which caches in the ARC, not the page cache), `O_DIRECT` on files, and reads using the file position (`off` = −1). Only disk devices themselves get the direct bio path: FreeBSD filesystems have no asynchronous read or write entry point, and sending bios under a filesystem would bypass its block allocation and locking. It also covers reads into a buffer that isn't mapped yet: the inline copy runs with page faults disabled, so the buffer's first use goes through the worker.
 - **One operation per enter costs about 60 ns more than an empty `kevent`.** That's the `NOP` floor: parsing an SQE and posting a CQE. Batching removes it.
 - **A wait that just misses its completion pays a full sleep.** When the completion comes from another thread (the TCP loopback netisr, for instance) a moment after the enter checks, the enter sleeps and pays a wake-up of about 1 µs; see [Accept](#accept-a-tcp-loopback-connection-set-up-and-torn-down). Spinning briefly before sleeping would avoid that, at the cost of CPU time on waits that don't end quickly.
 - **An armed `RECV` is still 32–39% dearer than kqueue.** Each one installs and removes a socket upcall, where kqueue's filter stays registered. Multishot `RECV` avoids it. Keeping the upcall installed between single-shot receives would close most of the gap, but needs care with the one upcall slot per socket buffer.
@@ -222,7 +237,7 @@ make
 sudo kldload ./kmod/kqring.ko
 ulimit -l 8192                    # the send group registers 2 MiB of buffers
 ./tests/kqring_bench > bench.1.out           # all groups
-./tests/kqring_bench fanin send   # selected groups: floor pingpong fanin accept pipe file send timer
+./tests/kqring_bench fanin send   # selected groups: floor pingpong fanin accept pipe file send timer disk
 sudo kldunload kqring
 ```
 
@@ -234,4 +249,4 @@ Each line of output is `ROW <group> <variant> <ns/op>`. To match these tables, r
 python3 tests/bench_report.py docs/bench bench.*.out
 ```
 
-The `file` group writes a 64 MiB temporary file in `/tmp`.
+The `file` group writes a 64 MiB temporary file in `/tmp`. The `disk` group runs only with `KQRING_BENCH_DISK` set to a device it may overwrite, for example `sudo mdconfig -a -t malloc -s 64m -u 9 && sudo chown $USER /dev/md9`; the test suite's disk test uses `KQRING_TEST_DISK` the same way.

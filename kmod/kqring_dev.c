@@ -194,6 +194,9 @@ kqring_ctx_cancel_all(struct kqring_ctx *ctx)
 
 	sx_xlock(&ctx->sq_sx);
 	mtx_lock(&ctx->mtx);
+	/* Disk requests own their user pages until their bios finish. */
+	while (ctx->nbio > 0)
+		msleep(&ctx->nbio, &ctx->mtx, 0, "kqbio", 0);
 	while ((op = TAILQ_FIRST(&ctx->active_ops)) != NULL) {
 		bool retired;
 
