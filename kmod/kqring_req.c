@@ -615,6 +615,8 @@ kqring_op_attempt(struct kqring_ctx *ctx, struct kqring_op *op,
 		case IORING_OP_WRITE_FIXED:
 		case IORING_OP_WRITEV_FIXED:
 			rc = kqring_exec_send(ctx, op, expect);
+			/* A bundle with buffers left sends again at once. */
+			more = true;
 			break;
 		case IORING_OP_SENDMSG:
 		case IORING_OP_SENDMSG_ZC:

@@ -6760,7 +6760,7 @@ test_kpoll(void)
 	struct io_uring_sqe *sqe;
 	struct io_uring_cqe c;
 	struct test_ring t;
-	int pfd[KPOLL_NPIPES][2], sv[2], seen[KPOLL_NPIPES];
+	int pfd[KPOLL_NPIPES][2], seen[KPOLL_NPIPES];
 	char ch;
 
 	ring_init(&t);
@@ -6829,71 +6829,60 @@ test_kpoll(void)
 	close(t.fd);
 
 	/*
-	 * 5. A child arms a poll, passes its ring to us and exits: the ring
-	 * outlives the child's descriptor table, which held its kqueue.
+	 * 5. A child arms a poll and exits while its own child, which
+	 * inherited the ring, keeps it open: the ring outlives the
+	 * descriptor table that held its kqueue.  The grandchild sees the
+	 * child gone as EOF on own[0] and reports back on res[].
 	 */
-	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	int own[2], res[2], status = 0;
+	char r = 0;
+
+	assert(pipe(own) == 0 && pipe(res) == 0);
 	pid_t pid = fork();
 	assert(pid >= 0);
 	if (pid == 0) {
 		struct test_ring ct;
-		union {
-			struct cmsghdr cm;
-			char buf[CMSG_SPACE(sizeof(int))];
-		} cmsg_buf;
-		struct iovec iov = { &ch, 1 };
-		struct msghdr msg;
-		struct cmsghdr *cm;
+		pid_t gpid;
 
-		ch = 'r';
+		close(res[0]);
 		ring_init(&ct);
 		sqe = ring_prep(&ct, IORING_OP_POLL_ADD, pfd[1][0], 72005);
 		sqe->poll32_events = POLLIN;
 		sqe->len = IORING_POLL_ADD_MULTI;
 		ring_push_sqe(&ct);
 		ring_submit(&ct);
-		memset(&cmsg_buf, 0, sizeof(cmsg_buf));
-		memset(&msg, 0, sizeof(msg));
-		msg.msg_iov = &iov;
-		msg.msg_iovlen = 1;
-		msg.msg_control = cmsg_buf.buf;
-		msg.msg_controllen = sizeof(cmsg_buf.buf);
-		cm = CMSG_FIRSTHDR(&msg);
-		cm->cmsg_len = CMSG_LEN(sizeof(int));
-		cm->cmsg_level = SOL_SOCKET;
-		cm->cmsg_type = SCM_RIGHTS;
-		memcpy(CMSG_DATA(cm), &ct.fd, sizeof(int));
-		_exit(sendmsg(sv[1], &msg, 0) == 1 ? 0 : 1);
+		gpid = fork();
+		if (gpid < 0)
+			_exit(1);
+		if (gpid == 0) {
+			r = 'k';
+			close(own[1]);
+			if (read(own[0], &ch, 1) != 0)
+				r = 'e';
+			/* Its pipe becoming readable reaches no one. */
+			if (write(pfd[1][1], "z", 1) != 1)
+				r = 'w';
+			usleep(100 * 1000);
+			close(ct.fd);
+			if (write(res[1], &r, 1) != 1)
+				_exit(1);
+			_exit(0);
+		}
+		_exit(0);
 	}
-	int status = 0, rfd = -1;
-	union {
-		struct cmsghdr cm;
-		char buf[CMSG_SPACE(sizeof(int))];
-	} rbuf;
-	struct iovec riov = { &ch, 1 };
-	struct msghdr rmsg = {
-		.msg_iov = &riov,
-		.msg_iovlen = 1,
-		.msg_control = rbuf.buf,
-		.msg_controllen = sizeof(rbuf.buf),
-	};
-	assert(recvmsg(sv[0], &rmsg, 0) == 1 && ch == 'r');
-	memcpy(&rfd, CMSG_DATA(CMSG_FIRSTHDR(&rmsg)), sizeof(int));
+	close(own[0]);
+	close(own[1]);
+	close(res[1]);
 	assert(waitpid(pid, &status, 0) == pid);
 	assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-	/* Its pipe becoming readable reaches no one; closing it is clean. */
-	assert(write(pfd[1][1], "z", 1) == 1);
-	usleep(100 * 1000);
-	close(rfd);
-
-	close(sv[0]);
-	close(sv[1]);
+	assert(read(res[0], &r, 1) == 1 && r == 'k');
+	close(res[0]);
 	for (int i = 0; i < KPOLL_NPIPES; i++) {
 		close(pfd[i][0]);
 		close(pfd[i][1]);
 	}
 	printf("[PASS] kqueue POLL_ADD: %d pipes multishot, same fd twice, "
-	    "user_data update, owner exit with the ring passed on\n",
+	    "user_data update, owner exit with the ring inherited\n",
 	    KPOLL_NPIPES);
 }
 
@@ -7412,13 +7401,12 @@ static void
 test_phase5_security_audit(void)
 {
 	/*
-	 * 1. AF_UNIX SCM_RIGHTS reference-cycle leak test:
-	 * A child creates a ring, registers a socketpair in the ring's fixed
-	 * table, closes the user socket fds (so only the ring's fixed table
-	 * holds the sockets), sends the ring's own fd over the fixed socket
-	 * via SCM_RIGHTS, and exits without closing the ring. Process-exit
-	 * teardown must drop the ring's fixed table, breaking the cycle so
-	 * the ring is destroyed with zero leaked kernel memory.
+	 * 1. AF_UNIX SCM_RIGHTS reference cycle: a child creates a ring,
+	 * registers a socketpair in the ring's fixed table, closes the user
+	 * socket fds (so only the ring's fixed table holds the sockets) and
+	 * tries to send the ring's own fd over the fixed socket.  A ring file
+	 * cannot be passed (EOPNOTSUPP), so the cycle cannot form; exit
+	 * teardown still drops the table with an armed worker op.
 	 */
 	pid_t pid = fork();
 	assert(pid >= 0);
@@ -7457,11 +7445,16 @@ test_phase5_security_audit(void)
 		sqe->flags = IOSQE_FIXED_FILE;
 		sqe->addr = (uint64_t)(uintptr_t)&msg;
 		ring_push_sqe(&ct);
-		assert(submit_one(&ct) == 1);
+		assert(submit_one(&ct) == -EOPNOTSUPP);
+		/* Plain sendmsg(2) of the ring fails the same way. */
+		int usv[2];
+		assert(socketpair(AF_UNIX, SOCK_STREAM, 0, usv) == 0);
+		assert(sendmsg(usv[0], &msg, 0) == -1 && errno == EOPNOTSUPP);
+		close(usv[0]);
+		close(usv[1]);
 		/*
 		 * Also arm a blocking worker op (POLL_ADD on fixed slot 0)
-		 * and close ct.fd before _exit(0) so the only struct file
-		 * reference to ct.fd is in sv[1]'s SCM_RIGHTS buffer.
+		 * and close ct.fd before _exit(0).
 		 */
 		sqe = ring_prep(&ct, IORING_OP_POLL_ADD, 0, 75002);
 		sqe->flags = IOSQE_FIXED_FILE | IOSQE_ASYNC;

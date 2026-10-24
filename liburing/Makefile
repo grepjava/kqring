@@ -75,13 +75,16 @@ examples: lib
 	@echo "examples: $$(ls ${OUT}/examples | wc -l) built," \
 	    "$$(wc -l < ${OUT}/examples.unbuilt) not (see ${OUT}/examples.unbuilt)"
 
+# xfail_*.c are liburing's AddressSanitizer tests (built only with ASan
+# there): without it they wait for a completion that never comes.
 tests: lib
 	mkdir -p ${OUT}/test
+	rm -f ${OUT}/test/xfail_*.t
 	: > ${OUT}/test.unbuilt
 	cd ${WRKSRC}/test && ${CC} ${CFLAGS} ${CPPFLAGS} ${TEST_CPPFLAGS} \
 	    -c helpers.c -o ${OUT}/test/helpers.o
 	cd ${WRKSRC}/test && for s in *.c; do \
-	    case $$s in helpers.c) continue;; esac; \
+	    case $$s in helpers.c|xfail_*) continue;; esac; \
 	    ${CC} ${CFLAGS} ${CPPFLAGS} ${TEST_CPPFLAGS} $$s ${OUT}/test/helpers.o \
 	    -o ${OUT}/test/$${s%.c}.t ${OUT}/liburing.a -lpthread -lm \
 	    >/dev/null 2>&1 || echo $${s%.c} >> ${OUT}/test.unbuilt; done

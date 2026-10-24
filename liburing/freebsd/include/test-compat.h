@@ -31,4 +31,23 @@ __kqring_test_mmap(void *addr, size_t len, int prot, int flags, int fd,
 }
 #define mmap(a, l, p, f, d, o)	__kqring_test_mmap(a, l, p, f, d, o)
 
+/*
+ * sendmsg(2) of a ring descriptor with SCM_RIGHTS: Linux (6.7+) refuses
+ * it with EINVAL, which tests take as "rings cannot be passed" and skip.
+ * FreeBSD refuses any descriptor that cannot be passed with EOPNOTSUPP.
+ */
+#include <sys/socket.h>
+#include <errno.h>
+
+static inline ssize_t
+__kqring_test_sendmsg(int s, const struct msghdr *msg, int flags)
+{
+	ssize_t n = sendmsg(s, msg, flags);
+
+	if (n < 0 && errno == EOPNOTSUPP && msg->msg_controllen != 0)
+		errno = EINVAL;
+	return (n);
+}
+#define sendmsg(s, m, f)	__kqring_test_sendmsg(s, m, f)
+
 #endif

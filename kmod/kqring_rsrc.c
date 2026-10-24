@@ -234,7 +234,7 @@ kqring_buf_commit(struct kqring_ctx *ctx, const struct kqring_sel *sel,
 /*
  * Drop a reference to a registered file or buffer; the last one posts its
  * tag CQE (not while the ring is being torn down) and releases the file.
- * Owner thread (or kqring_dtor()), ctx->mtx not held: fdrop() may close.
+ * Owner thread (or kqring_close()), ctx->mtx not held: fdrop() may close.
  */
 void
 kqring_rsrc_put(struct kqring_ctx *ctx, struct kqring_rsrc *r)

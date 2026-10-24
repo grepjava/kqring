@@ -3,18 +3,19 @@
  *
  * Copyright (c) 2026 The kqring Authors
  *
- * kqring.c: FreeBSD Kernel Module implementing the SINGLE_ISSUER |
- * DEFER_TASKRUN io_uring subset + Provided Buffer Rings (PBUF_RING).
+ * kqring: FreeBSD kernel module implementing io_uring.
  *
  * Architectural Summary:
- *   - Exposes /dev/kqring with per-descriptor state via devfs_set_cdevpriv(9).
- *   - Maps SQ/CQ rings and SQE arrays via .d_mmap_single backed by wired
+ *   - Opening /dev/kqring makes a ring file with kqring's own fileops
+ *     (d_fdopen; ctx in f_data), which cannot be passed over UNIX sockets.
+ *   - Maps SQ/CQ rings and SQE arrays via fo_mmap backed by wired
  *     anonymous VM objects (vm_pager_allocate + pmap_qenter). Each mapping
  *     retains a VM object reference across close(2).
- *   - SINGLE_ISSUER restricts userspace submission and registration.
- *     Normally the issuer drains taskwork, changes tables and posts CQEs.
- *     SQPOLL adds an in-process submission kthread; sq_sx serializes it with
- *     enter and registration. Worker kthreads share the process address
+ *   - SINGLE_ISSUER restricts submission and registration to one thread;
+ *     a shared ring takes any thread of the owner process, serialized by
+ *     sq_sx.  Normally the issuer drains taskwork, changes tables and posts
+ *     CQEs.  SQPOLL adds an in-process submission kthread; sq_sx serializes
+ *     it with enter and registration. Worker kthreads share the process address
  *     space and descriptor table, execute I/O with held credentials, and
  *     queue results for the serialized issuer to complete.
  *   - Socket readiness callbacks never access user I/O buffers or provided
@@ -587,8 +588,7 @@ struct kqring_restrictions {
 };
 
 /*
- * Per-open /dev/kqring context, attached to the file descriptor via
- * devfs_set_cdevpriv(9).
+ * Per-open /dev/kqring context: the ring file's f_data.
  */
 struct kqring_ctx {
 	LIST_ENTRY(kqring_ctx)	proc_link;	/* kqring_ctx_list; proc_mtx */
@@ -739,7 +739,7 @@ struct kqring_ctx {
 	bool			drain_barrier;	/* a drained chain is in flight */
 	uint32_t		cq_seq;		/* CQEs posted (not by TIMEOUTs) */
 	/*
-	 * CQ overflow list.  Only the owner thread (enter) and kqring_dtor()
+	 * CQ overflow list.  Only the owner thread (enter) and kqring_close()
 	 * touch it, so no lock is needed.
 	 */
 	STAILQ_HEAD(, kqring_ocqe) ocq;
@@ -759,7 +759,7 @@ struct kqring_ctx {
 	u_int			sleeping;	/* threads in msleep; under mtx */
 	/*
 	 * Recycled ops (linked via active_link).  Only touched by the owner
-	 * thread (enter) and by kqring_dtor(), so no lock is needed.
+	 * thread (enter) and by kqring_close(), so no lock is needed.
 	 */
 	struct kqring_op_list	free_ops;
 	int			nfree;

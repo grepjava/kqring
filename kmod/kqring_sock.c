@@ -741,6 +741,26 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 	return (0);
 }
 
+/* Drop the first `done` bytes of an iovec array (biov[], in place). */
+static void
+kqring_iov_skip(struct iovec **iovp, u_int *cntp, size_t done)
+{
+	struct iovec *iov = *iovp;
+	u_int cnt = *cntp;
+
+	while (cnt > 0 && done >= iov->iov_len) {
+		done -= iov->iov_len;
+		iov++;
+		cnt--;
+	}
+	if (cnt > 0) {
+		iov->iov_base = (char *)iov->iov_base + done;
+		iov->iov_len -= done;
+	}
+	*iovp = iov;
+	*cntp = cnt;
+}
+
 /*
  * SEND, SEND_ZC, and WRITE / WRITEV on a socket.  SEND may send from
  * provided buffers (IOSQE_BUFFER_SELECT, several with
@@ -763,7 +783,7 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 	u_int iovcnt = 1;
 	uint32_t cqe_flags = 0;
 	bool buf_select = (sqe->flags & IOSQE_BUFFER_SELECT) != 0;
-	bool waitall = false;
+	bool bundle = false, waitall = false;
 	size_t n;
 	int error, flags = MSG_DONTWAIT | MSG_NOSIGNAL, rc;
 
@@ -805,6 +825,11 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 		}
 		iov = biov;
 		iovcnt = sel.nbufs;
+		bundle = (sqe->ioprio & IORING_RECVSEND_BUNDLE) != 0 &&
+		    kqring_so_stream(so);
+		/* The same head buffers again: skip what went last time. */
+		if (bundle)
+			kqring_iov_skip(&iov, &iovcnt, op->done_io);
 	} else if (kqring_op_writev(sqe->opcode)) {
 		iov = op->args;
 		iovcnt = sqe->len;
@@ -834,6 +859,37 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 	}
 	error = sosend(so, to, &auio, NULL, NULL, flags, td);
 	n = (size_t)(want - auio.uio_resid);
+
+	/*
+	 * A bundle on a stream socket sends its whole batch, as io_uring
+	 * retries a short one: a buffer sent in part must not be consumed.
+	 * Progress waits in op->done_io, uncommitted, for room.
+	 */
+	if (bundle) {
+		if (auio.uio_resid > 0 && (error == 0 || error == EWOULDBLOCK)) {
+			op->done_io += n;
+			sx_xunlock(&ctx->bg_sx);
+			kqring_put_sock(op, fp, EAGAIN);
+			return (EAGAIN);
+		}
+		n += op->done_io;
+		op->done_io = 0;
+		if (n == 0) {
+			sx_xunlock(&ctx->bg_sx);
+			fdrop(fp, td);
+			return (kqring_done(op, -error, 0));
+		}
+		cqe_flags = kqring_buf_commit(ctx, &sel, n);
+		/*
+		 * As io_uring: a bundle goes on (IORING_CQE_F_MORE) while the
+		 * group has buffers; the batch that empties it ends it.
+		 */
+		if (error == 0 && !kqring_buf_none(ctx, sqe->buf_group))
+			cqe_flags |= IORING_CQE_F_MORE;
+		sx_xunlock(&ctx->bg_sx);
+		fdrop(fp, td);
+		return (kqring_done(op, kqring_xfer_res(n), cqe_flags));
+	}
 
 	if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
 		if (buf_select)
@@ -1326,6 +1382,7 @@ kqring_exec_accept(struct kqring_ctx *ctx, struct kqring_op *op,
 	u_int fflag;
 	int error, nfd = -1, tmp;
 	int aflags = (int)sqe->accept_flags;
+	uint32_t cflags;
 	int32_t res;
 
 	error = kqring_op_fget_caps(op, cap_rights_init_one(&rights,
@@ -1434,13 +1491,16 @@ kqring_exec_accept(struct kqring_ctx *ctx, struct kqring_op *op,
 		fdrop(nfp, td);		/* falloc_caps()'s extra reference */
 		res = nfd;
 	}
+	/* As io_uring: say whether more connections are queued (a hint). */
+	cflags = res >= 0 && !TAILQ_EMPTY(&head->sol_comp) ?
+	    IORING_CQE_F_SOCK_NONEMPTY : 0;
 	if (res >= 0 && (sqe->ioprio & IORING_ACCEPT_MULTISHOT) != 0) {
-		*more_out = !TAILQ_EMPTY(&head->sol_comp);
+		*more_out = cflags != 0;
 		fdrop(headfp, td);
-		return (kqring_done(op, res, IORING_CQE_F_MORE));
+		return (kqring_done(op, res, cflags | IORING_CQE_F_MORE));
 	}
 	fdrop(headfp, td);
-	return (kqring_done(op, res, 0));
+	return (kqring_done(op, res, cflags));
 
 fail:
 	if (nfp != NULL) {

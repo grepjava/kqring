@@ -6,6 +6,7 @@
 
 #include "kqring_var.h"
 
+#include <sys/mman.h>
 #include <sys/sysent.h>
 
 MALLOC_DEFINE(M_KQRING, "kqring", "FreeBSD kqring I/O ring state");
@@ -23,22 +24,47 @@ static eventhandler_tag kqring_exec_tag;
 static eventhandler_tag kqring_fork_tag;
 
 static struct cdev *kqring_cdev;
+/* Ring files not yet closed; unload waits for none (under kqring_proc_mtx). */
+static u_int kqring_nfiles;
 
-/* Forward declarations */
-static d_open_t		kqring_open;
-static d_ioctl_t	kqring_ioctl;
-static d_mmap_single_t	kqring_mmap_single;
-static d_poll_t		kqring_poll;
-static d_kqfilter_t	kqring_kqfilter;
+/*
+ * Opening /dev/kqring makes a ring file with kqring's own file operations
+ * (d_fdopen), not devfs's.  Like io_uring files since Linux 6.7, it cannot
+ * be passed over a UNIX socket (no DFLAG_PASSABLE: SCM_RIGHTS fails with
+ * EOPNOTSUPP), so no reference cycle through a socket in its own fixed
+ * table can form.  A child still inherits it across fork (DFLAG_FORK).
+ */
+static d_fdopen_t	kqring_fdopen;
+static fo_ioctl_t	kqring_ioctl;
+static fo_poll_t	kqring_poll;
+static fo_kqfilter_t	kqring_kqfilter;
+static fo_close_t	kqring_close;
+static fo_mmap_t	kqring_mmap;
+static fo_fork_t	kqring_fork;
 
 static struct cdevsw kqring_cdevsw = {
 	.d_version =	D_VERSION,
-	.d_open =	kqring_open,
-	.d_ioctl =	kqring_ioctl,
-	.d_mmap_single = kqring_mmap_single,
-	.d_poll =	kqring_poll,
-	.d_kqfilter =	kqring_kqfilter,
+	.d_fdopen =	kqring_fdopen,
 	.d_name =	"kqring",
+};
+
+static const struct fileops kqring_fileops = {
+	.fo_read = invfo_rdwr,
+	.fo_write = invfo_rdwr,
+	.fo_truncate = invfo_truncate,
+	.fo_ioctl = kqring_ioctl,
+	.fo_poll = kqring_poll,
+	.fo_kqfilter = kqring_kqfilter,
+	.fo_stat = vn_statfile,
+	.fo_close = kqring_close,
+	.fo_chmod = invfo_chmod,
+	.fo_chown = invfo_chown,
+	.fo_sendfile = invfo_sendfile,
+	.fo_fill_kinfo = vn_fill_kinfo,
+	.fo_mmap = kqring_mmap,
+	.fo_cmp = file_kcmp_generic,
+	.fo_fork = kqring_fork,
+	.fo_flags = DFLAG_FORK,
 };
 
 /*
@@ -46,13 +72,12 @@ static struct cdevsw kqring_cdevsw = {
  * the SQ has room, as io_uring_poll().
  */
 static int
-kqring_poll(struct cdev *dev __unused, int events, struct thread *td)
+kqring_poll(struct file *fp, int events, struct ucred *active_cred __unused,
+    struct thread *td)
 {
-	struct kqring_ctx *ctx;
+	struct kqring_ctx *ctx = fp->f_data;
 	int revents = 0;
 
-	if (devfs_get_cdevpriv((void **)&ctx) != 0)
-		return (events & (POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM));
 	mtx_lock(&ctx->mtx);
 	if (ctx->shm == NULL || ctx->closing) {
 		mtx_unlock(&ctx->mtx);
@@ -99,12 +124,10 @@ static const struct filterops kqring_read_filtops = {
 };
 
 static int
-kqring_kqfilter(struct cdev *dev __unused, struct knote *kn)
+kqring_kqfilter(struct file *fp, struct knote *kn)
 {
-	struct kqring_ctx *ctx;
+	struct kqring_ctx *ctx = fp->f_data;
 
-	if (devfs_get_cdevpriv((void **)&ctx) != 0)
-		return (EBADF);
 	if (kn->kn_filter != EVFILT_READ)
 		return (EINVAL);
 	kn->kn_fop = &kqring_read_filtops;
@@ -116,30 +139,35 @@ kqring_kqfilter(struct cdev *dev __unused, struct knote *kn)
 	return (0);
 }
 
-/* Whether fp is a /dev/kqring descriptor. */
+/* Whether fp is a ring file. */
 bool
 kqring_fp_is_ring(const struct file *fp)
 {
-	return (fp->f_type == DTYPE_VNODE && fp->f_vnode != NULL &&
-	    fp->f_vnode->v_type == VCHR && fp->f_vnode->v_rdev == kqring_cdev);
+	return (fp->f_ops == &kqring_fileops);
 }
 
-/* The ring context of a /dev/kqring file. */
+/* The ring context of a ring file. */
 int
 kqring_fp_ctx(struct file *fp, struct kqring_ctx **ctxp)
 {
-	struct thread *td = curthread;
-	struct file *saved;
-	int error;
-
 	if (!kqring_fp_is_ring(fp))
 		return (EBADF);
-	/* devfs_get_cdevpriv() looks at the file being operated on. */
-	saved = td->td_fpop;
-	td->td_fpop = fp;
-	error = devfs_get_cdevpriv((void **)ctxp);
-	td->td_fpop = saved;
-	return (error != 0 ? EBADF : 0);
+	*ctxp = fp->f_data;
+	return (0);
+}
+
+/* A forked child shares the parent's ring file, as on Linux. */
+static int
+kqring_fork(struct filedesc *fdp __unused, struct file *fp, struct file **fp1,
+    struct proc *p1 __unused, struct thread *td __unused)
+{
+	/* Second pass, once every descriptor is in place: nothing to do. */
+	if (fp == NULL)
+		return (0);
+	if (!fhold(fp))
+		return (EBADF);
+	*fp1 = fp;
+	return (0);
 }
 
 /* ============================================================================
@@ -365,10 +393,11 @@ kqring_ctx_cancel_all(struct kqring_ctx *ctx)
 	mtx_unlock(&ctx->mtx);
 }
 
-static void
-kqring_dtor(void *data)
+/* Last close of a ring file. */
+static int
+kqring_close(struct file *fp, struct thread *td __unused)
 {
-	struct kqring_ctx *ctx = data;
+	struct kqring_ctx *ctx = fp->f_data;
 
 	mtx_lock(&kqring_proc_mtx);
 	if (ctx->in_ctx_list) {
@@ -379,15 +408,28 @@ kqring_dtor(void *data)
 
 	kqring_ctx_cancel_all(ctx);
 	kqring_ctx_rele(ctx);
+	vrele(fp->f_vnode);
+	mtx_lock(&kqring_proc_mtx);
+	if (--kqring_nfiles == 0)
+		wakeup(&kqring_nfiles);
+	mtx_unlock(&kqring_proc_mtx);
+	return (0);
 }
 
+/*
+ * Open /dev/kqring: a new ring, as a file with kqring_fileops.  Returning
+ * ENXIO with the file's operations replaced tells open(2) the file is
+ * ready (as linuxkpi does); vn_open() then drops its vnode reference, so
+ * the file takes its own, for fstat(2) and procstat(1).
+ */
 static int
-kqring_open(struct cdev *dev __unused, int oflags __unused, int devtype __unused,
-    struct thread *td)
+kqring_fdopen(struct cdev *dev __unused, int fflags __unused,
+    struct thread *td, struct file *fp)
 {
 	struct kqring_ctx *ctx;
-	int error;
 
+	if (fp == NULL)
+		return (ENXIO);
 	ctx = malloc(sizeof(*ctx), M_KQRING, M_WAITOK | M_ZERO);
 	refcount_init(&ctx->refs, 1);
 	mtx_init(&ctx->mtx, "kqring", NULL, MTX_DEF);
@@ -415,8 +457,9 @@ kqring_open(struct cdev *dev __unused, int oflags __unused, int devtype __unused
 	ctx->clockid = CLOCK_MONOTONIC;
 	ctx->napi_track = IO_URING_NAPI_TRACKING_INACTIVE;
 
-	error = devfs_set_cdevpriv(ctx, kqring_dtor);
-	if (error != 0) {
+	mtx_lock(&kqring_proc_mtx);
+	if (kqring_unloading) {
+		mtx_unlock(&kqring_proc_mtx);
 		kqring_wq_put(ctx->wq);
 		callout_drain(&ctx->wq_abort_callout);
 		knlist_destroy(&ctx->rsel.si_note);
@@ -424,13 +467,15 @@ kqring_open(struct cdev *dev __unused, int oflags __unused, int devtype __unused
 		sx_destroy(&ctx->bg_sx);
 		mtx_destroy(&ctx->mtx);
 		free(ctx, M_KQRING);
-		return (error);
+		return (ENODEV);
 	}
-	mtx_lock(&kqring_proc_mtx);
+	kqring_nfiles++;
 	ctx->in_ctx_list = true;
 	LIST_INSERT_HEAD(&kqring_ctx_list, ctx, proc_link);
 	mtx_unlock(&kqring_proc_mtx);
-	return (0);
+	vref(fp->f_vnode);
+	finit(fp, fp->f_flag, DTYPE_DEV, ctx, &kqring_fileops);
+	return (ENXIO);
 }
 
 static uint32_t
@@ -614,7 +659,8 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	    IORING_FEAT_POLL_32BITS | IORING_FEAT_SQPOLL_NONFIXED |
 	    IORING_FEAT_CQE_SKIP | IORING_FEAT_LINKED_FILE |
 	    IORING_FEAT_NATIVE_WORKERS | IORING_FEAT_CUR_PERSONALITY |
-	    IORING_FEAT_RSRC_TAGS | IORING_FEAT_REG_REG_RING;
+	    IORING_FEAT_RSRC_TAGS | IORING_FEAT_REG_REG_RING |
+	    IORING_FEAT_RECVSEND_BUNDLE;
 
 	p.sq_off.head = offsetof(struct kqring_shm_header, sq_head);
 	p.sq_off.tail = offsetof(struct kqring_shm_header, sq_tail);
@@ -1210,18 +1256,19 @@ kqring_proc_fork(void *arg __unused, struct proc *p1,
 
 
 static int
-kqring_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
-    int fflag __unused, struct thread *td)
+kqring_ioctl(struct file *fp, u_long cmd, void *data,
+    struct ucred *active_cred __unused, struct thread *td)
 {
-	struct kqring_ctx *ctx;
+	struct kqring_ctx *ctx = fp->f_data;
 	struct file *rfp = NULL;
 	int error, res = 0;
 
-	error = devfs_get_cdevpriv((void **)&ctx);
-	if (error != 0)
-		return (error);
-
 	switch (cmd) {
+	case FIONBIO:
+		/* fcntl(F_SETFL, O_NONBLOCK): nothing on a ring blocks on it. */
+		return (0);
+	case FIOASYNC:
+		return (*(int *)data != 0 ? EINVAL : 0);
 	case KQRING_IOC_SETUP:
 		error = kqring_ioc_setup(ctx, (struct kqring_setup_arg *)data,
 		    td);
@@ -1482,18 +1529,14 @@ kqring_sys_deregister_all(void)
 	}
 }
 
+/* The object (with a reference) that a mapping at *offset shows. */
 static int
-kqring_mmap_single(struct cdev *cdev __unused, vm_ooffset_t *offset,
-    vm_size_t size, vm_object_t *object, int nprot)
+kqring_mmap_object(struct kqring_ctx *ctx, vm_ooffset_t *offset,
+    vm_size_t size, vm_object_t *object)
 {
-	struct kqring_ctx *ctx;
 	int error;
 
-	if ((nprot & ~(VM_PROT_READ | VM_PROT_WRITE)) != 0)
-		return (EINVAL);
-
-	error = devfs_get_cdevpriv((void **)&ctx);
-	if (error != 0 || !ctx->setup_done)
+	if (!ctx->setup_done)
 		return (EINVAL);
 
 	if (*offset == IORING_OFF_SQ_RING || *offset == IORING_OFF_CQ_RING) {
@@ -1535,6 +1578,43 @@ kqring_mmap_single(struct cdev *cdev __unused, vm_ooffset_t *offset,
 	return (EINVAL);
 }
 
+/*
+ * mmap(2) of the rings and SQE array at IORING_OFF_*: shared, readable
+ * and writable as the descriptor allows, never executable.
+ */
+static int
+kqring_mmap(struct file *fp, vm_map_t map, vm_offset_t *addr, vm_size_t size,
+    vm_prot_t prot, vm_prot_t cap_maxprot, int flags, vm_ooffset_t foff,
+    struct thread *td)
+{
+	struct kqring_ctx *ctx = fp->f_data;
+	vm_object_t object;
+	vm_prot_t maxprot = VM_PROT_NONE;
+	int error;
+
+	if ((prot & ~(VM_PROT_READ | VM_PROT_WRITE)) != 0 ||
+	    (flags & MAP_SHARED) == 0)
+		return (EINVAL);
+	if ((fp->f_flag & FREAD) != 0)
+		maxprot |= VM_PROT_READ;
+	else if ((prot & VM_PROT_READ) != 0)
+		return (EACCES);
+	if ((fp->f_flag & FWRITE) != 0)
+		maxprot |= VM_PROT_WRITE;
+	else if ((prot & VM_PROT_WRITE) != 0)
+		return (EACCES);
+	maxprot &= cap_maxprot;
+
+	error = kqring_mmap_object(ctx, &foff, size, &object);
+	if (error != 0)
+		return (error);
+	error = vm_mmap_object(map, addr, size, prot, maxprot, flags, object,
+	    foff, FALSE, td);
+	if (error != 0)
+		vm_object_deallocate(object);
+	return (error);
+}
+
 /* ============================================================================
  * Module Lifecycle
  * ============================================================================
@@ -1572,7 +1652,7 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			return (ENOMEM);
 		}
 		kqring_sys_register_all();
-		printf("kqring: loaded (/dev/kqring, SINGLE_ISSUER | DEFER_TASKRUN)\n");
+		printf("kqring: loaded (/dev/kqring)\n");
 		return (0);
 
 	case MOD_UNLOAD:
@@ -1583,7 +1663,16 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 		 * and refuse unload with EBUSY rather than hanging after
 		 * /dev/kqring is gone.
 		 */
+		/*
+		 * Open ring files use this module's file operations, which
+		 * cannot be revoked: unload only once they are all closed
+		 * (no new one opens once kqring_unloading is set).
+		 */
 		mtx_lock(&kqring_proc_mtx);
+		if (kqring_nfiles > 0) {
+			mtx_unlock(&kqring_proc_mtx);
+			return (EBUSY);
+		}
 		kqring_unloading = true;
 		while (kqring_live_zc > 0) {
 			int error = msleep(&kqring_live_zc, &kqring_proc_mtx,
@@ -1601,11 +1690,10 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 		 */
 		kqring_sys_deregister_all();
 		/*
-		 * destroy_dev() runs the destructor of every ring still open,
-		 * so no futex is hashed after it, and waits for ioctls in
-		 * progress, so none is using the registered-ring table.
-		 * EVENTHANDLER_DEREGISTER() waits for running exit/exec hooks.
-		 * Only then is the table torn down.
+		 * No ring is open, and destroy_dev() waits for opens in
+		 * progress.  EVENTHANDLER_DEREGISTER() waits for running
+		 * exit/exec hooks.  Only then is the registered-ring table
+		 * torn down.
 		 */
 		if (kqring_cdev != NULL)
 			destroy_dev(kqring_cdev);
