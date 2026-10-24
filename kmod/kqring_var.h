@@ -934,6 +934,23 @@ kqring_ring_readable(const struct kqring_ctx *ctx)
 }
 
 
+/* The uptime sbt from now (saturating), and what is left of it. */
+static inline sbintime_t
+kqring_deadline(sbintime_t sbt)
+{
+	sbintime_t now = getsbinuptime();
+
+	return (sbt > SBT_MAX - now ? SBT_MAX : now + sbt);
+}
+
+static inline sbintime_t
+kqring_until(sbintime_t deadline)
+{
+	sbintime_t now = getsbinuptime();
+
+	return (deadline > now ? deadline - now : 0);
+}
+
 static inline void
 kqring_taskwork_add_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 {

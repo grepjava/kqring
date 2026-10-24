@@ -689,7 +689,7 @@ test_enter_validation(struct test_ring *r)
 	/* Without EXT_ARG, arg would be a sigmask. */
 	assert(kqring_enter(r->fd, 1, 1, IORING_ENTER_GETEVENTS, &ga,
 	    sizeof(ga)) == -1 && errno == EINVAL);
-	/* Wrong argsz, a sigmask, or nonzero pad (min_wait_usec). */
+	/* Wrong argsz, or a sigmask. */
 	assert(kqring_enter(r->fd, 1, 1,
 	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
 	    sizeof(ga) - 1) == -1 && errno == EINVAL);
@@ -702,14 +702,9 @@ test_enter_validation(struct test_ring *r)
 	    sizeof(ga)) == -1 && errno == EINVAL);
 	ga.sigmask = 0;
 	ga.sigmask_sz = 0;
-	ga.pad = 1;
-	assert(kqring_enter(r->fd, 1, 1,
-	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
-	    sizeof(ga)) == -1 && errno == EINVAL);
 	assert(ring_pending(r) == 1);
 	assert(ring_cq_ready(r) == 0);
 
-	ga.pad = 0;
 	assert(kqring_enter(r->fd, 1, 1,
 	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
 	    sizeof(ga)) == 1);
@@ -6988,6 +6983,96 @@ test_pipe_nowait(void)
 	    "poll wakeups counted when drained, none for own writes\n");
 }
 
+static void *
+min_wait_writer(void *arg)
+{
+	usleep(60 * 1000);
+	assert(write(*(int *)arg, "b", 1) == 1);
+	return (NULL);
+}
+
+/* One enter waiting for want CQEs with min_wait_usec; returns msec. */
+static long
+min_wait_enter(struct test_ring *t, unsigned want, long ts_ms,
+    unsigned min_us, int *err)
+{
+	struct __kernel_timespec ts = { .tv_sec = ts_ms / 1000,
+	    .tv_nsec = (ts_ms % 1000) * 1000000 };
+	struct io_uring_getevents_arg ga = {
+		.ts = (uint64_t)(uintptr_t)&ts,
+		.min_wait_usec = min_us,
+	};
+	uint64_t t0 = now_ns();
+
+	*err = kqring_enter(t->fd, 0, want,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
+	    sizeof(ga)) == -1 ? errno : 0;
+	return ((long)((now_ns() - t0) / 1000000));
+}
+
+/*
+ * IORING_FEAT_MIN_TIMEOUT: wait min_wait_usec for the CQEs asked for,
+ * then return with any there are, or else wait for one until the
+ * timeout; a timeout shorter than min_wait ends the wait at min_wait.
+ */
+static void
+test_min_wait(void)
+{
+	struct io_uring_params p;
+	struct test_ring t;
+	char buf[4][8];
+	int pp[4][2], err;
+	long ms;
+
+	ring_init(&t);
+	memset(&p, 0, sizeof(p));
+	for (int i = 0; i < 4; i++) {
+		struct io_uring_sqe *sqe;
+
+		assert(pipe(pp[i]) == 0);
+		sqe = ring_prep(&t, IORING_OP_READ, pp[i][0], 74000 + i);
+		sqe->addr = (uintptr_t)buf[i];
+		sqe->len = sizeof(buf[i]);
+		sqe->off = (uint64_t)-1;
+		ring_push_sqe(&t);
+	}
+	ring_submit(&t);
+
+	/* 1. One of four ready: back after min_wait (20 ms), not 2 s. */
+	assert(write(pp[0][1], "a", 1) == 1);
+	ms = min_wait_enter(&t, 4, 2000, 20000, &err);
+	assert(err == 0 && ring_cq_ready(&t) == 1);
+	assert(ms >= 15 && ms < 500);
+	expect_cqe(&t, 74000, 1);
+
+	/* 2. None by min_wait (20 ms): the next one (at 60 ms) ends it. */
+	pthread_t th;
+	int wfd = pp[1][1];
+
+	assert(pthread_create(&th, NULL, min_wait_writer, &wfd) == 0);
+	ms = min_wait_enter(&t, 4, 2000, 20000, &err);
+	assert(err == 0 && ring_cq_ready(&t) == 1);
+	assert(ms >= 50 && ms < 500);
+	expect_cqe(&t, 74001, 1);
+	pthread_join(th, NULL);
+
+	/* 3. Nothing at all: ETIME at the timeout (150 ms). */
+	ms = min_wait_enter(&t, 4, 150, 20000, &err);
+	assert(err == ETIME && ms >= 120 && ms < 600);
+
+	/* 4. A timeout shorter than min_wait: ETIME at min_wait (150 ms). */
+	ms = min_wait_enter(&t, 4, 20, 150000, &err);
+	assert(err == ETIME && ms >= 120 && ms < 600);
+
+	close(t.fd);
+	for (int i = 0; i < 4; i++) {
+		close(pp[i][0]);
+		close(pp[i][1]);
+	}
+	printf("[PASS] min_wait_usec: returns with what there is after "
+	    "min_wait, then on the next CQE or the timeout\n");
+}
+
 static void
 test_sqe128_cqe32_attach_wq(void)
 {
@@ -7757,6 +7842,7 @@ main(int argc, char **argv)
 		test_nonsock_poll();
 		test_kpoll();
 		test_pipe_nowait();
+		test_min_wait();
 		test_sqe128_cqe32_attach_wq();
 		test_registered_rings();
 		test_sqpoll_and_iopoll();

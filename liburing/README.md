@@ -68,7 +68,6 @@ The 12 skips are tests that check for a feature and report its absence:
 - **Not implemented in kqring:**
   - `IORING_SETUP_NO_MMAP` (`buf-ring-nommap`, `no-mmap-inval`);
   - `IORING_SETUP_REGISTERED_FD_ONLY` (`reg-fd-only`);
-  - `min_wait_usec` waits (`min-timeout`, `min-timeout-wait`);
   - `IOPOLL` on an `O_DIRECT` file in the test's directory, which completes with `-EOPNOTSUPP` (`500f9fbadef8`).
 - **Linux-only facilities:** fault injection (`fc2a85cb02ef`), fsnotify (`fsnotify`), ublk (`uring_cmd_ublk`), and `/proc` paths (`wq-aff`).
 - **`ring-leak`** skips because a ring descriptor can't be sent with `SCM_RIGHTS`, as on Linux 6.7 and later. FreeBSD refuses with `EOPNOTSUPP` where Linux uses `EINVAL`, and `test-compat.h` maps one to the other for the tests.

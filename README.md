@@ -140,7 +140,7 @@ Except for the thread scaling, these are single-threaded loopback measurements. 
 **Threading and signals**
 - **One process per ring.** Workers look files up in the owner's descriptor table and run with its credentials, so a forked child that inherits a ring can't submit to it, wait on it or register with it (`EEXIST`); on Linux it can. It can still wake an `SQPOLL` thread with `IORING_ENTER_SQ_WAKEUP`. With `SINGLE_ISSUER`, only the owner thread may enter or register, as on Linux. Before `IORING_REGISTER_ENABLE_RINGS`, one thread at a time may register. `PROBE` and `SEND_MSG_RING` work from any thread.
 - **Ring descriptors can't be passed over UNIX sockets.** `sendmsg(2)` with `SCM_RIGHTS` fails with `EOPNOTSUPP` (Linux 6.7 and later refuse with `EINVAL`), so a ring can't end up in flight on a socket held in its own fixed-file table. A child still inherits a ring across `fork(2)`.
-- **No signal masks.** `kqring_enter()` rejects a signal mask, both the plain form and `struct io_uring_getevents_arg.sigmask` with `IORING_ENTER_EXT_ARG`, with `EINVAL`, and also rejects a non-zero `min_wait_usec`. Timeouts through `IORING_ENTER_EXT_ARG` work.
+- **No signal masks.** `kqring_enter()` rejects a signal mask, both the plain form and `struct io_uring_getevents_arg.sigmask` with `IORING_ENTER_EXT_ARG`, with `EINVAL`. Timeouts and `min_wait_usec` (`IORING_FEAT_MIN_TIMEOUT`) through `IORING_ENTER_EXT_ARG` work.
 - **`SIGPIPE`** is never raised.
 
 **Values and formats**

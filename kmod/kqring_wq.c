@@ -963,9 +963,12 @@ kqring_sqpoll_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
     bool has_timeout, sbintime_t sbt)
 {
 	struct kqring_shm_header *shm = ctx->shm;
+	sbintime_t deadline = has_timeout ? kqring_deadline(sbt) : 0;
 	int error;
 
 	for (;;) {
+		if (has_timeout)
+			sbt = kqring_until(deadline);
 		if ((atomic_load_32(&shm->sq_flags) &
 		    IORING_SQ_CQ_OVERFLOW) != 0) {
 			sx_xlock(&ctx->sq_sx);
@@ -1006,10 +1009,5 @@ kqring_sqpoll_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 
 		if (error == EINTR || error == ERESTART)
 			return (EINTR);
-		if (error == EWOULDBLOCK && has_timeout) {
-			if (sbt <= sleep_sbt)
-				return (ETIMEDOUT);
-			sbt -= sleep_sbt;
-		}
 	}
 }

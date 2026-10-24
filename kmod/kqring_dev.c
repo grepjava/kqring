@@ -660,7 +660,7 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	    IORING_FEAT_CQE_SKIP | IORING_FEAT_LINKED_FILE |
 	    IORING_FEAT_NATIVE_WORKERS | IORING_FEAT_CUR_PERSONALITY |
 	    IORING_FEAT_RSRC_TAGS | IORING_FEAT_REG_REG_RING |
-	    IORING_FEAT_RECVSEND_BUNDLE;
+	    IORING_FEAT_RECVSEND_BUNDLE | IORING_FEAT_MIN_TIMEOUT;
 
 	p.sq_off.head = offsetof(struct kqring_shm_header, sq_head);
 	p.sq_off.tail = offsetof(struct kqring_shm_header, sq_tail);
@@ -836,13 +836,45 @@ kqring_enter_unlock(struct kqring_ctx *ctx, bool lock)
 static int kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
     bool has_timeout, sbintime_t sbt, bool lock);
 
+/*
+ * The wait of an enter, with io_uring's min_wait_usec: wait up to min_sbt
+ * for min_complete CQEs, then return if there are any, or else wait for
+ * just one until the timeout (which counts from the start; one no later
+ * than min_sbt ends the wait there).
+ */
+static int
+kqring_enter_wait(struct kqring_ctx *ctx, uint32_t min_complete,
+    bool has_timeout, sbintime_t sbt, sbintime_t min_sbt, bool lock)
+{
+	bool sqpoll = (ctx->flags & IORING_SETUP_SQPOLL) != 0;
+	sbintime_t deadline;
+	int error;
+
+	if (min_sbt == 0 || min_complete <= 1)
+		return (sqpoll ? kqring_sqpoll_wait_cqes(ctx, min_complete,
+		    has_timeout, sbt) : kqring_wait_cqes(ctx, min_complete,
+		    has_timeout, sbt, lock));
+	deadline = has_timeout ? kqring_deadline(sbt) : 0;
+	error = sqpoll ? kqring_sqpoll_wait_cqes(ctx, min_complete, true,
+	    min_sbt) : kqring_wait_cqes(ctx, min_complete, true, min_sbt, lock);
+	if (error != ETIMEDOUT)
+		return (error);
+	if (has_timeout && sbt <= min_sbt)
+		return (ETIMEDOUT);
+	sbt = has_timeout ? kqring_until(deadline) : 0;
+	if (has_timeout && sbt == 0)
+		return (ETIMEDOUT);
+	return (sqpoll ? kqring_sqpoll_wait_cqes(ctx, 1, has_timeout, sbt) :
+	    kqring_wait_cqes(ctx, 1, has_timeout, sbt, lock));
+}
+
 static int
 kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
     struct thread *td)
 {
 	struct kqring_shm_header *shm = ctx->shm;
 	uint32_t submitted = 0;
-	sbintime_t sbt = 0;
+	sbintime_t sbt = 0, min_sbt = 0;
 	bool has_timeout = false;
 	bool sqpoll = (ctx->flags & IORING_SETUP_SQPOLL) != 0;
 	bool iopoll = (ctx->flags & IORING_SETUP_IOPOLL) != 0;
@@ -885,12 +917,10 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 		error = copyin(ea->arg, &ext, sizeof(ext));
 		if (error != 0)
 			return (error);
-		/*
-		 * Signal masks are not implemented, and pad is min_wait_usec
-		 * on newer Linux: reject both rather than ignore them.
-		 */
-		if (ext.sigmask != 0 || ext.pad != 0)
+		/* Signal masks are not implemented: reject, not ignore. */
+		if (ext.sigmask != 0)
 			return (EINVAL);
+		min_sbt = (sbintime_t)ext.min_wait_usec * SBT_1US;
 		if (wait && ext.ts != 0) {
 			struct timespec ts;
 			error = kqring_copyin_ts(ext.ts, &ts);
@@ -941,8 +971,8 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 		}
 		if (!wait || ea->min_complete == 0)
 			return (0);
-		return (kqring_sqpoll_wait_cqes(ctx, ea->min_complete,
-		    has_timeout, sbt));
+		return (kqring_enter_wait(ctx, ea->min_complete, has_timeout,
+		    sbt, min_sbt, false));
 	}
 
 	/*
@@ -973,8 +1003,8 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	 * then times out or is interrupted: an ioctl error would make
 	 * sys_ioctl() skip copying SUBMITTED_out back to userspace.
 	 */
-	error = kqring_wait_cqes(ctx, ea->min_complete, has_timeout, sbt,
-	    lock);
+	error = kqring_enter_wait(ctx, ea->min_complete, has_timeout, sbt,
+	    min_sbt, lock);
 	kqring_evfd_flush(ctx);
 	if (error != 0 && submitted > 0)
 		error = 0;
@@ -994,11 +1024,16 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 	bool may_poll = true;
 	sbintime_t spin = ctx->busy_poll_sbt;
 	uint32_t timeouts = atomic_load_acq_32(&ctx->cq_timeouts);
+	/* The timeout counts from here, however often the wait is woken. */
+	sbintime_t deadline = has_timeout ? kqring_deadline(sbt) : 0;
 	int error;
 
 	for (;;) {
 		uint32_t cq_count = atomic_load_acq_32(&shm->cq_tail) -
 		    atomic_load_acq_32(&shm->cq_head);
+
+		if (has_timeout)
+			sbt = kqring_until(deadline);
 		/*
 		 * A full CQ with overflow pending must be reaped first.  A
 		 * TIMEOUT completing also ends the wait, as in io_uring.
@@ -1033,8 +1068,6 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 				now = getsbinuptime();
 			}
 			spin = 0;
-			if (has_timeout)
-				sbt = MAX(sbt - (now - start), 0);
 			if (!TAILQ_EMPTY(&ctx->taskwork_ops) ||
 			    !STAILQ_EMPTY(&ctx->rcq))
 				goto drain;
@@ -1097,7 +1130,7 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		if (error == EINTR || error == ERESTART)
 			return (EINTR);
 		if (error == EWOULDBLOCK && has_timeout) {
-			if (sbt <= sleep_sbt) {
+			if (kqring_until(deadline) == 0) {
 				kqring_enter_lock(ctx, lock);
 				if (!ctx->closing) {
 					kqring_run_taskwork(ctx);
@@ -1111,7 +1144,6 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 					return (0);
 				return (ETIMEDOUT);
 			}
-			sbt -= sleep_sbt;
 		}
 drain:
 		kqring_enter_lock(ctx, lock);
