@@ -51,3 +51,20 @@ This document tracks the phased implementation of genuine zero-copy transmit pat
 1. **ABI Constraint:** `io_uring` `IORING_OP_SPLICE` requires at least one endpoint to be a pipe (`DTYPE_PIPE`), returning `-EINVAL` for direct `file -> socket` transfers.
 2. **Existing Zero-Copy Alternatives:** Applications transferring file or `shm_open(2)` data to sockets on FreeBSD either call native `sendfile(2)` directly or pair `IORING_OP_READ_FIXED` with Phase A `IORING_OP_SEND_ZC | IORING_RECVSEND_FIXED_BUF`.
 
+
+---
+
+## Measured Results and Follow-ups
+
+Measured on FreeBSD 15.1 (i5-8250U), as medians of 5 runs; see [`BENCHMARK.MD`](BENCHMARK.MD#bulk-send-one-message-sent-then-read-back-in-full).
+
+| Message | AF_UNIX, `SEND_ZC` registered vs `write(2)` | TCP loopback, `SEND_ZC` registered vs `write(2)` |
+|---|---:|---:|
+| 16 KiB | 41% slower | 21% faster |
+| 64 KiB | 6% faster | 15% faster |
+| 256 KiB | 37% faster | 24% faster |
+
+Unregistered buffers (pinned per request) cost a further 3–14%.
+
+- **Raise the zero-copy threshold for AF_UNIX.** Below 64 KiB the page holding and deferred notification cost more than the copy they save. `KQRING_ZC_MIN_LEN` (one page) could be per protocol, for example 64 KiB for `AF_UNIX` and one page for TCP.
+- **Document `RLIMIT_MEMLOCK`.** FreeBSD's default is 64 KiB, so registering buffers for zero-copy needs `memorylocked` raised in `login.conf(5)`. Done in [`README.md`](README.md) and `BENCHMARK.MD`.

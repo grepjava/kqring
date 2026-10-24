@@ -12,6 +12,7 @@ export_syms
 
 # Test binaries & logs
 tests/kqring_test
+tests/kqring_bench
 *.log
 vmcore.*
 graphify-out/

@@ -57,6 +57,14 @@ sudo kldunload kqring
 Run the test unbuffered so progress survives a panic:
 `timeout 180 stdbuf -o0 ./tests/kqring_test 2>&1 | tee test.log`
 
+Benchmarks (see `BENCHMARK.MD`): the `send` group registers 2 MiB of buffers,
+and the account's `RLIMIT_MEMLOCK` hard limit is 64 KiB, so raise it as root:
+
+```sh
+sudo sh -c 'ulimit -l 8192; exec sudo -u grepjava ./tests/kqring_bench' > bench.1.out
+python3 tests/bench_report.py docs/bench bench.*.out   # medians + SVG charts
+```
+
 ### After a panic
 
 - By default the host stops at `db>` and needs a manual reset. Before risky
