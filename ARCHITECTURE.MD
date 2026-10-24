@@ -1,12 +1,12 @@
 # `kqring` Architecture
 
-`kqring.ko` is a loadable FreeBSD 14/15 kernel module implementing the Linux `io_uring` ABI over `/dev/kqring`, designed around the **`IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN`** execution model.
+`kqring.ko` is a loadable FreeBSD 14/15 kernel module implementing the Linux `io_uring` ABI over `/dev/kqring`. Its fast path is the **`IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN`** execution model; rings shared by the threads of a process and rings without `DEFER_TASKRUN` are built on the same serialized issuer (section 3).
 
 ---
 
 ## 1. Module & Source Layout
 
-The kernel module (`kmod/`) is split into nine translation units sharing a single private header ([`kmod/kqring_var.h`](kmod/kqring_var.h)) and one public UAPI header ([`include/sys/kqring.h`](include/sys/kqring.h)):
+The kernel module (`kmod/`) is split into ten translation units sharing a single private header ([`kmod/kqring_var.h`](kmod/kqring_var.h)) and one public UAPI header ([`include/sys/kqring.h`](include/sys/kqring.h)):
 
 ```mermaid
 flowchart TB
@@ -26,6 +26,7 @@ flowchart TB
         SYNC["kqring_sync.c<br/>Futex, WAITID, timers,<br/>cancel, MSG_RING"]
         WQ["kqring_wq.c<br/>IO_WQ_BOUND / UNBOUND<br/>worker pool, SQPOLL"]
         ZC["kqring_zc.c<br/>Page wiring, RLIMIT_MEMLOCK,<br/>EXT_SFBUF, ZC notif"]
+        KPOLL["kqring_kpoll.c<br/>Non-socket POLL_ADD:<br/>per-ring kqueue + poller"]
     end
 
     UAPI -- "system calls (ioctl fallback) / mmap" --> DEV
@@ -45,13 +46,15 @@ flowchart TB
     WQ --> REQ
     WQ --> SOCK
     WQ --> FILE
+    WQ --> KPOLL
+    REQ --> KPOLL
 ```
 
 | File | Responsibility |
 |---|---|
 | [`include/sys/kqring.h`](include/sys/kqring.h) | Dual kernel/userspace UAPI header: `io_uring_sqe`, `io_uring_cqe`, `io_uring_params`, `io_uring_buf_ring`, `/dev/kqring` ioctls, opcode/flag constants, and inline userspace wrappers (native system calls, found through `kern.kqring.sys_*`, with the ioctls as fallback). |
 | [`kmod/kqring_var.h`](kmod/kqring_var.h) | Kernel-internal structs (`kqring_ctx`, `kqring_op`, `kqring_wq`, `kqring_rsrc`, `kqring_bgroup`, `kqring_zc_buf`, `kqring_zc_notif`), limits, cross-TU prototypes, and hot-path `static inline` helpers. |
-| [`kmod/kqring_dev.c`](kmod/kqring_dev.c) | `/dev/kqring` `cdevsw`, `kqring_open`, `kqring_ioctl`, the `kqring_setup(2)` / `kqring_enter(2)` / `kqring_register(2)` system calls (registered in free `sysent` slots at load and drained at unload), `kqring_mmap_single`, ring setup/teardown, `kqring_wait_cqes`, process `exit`/`exec`/`fork` eventhandlers, and module load/unload. |
+| [`kmod/kqring_dev.c`](kmod/kqring_dev.c) | `/dev/kqring` `cdevsw` (`d_fdopen` only) and the ring file's own `struct fileops` (`kqring_ioctl`, `kqring_poll`, `kqring_kqfilter`, `kqring_mmap`, `kqring_close`, `kqring_fork`), the `kqring_setup(2)` / `kqring_enter(2)` / `kqring_register(2)` system calls (registered in free `sysent` slots at load and drained at unload), ring setup/teardown, `kqring_wait_cqes`, process `exit`/`exec`/`fork` eventhandlers, and module load/unload. |
 | [`kmod/kqring_req.c`](kmod/kqring_req.c) | OBJT_DEFAULT shared memory allocation, CQ ring posting and overflow queue, SQE preparation (`SUBMIT_STABLE` copyin), request allocation/free, chain/drain scheduling, and deferred taskwork execution. |
 | [`kmod/kqring_rsrc.c`](kmod/kqring_rsrc.c) | Reference-counted fixed files (`ctx->files`) with Capsicum rights, registered buffers (`ctx->bufs`), classic & mmap provided-buffer rings (`ctx->bgroups`), and credential personalities. |
 | [`kmod/kqring_register.c`](kmod/kqring_register.c) | `KQRING_IOC_REGISTER` dispatcher (`IORING_REGISTER_*`), restrictions, `IORING_REGISTER_PROBE`, and `eventfd` registration/signalling. |
@@ -59,13 +62,16 @@ flowchart TB
 | [`kmod/kqring_file.c`](kmod/kqring_file.c) | Synchronous, inline (page-cache reads via `VOP_READ_PGCACHE`, `O_NONBLOCK` pipes), direct-to-driver (disk devices: unmapped bios over held user pages, completed by `kqring_bio_done()` as taskwork; not cancelable in flight, and ring teardown waits on `ctx->nbio`) and worker-offloaded VFS/file/pipe operations (`READ`/`WRITE`, `READ_MULTISHOT`, `SPLICE`, `TEE`, `OPENAT`/`OPENAT2`, `STATX`, `*XATTR`, `FSYNC`, `FALLOCATE`, `FTRUNCATE`, `FADVISE`, `MADVISE`). |
 | [`kmod/kqring_sync.c`](kmod/kqring_sync.c) | `FUTEX_WAIT`/`FUTEX_WAITV`/`FUTEX_WAKE` (`umtx_key`), `WAITID`, `callout`-backed `TIMEOUT`/`LINK_TIMEOUT`/`TIMEOUT_REMOVE`, `ASYNC_CANCEL`/`SYNC_CANCEL`, `POLL_REMOVE`, and cross-ring `MSG_RING`. |
 | [`kmod/kqring_wq.c`](kmod/kqring_wq.c) | Per-ring or shared (`IORING_SETUP_ATTACH_WQ`) in-process kernel worker pools (`IO_WQ_BOUND` / `IO_WQ_UNBOUND`), non-blocking worker retirement/abort callout, and `IORING_SETUP_SQPOLL`. |
+| [`kmod/kqring_kpoll.c`](kmod/kqring_kpoll.c) | `POLL_ADD` on files other than sockets: `EVFILT_READ`/`EVFILT_WRITE` knotes on a kqueue the ring owns, the `kqpoll` thread that waits on it, and delivery of its events as taskwork (section 5a). |
 | [`kmod/kqring_zc.c`](kmod/kqring_zc.c) | Physical page holding (`vm_fault_quick_hold_pages`), per-UID `RLIMIT_MEMLOCK` & `vm.max_user_wired` accounting, `EXT_SFBUF` completion callbacks, and COW refresh on `fork(2)`. |
 
 ---
 
-## 2. Shared-Memory Layout (`mmap_single`)
+## 2. Shared-Memory Layout (`fo_mmap`)
 
-Each ring context (`struct kqring_ctx`) allocates two wired `vm_object_t` regions during `KQRING_IOC_SETUP` and optional per-group regions during `IORING_REGISTER_PBUF_RING` (`IOU_PBUF_RING_MMAP`). Each `mmap(2)` call acquires its own `vm_object_reference()`, preventing use-after-free if a buffer ring is unregistered while still mapped in userspace.
+Opening `/dev/kqring` creates a ring file with kqring's own `struct fileops` (installed from `d_fdopen`, as linuxkpi does), with the ring context (`struct kqring_ctx`) in `f_data`. Its `fo_mmap` maps the objects below with `vm_mmap_object()`: shared only, never executable, and writable only through a descriptor opened for writing.
+
+Each ring context allocates two wired `vm_object_t` regions during `KQRING_IOC_SETUP` and optional per-group regions during `IORING_REGISTER_PBUF_RING` (`IOU_PBUF_RING_MMAP`). Each `mmap(2)` call acquires its own `vm_object_reference()`, preventing use-after-free if a buffer ring is unregistered while still mapped in userspace.
 
 ```mermaid
 flowchart LR
@@ -94,14 +100,17 @@ flowchart LR
 
 ---
 
-## 3. Execution Model (`SINGLE_ISSUER | DEFER_TASKRUN`)
+## 3. Execution Model
 
 `kqring` enforces a strict single-writer invariant for the Completion Queue (CQ), request lifecycle, and resource tables:
 
 1. **Asynchronous contexts never write CQEs or mutate resource tables.** Socket upcalls, `callout` timer callbacks, `MSG_RING` senders, and in-process worker threads only enqueue work onto `ctx->taskwork_ops` (or `ctx->rcq` for `MSG_RING`), set `IORING_SQ_TASKRUN`, and wake the ring sleeper (`&ctx->cq_wait` / `ctx->sqpoll_Wait` / `ctx->evfd`).
 2. **All completions and table mutations run on the serialized issuer path:**
-   - **Standard mode:** The owning thread (`ctx->owner_tid`) inside `kqring_enter(2)` (or `KQRING_IOC_ENTER`).
-   - **`IORING_SETUP_SQPOLL` mode:** Either the in-process `kqring_sqpoll_thread` or the owning thread, mutually serialized by `sx_xlock(&ctx->sq_sx)`.
+   - **`SINGLE_ISSUER | DEFER_TASKRUN`:** The owning thread (`ctx->owner_tid`) inside `kqring_enter(2)` (or `KQRING_IOC_ENTER`).
+   - **Shared rings (no `SINGLE_ISSUER`):** any thread of the owner process (`ctx->shared`), one at a time under `sx_xlock(&ctx->sq_sx)`.
+   - **No `DEFER_TASKRUN` (`ctx->taskrun_only`):** a `kqtask` kernel thread in the owner process also runs taskwork as it is queued, so completions appear without an enter, as Linux's task_work does; it takes `sq_sx` like an enter and wakes waiters after each batch.
+   - **`IORING_SETUP_SQPOLL` mode:** Either the in-process `kqsqp` thread (`kqring_sqpoll_thread`) or an entering thread, mutually serialized by `sx_xlock(&ctx->sq_sx)`.
+   - Threads of another process (a forked child) cannot enter or register (`EEXIST`): workers resolve descriptors in the owner's table, so the ring stays bound to one process.
 
 ```mermaid
 flowchart LR
@@ -221,6 +230,18 @@ sequenceDiagram
 - **The socket's file is held across retries:** a `RECV`, `RECVMSG`, `SEND` or `SENDMSG` attempt that would block keeps the file reference it looked up (`op->sock_fp`, taken with the operation's own Capsicum rights). Arming and every later attempt use it instead of looking up `sqe->fd` again, and `kqring_op_free()` releases it. As with io_uring's `req->file`, closing the descriptor or `dup2(2)` over it no longer affects the request: it completes from its original socket, or on cancellation.
 - **`listen(2)` race protection:** On FreeBSD 15, `solisten_proto()` converts a socket's `so_rcv`/`so_snd` union into listen queues under both sockbuf locks. Every sockbuf lock acquisition in `kqring_sock.c` re-checks `SOLISTENING(so)` before touching `so_rcv` or `so_snd`.
 
+### 5a. Non-Socket `POLL_ADD` (`kqring_kpoll.c`)
+
+Pipes, FIFOs, eventfds, ttys, kqueues, ring descriptors and devices with a `d_kqfilter` have no upcall slot, so a `POLL_ADD` on them becomes kqueue knotes:
+
+- **One kqueue per ring, with no descriptor.** On the first such poll, `kern_kqueue()` creates a kqueue on the owner's descriptor table; kqring takes a file reference (`ctx->kp_fp`) and closes the descriptor at once. One `kqpoll` kernel thread per ring waits in `kern_kevent_fp()` on it (waking every 50 ms to notice suspension and teardown).
+- **Each request is one or two knotes** (`EVFILT_READ` and/or `EVFILT_WRITE` on `sqe->fd`), with `udata` = a per-ring request id. A single-shot poll uses `EV_ONESHOT`; a multishot one `EV_CLEAR` (or neither for `IORING_POLL_ADD_LEVEL`). The knote catches every wakeup of the file, so any number of polls cost no threads.
+- **Delivery is taskwork.** The poller only records the events (`op->kp_revents`, `op->kp_nev`) under `ctx->mtx` and queues the request; `kqring_kpoll_deliver()` posts one CQE per event for a multishot poll, ending it instead when the CQ would overflow.
+- **Lookups are hashed:** armed polls by descriptor (`ctx->kp_ops[]`, for events and the one-knote-per-descriptor-and-filter check) and every armed `POLL_ADD` by `user_data` (`ctx->poll_hash[]`, for `POLL_REMOVE`).
+- **Fallbacks:** a poll on a fixed file (no descriptor to register), on a file without a kqfilter, or a second one on the same descriptor and filter waits on a worker (`kqring_wq_poll_wait()`).
+- **Lifetime:** the kqueue lives on the owner's descriptor table, which `exit1()` frees once the process's threads are gone, and a ring can outlive it (a child inherited the descriptor). So the poller closes the kqueue itself when it leaves because the process exits or execs; ring teardown closes it otherwise. Knotes are deleted (`EV_DELETE`) only from the owner process; elsewhere they go with the kqueue.
+- **Difference from Linux:** events are collected by the poller thread, not in the waker's context. If a file becomes ready and is drained again before the poller looks, `kqueue_scan()` re-checks the knote, finds it not ready and drops the event, so no CQE is posted.
+
 ---
 
 ## 6. Zero-Copy Transmit (`SEND_ZC` / `SENDMSG_ZC`)
@@ -315,7 +336,7 @@ Before a non-socket `READ`/`WRITE` is handed to a worker, `kqring_file_rw_inline
 - **Regular files:** a positioned read is served from the page cache through `VOP_READ_PGCACHE` (UFS, tmpfs), the path `vn_read()` tries first. It grabs resident pages without sleeping and returns `EJUSTRETURN` on a miss. As `vn_io_fault()` does for `read(2)`, it holds a read range lock (taken with `vn_rangelock_tryrlock()`, never waiting) and copies out with page faults disabled, so a destination that would fault (unmapped, or mapped from the same file) cannot deadlock against the busied file pages. A miss, a contended range, a copy that would fault, or a partial copy short of end of file leaves the request untouched for the worker, which redoes it in full.
 - **Pipes:** `READ`/`WRITE` on an `O_NONBLOCK` pipe never waits, so it runs inline. A blocking pipe stays on the worker: `pipe_read()` has no per-call non-blocking mode, and another reader could drain the pipe between a readiness check and the read.
 
-Blocking operations on regular files, pipes, FIFOs, devices, VFS paths, `WAITID`, non-socket `POLL_ADD`, and any SQE with `IOSQE_ASYNC` execute on an in-process kernel worker pool (`struct kqring_wq`, `IORING_FEAT_NATIVE_WORKERS`):
+Blocking operations on regular files, pipes, FIFOs, devices, VFS paths, `WAITID`, non-socket `POLL_ADD` that cannot be a knote (section 5a), and any SQE with `IOSQE_ASYNC` execute on an in-process kernel worker pool (`struct kqring_wq`, `IORING_FEAT_NATIVE_WORKERS`):
 
 - **Two sub-pools per `kqring_wq`:**
   - `IO_WQ_BOUND` (default cap 64): regular file/device I/O.
@@ -324,7 +345,7 @@ Blocking operations on regular files, pipes, FIFOs, devices, VFS paths, `WAITID`
 - **Non-blocking cancellation & detached close:**
   - When an armed worker request is cancelled (`ASYNC_CANCEL`, `SYNC_CANCEL`, `POLL_REMOVE`, `LINK_TIMEOUT`, or ring close), `kqring` never blocks the issuer waiting for the worker thread.
   - Instead, the op is moved to `ctx->retired_ops` (`op->wq_retired = true`), its `-ECANCELED` (or `-ETIME`) CQE is posted via taskwork, `kqring_wq_abort_td()` sends `sleepq_abort(wtd, EINTR)` to interrupt any interruptible sleep, and `ctx->wq_abort_callout` periodically re-sends the interrupt every 1 ms until the worker exits its syscall and releases the op.
-  - On `close(ring_fd)`, `kqring_dtor()` detaches any still-running workers (`op->wq_abandoned = true`) and defers final `kqring_ctx` / `kqring_wq` destruction until the last detached worker drops its `ctx->refs` reference (`kqring_ctx_rele()`).
+  - On `close(ring_fd)`, `kqring_close()` detaches any still-running workers (`op->wq_abandoned = true`) and defers final `kqring_ctx` / `kqring_wq` destruction until the last detached worker drops its `ctx->refs` reference (`kqring_ctx_rele()`).
 
 ---
 
@@ -347,7 +368,7 @@ flowchart TD
 
 | Lock | Type | Protects | Ordering Rules |
 |---|---|---|---|
-| `kqring_proc_mtx` | `MTX_DEF` | `kqring_proc_hash`, `kqring_ctx_list`, `kqring_live_workers`, `kqring_live_zc`, `kqring_unloading` | Acquired before `ctx->mtx` or `wq->mtx` during process `exit`/`exec`/`fork` and module unload. |
+| `kqring_proc_mtx` | `MTX_DEF` | `kqring_proc_hash`, `kqring_ctx_list`, `kqring_live_workers`, `kqring_live_zc`, `kqring_nfiles`, `kqring_unloading` | Acquired before `ctx->mtx` or `wq->mtx` during process `exit`/`exec`/`fork` and module unload. |
 | `ctx->sq_sx` | `struct sx` | Serializes `kqring_sqpoll_thread`, enter submission/taskwork, register, setup, and teardown (`kqring_ctx_cancel_all`) | Sleepable outer lock; never held by upcalls, callouts, or workers. Enter skips it when the ring has no SQPOLL thread and its worker pool belongs to the caller's process: then nothing else can run that code concurrently (close waits for the enter's file reference, and the owner's own exit or exec waits for the owner to leave the kernel). |
 | `ctx->bg_sx` | `struct sx` | `ctx->bgroups` hash, `PROVIDED_BUFFERS`, `PBUF_RING` selection/commit | Sleepable lock; nests inside `ctx->sq_sx` and outside `SOCK_BUF_LOCK` / `ctx->mtx`. |
 | `SOCK_IO_SEND_LOCK` | `struct sx` | Serializes socket send operations (`kqring_send_zc_iov`, `sosend`) | Acquired before `SOCK_BUF_LOCK`, `kqring_zc_mtx`, and `ctx->mtx`. |
@@ -361,7 +382,9 @@ flowchart TD
 
 ## 9. Process Lifecycle & Security Boundaries
 
-- **Process exit (`kqring_proc_exit`):** Releases `ctx->files` and `ctx->bufs` and stops workers/SQPOLL for every ring created by the exiting process. This breaks any `AF_UNIX` `SCM_RIGHTS` reference cycle where a ring descriptor is in flight inside an unread socket buffer whose endpoint is also installed in `ctx->files`.
+- **Ring files cannot be passed over UNIX sockets.** `kqring_fileops` has no `DFLAG_PASSABLE`, so `SCM_RIGHTS` fails with `EOPNOTSUPP` (Linux 6.7 and later refuse io_uring files the same way). A ring can therefore never be in flight on a socket held in its own fixed-file table. It sets `DFLAG_FORK` instead, and `kqring_fork()` shares the same open file with a forked child, as an ordinary descriptor would be.
+- **Module unload** fails with `EBUSY` while any ring file is open (`kqring_nfiles`): their file operations cannot be revoked as devfs revokes a cdev's. Once `kqring_unloading` is set, no ring can be opened.
+- **Process exit (`kqring_proc_exit`):** Releases `ctx->files` and `ctx->bufs` and stops workers/SQPOLL for every ring created by the exiting process, as a second line of defence against reference cycles through the fixed-file table.
 - **Process `execve(2)` (`kqring_proc_exec`):** Marks all rings owned by the process as `ctx->closing = true`, stops `SQPOLL` and workers, disarms all in-flight operations, and frees fixed resource tables so a new executable image cannot inherit active asynchronous kernel operations or pre-execve credentials.
 - **Process `fork(2)` (`kqring_proc_fork`):** Increments `ctx->cow_gen` on all rings in the parent process so any registered buffer (`IORING_RECVSEND_FIXED_BUF`) refreshes its held physical pages on the next zero-copy send after copy-on-write mappings are established.
 - **Capsicum (`CAP_RIGHTS` & `IN_CAPABILITY_MODE`):**
