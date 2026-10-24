@@ -82,14 +82,15 @@ Programs that use liburing build against the port in [`liburing/`](liburing/), w
 Compared with `kqueue(2)`, or the plain system call where kqueue has no role, on a 4-core i5-8250U running FreeBSD 15.1 (medians of 5 runs):
 
 - **Many ready sockets:** 14–17% faster than kqueue, from 16 up to 1,024 connections, because one enter reaps every message.
-- **One connection:** multishot `RECV` is 2–14% faster than kqueue on AF_UNIX, and receiving into one reused buffer is 18–21% faster.
-- **Cached file reads:** 32 `READ`s per enter cost 27% less than `pread(2)`, served inline from the page cache. One `READ` per enter costs 16% more.
-- **Zero-copy send:** `SEND_ZC` from a registered buffer is 37% faster than `write(2)` for 256 KiB messages on AF_UNIX and 23% faster on TCP loopback, and 15–17% faster at 64 KiB.
-- **Batching and timers:** 32 `NOP`s per enter cost 77 ns each, and a single `NOP` enter 345 ns (an empty `kevent` costs 287 ns). `TIMEOUT` is 43% faster; multishot `ACCEPT` is on par with kqueue.
+- **One connection:** multishot `RECV` is 4–15% faster than kqueue on AF_UNIX, and receiving into one reused buffer is 19–22% faster.
+- **Cached file reads:** 32 `READ`s per enter cost 30% less than `pread(2)`, served inline from the page cache. One `READ` per enter costs 14% more.
+- **Zero-copy send:** `SEND_ZC` from a registered buffer is 38% faster than `write(2)` for 256 KiB messages on AF_UNIX and 27% faster on TCP loopback, and 17–19% faster at 64 KiB.
+- **Batching and timers:** 32 `NOP`s per enter cost 64 ns each, and a single `NOP` enter 324 ns (an empty `kevent` costs 289 ns). `TIMEOUT` is 45% faster; multishot `ACCEPT` is on par with kqueue.
 - **Disk devices:** 4 KiB random reads on an md(4) disk cost 41% less than through a worker, and 32 per enter run 4.5× faster than `pread(2)`.
-- **Pipes:** on an `O_NONBLOCK` pipe, `READ` runs inline and is 19% faster than kqueue. On a blocking pipe it goes through a worker thread and is 5× slower.
+- **Pipes:** a `READ` on a pipe with data runs inline, blocking or not, and is 17–19% faster than kqueue. A read that has to wait goes through a worker thread.
+- **Threads:** with one ring per thread, enters scale across CPUs: 12.5 M single-`NOP` enters per second on 8 threads, against 3.1 M on one.
 
-These are single-threaded loopback measurements. See [`BENCHMARK.MD`](BENCHMARK.MD) for the method, every result, and the known gaps.
+Except for the thread scaling, these are single-threaded loopback measurements. See [`BENCHMARK.MD`](BENCHMARK.MD) for the method, every result, and the known gaps.
 
 ---
 

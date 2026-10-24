@@ -7,39 +7,35 @@ How `kqring` compares with FreeBSD's `kqueue(2)` on the same workloads. Where kq
 ## Summary
 
 - **Many connections: kqring is 14–17% faster.** When many sockets become ready at once, one `kqring_enter()` reaps every message, where kqueue needs one `recv(2)` per message after the `kevent(2)`. The gain is the same at 16, 256 and 1,024 connections.
-- **One connection: faster for small messages.** On AF_UNIX, a multishot `RECV` is 14% faster than kqueue at 64 B, 8% at 1 KiB and 2% at 4 KiB. Receiving into one reused buffer, kqring is 18–21% faster at every size tested.
-- **Cached file reads beat `pread(2)` when batched.** 32 `READ`s per enter cost 791 ns each, 27% less than `pread(2)`. A single `READ` per enter costs 16% more than `pread(2)`, the price of the extra SQE and CQE. Both are served inline from the page cache, without a worker thread.
-- **Zero-copy send pays off from 64 KiB.** `SEND_ZC` from a registered buffer is 37% faster than `write(2)` for 256 KiB messages on AF_UNIX and 23% faster on TCP loopback, and 15–17% faster at 64 KiB. At 16–32 KiB it ranges from 5% faster to 13% slower than `write(2)`. On AF_UNIX, kqring copies small sends from unregistered buffers itself, because that's cheaper there.
-- **Batching is where kqring shines.** 32 `NOP`s per enter cost 77 ns each, against 287 ns for an empty `kevent(2)` and 345 ns for a single `NOP` enter.
-- **Timers are faster, accept is even.** A 1 µs `TIMEOUT` completes 43% faster than a 1 µs `EVFILT_TIMER`. A multishot `ACCEPT` is 1% faster than kqueue plus `accept(2)`; see the note under [Accept](#accept-a-tcp-loopback-connection-set-up-and-torn-down).
-- **Disk devices go straight to the driver.** 4 KiB random reads on an md(4) disk cost 41% less than through a worker, and 32 in flight cost 975 ns each, 78% less than `pread(2)`.
-- **Pipes: fast when non-blocking, 5× slower when blocking.** A `READ` on an `O_NONBLOCK` pipe runs inline and is 19% faster than kqueue. On a blocking pipe it still goes through a worker thread, at about 4.4 µs per round trip; see [Known gaps](#known-gaps).
+- **One connection: faster for small messages.** On AF_UNIX, a multishot `RECV` is 15% faster than kqueue at 64 B, 9% at 1 KiB and 4% at 4 KiB. Receiving into one reused buffer, kqring is 19–22% faster at every size tested.
+- **Cached file reads beat `pread(2)` when batched.** 32 `READ`s per enter cost 786 ns each, 30% less than `pread(2)`. A single `READ` per enter costs 14% more than `pread(2)`, the price of the extra SQE and CQE. Both are served inline from the page cache, without a worker thread.
+- **Zero-copy send pays off from 64 KiB.** `SEND_ZC` from a registered buffer is 38% faster than `write(2)` for 256 KiB messages on AF_UNIX and 27% faster on TCP loopback, and 17–19% faster at 64 KiB. At 16–32 KiB it ranges from 7% faster to 7% slower than `write(2)`. On AF_UNIX, kqring copies small sends from unregistered buffers itself, because that's cheaper there.
+- **Batching is where kqring shines.** 32 `NOP`s per enter cost 64 ns each, against 289 ns for an empty `kevent(2)` and 324 ns for a single `NOP` enter.
+- **Timers are faster, accept is even.** A 1 µs `TIMEOUT` completes 45% faster than a 1 µs `EVFILT_TIMER`. A multishot `ACCEPT` is 2% faster than kqueue plus `accept(2)`; see the note under [Accept](#accept-a-tcp-loopback-connection-set-up-and-torn-down).
+- **Disk devices go straight to the driver.** 4 KiB random reads on an md(4) disk cost 41% less than through a worker, and 32 in flight cost 975 ns each, 78% less than `pread(2)` (measured on the previous build).
+- **Pipes: 17–19% faster than kqueue.** A `READ` on a pipe that has data runs inline, blocking or not. Only a read that has to wait goes to a worker thread.
 - **Rings scale with threads.** With one ring per thread, single-`NOP` enters reach 12.5 M/s on 8 threads (6.5 M/s before this build) and ping-pong stays 17–29% ahead of kqueue at every thread count; see [Multi-threaded scaling](#multi-threaded-scaling-one-ring-per-thread).
-- **Arming still costs.** A `RECV` submitted before its data arrives costs 32–39% more than kqueue, because it takes three syscalls (submit, `write`, wait) and installs and removes a socket upcall each time. Use multishot for steady-state receive.
+- **Arming still costs.** A `RECV` submitted before its data arrives costs 37–43% more than kqueue, because it takes three syscalls (submit, `write`, wait) and installs and removes a socket upcall each time. Use multishot for steady-state receive.
 
 ## What changed in this build
 
-The enter path was profiled with DTrace kernel sampling. About a third of a one-`NOP` enter was spent in FreeBSD's generic `ioctl(2)` and devfs dispatch (`devvn_refthread`, `kern_ioctl`, copying the argument structure in and out), before any kqring code ran. Four changes followed:
+Against the previous published build:
 
-1. **Native system calls.** `kqring_setup(2)`, `kqring_enter(2)` and `kqring_register(2)` take their arguments in registers. The module registers them in free system-call slots at load (`sysctl kern.kqring.sys_*`), and the wrappers in `<sys/kqring.h>` use them, falling back to the ioctls where no slot was free. This saves about 92 ns per enter.
-2. **No `sq_sx` lock on the common enter path.** Enter skips it when the ring has no `SQPOLL` thread and its worker pool belongs to the caller's process. Nothing else can run that code concurrently then.
-3. **A socket request that would block keeps its file**, as io_uring keeps `req->file`. The upcall-driven retry no longer looks up the descriptor again, which saves about 30 ns per armed `RECV`. As on Linux, closing the descriptor or `dup2(2)` over it no longer affects the request.
-4. **Reused requests clear only the fields that need it.** The 512-byte request structure was cleared in full each time; the callout and the SQE copy are now left alone.
-
-Changes 2 and 4 together save about 3 ns, which is within noise. Against the previous build:
+1. **`kqring_enter(2)` scales across threads.** A module's system calls are counted in their `sysent` entry so that unloading can wait for them: two atomic compare-and-swaps per call on one word every CPU shares. kqring now counts enter calls per CPU instead; see [Multi-threaded scaling](#multi-threaded-scaling-one-ring-per-thread).
+2. **Pipes with data are read inline, blocking or not**, as are writes to pipes with room. Before, a blocking pipe always went through a worker thread.
+3. **`POLL_ADD` on pipes, eventfds and other non-socket files** waits as a knote on a kqueue the ring owns, served by one kernel thread per ring, instead of one blocking worker per poll. It isn't in these benchmarks.
+4. **liburing compatibility work**: rings shared by the threads of a process, provided-buffer receives that fail `-ENOBUFS` on an empty group as on Linux, bundle sends, and ring descriptors that can't be passed over UNIX sockets. The `-ENOBUFS` check costs an idle socket's receive a few tens of nanoseconds, which shows in the armed `RECV` row.
 
 | Variant | Before | After | Change |
 |---|---:|---:|---:|
-| `NOP`, one per enter | 439 | 345 | −21% |
-| AF_UNIX `RECV`, one reused buffer, 64 B | 981 | 886 | −10% |
-| AF_UNIX multishot `RECV`, 64 B | 1,065 | 964 | −9% |
-| AF_UNIX `RECV` armed before the data, 64 B | 1,698 | 1,474 | −13% |
-| `READ`, `O_NONBLOCK` pipe | 919 | 828 | −10% |
-| `READ`, cached file, one per enter | 1,356 | 1,260 | −7% |
-| `SEND`, AF_UNIX, 16 KiB | 2,033 | 1,933 | −5% |
-| Multishot `ACCEPT`, TCP loopback | 14,838 | 15,981 | +8% |
-
-Batched rows barely move, because they already amortised the enter. The `ACCEPT` row got slower for a timing reason, explained under [Accept](#accept-a-tcp-loopback-connection-set-up-and-torn-down).
+| `NOP`, one per enter | 345 | 324 | −6% |
+| `NOP`, 32 per enter | 77 | 64 | −17% |
+| AF_UNIX `RECV`, one reused buffer, 64 B | 886 | 863 | −3% |
+| AF_UNIX multishot `RECV`, 64 B | 964 | 948 | −2% |
+| AF_UNIX `RECV` armed before the data, 64 B | 1,474 | 1,523 | +3% |
+| `READ`, blocking pipe | 5,410 | 850 | −84% |
+| `READ`, cached file, 32 per enter | 791 | 786 | −1% |
+| `NOP`, one per enter, 8 threads (M/s, higher is better) | 6.5 | 12.5 | +92% |
 
 ## Setup
 
@@ -53,7 +49,7 @@ Batched rows barely move, because they already amortised the enter. The `ACCEPT`
 | Benchmark | [`tests/kqring_bench.c`](tests/kqring_bench.c), built with `cc -O2` |
 | Limits | `ulimit -l 8192` (the FreeBSD default of 64 KiB is too small to register the send buffers) |
 
-The functional suite ([`tests/kqring_test.c`](tests/kqring_test.c)) passed 71/71 in each of 10 passes on the same build, with the module reloaded before each pass. After every pass and every benchmark run, `vmstat -m` showed no kqring memory in use, and `vm.stats.vm.v_user_wire_count` and `kern.openfiles` were back to their starting values.
+The functional suite ([`tests/kqring_test.c`](tests/kqring_test.c)) passed 76/76 in each of 10 passes on the same build, with the module reloaded before each pass. After every pass and every benchmark run, `vmstat -m` showed no kqring memory in use, and `vm.stats.vm.v_user_wire_count` and `kern.openfiles` were back to their starting values.
 
 ## Method
 
@@ -71,12 +67,12 @@ Times are in nanoseconds per operation, lower is better. Percentages are relativ
 
 | Variant | ns/op | vs kqueue |
 |---|---:|---:|
-| `kevent(2)`, nothing to do | 287 | |
-| kqring `NOP`, one per enter | 345 | +20% |
-| kqring `NOP`, 32 per enter | 77 | −73% |
-| kqring `NOP` with `IOSQE_ASYNC`, through a worker | 4,443 | +1,449% |
+| `kevent(2)`, nothing to do | 289 | |
+| kqring `NOP`, one per enter | 324 | +12% |
+| kqring `NOP`, 32 per enter | 64 | −78% |
+| kqring `NOP` with `IOSQE_ASYNC`, through a worker | 4,371 | +1,415% |
 
-A single kqring enter costs 58 ns more than an empty `kevent`, because it parses an SQE and posts a CQE. Through the `ioctl(2)` fallback it costs about 435 ns. Batching amortises the rest quickly. The `IOSQE_ASYNC` row is the cost of a round trip through a worker thread.
+A single kqring enter costs 36 ns more than an empty `kevent`, because it parses an SQE and posts a CQE. Through the `ioctl(2)` fallback it costs about 365 ns. Batching amortises the rest quickly. The `IOSQE_ASYNC` row is the cost of a round trip through a worker thread.
 
 ### Ping-pong: one message written, then received, on one connection
 
@@ -86,12 +82,12 @@ A single kqring enter costs 58 ns more than an empty `kevent`, because it parses
 
 | Variant | 64 B | 1 KiB | 4 KiB |
 |---|---:|---:|---:|
-| `write` + `recv`, no waiting (floor) | 722 | 752 | 841 |
-| kqueue: `write` + `kevent` + `recv` | 1,120 | 1,153 | 1,262 |
-| kqring `RECV`, provided buffer | 1,000 (−11%) | 1,100 (−5%) | 1,270 (+1%) |
-| kqring `RECV`, one reused buffer | **886 (−21%)** | **921 (−20%)** | **1,033 (−18%)** |
-| kqring multishot `RECV`, provided buffers | 964 (−14%) | 1,062 (−8%) | 1,238 (−2%) |
-| kqring `RECV` armed before the data arrives | 1,474 (+32%) | 1,584 (+37%) | 1,751 (+39%) |
+| `write` + `recv`, no waiting (floor) | 721 | 752 | 833 |
+| kqueue: `write` + `kevent` + `recv` | 1,111 | 1,153 | 1,264 |
+| kqring `RECV`, provided buffer | 983 (−12%) | 1,081 (−6%) | 1,241 (−2%) |
+| kqring `RECV`, one reused buffer | **863 (−22%)** | **906 (−21%)** | **1,018 (−19%)** |
+| kqring multishot `RECV`, provided buffers | 948 (−15%) | 1,050 (−9%) | 1,210 (−4%) |
+| kqring `RECV` armed before the data arrives | 1,523 (+37%) | 1,643 (+43%) | 1,808 (+43%) |
 
 The provided-buffer variants rotate through a 16 MiB buffer ring (4,096 × 4 KiB), and the resulting cache misses cost 100–240 ns per message against a reused buffer, more as messages grow. Applications that use fewer, smaller buffers should see results close to the one-buffer row.
 
@@ -99,11 +95,11 @@ The provided-buffer variants rotate through a 16 MiB buffer ring (4,096 × 4 KiB
 
 | Variant | ns/op | vs kqueue |
 |---|---:|---:|
-| kqueue: `write` + `kevent` + `recv` | 5,884 | |
-| kqring `RECV`, provided buffer | 6,096 | +4% |
-| kqring `RECV`, one reused buffer | 5,956 | +1% |
-| kqring multishot `RECV` | 5,933 | +1% |
-| kqring `RECV` armed before the data arrives | 6,512 | +11% |
+| kqueue: `write` + `kevent` + `recv` | 5,932 | |
+| kqring `RECV`, provided buffer | 6,226 | +5% |
+| kqring `RECV`, one reused buffer | 6,082 | +3% |
+| kqring multishot `RECV` | 5,894 | −1% |
+| kqring `RECV` armed before the data arrives | 6,690 | +13% |
 
 TCP is dominated by the loopback stack (about 5 µs per message), so the mechanisms differ by a few percent. On loopback the data isn't always there the moment `write()` returns, so there's no no-wait floor for TCP.
 
@@ -115,9 +111,9 @@ Each round writes one 64-byte message to each of N AF_UNIX connections and then 
 
 | Variant | N = 16 | N = 256 | N = 1,024 |
 |---|---:|---:|---:|
-| kqueue: one `kevent` returns N events, then N `recv` | 828 | 858 | 864 |
-| kqring: N multishot `RECV`s, one enter reaps N CQEs | **684 (−17%)** | **712 (−17%)** | **736 (−15%)** |
-| kqring: N single-shot `RECV`s submitted and completed in one enter | 711 (−14%) | 739 (−14%) | 744 (−14%) |
+| kqueue: one `kevent` returns N events, then N `recv` | 830 | 858 | 863 |
+| kqring: N multishot `RECV`s, one enter reaps N CQEs | **691 (−17%)** | **720 (−16%)** | **744 (−14%)** |
+| kqring: N single-shot `RECV`s submitted and completed in one enter | 703 (−15%) | 726 (−15%) | 732 (−15%) |
 
 This is the shape of a busy server, and where the ring model pays off: kqring makes one system call for N messages, kqueue makes N + 1.
 
@@ -134,19 +130,19 @@ Throughput in GB/s (higher is better), with the time per message against `write(
 
 | Variant | 16 KiB | 32 KiB | 64 KiB | 256 KiB |
 |---|---:|---:|---:|---:|
-| `write(2)` | 9.50 | 11.39 | 12.41 | 10.26 |
-| kqring `SEND` | 8.48 (+12%) | 10.46 (+9%) | 11.77 (+5%) | 10.12 (+1%) |
-| kqring `SEND_ZC`, registered buffer | 8.39 (+13%) | 11.98 (−5%) | **14.92 (−17%)** | **16.40 (−37%)** |
-| kqring `SEND_ZC`, unregistered buffer | 7.94 (+20%), copied | 10.45 (+9%) | 12.84 (−3%) | **14.15 (−27%)** |
+| `write(2)` | 9.43 | 11.24 | 12.16 | 9.90 |
+| kqring `SEND` | 8.59 (+10%) | 10.60 (+6%) | 11.53 (+5%) | 9.88 (0%) |
+| kqring `SEND_ZC`, registered buffer | 8.57 (+10%) | 12.12 (−7%) | **14.93 (−19%)** | **16.02 (−38%)** |
+| kqring `SEND_ZC`, unregistered buffer | 8.07 (+17%), copied | 10.55 (+7%) | 12.83 (−5%) | **13.86 (−29%)** |
 
 **TCP loopback**
 
 | Variant | 16 KiB | 32 KiB | 64 KiB | 256 KiB |
 |---|---:|---:|---:|---:|
-| `write(2)` | 2.23 | 4.01 | 4.77 | 5.13 |
-| kqring `SEND` | 2.13 (+4%) | 3.94 (+2%) | 4.63 (+3%) | 5.04 (+2%) |
-| kqring `SEND_ZC`, registered buffer | 2.26 (−2%) | 3.68 (+9%) | **5.64 (−15%)** | **6.67 (−23%)** |
-| kqring `SEND_ZC`, unregistered buffer | 2.16 (+3%) | 3.65 (+10%) | 5.34 (−11%) | **6.07 (−15%)** |
+| `write(2)` | 2.23 | 3.92 | 4.72 | 5.12 |
+| kqring `SEND` | 2.15 (+3%) | 3.92 (0%) | 4.66 (+1%) | 5.13 (0%) |
+| kqring `SEND_ZC`, registered buffer | 2.30 (−3%) | 3.66 (+7%) | **5.69 (−17%)** | **6.99 (−27%)** |
+| kqring `SEND_ZC`, unregistered buffer | 2.20 (+1%) | 3.60 (+9%) | 5.42 (−13%) | **6.22 (−18%)** |
 
 - **When kqring sends zero-copy.** A registered buffer's pages are held once, at registration, so a send from one goes zero-copy from one page up. An unregistered buffer has to be pinned and charged to `RLIMIT_MEMLOCK` on every send. On AF_UNIX, where the alternative is a single `memcpy`, that costs more than copying below about 32 KiB. So kqring copies those sends itself and reports `IORING_NOTIF_USAGE_ZC_COPIED`, as io_uring allows. The threshold is `sysctl kern.kqring.zc_local_min_len`, 32 KiB by default, chosen from these measurements: an unregistered 16 KiB send took 2,147–2,188 ns copied and 2,287–2,319 ns zero-copy, and at 32 KiB zero-copy won (3,230–3,257 against 3,379–3,536 ns). TCP always uses one page.
 - **The small-message gap is the ring, not zero-copy.** At 16 KiB, every kqring variant on AF_UNIX costs about 200–340 ns more than `write(2)`, the same as a plain copying `SEND`. That's the fixed cost of the SQE, the CQE and the enter, which batching would amortise.
@@ -158,9 +154,9 @@ The client resets on close (`SO_LINGER` 0), so no `TIME_WAIT` builds up.
 
 | Variant | ns/connection | vs kqueue |
 |---|---:|---:|
-| Blocking `accept(2)` (floor) | 14,474 | −11% |
-| kqueue: `kevent` + `accept` | 16,181 | |
-| kqring multishot `ACCEPT` | 15,981 | −1% |
+| Blocking `accept(2)` (floor) | 14,486 | −11% |
+| kqueue: `kevent` + `accept` | 16,297 | |
+| kqring multishot `ACCEPT` | 16,047 | −2% |
 
 The previous build measured 14,838 ns here. The faster enter is what made it slower: the connection is completed by the loopback netisr thread, and the enter now usually checks before that thread has queued it. So nearly every iteration sleeps and pays a wake-up of about 1 µs. DTrace counted about 20,000 more sleeps per run than with the `ioctl(2)` fallback, one per connection. Forcing the fallback on this build gives 15,529–16,146 ns.
 
@@ -170,31 +166,31 @@ The previous build measured 14,838 ns here. The faster enter is what made it slo
 
 kqring runs a non-socket `READ` or `WRITE` inline, on the thread that submitted it, when that cannot block:
 - **Regular files:** a positioned read whose pages are all in the page cache. It is served the way `read(2)` serves it first, through `VOP_READ_PGCACHE` (UFS and tmpfs).
-- **Pipes:** any `READ` or `WRITE` on an `O_NONBLOCK` pipe.
+- **Pipes:** a `READ` on a pipe that has data, or a `WRITE` to one with room, blocking or not.
 
-Everything else goes to a worker thread.
+Everything else goes to a worker thread, including a pipe `READ` that has to wait for data (even on an `O_NONBLOCK` pipe: like io_uring, kqring waits rather than fail with `-EAGAIN`).
 
 **Pipe: a 64-byte message**
 
 | Variant | ns/op | vs kqueue |
 |---|---:|---:|
-| `write` + `read`, no waiting (floor) | 616 | −40% |
-| kqueue: `write` + `kevent` + `read` | 1,019 | |
-| kqring `READ`, `O_NONBLOCK` pipe (inline) | **828** | **−19%** |
-| kqring `READ`, blocking pipe (worker) | 5,410 | +431% |
+| `write` + `read`, no waiting (floor) | 620 | −39% |
+| kqueue: `write` + `kevent` + `read` | 1,024 | |
+| kqring `READ`, `O_NONBLOCK` pipe, data ready (inline) | **834** | **−19%** |
+| kqring `READ`, blocking pipe, data ready (inline) | 850 | −17% |
 
 **File: 4 KiB random reads from a 64 MiB file in the page cache.** kqueue can't wait on regular files, so the comparison is `pread(2)`.
 
 | Variant | ns/op | vs `pread` |
 |---|---:|---:|
-| `pread(2)` | 1,091 | |
-| kqring `READ`, one per enter | 1,260 | +16% |
-| kqring `READ`, one per enter, registered file (`IOSQE_FIXED_FILE`) | 1,259 | +15% |
-| kqring `READ`, 32 per enter | **791** | **−27%** |
+| `pread(2)` | 1,116 | |
+| kqring `READ`, one per enter | 1,273 | +14% |
+| kqring `READ`, one per enter, registered file (`IOSQE_FIXED_FILE`) | 1,255 | +12% |
+| kqring `READ`, 32 per enter | **786** | **−30%** |
 
 Before inline reads, these were 5,540 ns and 4,696 ns, because every read made a round trip through a worker.
 
-A registered file saves almost nothing, so the descriptor lookups a `READ` makes aren't where the single-read gap comes from. It is the fixed cost of an enter, shown by the `NOP` row (345 ns against 287 ns for an empty `kevent`), plus the SQE and CQE.
+A registered file saves almost nothing, so the descriptor lookups a `READ` makes aren't where the single-read gap comes from. It is the fixed cost of an enter, shown by the `NOP` row (324 ns against 289 ns for an empty `kevent`), plus the SQE and CQE.
 
 ### Disk device: 4 KiB random reads and writes
 
@@ -214,8 +210,8 @@ With one request per enter, kqring pays one sleep and wake-up more than `pread(2
 
 | Variant | ns/op | vs kqueue |
 |---|---:|---:|
-| kqueue `EVFILT_TIMER`, `NOTE_USECONDS` 1 | 8,865 | |
-| kqring `TIMEOUT`, 1 µs | 5,057 | −43% |
+| kqueue `EVFILT_TIMER`, `NOTE_USECONDS` 1 | 8,806 | |
+| kqring `TIMEOUT`, 1 µs | 4,820 | −45% |
 
 Both are dominated by timer-interrupt scheduling, not by the API.
 
@@ -241,7 +237,7 @@ Both are dominated by timer-interrupt scheduling, not by the API.
 
 ## Known gaps
 
-- **Blocking pipes still go through a worker thread.** FreeBSD's `pipe_read()` decides whether to block from the descriptor's `O_NONBLOCK` flag, and has no per-call non-blocking read. kqring can't safely read a blocking pipe inline: another reader could drain it between a readiness check and the read, and the ring owner would then block. A worker round trip costs about 4.4 µs (the `IOSQE_ASYNC` floor row). Applications can set `O_NONBLOCK` on the pipe to get the inline path. A `READ` on an empty non-blocking pipe then completes with `-EAGAIN`, as `read(2)` would, so wait for data with `POLL_ADD` first.
+- **A pipe read that has to wait goes through a worker thread**, as does a write to a full pipe: FreeBSD's `pipe_read()` and `pipe_write()` decide whether to block from the descriptor's `O_NONBLOCK` flag and have no per-call non-blocking mode. A worker round trip costs about 4.4 µs (the `IOSQE_ASYNC` floor row). For the same reason, a read of a blocking pipe that another thread drains between kqring's readiness check and the read waits in `pipe_read()` on the ring owner's thread, as `read(2)` would. Waiting for data with `POLL_ADD` first avoids the worker; only one reader per pipe avoids the wait.
 - **Page-cache misses, and filesystems without the page-cache read path, go through a worker.** This covers file reads that need the disk, ZFS (which caches in the ARC, not the page cache), `O_DIRECT` on files, and reads using the file position (`off` = −1). Only disk devices themselves get the direct bio path: FreeBSD filesystems have no asynchronous read or write entry point, and sending bios under a filesystem would bypass its block allocation and locking. It also covers reads into a buffer that isn't mapped yet: the inline copy runs with page faults disabled, so the buffer's first use goes through the worker.
 - **One operation per enter costs about 60 ns more than an empty `kevent`.** That's the `NOP` floor: parsing an SQE and posting a CQE. Batching removes it.
 - **A wait that just misses its completion pays a full sleep.** When the completion comes from another thread (the TCP loopback netisr, for instance) a moment after the enter checks, the enter sleeps and pays a wake-up of about 1 µs; see [Accept](#accept-a-tcp-loopback-connection-set-up-and-torn-down). `IORING_REGISTER_NAPI` opts in to a busy-wait before sleeping. With 50 µs, multishot `ACCEPT` drops from about 15.9 to 14.1 µs, below the blocking `accept(2)` floor, at the cost of CPU time on waits that don't end quickly.

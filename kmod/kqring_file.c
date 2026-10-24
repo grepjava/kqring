@@ -358,10 +358,10 @@ kqring_file_bio_try(struct kqring_ctx *ctx, struct kqring_op *op,
  * that cannot block it, as io_uring tries non-blocking I/O before punting
  * to io-wq:
  *
- *  - A non-blocking pipe: kqring_exec_file_rw() never waits on one, so it
- *    gives the same result here as on a worker.  (A blocking pipe has no
- *    per-call non-blocking read: another reader could drain it between a
- *    readiness check and the read, so it stays on the worker.)
+ *  - A pipe with data to read (or room to write), blocking or not.  A
+ *    blocking pipe has no per-call non-blocking read, so if another
+ *    reader drains it between the check and the read, the issuer waits
+ *    in pipe_read() as read(2) would; an empty one goes to a worker.
  *  - A positioned read of a regular file that the page cache satisfies.
  *    VOP_READ_PGCACHE grabs resident pages without sleeping and gives up
  *    with EJUSTRETURN otherwise; vn_read() tries it first the same way.

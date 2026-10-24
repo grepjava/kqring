@@ -45,25 +45,25 @@
 <text x="690.0" y="312" class="tick" text-anchor="middle">1,000</text>
 <text x="740" y="312" class="tick" text-anchor="end">ns</text>
 <text x="92.0" y="127.0" class="lab" text-anchor="end">16 sockets</text>
-<path d="M102.0,100.0 H585.0 Q589.0,100.0 589.0,104.0 V110.0 Q589.0,114.0 585.0,114.0 H102.0 Z" fill="var(--kqueue)"><title>16 sockets — kqueue + recv: 828 ns</title></path>
-<text x="594.0" y="111" class="val">828</text>
-<path d="M102.0,116.0 H500.5 Q504.5,116.0 504.5,120.0 V126.0 Q504.5,130.0 500.5,130.0 H102.0 Z" fill="var(--s1)"><title>16 sockets — kqring multishot RECV: 684 ns</title></path>
-<text x="509.5" y="127" class="val">684</text>
-<path d="M102.0,132.0 H516.2 Q520.2,132.0 520.2,136.0 V142.0 Q520.2,146.0 516.2,146.0 H102.0 Z" fill="var(--s2)"><title>16 sockets — kqring RECV batch: 711 ns</title></path>
-<text x="525.2" y="143" class="val">711</text>
+<path d="M102.0,100.0 H585.9 Q589.9,100.0 589.9,104.0 V110.0 Q589.9,114.0 585.9,114.0 H102.0 Z" fill="var(--kqueue)"><title>16 sockets — kqueue + recv: 830 ns</title></path>
+<text x="594.9" y="111" class="val">830</text>
+<path d="M102.0,116.0 H504.1 Q508.1,116.0 508.1,120.0 V126.0 Q508.1,130.0 504.1,130.0 H102.0 Z" fill="var(--s1)"><title>16 sockets — kqring multishot RECV: 691 ns</title></path>
+<text x="513.1" y="127" class="val">691</text>
+<path d="M102.0,132.0 H511.5 Q515.5,132.0 515.5,136.0 V142.0 Q515.5,146.0 511.5,146.0 H102.0 Z" fill="var(--s2)"><title>16 sockets — kqring RECV batch: 703 ns</title></path>
+<text x="520.5" y="143" class="val">703</text>
 <text x="92.0" y="191.0" class="lab" text-anchor="end">256 sockets</text>
 <path d="M102.0,164.0 H602.7 Q606.7,164.0 606.7,168.0 V174.0 Q606.7,178.0 602.7,178.0 H102.0 Z" fill="var(--kqueue)"><title>256 sockets — kqueue + recv: 858 ns</title></path>
 <text x="611.7" y="175" class="val">858</text>
-<path d="M102.0,180.0 H516.4 Q520.4,180.0 520.4,184.0 V190.0 Q520.4,194.0 516.4,194.0 H102.0 Z" fill="var(--s1)"><title>256 sockets — kqring multishot RECV: 712 ns</title></path>
-<text x="525.4" y="191" class="val">712</text>
-<path d="M102.0,196.0 H532.3 Q536.3,196.0 536.3,200.0 V206.0 Q536.3,210.0 532.3,210.0 H102.0 Z" fill="var(--s2)"><title>256 sockets — kqring RECV batch: 739 ns</title></path>
-<text x="541.3" y="207" class="val">739</text>
+<path d="M102.0,180.0 H521.3 Q525.3,180.0 525.3,184.0 V190.0 Q525.3,194.0 521.3,194.0 H102.0 Z" fill="var(--s1)"><title>256 sockets — kqring multishot RECV: 720 ns</title></path>
+<text x="530.3" y="191" class="val">720</text>
+<path d="M102.0,196.0 H525.1 Q529.1,196.0 529.1,200.0 V206.0 Q529.1,210.0 525.1,210.0 H102.0 Z" fill="var(--s2)"><title>256 sockets — kqring RECV batch: 726 ns</title></path>
+<text x="534.1" y="207" class="val">726</text>
 <text x="92.0" y="255.0" class="lab" text-anchor="end">1,024 sockets</text>
-<path d="M102.0,228.0 H605.9 Q609.9,228.0 609.9,232.0 V238.0 Q609.9,242.0 605.9,242.0 H102.0 Z" fill="var(--kqueue)"><title>1,024 sockets — kqueue + recv: 864 ns</title></path>
-<text x="614.9" y="239" class="val">864</text>
-<path d="M102.0,244.0 H530.8 Q534.8,244.0 534.8,248.0 V254.0 Q534.8,258.0 530.8,258.0 H102.0 Z" fill="var(--s1)"><title>1,024 sockets — kqring multishot RECV: 736 ns</title></path>
-<text x="539.8" y="255" class="val">736</text>
-<path d="M102.0,260.0 H535.6 Q539.6,260.0 539.6,264.0 V270.0 Q539.6,274.0 535.6,274.0 H102.0 Z" fill="var(--s2)"><title>1,024 sockets — kqring RECV batch: 744 ns</title></path>
-<text x="544.6" y="271" class="val">744</text>
+<path d="M102.0,228.0 H605.3 Q609.3,228.0 609.3,232.0 V238.0 Q609.3,242.0 605.3,242.0 H102.0 Z" fill="var(--kqueue)"><title>1,024 sockets — kqueue + recv: 863 ns</title></path>
+<text x="614.3" y="239" class="val">863</text>
+<path d="M102.0,244.0 H535.5 Q539.5,244.0 539.5,248.0 V254.0 Q539.5,258.0 535.5,258.0 H102.0 Z" fill="var(--s1)"><title>1,024 sockets — kqring multishot RECV: 744 ns</title></path>
+<text x="544.5" y="255" class="val">744</text>
+<path d="M102.0,260.0 H528.5 Q532.5,260.0 532.5,264.0 V270.0 Q532.5,274.0 528.5,274.0 H102.0 Z" fill="var(--s2)"><title>1,024 sockets — kqring RECV batch: 732 ns</title></path>
+<text x="537.5" y="271" class="val">732</text>
 <line x1="102.0" y1="94" x2="102.0" y2="296" class="axis"/>
 </svg>
