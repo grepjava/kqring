@@ -235,7 +235,7 @@ Both are dominated by timer-interrupt scheduling, not by the API.
 | the same, kqring `READ`, 32 per enter | 1.33 | 1.83 | 2.40 | 2.65 |
 
 - **Enter scales.** In the first run of this benchmark, one `NOP` per enter reached only 6.5 M/s on 8 threads, while `kevent(2)` reached 23.8 M/s. DTrace showed why: a module's system calls are counted in their `sysent` entry so that unloading can wait for them, and that is two atomic compare-and-swaps per call on one word that every CPU shares. `kevent(2)`, compiled into the kernel, isn't counted. kqring now counts its enter calls per CPU instead (see `kqring_sys_enter()`), and the same loop reaches 12–19 M/s on 8 threads. Per-thread cost is flat from 2 to 4 threads.
-- **Ping-pong stays ahead of kqueue on every thread count**, by 29% on 1 thread and 17% on 8: kqring does more work per message in the kernel, which costs more once two threads share a core.
+- **Ping-pong stays ahead of kqueue on every thread count**, by 29% on 1 thread and 17% on 8.
 - **What's left is per-request work, not sharing.** At 8 threads, two threads share each core, and DTrace shows the time in submitting, completing and clearing requests, not in any lock. Runs on 8 threads vary more (the single-`NOP` row by up to 43%), because this is a 15 W laptop CPU whose all-core clock moves with load.
 - **Reads of one shared file are bound by the file's page cache**, for `pread(2)` too. Batching stops helping past 4 threads.
 
