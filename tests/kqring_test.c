@@ -19,9 +19,11 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/umtx.h>
+#include <sys/user.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -5350,6 +5352,185 @@ test_worker_nonblocking_pipe(void)
 	    "deferred BUFFER_SELECT\n");
 }
 
+/* Threads in this process, kqring worker threads included. */
+static int
+count_threads(void)
+{
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID | KERN_PROC_INC_THREAD,
+	    getpid() };
+	struct kinfo_proc *kp;
+	size_t len = 0;
+
+	assert(sysctl(mib, 4, NULL, &len, NULL, 0) == 0);
+	len *= 2;
+	kp = malloc(len);
+	assert(kp != NULL && sysctl(mib, 4, kp, &len, NULL, 0) == 0);
+	free(kp);
+	return ((int)(len / sizeof(*kp)));
+}
+
+/* Prepare a positioned READ of len bytes at off into buf. */
+static void
+prep_pread(struct test_ring *r, int fd, void *buf, size_t len, off_t off,
+    uint64_t ud)
+{
+	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_READ, fd, ud);
+
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = (uint32_t)len;
+	sqe->off = (uint64_t)off;
+	ring_push_sqe(r);
+}
+
+/*
+ * Reads that cannot block complete on the issuer, without a worker: a
+ * positioned read of a regular file from the page cache, and READ / WRITE
+ * on a non-blocking pipe.  No worker thread is started for them.
+ * Everything else (end of file, holes, a range only partly cached, a
+ * destination that would fault, IOSQE_ASYNC) falls back to a worker with
+ * the same result as before.
+ */
+static void
+test_inline_file_pipe(void)
+{
+	char path[] = "/tmp/kqring_inline.XXXXXX";
+	static char data[3 * 4096], buf[3 * 4096];
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	int fd, pfd[2];
+
+	ring_init(&t);
+	int threads = count_threads();	/* a new ring has no workers yet */
+	for (size_t i = 0; i < sizeof(data); i++)
+		data[i] = (char)('a' + i % 26);
+	/* An unmapped destination would fault, so go to a worker: map it. */
+	memset(buf, 0, sizeof(buf));
+	fd = mkstemp(path);
+	assert(fd >= 0);
+	unlink(path);
+	assert(pwrite(fd, data, sizeof(data), 0) == (ssize_t)sizeof(data));
+
+	/* Cached, page-crossing, and as READV. */
+	prep_pread(&t, fd, buf, 5000, 100, 62001);
+	assert(submit_one(&t) == 5000);
+	assert(memcmp(buf, data + 100, 5000) == 0);
+
+	struct iovec iov[2] = {
+		{ .iov_base = buf, .iov_len = 10 },
+		{ .iov_base = buf + 10, .iov_len = 4096 },
+	};
+	sqe = ring_prep(&t, IORING_OP_READV, fd, 62002);
+	sqe->addr = (uint64_t)(uintptr_t)iov;
+	sqe->len = 2;
+	sqe->off = 4000;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 4106);
+	assert(memcmp(buf, data + 4000, 4106) == 0);
+
+	/* Short at end of file, as pread(2) is. */
+	prep_pread(&t, fd, buf, 100, sizeof(data) - 10, 62003);
+	assert(submit_one(&t) == 10);
+	assert(memcmp(buf, data + sizeof(data) - 10, 10) == 0);
+
+	/* Non-blocking pipe: READ and WRITE never wait, so run inline. */
+	assert(pipe2(pfd, O_NONBLOCK) == 0);
+	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 62009);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 64;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EAGAIN);
+	sqe = ring_prep(&t, IORING_OP_WRITE, pfd[1], 62010);
+	sqe->addr = (uint64_t)(uintptr_t)"inline";
+	sqe->len = 6;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 6);
+	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 62011);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 64;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 6);
+	assert(memcmp(buf, "inline", 6) == 0);
+	close(pfd[0]);
+	close(pfd[1]);
+
+	/* None of the above started a worker thread. */
+	assert(count_threads() <= threads);
+
+	/* At end of file: 0.  Where offset + length overflows: as pread(2). */
+	prep_pread(&t, fd, buf, 100, sizeof(data), 62004);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 62004, 0);
+	ssize_t pr = pread(fd, buf, 100, INT64_MAX - 10);
+	int32_t pres = pr < 0 ? -errno : (int32_t)pr;
+	prep_pread(&t, fd, buf, 100, INT64_MAX - 10, 62014);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 62014, pres);
+
+	/*
+	 * A hole has no pages, so the read goes to a worker.  A range whose
+	 * first page is cached but whose second is a hole is copied in part
+	 * inline, then redone in full on the worker.
+	 */
+	assert(ftruncate(fd, 1 << 20) == 0);
+	memset(buf, 0x55, sizeof(buf));
+	prep_pread(&t, fd, buf, 8192, 512 << 10, 62005);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 62005, 8192);
+	for (size_t i = 0; i < 8192; i++)
+		assert(buf[i] == 0);
+	memset(buf, 0x55, sizeof(buf));
+	prep_pread(&t, fd, buf, 8192, 2 * 4096, 62006);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 62006, 8192);
+	assert(memcmp(buf, data + 2 * 4096, 4096) == 0);
+	for (size_t i = 4096; i < 8192; i++)
+		assert(buf[i] == 0);
+
+	/*
+	 * The inline copy never takes a page fault: a bad buffer, or one
+	 * mapped from the very range being read (its fault would need the
+	 * pages the copy holds busied), goes to the worker.
+	 */
+	prep_pread(&t, fd, (void *)(uintptr_t)8, 64, 0, 62007);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 62007, -EFAULT);
+	char *map = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED,
+	    fd, 0);
+	assert(map != MAP_FAILED);
+	prep_pread(&t, fd, map, 2 * 4096, 0, 62012);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 62012, 2 * 4096);
+	assert(memcmp(map, data, 2 * 4096) == 0);
+	prep_pread(&t, fd, map + 4096, 4096, 0, 62013);	/* overlapping */
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 62013, 4096);
+	assert(memcmp(map + 4096, data, 4096) == 0);
+	munmap(map, 2 * 4096);
+
+	/* IOSQE_ASYNC still goes through a worker. */
+	prep_pread(&t, fd, buf, 64, 0, 62008);
+	t.sqes[(t.sq_tail - 1) & t.sq_mask].flags = IOSQE_ASYNC;
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 62008, 64);
+	assert(memcmp(buf, data, 64) == 0);
+	close(fd);
+	close(t.fd);
+	printf("[PASS] Inline READ: page-cache file reads and non-blocking "
+	    "pipes skip the worker; misses, EOF, holes and IOSQE_ASYNC "
+	    "fall back\n");
+}
+
 /* Cancellation acknowledgement may precede worker release. */
 static void
 expect_cancel_pair(struct test_ring *r, uint64_t target, uint64_t cancel)
@@ -6725,6 +6906,7 @@ main(int argc, char **argv)
 		test_fixed_file_ops();
 		test_iowq_register();
 		test_worker_nonblocking_pipe();
+		test_inline_file_pipe();
 		test_worker_buffer_reservation();
 		test_worker_cancel_and_timeout();
 		test_worker_max_workers();

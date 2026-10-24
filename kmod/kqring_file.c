@@ -85,6 +85,158 @@ kqring_pipe_wait_read(struct kqring_ctx *ctx, struct file *fp,
 	return (error);
 }
 
+/* op's file for a read or write, checked as kern_preadv() checks it. */
+static int
+kqring_rw_fget(struct kqring_op *op, bool is_write, struct file **fpp,
+    int *flagsp)
+{
+	off_t offset = (off_t)op->sqe.off;
+	cap_rights_t rights;
+	struct file *fp;
+	int error, flags = 0;
+
+	/* off == -1 means "use the file position", as in io_uring. */
+	if (offset != (off_t)-1)
+		flags = FOF_OFFSET;
+	if (is_write && flags == 0)
+		cap_rights_init_one(&rights, CAP_WRITE);
+	else if (is_write)
+		cap_rights_init_one(&rights, CAP_PWRITE);
+	else if (flags == 0)
+		cap_rights_init_one(&rights, CAP_READ);
+	else
+		cap_rights_init_one(&rights, CAP_PREAD);
+	error = kqring_op_fget(op, &rights, is_write ? FWRITE : FREAD, &fp);
+	if (error != 0)
+		return (error);
+	if (flags != 0) {
+		if ((fp->f_ops->fo_flags & DFLAG_SEEKABLE) == 0)
+			error = ESPIPE;
+		else if (offset < 0 && (fp->f_vnode == NULL ||
+		    fp->f_vnode->v_type != VCHR))
+			error = EINVAL;
+		if (error != 0) {
+			fdrop(fp, curthread);
+			return (error);
+		}
+	}
+	*fpp = fp;
+	*flagsp = flags;
+	return (0);
+}
+
+/*
+ * READ / WRITE on a descriptor that is not a socket, on the issuer when
+ * that cannot block it, as io_uring tries non-blocking I/O before punting
+ * to io-wq:
+ *
+ *  - A non-blocking pipe: kqring_exec_file_rw() never waits on one, so it
+ *    gives the same result here as on a worker.  (A blocking pipe has no
+ *    per-call non-blocking read: another reader could drain it between a
+ *    readiness check and the read, so it stays on the worker.)
+ *  - A positioned read of a regular file that the page cache satisfies.
+ *    VOP_READ_PGCACHE grabs resident pages without sleeping and gives up
+ *    with EJUSTRETURN otherwise; vn_read() tries it first the same way.
+ *    A destination that is not mapped yet, or a contended range, also
+ *    goes to the worker.
+ *
+ * Returns true with op->res set if the request completed.  Otherwise op is
+ * unchanged and goes to a worker; a read that copied only part of a range
+ * (a page was not resident) is redone there in full, so the result is the
+ * same as if it had never been tried.
+ */
+bool
+kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
+    bool is_write)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct thread *td = curthread;
+	struct file *fp;
+	struct vnode *vp;
+	vm_object_t obj;
+	struct uio auio;
+	struct iovec aiov, *iov = &aiov;
+	u_int iovcnt = 1;
+	ssize_t want;
+	size_t done;
+	void *rl;
+	int error, flags, save;
+
+	if (kqring_rw_fget(op, is_write, &fp, &flags) != 0)
+		return (false);		/* the worker reports the error */
+	if (fp->f_type == DTYPE_PIPE && (fp->f_flag & FNONBLOCK) != 0) {
+		fdrop(fp, td);
+		kqring_exec_file_rw(ctx, op, is_write);
+		return (true);
+	}
+	vp = fp->f_vnode;
+	if (is_write || flags == 0 || (sqe->flags & IOSQE_BUFFER_SELECT) != 0 ||
+	    fp->f_type != DTYPE_VNODE || vp->v_type != VREG ||
+	    (fp->f_flag & O_DIRECT) != 0 || mac_vnode_check_read_enabled() ||
+	    (vn_irflag_read(vp) & (VIRF_DOOMED | VIRF_PGREAD)) != VIRF_PGREAD) {
+		fdrop(fp, td);
+		return (false);
+	}
+	if (kqring_op_readv(sqe->opcode)) {
+		iov = op->args;
+		iovcnt = sqe->len;
+	} else {
+		aiov.iov_base = (void *)(uintptr_t)sqe->addr;
+		aiov.iov_len = sqe->len;
+	}
+	kqring_uio_init(&auio, iov, iovcnt, UIO_READ);
+	auio.uio_offset = (off_t)sqe->off;
+	want = auio.uio_resid;
+	if (want == 0 || auio.uio_offset > OFF_MAX - want) {
+		fdrop(fp, td);
+		return (false);
+	}
+	/*
+	 * As vn_io_fault() does for read(2): hold the range against writers
+	 * (but never wait for it), and copy out with page faults disabled.  A
+	 * fault on the destination while file pages are busied could need
+	 * those very pages (a buffer mapped from the same file); a copy that
+	 * would fault fails with EFAULT and goes to the worker instead, whose
+	 * fo_read() faults the buffer in safely.
+	 */
+	rl = vn_rangelock_tryrlock(vp, auio.uio_offset, auio.uio_offset + want);
+	if (rl == NULL) {
+		fdrop(fp, td);
+		return (false);
+	}
+	save = vm_fault_disable_pagefaults();
+	error = VOP_READ_PGCACHE(vp, &auio, 0, fp->f_cred);
+	vm_fault_enable_pagefaults(save);
+	vn_rangelock_unlock(vp, rl);
+	done = (size_t)(want - auio.uio_resid);
+	if (error == EFAULT) {
+		fdrop(fp, td);
+		return (false);
+	}
+	if (error == EJUSTRETURN) {
+		/*
+		 * Nothing, or only part of the range, came from the page
+		 * cache (vn_read() would go on with VOP_READ()).  Part is the
+		 * whole answer at end of file, as for read(2).
+		 */
+		obj = atomic_load_ptr(&vp->v_object);
+		if (done == 0 || obj == NULL || auio.uio_offset <
+		    (off_t)atomic_load_64(&obj->un_pager.vnp.vnp_size)) {
+			fdrop(fp, td);
+			return (false);
+		}
+		error = 0;
+	}
+	if (error == 0)
+		fp->f_nextoff[UIO_READ] = auio.uio_offset;
+	fdrop(fp, td);
+	if (error != 0 && done == 0)
+		kqring_done(op, kqring_errno(error), 0);
+	else
+		kqring_done(op, kqring_xfer_res(done), 0);
+	return (true);
+}
+
 /*
  * READ / WRITE / READV / WRITEV and their _FIXED forms on anything but a
  * socket (sockets go through kqring_exec_recv() / kqring_exec_send() and
@@ -102,38 +254,15 @@ kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 	struct file *fp;
 	struct uio auio;
 	struct iovec aiov, *iov = &aiov;
-	cap_rights_t rights;
 	off_t offset = (off_t)sqe->off;
 	u_int iovcnt = 1;
 	uint32_t cflags = 0;
 	bool buf_select = (sqe->flags & IOSQE_BUFFER_SELECT) != 0;
-	int error, flags = 0;
+	int error, flags;
 
-	/* off == -1 means "use the file position", as in io_uring. */
-	if (offset != (off_t)-1)
-		flags = FOF_OFFSET;
-	if (is_write && flags == 0)
-		cap_rights_init_one(&rights, CAP_WRITE);
-	else if (is_write)
-		cap_rights_init_one(&rights, CAP_PWRITE);
-	else if (flags == 0)
-		cap_rights_init_one(&rights, CAP_READ);
-	else
-		cap_rights_init_one(&rights, CAP_PREAD);
-	error = kqring_op_fget(op, &rights, is_write ? FWRITE : FREAD, &fp);
+	error = kqring_rw_fget(op, is_write, &fp, &flags);
 	if (error != 0)
 		return (kqring_done(op, -error, 0));
-	if (flags != 0) {
-		if ((fp->f_ops->fo_flags & DFLAG_SEEKABLE) == 0)
-			error = ESPIPE;
-		else if (offset < 0 && (fp->f_vnode == NULL ||
-		    fp->f_vnode->v_type != VCHR))
-			error = EINVAL;
-		if (error != 0) {
-			fdrop(fp, td);
-			return (kqring_done(op, -error, 0));
-		}
-	}
 
 	if (buf_select) {
 		if (!is_write && !kqring_pipe_readable(fp)) {

@@ -1095,6 +1095,8 @@ bool	kqring_pipe_will_block(const struct file *fp, bool is_write,
 	    size_t want);
 int	kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 	    bool is_write);
+bool	kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
+	    bool is_write);
 int	kqring_exec_read_multishot(struct kqring_ctx *ctx, struct kqring_op *op,
 	    struct socket *expect, bool *more_out);
 int32_t	kqring_exec_splice(struct kqring_ctx *ctx, struct kqring_op *op);

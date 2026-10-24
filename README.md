@@ -17,7 +17,7 @@
   - [`kqring_register.c`](kmod/kqring_register.c) — `KQRING_IOC_REGISTER` operations.
   - [`kqring_zc.c`](kmod/kqring_zc.c) — zero-copy send: page holding, `RLIMIT_MEMLOCK` accounting and `EXT_SFBUF` mbufs.
   - [`Makefile`](kmod/Makefile) — `<bsd.kmod.mk>` build definition for `kqring.ko`.
-- [`tests/kqring_test.c`](tests/kqring_test.c) — Functional verification suite (69 test groups covering every supported opcode, registration, setup flags and the lifetime rules below), plus a short ping-pong comparison with `kqueue`.
+- [`tests/kqring_test.c`](tests/kqring_test.c) — Functional verification suite (70 test groups covering every supported opcode, registration, setup flags and the lifetime rules below), plus a short ping-pong comparison with `kqueue`.
 - [`tests/kqring_bench.c`](tests/kqring_bench.c) — Benchmarks against `kqueue(2)` and plain syscalls; [`tests/bench_report.py`](tests/bench_report.py) turns its runs into the tables and charts in [`BENCHMARK.MD`](BENCHMARK.MD).
 - [`TODO.MD`](TODO.MD) — zero-copy roadmap.
 
@@ -29,11 +29,12 @@
 
 On a 4-core i5-8250U running FreeBSD 15.1, as medians of 5 runs:
 
-- **Many ready sockets:** 16% faster than kqueue, from 16 up to 1,024 connections, because one enter reaps every message.
-- **One connection:** within ±5% with multishot `RECV`, and 11–13% faster when receiving into one reused buffer.
-- **Zero-copy send:** `SEND_ZC` is up to 37% faster than `write(2)` for 256 KiB messages, and 15–24% faster on TCP loopback from 16 KiB up.
-- **Batching, accept and timers:** 32 `NOP`s per enter cost 78 ns each (an empty `kevent` costs 287 ns); multishot `ACCEPT` is 7% faster, and `TIMEOUT` is 46% faster.
-- **Pipes and regular files are 5× slower** than `read(2)`/`pread(2)`, because every non-socket read currently goes through a worker thread.
+- **Many ready sockets:** 15–16% faster than kqueue, from 16 up to 1,024 connections, because one enter reaps every message.
+- **One connection:** between 4% faster and 7% slower with multishot `RECV`, and 10–12% faster when receiving into one reused buffer.
+- **Cached file reads:** 32 `READ`s per enter cost 29% less than `pread(2)`, served inline from the page cache.
+- **Zero-copy send:** `SEND_ZC` is up to 35% faster than `write(2)` for 256 KiB messages, and 15–25% faster on TCP loopback from 16 KiB up.
+- **Batching, accept and timers:** 32 `NOP`s per enter cost 78 ns each (an empty `kevent` costs 287 ns); multishot `ACCEPT` is 7% faster, and `TIMEOUT` is 41% faster.
+- **Blocking pipes are 5× slower** than kqueue, because their reads go through a worker thread. On an `O_NONBLOCK` pipe, `READ` runs inline and is 9% faster than kqueue.
 
 See [`BENCHMARK.MD`](BENCHMARK.MD) for the method, every result, and the known gaps.
 
@@ -60,11 +61,11 @@ These are implementation constraints, not a claim of immunity to known CVE class
 
 ## Supported Operations
 
-Socket operations try the transfer inline first in `KQRING_IOC_ENTER` (unless `IOSQE_ASYNC` is set) and then wait on a socket upcall. Blocking file, pipe, VFS, `WAITID` and `IOSQE_ASYNC` requests run on per-ring in-process kernel worker threads (`IO_WQ_BOUND` and `IO_WQ_UNBOUND`, `IORING_FEAT_NATIVE_WORKERS`) that share the process's address space and descriptor table and queue completions as deferred taskwork for the ring owner. Futexes and timers are driven from the serialized issuer path. With `SQPOLL`, an in-process submission thread consumes SQEs and drains taskwork; `sq_sx` serializes it with enter and registration.
+Socket operations try the transfer inline first in `KQRING_IOC_ENTER` (unless `IOSQE_ASYNC` is set) and then wait on a socket upcall. A positioned file read that the page cache satisfies, and a `READ` or `WRITE` on an `O_NONBLOCK` pipe, also complete inline. Other file, pipe, VFS, `WAITID` and `IOSQE_ASYNC` requests run on per-ring in-process kernel worker threads (`IO_WQ_BOUND` and `IO_WQ_UNBOUND`, `IORING_FEAT_NATIVE_WORKERS`) that share the process's address space and descriptor table and queue completions as deferred taskwork for the ring owner. Futexes and timers are driven from the serialized issuer path. With `SQPOLL`, an in-process submission thread consumes SQEs and drains taskwork; `sq_sx` serializes it with enter and registration.
 
 - **I/O:** `READ`, `WRITE`, `READV`, `WRITEV`, `READ_FIXED`, `WRITE_FIXED`, `READV_FIXED`, `WRITEV_FIXED`, `FSYNC`, `SYNC_FILE_RANGE`, `FALLOCATE`, `FTRUNCATE`, `FADVISE`, `MADVISE`, `SPLICE`, `TEE`.
   - `READ` and `READV` (with one iovec) take a provided buffer.
-  - On a socket, the read and write operations wait like `RECV` and `SEND` instead of blocking; on files, pipes and devices, they run on the in-process worker pool.
+  - On a socket, the read and write operations wait like `RECV` and `SEND` instead of blocking; on files, pipes and devices, they run on the in-process worker pool, except for the inline cases above.
   - `SPLICE` moves data between two descriptors where at least one is a pipe; `TEE` duplicates pipe buffer bytes to another pipe without consuming the source.
 - **Sockets & Pipes:** `RECV`, `SEND`, `RECVMSG`, `SENDMSG`, `SEND_ZC`, `SENDMSG_ZC`, `ACCEPT`, `CONNECT`, `SOCKET`, `BIND`, `LISTEN`, `SHUTDOWN`, `READ_MULTISHOT`, `URING_CMD`.
   - Multishot is supported for `RECV`, `RECVMSG`, `ACCEPT` and `READ_MULTISHOT` (on both sockets and pipes).
