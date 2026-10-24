@@ -79,6 +79,8 @@ now_ns(void)
 /* ring_setup() makes a shared ring (no SINGLE_ISSUER / DEFER_TASKRUN). */
 static bool ring_setup_shared;
 
+static void ring_map(struct test_ring *r, const struct io_uring_params *pp);
+
 /* Set up and map a ring, still disabled (IORING_SETUP_R_DISABLED). */
 static void
 ring_setup(struct test_ring *r)
@@ -102,6 +104,14 @@ ring_setup(struct test_ring *r)
 	assert((p.features & IORING_FEAT_NODROP) != 0);
 	assert((p.features & IORING_FEAT_EXT_ARG) != 0);
 	assert((p.features & IORING_FEAT_NATIVE_WORKERS) != 0);
+	ring_map(r, &p);
+}
+
+/* Map the rings setup (or IORING_REGISTER_RESIZE_RINGS) described in p. */
+static void
+ring_map(struct test_ring *r, const struct io_uring_params *pp)
+{
+	const struct io_uring_params p = *pp;
 
 	r->ring_map_len = p.cq_off.cqes +
 	    p.cq_entries * sizeof(struct io_uring_cqe);
@@ -7180,6 +7190,90 @@ test_no_mmap(void)
 	    "after fork), REGISTERED_FD_ONLY\n");
 }
 
+/*
+ * IORING_REGISTER_RESIZE_RINGS: SQEs not yet submitted and CQEs not yet
+ * reaped move to the new rings, which are mapped afresh; the old mapping
+ * stays readable until unmapped.  Too many queued CQEs for the new size
+ * is EOVERFLOW, and only DEFER_TASKRUN rings resize.
+ */
+static void
+test_resize_rings(void)
+{
+	struct io_uring_params p;
+	struct test_ring t, ts;
+	void *old_map;
+	size_t old_len;
+
+	ring_init(&t);
+	/* Two CQEs waiting, three SQEs not yet submitted. */
+	for (int i = 0; i < 2; i++) {
+		(void)ring_prep(&t, IORING_OP_NOP, -1, 76000 + i);
+		ring_push_sqe(&t);
+	}
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 2);
+	for (int i = 2; i < 5; i++) {
+		(void)ring_prep(&t, IORING_OP_NOP, -1, 76000 + i);
+		ring_push_sqe(&t);
+	}
+
+	memset(&p, 0, sizeof(p));
+	p.sq_entries = 4;
+	p.cq_entries = 4;
+	p.flags = IORING_SETUP_CQSIZE;
+	/* Five SQEs and CQEs together don't fit a CQ of 4 later; 3 do now. */
+	assert(reg(&t, IORING_REGISTER_RESIZE_RINGS, &p, 1) == 0);
+	assert(p.sq_entries == 4 && p.cq_entries == 4);
+	old_map = t.ring_map;
+	old_len = t.ring_map_len;
+	munmap(t.sqes, t.sqes_len);
+	ring_map(&t, &p);
+	assert(t.ring_map != old_map);
+	/* The old mapping still holds what was there. */
+	assert(*(unsigned *)((char *)old_map + p.cq_off.ring_entries) ==
+	    CQ_ENTRIES);
+	munmap(old_map, old_len);
+
+	assert(ring_cq_ready(&t) == 2);
+	expect_cqe(&t, 76000, 0);
+	expect_cqe(&t, 76001, 0);
+	assert(kqring_enter(t.fd, 3, 3, IORING_ENTER_GETEVENTS, NULL, 0) ==
+	    3);
+	for (int i = 2; i < 5; i++)
+		expect_cqe(&t, 76000 + i, 0);
+
+	/* Four CQEs queued: a CQ of 2 can't hold them. */
+	for (int i = 0; i < 4; i++) {
+		(void)ring_prep(&t, IORING_OP_NOP, -1, 76010 + i);
+		ring_push_sqe(&t);
+	}
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 4);
+	memset(&p, 0, sizeof(p));
+	p.sq_entries = 2;
+	p.cq_entries = 2;
+	p.flags = IORING_SETUP_CQSIZE;
+	assert(reg(&t, IORING_REGISTER_RESIZE_RINGS, &p, 1) == -EOVERFLOW);
+	memset(&p, 0, sizeof(p));
+	p.sq_entries = 16;
+	p.flags = IORING_SETUP_SQPOLL;
+	assert(reg(&t, IORING_REGISTER_RESIZE_RINGS, &p, 1) == -EINVAL);
+	for (int i = 0; i < 4; i++)
+		expect_cqe(&t, 76010 + i, 0);
+	close(t.fd);
+
+	/* Not DEFER_TASKRUN: EINVAL. */
+	ring_setup_shared = true;
+	ring_init(&ts);
+	ring_setup_shared = false;
+	memset(&p, 0, sizeof(p));
+	p.sq_entries = 16;
+	assert(reg(&ts, IORING_REGISTER_RESIZE_RINGS, &p, 1) == -EINVAL);
+	close(ts.fd);
+	printf("[PASS] RESIZE_RINGS: queued SQEs and CQEs move, EOVERFLOW, "
+	    "DEFER_TASKRUN only\n");
+}
+
 static void
 test_sqe128_cqe32_attach_wq(void)
 {
@@ -7951,6 +8045,7 @@ main(int argc, char **argv)
 		test_pipe_nowait();
 		test_min_wait();
 		test_no_mmap();
+		test_resize_rings();
 		test_sqe128_cqe32_attach_wq();
 		test_registered_rings();
 		test_sqpoll_and_iopoll();

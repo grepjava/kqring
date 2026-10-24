@@ -843,6 +843,8 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 	case IORING_REGISTER_IOWQ_MAX_WORKERS:
 		return (kqring_iowq_max_workers(ctx, ra));
 
+	case IORING_REGISTER_RESIZE_RINGS:
+		return (kqring_resize_rings(ctx, ra, td));
 	case IORING_REGISTER_RING_FDS:
 		return (kqring_ring_fds_register(td, ra, resp));
 	case IORING_UNREGISTER_RING_FDS:

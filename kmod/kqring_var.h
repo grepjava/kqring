@@ -226,6 +226,23 @@ struct kqring_shm_header {
 _Static_assert(sizeof(struct kqring_shm_header) == 64, "shm header is 64 bytes");
 
 /*
+ * The rings' memory: wired VM objects that the owner mmaps or, with
+ * IORING_SETUP_NO_MMAP, the owner's own pages, held (*_pages).  Either way
+ * mapped at *_kva.  The first region holds the header, SQ array and CQEs,
+ * the second the SQEs.
+ */
+struct kqring_rmem {
+	vm_object_t		ring_obj;
+	vm_offset_t		ring_kva;
+	size_t			ring_len;
+	vm_page_t		*ring_pages;
+	vm_object_t		sqes_obj;
+	vm_offset_t		sqes_kva;
+	size_t			sqes_len;
+	vm_page_t		*sqes_pages;
+};
+
+/*
  * A request: one submitted SQE, from submission until its final CQE.
  *
  * A request is in exactly one of these states, all owned by the ring owner
@@ -617,22 +634,14 @@ struct kqring_ctx {
 	uint32_t		cq_mask;
 
 	/*
-	 * Shared memory regions: wired VM objects that the owner mmaps, or
-	 * with IORING_SETUP_NO_MMAP the owner's own pages, held (*_pages).
-	 * Either way mapped at *_kva.  sq_array is NULL with NO_SQARRAY.
+	 * The rings, in mem; sq_array is NULL with NO_SQARRAY.  Others than
+	 * the issuer only look at them under mtx, so IORING_REGISTER_RESIZE_
+	 * RINGS swaps them under mtx (and sq_sx).
 	 */
-	vm_object_t		ring_obj;
-	vm_offset_t		ring_kva;
-	size_t			ring_alloc_len;
-	vm_page_t		*ring_pages;
+	struct kqring_rmem	mem;
 	struct kqring_shm_header *shm;
 	uint32_t		*sq_array;
 	struct io_uring_cqe	*cqes;
-
-	vm_object_t		sqes_obj;
-	vm_offset_t		sqes_kva;
-	size_t			sqes_alloc_len;
-	vm_page_t		*sqes_pages;
 	struct io_uring_sqe	*sqes;
 
 	/* Provided buffer groups by bgid; see struct kqring_bgroup. */
@@ -1169,6 +1178,8 @@ int	kqring_reg_ring_fget(struct thread *td, uint32_t slot, bool is_enter,
 int	kqring_alloc_shm(size_t bytes, vm_object_t *obj_out,
 	    vm_offset_t *kva_out, size_t *alloc_len_out);
 void	kqring_free_shm(vm_object_t obj, vm_offset_t kva, size_t alloc_len);
+int	kqring_resize_rings(struct kqring_ctx *ctx,
+	    const struct kqring_register_arg *ra, struct thread *td);
 int	kqring_ring_fds_insert(struct thread *td, struct file *fp,
 	    uint32_t *slotp);
 int	kqring_pin_shm(struct thread *td, uint64_t uaddr, size_t bytes,

@@ -33,9 +33,9 @@ liburing's test suite, run on FreeBSD 15.1 with `kqring.ko` from this tree (Octo
 | | Tests |
 |---|---|
 | Built | 168 (32 more need Linux-only headers or system calls) |
-| Passed | **136** (138 with `RLIMIT_MEMLOCK` raised) |
-| Skipped | 12 (the test found a feature missing and said so) |
-| Failed | 20, explained below |
+| Passed | **142** (144 with `RLIMIT_MEMLOCK` raised) |
+| Skipped | 7 (the test found a feature missing and said so) |
+| Failed | 19, explained below |
 
 liburing's two AddressSanitizer tests (`xfail_*`) aren't built. liburing itself only builds them with ASan, and without it they wait forever by design.
 
@@ -59,11 +59,10 @@ liburing's two AddressSanitizer tests (`xfail_*`) aren't built. liburing itself 
 | `io-cancel`, `timeout` | A forked child submits to, or cancels on, its parent's ring. kqring rings belong to one process: workers resolve descriptors in the owner's table, so allowing another process could let it reach files it can't see, for example from inside a Capsicum sandbox. The child gets `EEXIST`. |
 | `poll` | Its "lazy" test expects a poll on another ring's descriptor to complete inside the waker's system call. kqring's wakeup arrives through a kernel thread, a moment later. |
 | `waitid` | Expects Linux's result for a `WAITID` cancelled by a link timeout, which reflects an implementation detail of Linux rather than a documented rule. |
-| `resize-rings` | `IORING_REGISTER_RESIZE_RINGS` isn't implemented. |
 
 ### Skipped tests
 
-The 12 skips are tests that check for a feature and report its absence:
+The 7 skips are tests that check for a feature and report its absence:
 
 - **Not implemented in kqring:**
   - `IOPOLL` on an `O_DIRECT` file in the test's directory, which completes with `-EOPNOTSUPP` (`500f9fbadef8`).
