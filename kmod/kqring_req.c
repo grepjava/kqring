@@ -358,7 +358,7 @@ kqring_op_alloc(struct kqring_ctx *ctx)
 	if (op != NULL) {
 		TAILQ_REMOVE(&ctx->free_ops, op, active_link);
 		ctx->nfree--;
-		bzero(op, sizeof(*op));
+		bzero(op, offsetof(struct kqring_op, callout));
 	} else {
 		op = malloc(sizeof(*op), M_KQRING, M_WAITOK | M_ZERO);
 	}
@@ -388,6 +388,10 @@ kqring_op_free(struct kqring_op *op)
 		filecaps_free(&op->wq_caps);
 		fdrop(op->wq_fp, curthread);
 		op->wq_fp = NULL;
+	}
+	if (op->sock_fp != NULL) {
+		fdrop(op->sock_fp, curthread);
+		op->sock_fp = NULL;
 	}
 	if (op->args != NULL) {
 		struct kqring_fwait *fw = op->args;

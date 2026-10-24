@@ -50,10 +50,13 @@ kqring_sb_disarm(struct kqring_op *op, struct socket *so, int which)
 
 /*
  * Look up the socket an op works on.  For an armed op (taskwork),
- * `expect` is the socket it was armed on.  Every attempt re-resolves
- * sqe->fd (for Capsicum rights), and if the descriptor was closed or
- * reused for another file in the meantime the op fails with EBADF rather
- * than operating on the new file.
+ * `expect` is the socket it was armed on.  An op that would have blocked
+ * keeps its file (kqring_put_sock()) and is retried on it, as io_uring
+ * holds req->file: close(2) or dup2(2) over the descriptor no longer
+ * affects it, and the Capsicum rights were checked when it was looked up.
+ * Otherwise sqe->fd is resolved again, and if the descriptor was closed
+ * or reused for another file in the meantime the op fails with EBADF
+ * rather than operating on the new file.
  */
 static int
 kqring_getsock(const struct kqring_op *op, struct socket *expect,
@@ -63,6 +66,12 @@ kqring_getsock(const struct kqring_op *op, struct socket *expect,
 	struct file *fp;
 	int error;
 
+	if (op->sock_fp != NULL) {
+		if (!fhold(op->sock_fp))
+			return (EBADF);
+		*fpp = op->sock_fp;
+		return (0);
+	}
 	error = kqring_op_fget(op, rights, 0, &fp);
 	if (error != 0)
 		return (error);
@@ -76,6 +85,20 @@ kqring_getsock(const struct kqring_op *op, struct socket *expect,
 	}
 	*fpp = fp;
 	return (0);
+}
+
+/*
+ * Release fp after an attempt, unless the attempt would have blocked
+ * (rc == EAGAIN): then the op keeps the reference, taken by
+ * kqring_getsock() with the op's own rights, for arming and retrying.
+ */
+static void
+kqring_put_sock(struct kqring_op *op, struct file *fp, int rc)
+{
+	if (rc == EAGAIN && op->sock_fp == NULL)
+		op->sock_fp = fp;
+	else
+		fdrop(fp, curthread);
 }
 
 
@@ -265,7 +288,7 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	 */
 	if ((sqe->opcode != IORING_OP_RECV ||
 	    (sqe->msg_flags & MSG_OOB) == 0) && kqring_so_rcv_idle(so)) {
-		fdrop(fp, td);
+		kqring_put_sock(op, fp, EAGAIN);
 		return (EAGAIN);
 	}
 
@@ -275,7 +298,7 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 		    biov, bundle ? KQRING_MAX_BUNDLE : 1, &sel);
 		if (error != 0) {
 			sx_xunlock(&ctx->bg_sx);
-			fdrop(fp, td);
+			kqring_put_sock(op, fp, error);
 			if (error == EAGAIN)
 				return (EAGAIN);
 			return (kqring_done(op, -error, 0));
@@ -305,7 +328,7 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
 		if (buf_select)
 			sx_xunlock(&ctx->bg_sx);
-		fdrop(fp, td);
+		kqring_put_sock(op, fp, rc);
 		return (rc);
 	}
 
@@ -325,7 +348,7 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 		cqe_flags |= IORING_CQE_F_SOCK_NONEMPTY;
 	}
 	if (waitall && kqring_waitall(op, n, sqe->len, &n) == EAGAIN) {
-		fdrop(fp, td);
+		kqring_put_sock(op, fp, EAGAIN);
 		return (EAGAIN);
 	}
 	fdrop(fp, td);
@@ -729,13 +752,14 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 	}
 	error = sosend(so, to, &auio, NULL, NULL, flags, td);
 	n = (size_t)(want - auio.uio_resid);
-	fdrop(fp, td);
 
 	if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
 		if (buf_select)
 			sx_xunlock(&ctx->bg_sx);
+		kqring_put_sock(op, fp, rc);
 		return (rc);
 	}
+	fdrop(fp, td);
 	if (buf_select) {
 		cqe_flags = kqring_buf_commit(ctx, &sel, n);
 		sx_xunlock(&ctx->bg_sx);
@@ -984,7 +1008,7 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 		    kqring_msg_buf_cap(ma), &aiov, 1, &sel);
 		if (error != 0) {
 			sx_xunlock(&ctx->bg_sx);
-			fdrop(fp, td);
+			kqring_put_sock(op, fp, error);
 			if (error == EAGAIN)
 				return (EAGAIN);
 			return (kqring_done(op, -error, 0));
@@ -1001,7 +1025,7 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 	if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
 		if (buf_select)
 			sx_xunlock(&ctx->bg_sx);
-		fdrop(fp, td);
+		kqring_put_sock(op, fp, rc);
 		return (rc);
 	}
 
@@ -1027,7 +1051,7 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 		cqe_flags |= IORING_CQE_F_SOCK_NONEMPTY;
 	if (waitall && kqring_waitall(op, n, want + op->done_io, &n) ==
 	    EAGAIN) {
-		fdrop(fp, td);
+		kqring_put_sock(op, fp, EAGAIN);
 		return (EAGAIN);
 	}
 	fdrop(fp, td);
@@ -1935,20 +1959,26 @@ kqring_arm_socket_op(struct kqring_ctx *ctx, struct kqring_op *op, int dirs)
 	cap_rights_t rights;
 	int error;
 
-	error = kqring_op_fget(op, cap_rights_init_one(&rights, CAP_EVENT), 0,
-	    &fp);
-	if (error != 0) {
-		kqring_req_complete(ctx, op, -error, 0);
-		return (false);
-	}
-	if (fp->f_type != DTYPE_SOCKET) {
+	if (op->sock_fp != NULL) {
+		/* Kept by an attempt that would have blocked. */
+		so = op->sock_fp->f_data;
+		soref(so);
+	} else {
+		error = kqring_op_fget(op,
+		    cap_rights_init_one(&rights, CAP_EVENT), 0, &fp);
+		if (error != 0) {
+			kqring_req_complete(ctx, op, -error, 0);
+			return (false);
+		}
+		if (fp->f_type != DTYPE_SOCKET) {
+			fdrop(fp, td);
+			kqring_req_complete(ctx, op, -ENOTSOCK, 0);
+			return (false);
+		}
+		so = fp->f_data;
+		soref(so);
 		fdrop(fp, td);
-		kqring_req_complete(ctx, op, -ENOTSOCK, 0);
-		return (false);
 	}
-	so = fp->f_data;
-	soref(so);
-	fdrop(fp, td);
 
 	/* A re-armed op (POLL_REMOVE update) was cancelled when unarmed. */
 	op->cancelled = false;

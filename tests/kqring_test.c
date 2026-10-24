@@ -620,6 +620,48 @@ test_sqe_validation(struct test_ring *r)
 	    "-> sq_dropped\n");
 }
 
+/*
+ * The wrappers use the native system calls; the /dev/kqring ioctls they
+ * fall back to keep working on the same ring.
+ */
+static void
+test_native_syscalls(struct test_ring *r)
+{
+	struct kqring_enter_arg ea = {
+		.to_submit = 1,
+		.min_complete = 1,
+		.flags = IORING_ENTER_GETEVENTS,
+		.ring_fd = r->fd,
+	};
+	int pfd[2];
+
+	assert(kqring_sysnum(KQRING_SYS_SETUP) > 0);
+	assert(kqring_sysnum(KQRING_SYS_ENTER) > 0);
+	assert(kqring_sysnum(KQRING_SYS_REGISTER) > 0);
+
+	/* ioctl(2) enter on a ring set up and enabled by the syscalls. */
+	(void)ring_prep(r, IORING_OP_NOP, -1, 12100);
+	ring_push_sqe(r);
+	assert(ioctl(r->fd, KQRING_IOC_ENTER, &ea) == 0);
+	assert(ea.SUBMITTED_out == 1);
+	assert(ring_cq_ready(r) == 1);
+	struct io_uring_cqe c = ring_pop_cqe(r);
+	assert(c.user_data == 12100 && c.res == 0);
+
+	/* As io_uring_enter(2) and io_uring_register(2). */
+	assert(pipe(pfd) == 0);
+	assert(kqring_enter(pfd[0], 0, 0, 0, NULL, 0) == -1 &&
+	    errno == EOPNOTSUPP);
+	assert(kqring_register(pfd[0], IORING_REGISTER_PROBE, NULL, 0) == -1 &&
+	    errno == EOPNOTSUPP);
+	close(pfd[0]);
+	close(pfd[1]);
+	assert(kqring_enter(-1, 0, 0, 0, NULL, 0) == -1 && errno == EBADF);
+	assert(kqring_enter(r->fd, 0, 0, 0, NULL, 0) == 0);
+	printf("[PASS] native kqring_setup/enter/register system calls, "
+	    "ioctl fallback\n");
+}
+
 static void
 test_enter_validation(struct test_ring *r)
 {
@@ -849,8 +891,9 @@ test_dup_arm(struct test_ring *r)
 }
 
 /*
- * An armed op whose fd is closed and reused for another socket must not
- * operate on the new socket.
+ * An armed op keeps the socket it was submitted on, as io_uring keeps
+ * req->file: after its fd is closed and reused for another socket, it
+ * still completes from the original one and never touches the new one.
  */
 static void
 test_fd_reuse(struct test_ring *r)
@@ -868,20 +911,22 @@ test_fd_reuse(struct test_ring *r)
 	ring_submit(r);
 	assert(ring_cq_ready(r) == 0);
 
-	/* close(fd) fires the upcall; fd then names b[0]'s socket. */
+	/* fd now names b[0]'s socket; the op still waits on a[0]'s. */
 	assert(dup2(b[0], fd) == fd);
 	assert(write(b[1], "y", 1) == 1);
+	assert(ring_wait(r, 1, 200) != 0);
+	assert(write(a[1], "x", 1) == 1);
 	assert(ring_wait(r, 1, 2000) == 0);
 	struct io_uring_cqe c = ring_pop_cqe(r);
-	assert(c.user_data == 8101 && c.res == -EBADF);
+	assert(c.user_data == 8101 && c.res == 1 && buf[0] == 'x');
 	assert(read(fd, buf, sizeof(buf)) == 1 && buf[0] == 'y');
 
 	close(fd);
 	close(a[1]);
 	close(b[0]);
 	close(b[1]);
-	printf("[PASS] armed RECV after fd reuse -> -EBADF, new socket "
-	    "untouched\n");
+	printf("[PASS] armed RECV keeps its socket after fd reuse, new "
+	    "socket untouched\n");
 }
 
 /* Timeout or EINTR after submitting still reports the submitted count. */
@@ -6962,6 +7007,7 @@ main(int argc, char **argv)
 		test_setup_errors();
 		test_sqe_validation(&r);
 		test_enter_validation(&r);
+		test_native_syscalls(&r);
 		test_poll_add(&r);
 		test_cancel(&r);
 		test_futex_wait(&r);

@@ -63,7 +63,7 @@ The rings are mapped exactly as on Linux: `mmap(2)` on the ring descriptor at `I
 #endif
 ```
 
-The wrappers work through `ioctl(2)` on `/dev/kqring`: `kqring_setup()` opens it and returns the new ring's descriptor. Like the system calls, they return −1 and set `errno` on failure. Completion results (`cqe->res`) are negated **FreeBSD** errno values, and flags passed through SQEs (`O_*`, `MSG_*` and so on) use their FreeBSD values; see [Differences from Linux](#differences-from-linux).
+The wrappers make native system calls, which the module registers in free system-call slots when it loads; `sysctl kern.kqring.sys_setup`, `sys_enter` and `sys_register` give their numbers. `kqring_setup()` opens `/dev/kqring` and returns the new ring's descriptor. Where no slot was free, the wrappers fall back to `ioctl(2)` on the ring descriptor, which costs about 90 ns more per call. Like the Linux system calls, they return −1 and set `errno` on failure. Completion results (`cqe->res`) are negated **FreeBSD** errno values, and flags passed through SQEs (`O_*`, `MSG_*` and so on) use their FreeBSD values; see [Differences from Linux](#differences-from-linux).
 
 liburing has not been ported yet, so programs that use liburing rather than the raw interface don't build against kqring today.
 
@@ -80,12 +80,12 @@ liburing has not been ported yet, so programs that use liburing rather than the 
 
 Compared with `kqueue(2)`, or the plain system call where kqueue has no role, on a 4-core i5-8250U running FreeBSD 15.1 (medians of 5 runs):
 
-- **Many ready sockets:** 15–16% faster than kqueue, from 16 up to 1,024 connections, because one enter reaps every message.
-- **One connection:** between 4% faster and 7% slower with multishot `RECV`, and 10–12% faster when receiving into one reused buffer.
-- **Cached file reads:** 32 `READ`s per enter cost 29% less than `pread(2)`, served inline from the page cache. One `READ` per enter costs 24% more.
-- **Zero-copy send:** `SEND_ZC` from a registered buffer is 38% faster than `write(2)` for 256 KiB messages on AF_UNIX and 26% faster on TCP loopback, and 15–16% faster at 64 KiB.
-- **Batching, accept and timers:** 32 `NOP`s per enter cost 78 ns each (an empty `kevent` costs 287 ns); multishot `ACCEPT` is 8% faster, and `TIMEOUT` is 41% faster.
-- **Pipes:** on an `O_NONBLOCK` pipe, `READ` runs inline and is 10% faster than kqueue. On a blocking pipe it goes through a worker thread and is 5× slower.
+- **Many ready sockets:** 14–17% faster than kqueue, from 16 up to 1,024 connections, because one enter reaps every message.
+- **One connection:** multishot `RECV` is 2–14% faster than kqueue on AF_UNIX, and receiving into one reused buffer is 18–21% faster.
+- **Cached file reads:** 32 `READ`s per enter cost 27% less than `pread(2)`, served inline from the page cache. One `READ` per enter costs 16% more.
+- **Zero-copy send:** `SEND_ZC` from a registered buffer is 37% faster than `write(2)` for 256 KiB messages on AF_UNIX and 23% faster on TCP loopback, and 15–17% faster at 64 KiB.
+- **Batching and timers:** 32 `NOP`s per enter cost 77 ns each, and a single `NOP` enter 345 ns (an empty `kevent` costs 287 ns). `TIMEOUT` is 43% faster; multishot `ACCEPT` is on par with kqueue.
+- **Pipes:** on an `O_NONBLOCK` pipe, `READ` runs inline and is 19% faster than kqueue. On a blocking pipe it goes through a worker thread and is 5× slower.
 
 These are single-threaded loopback measurements. See [`BENCHMARK.MD`](BENCHMARK.MD) for the method, every result, and the known gaps.
 
@@ -209,7 +209,7 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
 - [`include/sys/kqring.h`](include/sys/kqring.h) — the io_uring ABI (`io_uring_sqe`, `io_uring_cqe`, `io_uring_params`, `io_uring_buf_ring`, `IORING_*` constants), the `/dev/kqring` ioctls, and the `kqring_setup` / `kqring_enter` / `kqring_register` wrappers. Shared by the kernel and userspace.
 - [`kmod/`](kmod/) — the kernel module (`style(9)` C), split by subsystem:
   - [`kqring_var.h`](kmod/kqring_var.h) — shared structures, limits and internal prototypes.
-  - [`kqring_dev.c`](kmod/kqring_dev.c) — `/dev/kqring`, ioctls, ring setup and mapping, enter, module load/unload and process exit/exec hooks.
+  - [`kqring_dev.c`](kmod/kqring_dev.c) — `/dev/kqring`, the system calls and ioctls, ring setup and mapping, enter, module load/unload and process exit/exec hooks.
   - [`kqring_req.c`](kmod/kqring_req.c) — ring memory, SQE preparation and argument copy-in, request lifecycle, links, drains, CQE posting and deferred work.
   - [`kqring_sock.c`](kmod/kqring_sock.c) — socket operations and upcalls, multishot, `POLL_ADD` and `URING_CMD`.
   - [`kqring_file.c`](kmod/kqring_file.c) — file, path, xattr, `SPLICE`/`TEE` and other VFS operations, including the inline page-cache read path.
