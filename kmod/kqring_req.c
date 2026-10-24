@@ -480,7 +480,8 @@ kqring_exec_sync(struct kqring_ctx *ctx, struct kqring_op *op)
 		res = kqring_exec_close(ctx, sqe);
 		break;
 	case IORING_OP_FILES_UPDATE:
-		res = sqe->off == IORING_FILE_INDEX_ALLOC ?
+		/* The offset is 32 bits (liburing sign-extends it into off). */
+		res = (uint32_t)sqe->off == IORING_FILE_INDEX_ALLOC ?
 		    kqring_files_update_alloc(ctx, sqe->addr, sqe->len) :
 		    kqring_files_update(ctx, (uint32_t)sqe->off, sqe->addr, 0,
 		    sqe->len);
@@ -1385,6 +1386,9 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		/* It installs a fixed file, so sqe->fd must be one. */
 		if ((sqe->flags & IOSQE_FIXED_FILE) == 0)
 			return (EBADF);
+		/* Not with borrowed credentials, as io_uring (EPERM). */
+		if (sqe->personality != 0)
+			return (EPERM);
 		break;
 	case IORING_OP_PROVIDE_BUFFERS:
 		/* sqe->fd buffers, IDs from sqe->off, as in io_uring. */
