@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="viz" width="760" height="374" viewBox="0 0 760 374" role="img" aria-label="Bulk send, TCP loopback: send a message, read it back in full">
+<title>Bulk send, TCP loopback: send a message, read it back in full</title>
+
+<style>
+  .viz { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+         --grid:#e1e0d9; --axis:#c3c2b7; --plain:#a8a69e; --kqueue:#eb6834;
+         --s1:#2a78d6; --s2:#1baf7a; --s3:#eda100; --s4:#e87ba4;
+         --faster:#2a78d6; --slower:#e34948; }
+  @media (prefers-color-scheme: dark) {
+    .viz { --surface:#1a1a19; --ink:#f0efec; --ink2:#c3c2b7; --muted:#898781;
+           --grid:#2c2c2a; --axis:#383835; --plain:#6f6d67; --kqueue:#d95926;
+           --s1:#3987e5; --s2:#199e70; --s3:#c98500; --s4:#d55181;
+           --faster:#3987e5; --slower:#e66767; }
+  }
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--ink); }
+  .title { font-size: 15px; font-weight: 600; }
+  .sub { font-size: 12px; fill: var(--ink2); }
+  .lab { font-size: 12px; fill: var(--ink2); }
+  .val { font-size: 11px; fill: var(--ink2); font-variant-numeric: tabular-nums; }
+  .tick { font-size: 11px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+  .grid { stroke: var(--grid); stroke-width: 1; }
+  .axis { stroke: var(--axis); stroke-width: 1; }
+</style>
+
+<rect width="760" height="374" rx="8" fill="var(--surface)"/>
+<text x="20" y="28" class="title">Bulk send, TCP loopback: send a message, read it back in full</text>
+<text x="20" y="48" class="sub">GB/s, higher is better</text>
+<rect x="20" y="64" width="10" height="10" rx="2" fill="var(--plain)"/>
+<text x="35" y="73" class="lab">write(2)</text>
+<rect x="101.0" y="64" width="10" height="10" rx="2" fill="var(--kqueue)"/>
+<text x="116.0" y="73" class="lab">kqring SEND</text>
+<rect x="200.0" y="64" width="10" height="10" rx="2" fill="var(--s1)"/>
+<text x="215.0" y="73" class="lab">SEND_ZC, registered buffer</text>
+<rect x="389.0" y="64" width="10" height="10" rx="2" fill="var(--s2)"/>
+<text x="404.0" y="73" class="lab">SEND_ZC, unregistered</text>
+<line x1="66.0" y1="94" x2="66.0" y2="344" class="grid"/>
+<text x="66.0" y="360" class="tick" text-anchor="middle">0.00</text>
+<line x1="190.8" y1="94" x2="190.8" y2="344" class="grid"/>
+<text x="190.8" y="360" class="tick" text-anchor="middle">1.60</text>
+<line x1="315.6" y1="94" x2="315.6" y2="344" class="grid"/>
+<text x="315.6" y="360" class="tick" text-anchor="middle">3.20</text>
+<line x1="440.4" y1="94" x2="440.4" y2="344" class="grid"/>
+<text x="440.4" y="360" class="tick" text-anchor="middle">4.80</text>
+<line x1="565.2" y1="94" x2="565.2" y2="344" class="grid"/>
+<text x="565.2" y="360" class="tick" text-anchor="middle">6.40</text>
+<line x1="690.0" y1="94" x2="690.0" y2="344" class="grid"/>
+<text x="690.0" y="360" class="tick" text-anchor="middle">8.00</text>
+<text x="740" y="360" class="tick" text-anchor="end">GB/s</text>
+<text x="56.0" y="135.0" class="lab" text-anchor="end">16 KiB</text>
+<path d="M66.0,100.0 H235.7 Q239.7,100.0 239.7,104.0 V110.0 Q239.7,114.0 235.7,114.0 H66.0 Z" fill="var(--plain)"><title>16 KiB — write(2): 2.23 GB/s</title></path>
+<text x="244.7" y="111" class="val">2.23</text>
+<path d="M66.0,116.0 H226.6 Q230.6,116.0 230.6,120.0 V126.0 Q230.6,130.0 226.6,130.0 H66.0 Z" fill="var(--kqueue)"><title>16 KiB — kqring SEND: 2.11 GB/s</title></path>
+<text x="235.6" y="127" class="val">2.11</text>
+<path d="M66.0,132.0 H281.1 Q285.1,132.0 285.1,136.0 V142.0 Q285.1,146.0 281.1,146.0 H66.0 Z" fill="var(--s1)"><title>16 KiB — SEND_ZC, registered buffer: 2.81 GB/s</title></path>
+<text x="290.1" y="143" class="val">2.81</text>
+<path d="M66.0,148.0 H273.2 Q277.2,148.0 277.2,152.0 V158.0 Q277.2,162.0 273.2,162.0 H66.0 Z" fill="var(--s2)"><title>16 KiB — SEND_ZC, unregistered: 2.71 GB/s</title></path>
+<text x="282.2" y="159" class="val">2.71</text>
+<text x="56.0" y="215.0" class="lab" text-anchor="end">64 KiB</text>
+<path d="M66.0,180.0 H430.5 Q434.5,180.0 434.5,184.0 V190.0 Q434.5,194.0 430.5,194.0 H66.0 Z" fill="var(--plain)"><title>64 KiB — write(2): 4.72 GB/s</title></path>
+<text x="439.5" y="191" class="val">4.72</text>
+<path d="M66.0,196.0 H420.5 Q424.5,196.0 424.5,200.0 V206.0 Q424.5,210.0 420.5,210.0 H66.0 Z" fill="var(--kqueue)"><title>64 KiB — kqring SEND: 4.60 GB/s</title></path>
+<text x="429.5" y="207" class="val">4.60</text>
+<path d="M66.0,212.0 H494.7 Q498.7,212.0 498.7,216.0 V222.0 Q498.7,226.0 494.7,226.0 H66.0 Z" fill="var(--s1)"><title>64 KiB — SEND_ZC, registered buffer: 5.55 GB/s</title></path>
+<text x="503.7" y="223" class="val">5.55</text>
+<path d="M66.0,228.0 H474.1 Q478.1,228.0 478.1,232.0 V238.0 Q478.1,242.0 474.1,242.0 H66.0 Z" fill="var(--s2)"><title>64 KiB — SEND_ZC, unregistered: 5.28 GB/s</title></path>
+<text x="483.1" y="239" class="val">5.28</text>
+<text x="56.0" y="295.0" class="lab" text-anchor="end">256 KiB</text>
+<path d="M66.0,260.0 H462.1 Q466.1,260.0 466.1,264.0 V270.0 Q466.1,274.0 462.1,274.0 H66.0 Z" fill="var(--plain)"><title>256 KiB — write(2): 5.13 GB/s</title></path>
+<text x="471.1" y="271" class="val">5.13</text>
+<path d="M66.0,276.0 H456.4 Q460.4,276.0 460.4,280.0 V286.0 Q460.4,290.0 456.4,290.0 H66.0 Z" fill="var(--kqueue)"><title>256 KiB — kqring SEND: 5.06 GB/s</title></path>
+<text x="465.4" y="287" class="val">5.06</text>
+<path d="M66.0,292.0 H587.8 Q591.8,292.0 591.8,296.0 V302.0 Q591.8,306.0 587.8,306.0 H66.0 Z" fill="var(--s1)"><title>256 KiB — SEND_ZC, registered buffer: 6.74 GB/s</title></path>
+<text x="596.8" y="303" class="val">6.74</text>
+<path d="M66.0,308.0 H564.0 Q568.0,308.0 568.0,312.0 V318.0 Q568.0,322.0 564.0,322.0 H66.0 Z" fill="var(--s2)"><title>256 KiB — SEND_ZC, unregistered: 6.44 GB/s</title></path>
+<text x="573.0" y="319" class="val">6.44</text>
+<line x1="66.0" y1="94" x2="66.0" y2="344" class="axis"/>
+</svg>

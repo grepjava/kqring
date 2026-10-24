@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="viz" width="760" height="326" viewBox="0 0 760 326" role="img" aria-label="Pipes and files: the worker-thread hand-off">
+<title>Pipes and files: the worker-thread hand-off</title>
+
+<style>
+  .viz { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+         --grid:#e1e0d9; --axis:#c3c2b7; --plain:#a8a69e; --kqueue:#eb6834;
+         --s1:#2a78d6; --s2:#1baf7a; --s3:#eda100; --s4:#e87ba4;
+         --faster:#2a78d6; --slower:#e34948; }
+  @media (prefers-color-scheme: dark) {
+    .viz { --surface:#1a1a19; --ink:#f0efec; --ink2:#c3c2b7; --muted:#898781;
+           --grid:#2c2c2a; --axis:#383835; --plain:#6f6d67; --kqueue:#d95926;
+           --s1:#3987e5; --s2:#199e70; --s3:#c98500; --s4:#d55181;
+           --faster:#3987e5; --slower:#e66767; }
+  }
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--ink); }
+  .title { font-size: 15px; font-weight: 600; }
+  .sub { font-size: 12px; fill: var(--ink2); }
+  .lab { font-size: 12px; fill: var(--ink2); }
+  .val { font-size: 11px; fill: var(--ink2); font-variant-numeric: tabular-nums; }
+  .tick { font-size: 11px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+  .grid { stroke: var(--grid); stroke-width: 1; }
+  .axis { stroke: var(--axis); stroke-width: 1; }
+</style>
+
+<rect width="760" height="326" rx="8" fill="var(--surface)"/>
+<text x="20" y="28" class="title">Pipes and files: the worker-thread hand-off</text>
+<text x="20" y="48" class="sub">ns per operation, lower is better</text>
+<rect x="20" y="64" width="10" height="10" rx="2" fill="var(--plain)"/>
+<text x="35" y="73" class="lab">read(2) / pread(2)</text>
+<rect x="161.0" y="64" width="10" height="10" rx="2" fill="var(--kqueue)"/>
+<text x="176.0" y="73" class="lab">kqueue</text>
+<rect x="230.0" y="64" width="10" height="10" rx="2" fill="var(--s1)"/>
+<text x="245.0" y="73" class="lab">kqring, inline</text>
+<rect x="347.0" y="64" width="10" height="10" rx="2" fill="var(--s2)"/>
+<text x="362.0" y="73" class="lab">kqring, via worker</text>
+<rect x="488.0" y="64" width="10" height="10" rx="2" fill="var(--s3)"/>
+<text x="503.0" y="73" class="lab">kqring, 32 per enter</text>
+<line x1="120.0" y1="94" x2="120.0" y2="296" class="grid"/>
+<text x="120.0" y="312" class="tick" text-anchor="middle">0</text>
+<line x1="234.0" y1="94" x2="234.0" y2="296" class="grid"/>
+<text x="234.0" y="312" class="tick" text-anchor="middle">1,200</text>
+<line x1="348.0" y1="94" x2="348.0" y2="296" class="grid"/>
+<text x="348.0" y="312" class="tick" text-anchor="middle">2,400</text>
+<line x1="462.0" y1="94" x2="462.0" y2="296" class="grid"/>
+<text x="462.0" y="312" class="tick" text-anchor="middle">3,600</text>
+<line x1="576.0" y1="94" x2="576.0" y2="296" class="grid"/>
+<text x="576.0" y="312" class="tick" text-anchor="middle">4,800</text>
+<line x1="690.0" y1="94" x2="690.0" y2="296" class="grid"/>
+<text x="690.0" y="312" class="tick" text-anchor="middle">6,000</text>
+<text x="740" y="312" class="tick" text-anchor="end">ns</text>
+<text x="110.0" y="127.0" class="lab" text-anchor="end">Pipe READ, 64 B</text>
+<path d="M120.0,100.0 H174.5 Q178.5,100.0 178.5,104.0 V110.0 Q178.5,114.0 174.5,114.0 H120.0 Z" fill="var(--plain)"><title>Pipe READ, 64 B — read(2) / pread(2): 616 ns</title></path>
+<text x="183.5" y="111" class="val">616</text>
+<path d="M120.0,116.0 H212.8 Q216.8,116.0 216.8,120.0 V126.0 Q216.8,130.0 212.8,130.0 H120.0 Z" fill="var(--kqueue)"><title>Pipe READ, 64 B — kqueue: 1,018 ns</title></path>
+<text x="221.8" y="127" class="val">1,018</text>
+<path d="M120.0,132.0 H642.9 Q646.9,132.0 646.9,136.0 V142.0 Q646.9,146.0 642.9,146.0 H120.0 Z" fill="var(--s2)"><title>Pipe READ, 64 B — kqring, via worker: 5,547 ns</title></path>
+<text x="651.9" y="143" class="val">5,547</text>
+<text x="110.0" y="191.0" class="lab" text-anchor="end">File READ, 4 KiB</text>
+<path d="M120.0,164.0 H221.1 Q225.1,164.0 225.1,168.0 V174.0 Q225.1,178.0 221.1,178.0 H120.0 Z" fill="var(--plain)"><title>File READ, 4 KiB — read(2) / pread(2): 1,106 ns</title></path>
+<text x="230.1" y="175" class="val">1,106</text>
+<path d="M120.0,180.0 H642.3 Q646.3,180.0 646.3,184.0 V190.0 Q646.3,194.0 642.3,194.0 H120.0 Z" fill="var(--s2)"><title>File READ, 4 KiB — kqring, via worker: 5,540 ns</title></path>
+<text x="651.3" y="191" class="val">5,540</text>
+<path d="M120.0,196.0 H562.1 Q566.1,196.0 566.1,200.0 V206.0 Q566.1,210.0 562.1,210.0 H120.0 Z" fill="var(--s3)"><title>File READ, 4 KiB — kqring, 32 per enter: 4,696 ns</title></path>
+<text x="571.1" y="207" class="val">4,696</text>
+<text x="110.0" y="255.0" class="lab" text-anchor="end">Empty op</text>
+<path d="M120.0,228.0 H143.3 Q147.3,228.0 147.3,232.0 V238.0 Q147.3,242.0 143.3,242.0 H120.0 Z" fill="var(--kqueue)"><title>Empty op — kqueue: 287 ns</title></path>
+<text x="152.3" y="239" class="val">287</text>
+<path d="M120.0,244.0 H157.8 Q161.8,244.0 161.8,248.0 V254.0 Q161.8,258.0 157.8,258.0 H120.0 Z" fill="var(--s1)"><title>Empty op — kqring, inline: 440 ns</title></path>
+<text x="166.8" y="255" class="val">440</text>
+<path d="M120.0,260.0 H545.0 Q549.0,260.0 549.0,264.0 V270.0 Q549.0,274.0 545.0,274.0 H120.0 Z" fill="var(--s2)"><title>Empty op — kqring, via worker: 4,516 ns</title></path>
+<text x="554.0" y="271" class="val">4,516</text>
+<line x1="120.0" y1="94" x2="120.0" y2="296" class="axis"/>
+</svg>
