@@ -59,7 +59,7 @@ flowchart TB
 | [`kmod/kqring_rsrc.c`](kmod/kqring_rsrc.c) | Reference-counted fixed files (`ctx->files`) with Capsicum rights, registered buffers (`ctx->bufs`), classic & mmap provided-buffer rings (`ctx->bgroups`), and credential personalities. |
 | [`kmod/kqring_register.c`](kmod/kqring_register.c) | `KQRING_IOC_REGISTER` dispatcher (`IORING_REGISTER_*`), restrictions, `IORING_REGISTER_PROBE`, and `eventfd` registration/signalling. |
 | [`kmod/kqring_sock.c`](kmod/kqring_sock.c) | Non-blocking inline socket execution, `soupcall_set` / `solisten_upcall_set` arming, multishot `RECV`/`RECVMSG`/`ACCEPT`, `POLL_ADD`, `URING_CMD`, and `SEND_ZC`/`SENDMSG_ZC` mbuf construction. |
-| [`kmod/kqring_file.c`](kmod/kqring_file.c) | Synchronous, inline (page-cache reads via `VOP_READ_PGCACHE`, `O_NONBLOCK` pipes), direct-to-driver (disk devices: unmapped bios over held user pages, completed by `kqring_bio_done()` as taskwork; not cancelable in flight, and ring teardown waits on `ctx->nbio`) and worker-offloaded VFS/file/pipe operations (`READ`/`WRITE`, `READ_MULTISHOT`, `SPLICE`, `TEE`, `OPENAT`/`OPENAT2`, `STATX`, `*XATTR`, `FSYNC`, `FALLOCATE`, `FTRUNCATE`, `FADVISE`, `MADVISE`). |
+| [`kmod/kqring_file.c`](kmod/kqring_file.c) | Synchronous, inline (page-cache reads via `VOP_READ_PGCACHE`, ready pipes), direct-to-driver (disk devices: unmapped bios over held user pages, completed by `kqring_bio_done()` as taskwork; not cancelable in flight, and ring teardown waits on `ctx->nbio`) and worker-offloaded VFS/file/pipe operations (`READ`/`WRITE`, `READ_MULTISHOT`, `SPLICE`, `TEE`, `OPENAT`/`OPENAT2`, `STATX`, `*XATTR`, `FSYNC`, `FALLOCATE`, `FTRUNCATE`, `FADVISE`, `MADVISE`). |
 | [`kmod/kqring_sync.c`](kmod/kqring_sync.c) | `FUTEX_WAIT`/`FUTEX_WAITV`/`FUTEX_WAKE` (`umtx_key`), `WAITID`, `callout`-backed `TIMEOUT`/`LINK_TIMEOUT`/`TIMEOUT_REMOVE`, `ASYNC_CANCEL`/`SYNC_CANCEL`, `POLL_REMOVE`, and cross-ring `MSG_RING`. |
 | [`kmod/kqring_wq.c`](kmod/kqring_wq.c) | Per-ring or shared (`IORING_SETUP_ATTACH_WQ`) in-process kernel worker pools (`IO_WQ_BOUND` / `IO_WQ_UNBOUND`), non-blocking worker retirement/abort callout, and `IORING_SETUP_SQPOLL`. |
 | [`kmod/kqring_kpoll.c`](kmod/kqring_kpoll.c) | `POLL_ADD` on files other than sockets: `EVFILT_READ`/`EVFILT_WRITE` knotes on a kqueue the ring owns, the `kqpoll` thread that waits on it, and delivery of its events as taskwork (section 5a). |
@@ -165,7 +165,7 @@ stateDiagram-v2
 
     Ready --> Issuing: kqring_req_issue()<br/>+ kqring_req_resources()
 
-    Issuing --> Completed: Inline completion<br/>(NOP, sync VFS, ready socket,<br/>page-cache file read, O_NONBLOCK pipe)
+    Issuing --> Completed: Inline completion<br/>(NOP, sync VFS, ready socket,<br/>page-cache file read, ready pipe)
     Issuing --> ArmedSocket: EAGAIN on socket<br/>(kqring_arm_socket_op)
     Issuing --> ArmedWorker: Blocking file/pipe/VFS or IOSQE_ASYNC<br/>(kqring_wq_enqueue)
     Issuing --> ArmedSync: FUTEX_WAIT / WAITID / TIMEOUT<br/>(active_ops + subsystem list)
@@ -334,7 +334,7 @@ classDiagram
 Before a non-socket `READ`/`WRITE` is handed to a worker, `kqring_file_rw_inline()` tries to complete it on the issuer when that cannot block, as Linux `io_uring` tries `IOCB_NOWAIT` before punting to `io-wq`:
 
 - **Regular files:** a positioned read is served from the page cache through `VOP_READ_PGCACHE` (UFS, tmpfs), the path `vn_read()` tries first. It grabs resident pages without sleeping and returns `EJUSTRETURN` on a miss. As `vn_io_fault()` does for `read(2)`, it holds a read range lock (taken with `vn_rangelock_tryrlock()`, never waiting) and copies out with page faults disabled, so a destination that would fault (unmapped, or mapped from the same file) cannot deadlock against the busied file pages. A miss, a contended range, a copy that would fault, or a partial copy short of end of file leaves the request untouched for the worker, which redoes it in full.
-- **Pipes:** `READ`/`WRITE` on an `O_NONBLOCK` pipe never waits, so it runs inline. A blocking pipe stays on the worker: `pipe_read()` has no per-call non-blocking mode, and another reader could drain the pipe between a readiness check and the read.
+- **Pipes:** a `READ` on a pipe that has data, or a `WRITE` to one with room, runs inline, blocking or not; one that would wait goes to a worker, even on an `O_NONBLOCK` pipe (io_uring polls rather than fail with `EAGAIN`). `pipe_read()` has no per-call non-blocking mode, so if another reader drains a blocking pipe between the readiness check and the read, the issuer waits in `pipe_read()` as `read(2)` would.
 
 Blocking operations on regular files, pipes, FIFOs, devices, VFS paths, `WAITID`, non-socket `POLL_ADD` that cannot be a knote (section 5a), and any SQE with `IOSQE_ASYNC` execute on an in-process kernel worker pool (`struct kqring_wq`, `IORING_FEAT_NATIVE_WORKERS`):
 
