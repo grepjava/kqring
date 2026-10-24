@@ -74,3 +74,9 @@ Run the test unbuffered so progress survives a panic:
 - Listening sockets have no `so_rcv`; use `solisten_upcall_set()` under
   `SOCK_LOCK`, never `soupcall_set()`.
 - `kern_accept4()` takes 5 args and `SOCK_*` flags; `SS_CANTRCVMORE` is gone.
+- `listen(2)` can turn a socket into a listener while an op is armed on it:
+  `solisten_proto()` bzeroes `so_rcv`/`so_snd` (the union with the listen
+  queues) under both sockbuf mutexes. Re-check `SOLISTENING()` after taking
+  `SOCK_BUF_LOCK` before touching a sockbuf.
+- `soupcall_set()` / `solisten_upcall_set()` silently overwrite an existing
+  upcall (no KASSERT on 15.1); there is one slot per sockbuf.

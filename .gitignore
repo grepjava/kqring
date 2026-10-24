@@ -14,3 +14,4 @@ export_syms
 tests/kqring_test
 *.log
 vmcore.*
+graphify-out/
