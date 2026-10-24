@@ -3355,7 +3355,7 @@ kqring_exec_sendmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 	struct msghdr msg;
 	cap_rights_t rights;
 	bool waitall;
-	size_t n;
+	size_t n = 0;
 	int error, flags, rc;
 
 	/* As sendmsg(2): no addressed sends in capability mode. */
