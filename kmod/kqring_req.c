@@ -191,6 +191,8 @@ kqring_op_disarm_locked(struct kqring_op *op)
 		op->polled = false;
 		ctx->npolled--;
 	}
+	if (op->kp_on)
+		kqring_kpoll_disarm_locked(ctx, op);
 	if (wq != NULL) {
 		mtx_lock(&wq->mtx);
 		op->wq_canceled = true;
@@ -261,6 +263,8 @@ kqring_op_unarm_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 	op->cancelled = true;
 	op->armed = false;
 	TAILQ_REMOVE(&ctx->active_ops, op, active_link);
+	if (op->sqe.opcode == IORING_OP_POLL_ADD)
+		LIST_REMOVE(op, poll_hlink);
 	if (op->nfwait != 0)
 		ctx->nfutex--;
 	if (op->sqe.opcode == IORING_OP_WAITID && ctx->nwaitid > 0)
@@ -2101,6 +2105,11 @@ kqring_taskwork_run_one(struct kqring_ctx *ctx, struct kqring_op *op)
 		kqring_op_unarm_locked(ctx, op);
 		mtx_unlock(&ctx->mtx);
 		kqring_req_complete(ctx, op, res, op->cflags);
+		return;
+	}
+	/* A non-socket poll's knotes fired (kqring_kpoll.c). */
+	if (op->kp_on) {
+		kqring_kpoll_deliver(ctx, op);
 		return;
 	}
 	switch (op->sqe.opcode) {

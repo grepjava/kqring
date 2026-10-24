@@ -194,7 +194,7 @@ kqring_so_readable(struct socket *so, bool *readable)
  * Pick provided buffers (from sqe->buf_group) for a receive of at most
  * `len` bytes (0: the buffers' size): one, or up to `nmax` for a bundle.
  * Returns EAGAIN, without consuming a buffer, if nothing is there to
- * receive.
+ * receive, and ENOBUFS, even then, if the group has no buffers.
  */
 static int
 kqring_recv_pick_buf(struct kqring_ctx *ctx, const struct kqring_op *op,
@@ -204,6 +204,8 @@ kqring_recv_pick_buf(struct kqring_ctx *ctx, const struct kqring_op *op,
 	bool readable;
 	int error;
 
+	if (kqring_buf_none(ctx, op->sqe.buf_group))
+		return (ENOBUFS);
 	error = kqring_so_readable(so, &readable);
 	if (error != 0)
 		return (error);
@@ -325,7 +327,7 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	    (sqe->ioprio & IORING_RECV_MULTISHOT) != 0);
 	bool bundle = sqe->opcode == IORING_OP_RECV &&
 	    (sqe->ioprio & IORING_RECVSEND_BUNDLE) != 0;
-	bool waitall;
+	bool drained = false, waitall;
 	size_t n;
 	int error, flags, rc;
 
@@ -352,6 +354,18 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	 * buffer, as soreceive() would end (EWOULDBLOCK, nothing moved).
 	 * Out-of-band data is not in the receive buffer, so MSG_OOB asks.
 	 */
+	if (buf_select) {
+		bool none;
+
+		/* As kqring_recv_pick_buf() would, data or not. */
+		sx_xlock(&ctx->bg_sx);
+		none = kqring_buf_none(ctx, sqe->buf_group);
+		sx_xunlock(&ctx->bg_sx);
+		if (none) {
+			kqring_put_sock(op, fp, ENOBUFS);
+			return (kqring_done(op, -ENOBUFS, 0));
+		}
+	}
 	if ((sqe->opcode != IORING_OP_RECV ||
 	    (sqe->msg_flags & MSG_OOB) == 0) && kqring_so_rcv_idle(so)) {
 		kqring_put_sock(op, fp, EAGAIN);
@@ -405,11 +419,13 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (buf_select) {
 		if (n > 0)
 			cqe_flags |= kqring_buf_commit(ctx, &sel, n);
+		drained = kqring_buf_none(ctx, sqe->buf_group);
 		sx_xunlock(&ctx->bg_sx);
 	}
 	if (multishot && n > 0) {
 		cqe_flags |= IORING_CQE_F_MORE;
-		*more_out = kqring_so_rcv_pending(so, true);
+		/* Out of buffers: go again, to end with ENOBUFS. */
+		*more_out = drained || kqring_so_rcv_pending(so, true);
 	} else if (kqring_so_rcv_pending(so, false)) {
 		cqe_flags |= IORING_CQE_F_SOCK_NONEMPTY;
 	}
@@ -969,7 +985,7 @@ kqring_exec_recvmsg_multi(struct kqring_ctx *ctx, struct kqring_op *op,
 	size_t ctlsz = ma->msg.msg_controllen;
 	size_t hdr = sizeof(out) + namesz + ctlsz, clen, n;
 	char *ubuf;
-	int error;
+	int error, rc;
 
 	error = kqring_recv_pick_buf(ctx, op, so, kqring_msg_buf_cap(ma),
 	    &biov, 1, &sel);
@@ -1026,9 +1042,12 @@ kqring_exec_recvmsg_multi(struct kqring_ctx *ctx, struct kqring_op *op,
 		return (kqring_done(op, -error, 0));
 
 	n = hdr + MIN(n, aiov.iov_len);
-	*more_out = kqring_so_rcv_pending(so, true);
-	return (kqring_done(op, kqring_xfer_res(n),
-	    kqring_buf_commit(ctx, &sel, n) | IORING_CQE_F_MORE));
+	rc = kqring_done(op, kqring_xfer_res(n),
+	    kqring_buf_commit(ctx, &sel, n) | IORING_CQE_F_MORE);
+	/* Out of buffers: go again, to end with ENOBUFS. */
+	*more_out = kqring_buf_none(ctx, sqe->buf_group) ||
+	    kqring_so_rcv_pending(so, true);
+	return (rc);
 }
 
 /* RECVMSG: kqring_recvit() on the kernel copy of the msghdr's iovec. */

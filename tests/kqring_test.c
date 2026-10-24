@@ -6746,6 +6746,157 @@ test_nonsock_poll(void)
 	    "FIXED_FILE, POLL_REMOVE, POLLHUP\n");
 }
 
+#define KPOLL_NPIPES	100
+
+/*
+ * Non-socket POLL_ADD as knotes on the ring's kqueue: many at once, two on
+ * one descriptor and filter (the second waits on a worker), a user_data
+ * update, closing the ring with polls armed, and a ring that outlives its
+ * owner's descriptor table.
+ */
+static void
+test_kpoll(void)
+{
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	struct test_ring t;
+	int pfd[KPOLL_NPIPES][2], sv[2], seen[KPOLL_NPIPES];
+	char ch;
+
+	ring_init(&t);
+	for (int i = 0; i < KPOLL_NPIPES; i++)
+		assert(pipe(pfd[i]) == 0);
+
+	/* 1. Two POLLIN polls on one pipe both complete. */
+	for (int i = 0; i < 2; i++) {
+		sqe = ring_prep(&t, IORING_OP_POLL_ADD, pfd[0][0], 72001 + i);
+		sqe->poll32_events = POLLIN;
+		ring_push_sqe(&t);
+	}
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+	assert(write(pfd[0][1], "a", 1) == 1);
+	assert(ring_wait(&t, 2, 2000) == 0);
+	for (int i = 0; i < 2; i++) {
+		c = ring_pop_cqe(&t);
+		assert((c.user_data == 72001 || c.user_data == 72002) &&
+		    (c.res & POLLIN) != 0 && (c.flags & IORING_CQE_F_MORE) == 0);
+	}
+	assert(read(pfd[0][0], &ch, 1) == 1);
+
+	/* 2. A multishot poll on each pipe; one CQE per write. */
+	for (int i = 0; i < KPOLL_NPIPES; i++) {
+		sqe = ring_prep(&t, IORING_OP_POLL_ADD, pfd[i][0], 72100 + i);
+		sqe->poll32_events = POLLIN;
+		sqe->len = IORING_POLL_ADD_MULTI;
+		ring_push_sqe(&t);
+	}
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+	for (int round = 0; round < 2; round++) {
+		memset(seen, 0, sizeof(seen));
+		for (int i = 0; i < KPOLL_NPIPES; i++)
+			assert(write(pfd[i][1], "x", 1) == 1);
+		for (int n = 0; n < KPOLL_NPIPES; n++) {
+			if (ring_cq_ready(&t) == 0)
+				assert(ring_wait(&t, 1, 2000) == 0);
+			c = ring_pop_cqe(&t);
+			assert(c.user_data >= 72100 &&
+			    c.user_data < 72100 + KPOLL_NPIPES);
+			assert((c.res & POLLIN) != 0 &&
+			    (c.flags & IORING_CQE_F_MORE) != 0);
+			assert(seen[c.user_data - 72100]++ == 0);
+		}
+		for (int i = 0; i < KPOLL_NPIPES; i++)
+			assert(read(pfd[i][0], &ch, 1) == 1);
+	}
+
+	/* 3. POLL_REMOVE updating user_data: later CQEs carry the new one. */
+	sqe = ring_prep(&t, IORING_OP_POLL_REMOVE, -1, 72003);
+	sqe->addr = 72100;
+	sqe->off = 72004;
+	sqe->len = IORING_POLL_UPDATE_USER_DATA;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	assert(write(pfd[0][1], "y", 1) == 1);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 72004 && (c.res & POLLIN) != 0 &&
+	    (c.flags & IORING_CQE_F_MORE) != 0);
+	assert(read(pfd[0][0], &ch, 1) == 1);
+
+	/* 4. Closing the ring with all of them armed. */
+	close(t.fd);
+
+	/*
+	 * 5. A child arms a poll, passes its ring to us and exits: the ring
+	 * outlives the child's descriptor table, which held its kqueue.
+	 */
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	pid_t pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		struct test_ring ct;
+		union {
+			struct cmsghdr cm;
+			char buf[CMSG_SPACE(sizeof(int))];
+		} cmsg_buf;
+		struct iovec iov = { &ch, 1 };
+		struct msghdr msg;
+		struct cmsghdr *cm;
+
+		ch = 'r';
+		ring_init(&ct);
+		sqe = ring_prep(&ct, IORING_OP_POLL_ADD, pfd[1][0], 72005);
+		sqe->poll32_events = POLLIN;
+		sqe->len = IORING_POLL_ADD_MULTI;
+		ring_push_sqe(&ct);
+		ring_submit(&ct);
+		memset(&cmsg_buf, 0, sizeof(cmsg_buf));
+		memset(&msg, 0, sizeof(msg));
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		msg.msg_control = cmsg_buf.buf;
+		msg.msg_controllen = sizeof(cmsg_buf.buf);
+		cm = CMSG_FIRSTHDR(&msg);
+		cm->cmsg_len = CMSG_LEN(sizeof(int));
+		cm->cmsg_level = SOL_SOCKET;
+		cm->cmsg_type = SCM_RIGHTS;
+		memcpy(CMSG_DATA(cm), &ct.fd, sizeof(int));
+		_exit(sendmsg(sv[1], &msg, 0) == 1 ? 0 : 1);
+	}
+	int status = 0, rfd = -1;
+	union {
+		struct cmsghdr cm;
+		char buf[CMSG_SPACE(sizeof(int))];
+	} rbuf;
+	struct iovec riov = { &ch, 1 };
+	struct msghdr rmsg = {
+		.msg_iov = &riov,
+		.msg_iovlen = 1,
+		.msg_control = rbuf.buf,
+		.msg_controllen = sizeof(rbuf.buf),
+	};
+	assert(recvmsg(sv[0], &rmsg, 0) == 1 && ch == 'r');
+	memcpy(&rfd, CMSG_DATA(CMSG_FIRSTHDR(&rmsg)), sizeof(int));
+	assert(waitpid(pid, &status, 0) == pid);
+	assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	/* Its pipe becoming readable reaches no one; closing it is clean. */
+	assert(write(pfd[1][1], "z", 1) == 1);
+	usleep(100 * 1000);
+	close(rfd);
+
+	close(sv[0]);
+	close(sv[1]);
+	for (int i = 0; i < KPOLL_NPIPES; i++) {
+		close(pfd[i][0]);
+		close(pfd[i][1]);
+	}
+	printf("[PASS] kqueue POLL_ADD: %d pipes multishot, same fd twice, "
+	    "user_data update, owner exit with the ring passed on\n",
+	    KPOLL_NPIPES);
+}
+
 static void
 test_sqe128_cqe32_attach_wq(void)
 {
@@ -7509,6 +7660,7 @@ main(int argc, char **argv)
 		test_worker_process_lifecycle();
 		test_splice_and_tee();
 		test_nonsock_poll();
+		test_kpoll();
 		test_sqe128_cqe32_attach_wq();
 		test_registered_rings();
 		test_sqpoll_and_iopoll();

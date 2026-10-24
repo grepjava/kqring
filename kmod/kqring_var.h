@@ -169,6 +169,10 @@ MALLOC_DECLARE(M_SELFD);
 /* Provided buffers one bundle (IORING_RECVSEND_BUNDLE) transfer may use. */
 #define KQRING_MAX_BUNDLE	32
 #define KQRING_BGROUP_HASH	64
+/* Buckets of armed non-socket polls, by descriptor. */
+#define KQRING_KP_HASH		256
+/* Buckets of armed POLL_ADDs, by user_data (POLL_REMOVE's lookup). */
+#define KQRING_POLL_HASH	256
 /* In-process worker pools: IO_WQ_BOUND (0) and IO_WQ_UNBOUND (1). */
 #define KQRING_WQ_TYPES		2
 #define KQRING_WQ_MAX_WORKERS	256U
@@ -247,6 +251,21 @@ struct kqring_op {
 	/* The waiter lists op is on: so_rcv (or the listener), so_snd. */
 	struct kqring_sowatch	*sw[2];
 	TAILQ_ENTRY(kqring_op)	sw_link[2];
+	/*
+	 * POLL_ADD on a non-socket file, as knotes on the ring's kqueue
+	 * (kqring_kpoll.c): in ctx->kp_ops[] by fd while kp_on, with the events
+	 * the poller saw since the last delivery (under ctx->mtx).
+	 */
+	TAILQ_ENTRY(kqring_op)	kp_link;
+	/* An armed POLL_ADD: in ctx->poll_hash[] by user_data. */
+	LIST_ENTRY(kqring_op)	poll_hlink;
+	uint64_t		kp_id;		/* knotes' udata */
+	int			kp_fd;		/* their ident */
+	uint8_t			kp_filters;	/* KQRING_KP_READ / _WRITE */
+	const void		*kp_data;	/* its file's f_data: only compared */
+	bool			kp_on;
+	int			kp_revents;
+	u_int			kp_nev;
 	bool			listening;	/* armed via solisten_upcall_set */
 	bool			in_taskwork;
 	bool			cancelled;	/* no longer armed; under mtx */
@@ -332,6 +351,7 @@ struct kqring_op {
 };
 
 TAILQ_HEAD(kqring_op_list, kqring_op);
+LIST_HEAD(kqring_poll_head, kqring_op);
 
 /*
  * An armed FUTEX_WAIT, or one word of an armed FUTEX_WAITV, hashed by its
@@ -630,6 +650,16 @@ struct kqring_ctx {
 	bool			taskrun_only;
 
 	/*
+	 * Non-socket POLL_ADD (kqring_kpoll.c): a kqueue with no descriptor,
+	 * and a kthread blocked in kevent(2) on it.
+	 */
+	struct file		*kp_fp;
+	struct thread		*kp_td;
+	bool			kp_running;
+	uint64_t		kp_next_id;
+	TAILQ_HEAD(, kqring_op)	kp_ops[KQRING_KP_HASH];
+
+	/*
 	 * Registered files and buffers (owner thread only).  A NULL slot is
 	 * empty.  IORING_FILE_INDEX_ALLOC picks slots in
 	 * [file_alloc_off, file_alloc_end), starting at file_alloc_hint.
@@ -685,6 +715,7 @@ struct kqring_ctx {
 	bool			wq_abort_pending;
 	struct kqring_op_list	retired_ops;	/* canceled workers still live */
 	struct kqring_op_list	active_ops;
+	struct kqring_poll_head	poll_hash[KQRING_POLL_HASH];
 	struct kqring_op_list	taskwork_ops;
 	int			nfutex;		/* armed FUTEX_WAIT(V) ops */
 	int			nseqto;		/* armed completion-count TIMEOUTs */
@@ -962,12 +993,22 @@ struct kqring_sowatch {
 
 #define	KQRING_SW_IDX(which)	((which) == SO_RCV ? 0 : 1)
 
+static inline struct kqring_poll_head *
+kqring_poll_bucket(struct kqring_ctx *ctx, uint64_t user_data)
+{
+	return (&ctx->poll_hash[(u_int)(user_data ^ (user_data >> 32)) %
+	    KQRING_POLL_HASH]);
+}
+
 static inline void
 kqring_op_arm_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 {
 	mtx_assert(&ctx->mtx, MA_OWNED);
 	op->armed = true;
 	TAILQ_INSERT_TAIL(&ctx->active_ops, op, active_link);
+	if (op->sqe.opcode == IORING_OP_POLL_ADD)
+		LIST_INSERT_HEAD(kqring_poll_bucket(ctx, op->sqe.user_data), op,
+		    poll_hlink);
 }
 
 static inline bool
@@ -1137,6 +1178,7 @@ void	kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 struct kqring_bgroup *kqring_bgroup_find(struct kqring_ctx *ctx, uint16_t bgid);
 int	kqring_buf_select(struct kqring_ctx *ctx, uint16_t bgid, size_t max,
 	    struct iovec *iov, u_int nmax, struct kqring_sel *sel);
+bool	kqring_buf_none(struct kqring_ctx *ctx, uint16_t bgid);
 uint32_t kqring_buf_commit(struct kqring_ctx *ctx,
 	    const struct kqring_sel *sel, size_t done);
 void	kqring_rsrc_put(struct kqring_ctx *ctx, struct kqring_rsrc *r);
@@ -1370,6 +1412,20 @@ int	kqring_op_wq_type(const struct kqring_op *op);
 bool	kqring_arm_nonsock_op(struct kqring_ctx *ctx, struct kqring_op *op);
 void	kqring_wq_rearm_ready(struct kqring_ctx *ctx, struct kqring_op *op);
 int	kqring_sqpoll_start(struct kqring_ctx *ctx, struct thread *td);
+bool	kqring_kthread_check_suspend(struct kqring_ctx *ctx);
+void	kqring_worker_hold(void);
+void	kqring_worker_rele(void);
+
+/* kqring_kpoll.c */
+#define	KQRING_KP_READ	0x01
+#define	KQRING_KP_WRITE	0x02
+int	kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
+	    const struct file *fp);
+void	kqring_kpoll_disarm_locked(struct kqring_ctx *ctx,
+	    struct kqring_op *op);
+void	kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op);
+void	kqring_kpoll_stop(struct kqring_ctx *ctx);
+void	kqring_kpoll_close(struct kqring_ctx *ctx);
 
 /* Whether the ring has a kthread (SQPOLL, or completions only). */
 static inline bool

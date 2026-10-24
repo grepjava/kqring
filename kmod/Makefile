@@ -7,7 +7,7 @@
 KMOD=	kqring
 SRCS=	kqring_dev.c kqring_req.c kqring_rsrc.c kqring_register.c \
 	kqring_sock.c kqring_file.c kqring_sync.c kqring_wq.c \
-	kqring_zc.c vnode_if.h
+	kqring_zc.c kqring_kpoll.c vnode_if.h
 
 CFLAGS+= -I${.CURDIR}/../include -Wall -Wextra -Werror
 # FreeBSD kernel headers (e.g. sys/ktrace.h) have unused parameters.

@@ -73,7 +73,7 @@ kqring_wq_mark_blocking(struct kqring_ctx *ctx, struct kqring_op *op)
  * ============================================================================
  */
 
-static void
+void
 kqring_worker_hold(void)
 {
 	mtx_lock(&kqring_proc_mtx);
@@ -81,7 +81,7 @@ kqring_worker_hold(void)
 	mtx_unlock(&kqring_proc_mtx);
 }
 
-static void
+void
 kqring_worker_rele(void)
 {
 	mtx_lock(&kqring_proc_mtx);
@@ -642,6 +642,20 @@ kqring_arm_nonsock_op(struct kqring_ctx *ctx, struct kqring_op *op)
 	if (sqe->opcode == IORING_OP_POLL_ADD) {
 		error = kqring_op_fget(op,
 		    cap_rights_init_one(&rights, CAP_POLL_EVENT), 0, &fp);
+		if (error == 0) {
+			/* As knotes on the ring's kqueue, or else a worker. */
+			error = kqring_kpoll_arm(ctx, op, fp);
+			fdrop(fp, td);
+			if (error == 0)
+				return (true);
+			if (error != EOPNOTSUPP) {
+				kqring_req_complete(ctx, op, -error, 0);
+				return (false);
+			}
+			error = kqring_op_fget(op,
+			    cap_rights_init_one(&rights, CAP_POLL_EVENT), 0,
+			    &fp);
+		}
 	} else if (sqe->opcode == IORING_OP_READ_MULTISHOT) {
 		error = kqring_op_fget(op,
 		    cap_rights_init_one(&rights, CAP_READ), FREAD, &fp);
@@ -713,8 +727,13 @@ kqring_wq_rearm_ready(struct kqring_ctx *ctx, struct kqring_op *op)
 }
 
 
-static bool
-kqring_sqpoll_check_suspend(struct kqring_ctx *ctx)
+/*
+ * Handle stop and single-threading requests (fork, exec, exit, SIGSTOP)
+ * on a ring kthread (SQPOLL, completions, poller).  Returns true if the
+ * ring is closing or the process exiting: the thread then exits.
+ */
+bool
+kqring_kthread_check_suspend(struct kqring_ctx *ctx)
 {
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
@@ -784,7 +803,7 @@ kqring_sqpoll_thread(void *arg)
 
 	last_active = getsbinuptime();
 	for (;;) {
-		if (kqring_sqpoll_check_suspend(ctx))
+		if (kqring_kthread_check_suspend(ctx))
 			break;
 
 		sx_xlock(&ctx->sq_sx);
@@ -881,7 +900,7 @@ kqring_sqpoll_thread(void *arg)
 		 * (exit, exec, SIGSTOP) only aborts sleeps with PCATCH, and an
 		 * idle ring sleeps here without a timeout.  Signals are masked,
 		 * so only stop and exit requests interrupt it, and the loop
-		 * then suspends or exits in kqring_sqpoll_check_suspend().
+		 * then suspends or exits in kqring_kthread_check_suspend().
 		 */
 		ctx->sleeping++;
 		(void)msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, PCATCH, "kqsqid",

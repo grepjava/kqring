@@ -723,9 +723,8 @@ kqring_poll_remove(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
 	bool retired = false;
 
 	mtx_lock(&ctx->mtx);
-	TAILQ_FOREACH(op, &ctx->active_ops, active_link) {
-		if (op->sqe.opcode == IORING_OP_POLL_ADD && !op->cancelled &&
-		    op->sqe.user_data == sqe->addr)
+	LIST_FOREACH(op, kqring_poll_bucket(ctx, sqe->addr), poll_hlink) {
+		if (!op->cancelled && op->sqe.user_data == sqe->addr)
 			break;
 	}
 	if (op != NULL) {

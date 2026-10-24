@@ -161,6 +161,31 @@ kqring_buf_select(struct kqring_ctx *ctx, uint16_t bgid, size_t max,
 }
 
 /*
+ * Whether group bgid certainly has no buffer to give (it does not exist, or
+ * it is empty), so that a receive selecting from it fails ENOBUFS whether
+ * or not data is waiting, as io_uring selects before it receives.  A group
+ * reserved by another transfer may get its buffers back: not "none".
+ * Under ctx->bg_sx.
+ */
+bool
+kqring_buf_none(struct kqring_ctx *ctx, uint16_t bgid)
+{
+	struct kqring_bgroup *bg;
+	uint16_t tail;
+
+	sx_assert(&ctx->bg_sx, SA_XLOCKED);
+	bg = kqring_bgroup_find(ctx, bgid);
+	if (bg == NULL)
+		return (true);
+	if (bg->busy)
+		return (false);
+	if (!bg->is_ring)
+		return (STAILQ_EMPTY(&bg->bufs));
+	/* A fault is reported by the selection that follows. */
+	return (kqring_bring_tail(bg, &tail) == 0 && tail == bg->head);
+}
+
+/*
  * Consume the selected buffers that n > 0 bytes went into, and return the
  * CQE flags reporting them (the first buffer's ID).  With
  * IOU_PBUF_RING_INC, a buffer only partly used stays at the head with

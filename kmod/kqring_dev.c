@@ -191,6 +191,7 @@ kqring_ctx_free_final(struct kqring_ctx *ctx)
 	}
 
 	/* Every request (and its references) is gone: drop the tables. */
+	kqring_kpoll_close(ctx);
 	kqring_files_free(ctx);
 	kqring_bufs_free(ctx);
 	for (int i = 0; i < KQRING_BGROUP_HASH; i++) {
@@ -267,6 +268,7 @@ kqring_ctx_cancel_all(struct kqring_ctx *ctx)
 	}
 	while (ctx->sqpoll_running)
 		msleep(&ctx->sqpoll_running, &ctx->mtx, 0, "kqsqdt", 0);
+	kqring_kpoll_stop(ctx);
 	if (ctx->cancelling) {
 		if (ctx->cancel_td != curthread) {
 			while (!ctx->cancelled)
@@ -316,6 +318,8 @@ kqring_ctx_cancel_all(struct kqring_ctx *ctx)
 	wq = ctx->wq;
 	mtx_unlock(&ctx->mtx);
 	kqring_wq_close(wq);
+	/* No poll is armed and the poller is gone: close the kqueue. */
+	kqring_kpoll_close(ctx);
 
 	while ((op = TAILQ_FIRST(&ctx->ready_q)) != NULL) {
 		TAILQ_REMOVE(&ctx->ready_q, op, q_link);
@@ -399,6 +403,10 @@ kqring_open(struct cdev *dev __unused, int oflags __unused, int devtype __unused
 	TAILQ_INIT(&ctx->ready_q);
 	TAILQ_INIT(&ctx->defer_q);
 	TAILQ_INIT(&ctx->zc_pending);
+	for (int i = 0; i < KQRING_KP_HASH; i++)
+		TAILQ_INIT(&ctx->kp_ops[i]);
+	for (int i = 0; i < KQRING_POLL_HASH; i++)
+		LIST_INIT(&ctx->poll_hash[i]);
 	STAILQ_INIT(&ctx->ocq);
 	STAILQ_INIT(&ctx->rcq);
 	for (int i = 0; i < KQRING_BGROUP_HASH; i++)
