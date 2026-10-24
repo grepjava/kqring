@@ -65,7 +65,7 @@ extern "C" {
 
 /*
  * Linux-compatible fixed-width types for source compatibility with code
- * written against <linux/io_uring.h> (such as Vega's cvega.c).
+ * written against <linux/io_uring.h>.
  */
 #ifndef __u8
 typedef uint8_t   __u8;
@@ -904,8 +904,8 @@ kqring_ctl_fd(void)
 }
 
 /*
- * Drop-in userspace wrappers matching cvega.c's uring_setup / uring_enter /
- * uring_register signatures.
+ * Userspace wrappers with the arguments of Linux's io_uring_setup(2),
+ * io_uring_enter(2) and io_uring_register(2).
  */
 static inline long
 kqring_setup(unsigned entries, struct io_uring_params *p)

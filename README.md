@@ -1,25 +1,76 @@
-# `kqring` — `io_uring` (`SINGLE_ISSUER | DEFER_TASKRUN` + `PBUF_RING`) for FreeBSD
+# kqring — io_uring for FreeBSD
 
-`kqring.ko` is a loadable FreeBSD kernel module implementing a subset of the Linux `io_uring` ABI, engineered specifically for modern per-worker thread-per-core runtimes like **Vega** (`SINGLE_ISSUER | DEFER_TASKRUN` + `PBUF_RING` + `RECV_MULTISHOT`).
+`kqring` brings Linux's [`io_uring`](https://kernel.dk/io_uring.pdf) asynchronous I/O interface to FreeBSD, as a loadable kernel module (`kqring.ko`) for FreeBSD 14 and 15.
 
-## Layout
+It uses the io_uring ABI as-is, with the same structure layouts and `IORING_*` constants:
+- submission and completion queues shared with the kernel through `mmap(2)`;
+- `struct io_uring_sqe`, `struct io_uring_cqe` and `struct io_uring_params`;
+- provided-buffer rings.
 
-- [`include/sys/kqring.h`](include/sys/kqring.h) — Dual kernel/userspace header (`io_uring_sqe`, `io_uring_cqe`, `io_uring_buf_ring`, `/dev/kqring` ioctls, and inline `kqring_setup` / `kqring_enter` / `kqring_register` wrappers).
-- [`kmod/`](kmod/) — FreeBSD 14/15 loadable kernel module (`style(9)` C), split by subsystem:
-  - [`kqring_var.h`](kmod/kqring_var.h) — shared structures, limits and internal prototypes.
-  - [`kqring_dev.c`](kmod/kqring_dev.c) — `/dev/kqring`, ioctls, ring setup and mapping, enter, module load/unload and process exit/exec hooks.
-  - [`kqring_req.c`](kmod/kqring_req.c) — ring memory, SQE preparation and argument copy-in, request lifecycle, links, drains, CQE posting and taskwork.
-  - [`kqring_sock.c`](kmod/kqring_sock.c) — socket operations and upcalls, multishot, `POLL_ADD` and `URING_CMD`.
-  - [`kqring_file.c`](kmod/kqring_file.c) — file, path, xattr, `SPLICE`/`TEE` and other VFS operations.
-  - [`kqring_sync.c`](kmod/kqring_sync.c) — timeouts, futexes, `WAITID`, `MSG_RING` and cancellation.
-  - [`kqring_wq.c`](kmod/kqring_wq.c) — in-process worker pools and the `SQPOLL` thread.
-  - [`kqring_rsrc.c`](kmod/kqring_rsrc.c) — fixed files, registered buffers, provided buffers and buffer rings, resource tags and personalities.
-  - [`kqring_register.c`](kmod/kqring_register.c) — `KQRING_IOC_REGISTER` operations.
-  - [`kqring_zc.c`](kmod/kqring_zc.c) — zero-copy send: page holding, `RLIMIT_MEMLOCK` accounting and `EXT_SFBUF` mbufs.
-  - [`Makefile`](kmod/Makefile) — `<bsd.kmod.mk>` build definition for `kqring.ko`.
-- [`tests/kqring_test.c`](tests/kqring_test.c) — Functional verification suite (70 test groups covering every supported opcode, registration, setup flags and the lifetime rules below), plus a short ping-pong comparison with `kqueue`.
-- [`tests/kqring_bench.c`](tests/kqring_bench.c) — Benchmarks against `kqueue(2)` and plain syscalls; [`tests/bench_report.py`](tests/bench_report.py) turns its runs into the tables and charts in [`BENCHMARK.MD`](BENCHMARK.MD).
-- [`TODO.MD`](TODO.MD) — zero-copy roadmap.
+Code written against `<linux/io_uring.h>` builds against [`<sys/kqring.h>`](include/sys/kqring.h) instead, and needs only its three syscall wrappers replaced.
+
+**Status.** kqring implements most of io_uring:
+- about 60 opcodes, multishot operations, linked requests, timeouts and cancellation;
+- fixed files, registered and provided buffers;
+- zero-copy send, `SQPOLL` and in-process worker threads.
+
+It has its own functional test suite and benchmarks, and has been reviewed against the classes of bugs behind Linux io_uring's CVEs. It has **not** had an independent security audit, and it is an out-of-tree kernel module: a bug in it can crash the machine. The most important limitation is that rings must be created with `IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN` (see [Requirements](#requirements)).
+
+---
+
+## Quick start
+
+Kernel sources must be installed in `/usr/src` and match the running kernel (`freebsd-version -ku`).
+
+```sh
+make                                   # builds kmod/kqring.ko, tests/kqring_test, tests/kqring_bench
+sudo kldload ./kmod/kqring.ko          # creates /dev/kqring
+./tests/kqring_test                    # functional test suite
+./tests/kqring_bench                   # benchmarks (the send group needs ulimit -l 8192; see BENCHMARK.MD)
+sudo kldunload kqring
+```
+
+---
+
+## Using kqring from io_uring code
+
+[`<sys/kqring.h>`](include/sys/kqring.h) provides the io_uring structures and constants, plus three wrappers with the same arguments as Linux's system calls:
+
+| Linux system call | kqring wrapper |
+|---|---|
+| `io_uring_setup(entries, params)` | `kqring_setup(entries, params)` |
+| `io_uring_enter(fd, to_submit, min_complete, flags, arg, argsz)` | `kqring_enter(fd, to_submit, min_complete, flags, arg, argsz)` |
+| `io_uring_register(fd, opcode, arg, nr_args)` | `kqring_register(fd, opcode, arg, nr_args)` |
+
+The rings are mapped exactly as on Linux: `mmap(2)` on the ring descriptor at `IORING_OFF_SQ_RING`, `IORING_OFF_SQES` and `IORING_OFF_PBUF_RING`, using the offsets returned in `struct io_uring_params`. So a program with its own syscall wrappers ports like this:
+
+```c
+#if defined(__linux__)
+#include <linux/io_uring.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#define uring_setup(entries, p) \
+	syscall(__NR_io_uring_setup, (entries), (p))
+#define uring_enter(fd, submit, wait, flags, arg, argsz) \
+	syscall(__NR_io_uring_enter, (fd), (submit), (wait), (flags), (arg), (argsz))
+#define uring_register(fd, op, arg, nr) \
+	syscall(__NR_io_uring_register, (fd), (op), (arg), (nr))
+#elif defined(__FreeBSD__)
+#include <sys/kqring.h>
+#define uring_setup(entries, p)                          kqring_setup((entries), (p))
+#define uring_enter(fd, submit, wait, flags, arg, argsz) kqring_enter((fd), (submit), (wait), (flags), (arg), (argsz))
+#define uring_register(fd, op, arg, nr)                  kqring_register((fd), (op), (arg), (nr))
+#endif
+```
+
+The wrappers work through `ioctl(2)` on `/dev/kqring`: `kqring_setup()` opens it and returns the new ring's descriptor. Like the system calls, they return −1 and set `errno` on failure. Completion results (`cqe->res`) are negated **FreeBSD** errno values, and flags passed through SQEs (`O_*`, `MSG_*` and so on) use their FreeBSD values; see [Differences from Linux](#differences-from-linux).
+
+liburing has not been ported yet, so programs that use liburing rather than the raw interface don't build against kqring today.
+
+### Requirements
+
+- **`IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN` are required.** `kqring_setup()` fails with `EINVAL` without them. Only the thread that created the ring may submit (`kqring_enter()` from another thread fails with `EEXIST`), and completions are posted when that thread enters the ring. This is the model thread-per-core runtimes use. Rings shared between threads, Linux's default, are not supported yet.
+- **Raise `RLIMIT_MEMLOCK` to register buffers.** Registered buffers' pages are held for zero-copy send and charged to the user's locked-memory limit, which FreeBSD sets to only 64 KiB by default (Linux uses 8 MiB). Set `memorylocked` in `login.conf(5)`, or use `ulimit -l`.
 
 ---
 
@@ -27,45 +78,31 @@
 
 ![kqring vs kqueue: speed-up per operation](docs/bench/summary.svg)
 
-On a 4-core i5-8250U running FreeBSD 15.1, as medians of 5 runs:
+Compared with `kqueue(2)`, or the plain system call where kqueue has no role, on a 4-core i5-8250U running FreeBSD 15.1 (medians of 5 runs):
 
 - **Many ready sockets:** 15–16% faster than kqueue, from 16 up to 1,024 connections, because one enter reaps every message.
 - **One connection:** between 4% faster and 7% slower with multishot `RECV`, and 10–12% faster when receiving into one reused buffer.
-- **Cached file reads:** 32 `READ`s per enter cost 29% less than `pread(2)`, served inline from the page cache.
+- **Cached file reads:** 32 `READ`s per enter cost 29% less than `pread(2)`, served inline from the page cache. One `READ` per enter costs 24% more.
 - **Zero-copy send:** `SEND_ZC` from a registered buffer is 38% faster than `write(2)` for 256 KiB messages on AF_UNIX and 26% faster on TCP loopback, and 15–16% faster at 64 KiB.
 - **Batching, accept and timers:** 32 `NOP`s per enter cost 78 ns each (an empty `kevent` costs 287 ns); multishot `ACCEPT` is 8% faster, and `TIMEOUT` is 41% faster.
-- **Blocking pipes are 5× slower** than kqueue, because their reads go through a worker thread. On an `O_NONBLOCK` pipe, `READ` runs inline and is 10% faster than kqueue.
+- **Pipes:** on an `O_NONBLOCK` pipe, `READ` runs inline and is 10% faster than kqueue. On a blocking pipe it goes through a worker thread and is 5× slower.
 
-See [`BENCHMARK.MD`](BENCHMARK.MD) for the method, every result, and the known gaps.
-
----
-
-## Resource lifetime and execution model
-
-These are implementation constraints, not a claim of immunity to known CVE classes. They have been reviewed internally against each class (including the worker, `SQPOLL` and zero-copy paths), but kqring has not had an independent security audit.
-
-| Linux `io_uring` CVE Class | `kqring.ko` behavior |
-|---|---|
-| **`io-wq` async worker UAFs** | In-process worker `kthread`s (`IORING_FEAT_NATIVE_WORKERS`) run inside `curproc` and never touch the CQ ring or the owner's fixed-file / registered-buffer tables (`ctx->files`, `ctx->bufs`). Requests retain resource and credential references. Workers execute I/O and queue results for the serialized issuer to complete. Without `SQPOLL`, the userspace owner drains taskwork in `KQRING_IOC_ENTER`; with `SQPOLL`, the in-process submission thread also drains it under `sq_sx`. |
-| **`IOSQE_FIXED_FILE` reference cycles** | A ring can never be put in a fixed-file table (register, update, direct descriptors, `MSG_RING` `SEND_FD`), and a ring's fixed-file table is released when its owning process exits or calls `execve(2)` (breaking any `AF_UNIX` `SCM_RIGHTS` cycle where a ring descriptor is in flight on a socket held in its fixed table). Each slot holds a file reference and the file's Capsicum rights, which every request on it is checked against. Descriptors are re-resolved with rights checks on every attempt, and armed sockets hold `soref()`. |
-| **Fixed-file / registered-buffer node use-after-free on update** | Slots are reference-counted nodes. A request takes a reference when it is issued and drops it when freed, so replacing or unregistering a slot never affects a request still using it. The tag CQE is posted once the last reference is gone. Table changes are serialized on the issuer path, including the `SQPOLL` thread when enabled. |
-| **Pinned user-buffer page lifetime bugs** | Ordinary request buffers and user-memory buffer rings are not pinned (`READ_FIXED` and friends copy with `uiomove()`, and buffer rings with `copyin()`). Registered buffers hold their backing pages (`vm_fault_quick_hold_pages`) for zero-copy `SEND_ZC` (`IORING_RECVSEND_FIXED_BUF`), up to 16 MiB per buffer, charged against the user's `RLIMIT_MEMLOCK` and `vm.max_user_wired`. The charge is attached to the reference-counted page descriptor (`kqring_zc_buf`) and released only when the last reference (slot and all in-flight `EXT_SFBUF` mbufs) drops; copy-on-write mappings after `fork(2)` are refreshed before zero-copy transmit. |
-| **Mapped buffer ring use-after-free (CVE-2024-0582)** | `IOU_PBUF_RING_MMAP` rings are VM objects, and each mapping holds its own reference. Unregistering a ring that is still mapped leaves the process with ordinary memory, never freed pages. The wired memory these rings use is capped per ring. |
-| **Credentials outliving their context** | Personalities hold `crhold()` references, and so does each request using one. The executing issuer or worker switches credentials only for that request's work. A personality registered before `cap_enter(2)` is refused once the process is in capability mode, so it cannot be used to leave the sandbox. |
-| **`eventfd` use-after-free** | The ring holds an `eventfd_get()` reference. Upcalls signal it under the ring lock, which unregistering also takes. |
-| **EOF buffer-ID leak on `IOSQE_BUFFER_SELECT`** | Unlike Linux `io_uring` (which consumes a `PBUF_RING` buffer ID even when `recv` returns `0` at EOF), `kqring_pbuf_commit()` only advances the kernel ring head when `transferred > 0`. |
-| **`MSG_RING` cross-ring CQ races** | CQ writes run on the serialized issuer path (owner or `SQPOLL` thread). `MSG_RING` queues the CQE on the target ring under its lock and wakes the owner, which posts it from taskwork. |
-| **SQE argument TOCTOU / stale user pointers** | Everything an SQE points to (paths, iovecs, `msghdr`s, socket addresses, `open_how`, xattr names and values, futex vectors, timespecs) is copied in at submission (`IORING_FEAT_SUBMIT_STABLE`), charged to a per-ring budget, and live in-flight requests per ring are capped at `KQRING_MAX_REQS`. Only output buffers are touched later. |
+These are single-threaded loopback measurements. See [`BENCHMARK.MD`](BENCHMARK.MD) for the method, every result, and the known gaps.
 
 ---
 
-## Supported Operations
+## Supported operations
 
-Socket operations try the transfer inline first in `KQRING_IOC_ENTER` (unless `IOSQE_ASYNC` is set) and then wait on a socket upcall. A positioned file read that the page cache satisfies, and a `READ` or `WRITE` on an `O_NONBLOCK` pipe, also complete inline. Other file, pipe, VFS, `WAITID` and `IOSQE_ASYNC` requests run on per-ring in-process kernel worker threads (`IO_WQ_BOUND` and `IO_WQ_UNBOUND`, `IORING_FEAT_NATIVE_WORKERS`) that share the process's address space and descriptor table and queue completions as deferred taskwork for the ring owner. Futexes and timers are driven from the serialized issuer path. With `SQPOLL`, an in-process submission thread consumes SQEs and drains taskwork; `sq_sx` serializes it with enter and registration.
+**How requests run.**
+- **Sockets** are tried inline in `kqring_enter()` (unless `IOSQE_ASYNC` is set); if the socket isn't ready, the request waits on a socket upcall.
+- **Also inline:** positioned file reads that the page cache satisfies, and any `READ` or `WRITE` on an `O_NONBLOCK` pipe.
+- **On workers:** other file, pipe and VFS requests, `WAITID` and `IOSQE_ASYNC` requests run on per-ring kernel worker threads (`IO_WQ_BOUND` and `IO_WQ_UNBOUND`, `IORING_FEAT_NATIVE_WORKERS`). These live in the ring owner's process, sharing its address space and descriptor table, and hand completions back to the owner.
+- **On the owner's path:** futexes and timers.
+- **With `IORING_SETUP_SQPOLL`:** a kernel thread in the process consumes SQEs, so the owner need not enter the ring to submit.
 
 - **I/O:** `READ`, `WRITE`, `READV`, `WRITEV`, `READ_FIXED`, `WRITE_FIXED`, `READV_FIXED`, `WRITEV_FIXED`, `FSYNC`, `SYNC_FILE_RANGE`, `FALLOCATE`, `FTRUNCATE`, `FADVISE`, `MADVISE`, `SPLICE`, `TEE`.
   - `READ` and `READV` (with one iovec) take a provided buffer.
-  - On a socket, the read and write operations wait like `RECV` and `SEND` instead of blocking; on files, pipes and devices, they run on the in-process worker pool, except for the inline cases above.
+  - On a socket, the read and write operations wait like `RECV` and `SEND` instead of blocking.
   - `SPLICE` moves data between two descriptors where at least one is a pipe; `TEE` duplicates pipe buffer bytes to another pipe without consuming the source.
 - **Sockets & Pipes:** `RECV`, `SEND`, `RECVMSG`, `SENDMSG`, `SEND_ZC`, `SENDMSG_ZC`, `ACCEPT`, `CONNECT`, `SOCKET`, `BIND`, `LISTEN`, `SHUTDOWN`, `READ_MULTISHOT`, `URING_CMD`.
   - Multishot is supported for `RECV`, `RECVMSG`, `ACCEPT` and `READ_MULTISHOT` (on both sockets and pipes).
@@ -78,7 +115,9 @@ Socket operations try the transfer inline first in `KQRING_IOC_ENTER` (unless `I
   - `OPENAT`, `OPENAT2`, `ACCEPT` (including multishot), `SOCKET` and `PIPE` can create direct descriptors (`file_index`), and `CLOSE` can close them.
 - **Synchronisation:** `FUTEX_WAIT`, `FUTEX_WAITV`, `FUTEX_WAKE`, `WAITID`, `MSG_RING` (`IORING_MSG_DATA` and `IORING_MSG_SEND_FD`, including 32-byte `big_cqe` payload transfer on `SQE128` + `CQE32` rings).
 - **Control:** `NOP`, `POLL_ADD` (including multishot and `IORING_POLL_ADD_LEVEL` on sockets, pipes, eventfds, and files), `POLL_REMOVE`, `TIMEOUT`, `TIMEOUT_REMOVE`, `LINK_TIMEOUT`, `ASYNC_CANCEL` (including `IORING_ASYNC_CANCEL_FD_FIXED`).
-- **Setup flags:** `IORING_SETUP_SINGLE_ISSUER`, `IORING_SETUP_DEFER_TASKRUN`, `IORING_SETUP_CQSIZE`, `IORING_SETUP_CLAMP`, `IORING_SETUP_R_DISABLED`, `IORING_SETUP_SUBMIT_ALL`, `IORING_SETUP_COOP_TASKRUN`, `IORING_SETUP_TASKRUN_FLAG`, `IORING_SETUP_SQE128`, `IORING_SETUP_CQE32`, `IORING_SETUP_ATTACH_WQ`, `IORING_SETUP_SQPOLL`, `IORING_SETUP_SQ_AFF`, and `IORING_SETUP_IOPOLL`.
+- **Setup flags:**
+  - `IORING_SETUP_SINGLE_ISSUER` and `IORING_SETUP_DEFER_TASKRUN` are required.
+  - Optional: `IORING_SETUP_CQSIZE`, `IORING_SETUP_CLAMP`, `IORING_SETUP_R_DISABLED`, `IORING_SETUP_SUBMIT_ALL`, `IORING_SETUP_COOP_TASKRUN`, `IORING_SETUP_TASKRUN_FLAG`, `IORING_SETUP_SQE128`, `IORING_SETUP_CQE32`, `IORING_SETUP_ATTACH_WQ`, `IORING_SETUP_SQPOLL`, `IORING_SETUP_SQ_AFF` and `IORING_SETUP_IOPOLL`.
 - **SQE flags:** `IOSQE_FIXED_FILE`, `IOSQE_IO_LINK`, `IOSQE_IO_HARDLINK`, `IOSQE_IO_DRAIN`, `IOSQE_ASYNC`, `IOSQE_CQE_SKIP_SUCCESS` and `IOSQE_BUFFER_SELECT` (any group), plus `sqe->personality`.
 - **Registration:**
   - Files: `FILES`, `FILES2`, `FILES_UPDATE`, `FILES_UPDATE2`, `UNREGISTER_FILES` and `FILE_ALLOC_RANGE`, with sparse tables and tags.
@@ -88,71 +127,102 @@ Socket operations try the transfer inline first in `KQRING_IOC_ENTER` (unless `I
   - Workers: `IOWQ_AFF`, `UNREGISTER_IOWQ_AFF` and `IOWQ_MAX_WORKERS`.
   - Other: `EVENTFD`, `EVENTFD_ASYNC`, `UNREGISTER_EVENTFD`, `PERSONALITY`, `UNREGISTER_PERSONALITY`, `RESTRICTIONS`, `ENABLE_RINGS`, `PROBE`, `SYNC_CANCEL`, `SEND_MSG_RING` and `CLOCK`.
 
-These Linux-only operations are rejected with `-EOPNOTSUPP` or `-EINVAL`:
+`IORING_REGISTER_PROBE` reports exactly which opcodes are available. These Linux operations have no FreeBSD equivalent and are rejected with `-EOPNOTSUPP` or `-EINVAL`: `EPOLL_CTL`, `EPOLL_WAIT`, `RECV_ZC`, and NAPI.
 
-- **No FreeBSD equivalent:** `EPOLL_CTL`, `EPOLL_WAIT`, `RECV_ZC`, and NAPI.
+---
 
-**Differences from Linux:**
+## Differences from Linux
 
-- **Provided-buffer reservations.** Blocking worker I/O reserves a group's head without holding the ring-wide buffer-group lock. Other selections from that group fail with `-ENOBUFS`; removal or unregister fails with `EBUSY` until the transfer returns. Other groups and registration remain usable. EOF consumes no buffer.
-- **Worker cancellation and CQE ordering.** Cancel (`ASYNC_CANCEL`, `POLL_REMOVE`) and `LINK_TIMEOUT` request an interrupt without waiting for running worker I/O. Because the cancel/remove/timeout SQE completes immediately while the target request's `-ECANCELED` CQE and resource release wait until its worker returns via taskwork, the cancel/remove/timeout CQE can arrive **before** the target's `-ECANCELED` CQE (whereas Linux posts the cancelled target's CQE first), and a cancellation CQE does not promise that the I/O had no side effects. Callers must wait for the target request's own CQE before freeing its buffers or state. Ring close detaches running workers without waiting and defers final context/pool deallocation until the last worker returns (module unload drains any remaining workers). `SYNC_CANCEL` accepts the cancellation but does not wait for the target CQE.
-- **`execve(2)` disables open rings.** On `execve(2)`, any ring owned by the calling process is torn down (`ctx->closing = true`): its worker pool and `SQPOLL` thread are stopped, in-flight requests are disarmed and freed without posting `-ECANCELED` CQEs, and its fixed tables are released. A ring descriptor kept open across `execve(2)` (with `FD_CLOEXEC` cleared) therefore returns `EBADF` on subsequent `kqring_enter` and `kqring_register` calls, whereas Linux keeps the ring usable and posts `-ECANCELED` for cancelled requests.
+**Threading and signals**
+- **Single issuer only.** See [Requirements](#requirements). Register calls that change an enabled ring must also come from the owner thread (`EEXIST` otherwise). Before `IORING_REGISTER_ENABLE_RINGS`, one thread at a time may register. `PROBE` and `SEND_MSG_RING` work from any thread.
+- **No signal masks.** `kqring_enter()` rejects a signal mask, both the plain form and `struct io_uring_getevents_arg.sigmask` with `IORING_ENTER_EXT_ARG`, with `EINVAL`, and also rejects a non-zero `min_wait_usec`. Timeouts through `IORING_ENTER_EXT_ARG` work.
+- **`SIGPIPE`** is never raised.
 
+**Values and formats**
 - **Native values.** Flags and constants use their FreeBSD values: `O_*`, `AT_*`, `MSG_*`, `SOCK_*`, `POSIX_FADV_*`, `MADV_*`, `idtype_t` and `W*`. CQE errors are negated FreeBSD errnos.
-- **Timeouts.** These complete with `-ETIME`, which the header defines as `ETIMEDOUT`.
-- **Zero-copy send.** `SEND_ZC` and `SENDMSG_ZC` on connected stream sockets (transfers of at least `PAGE_SIZE` bytes; on `AF_UNIX`, a transfer from an unregistered buffer must be at least `kern.kqring.zc_local_min_len` bytes, 32 KiB by default, because below that pinning it costs more than copying) attach the buffer's held physical pages (from a registered `IORING_RECVSEND_FIXED_BUF` slot or pinned on the fly from unregistered user buffers / `msg_iov` segments and charged against `RLIMIT_MEMLOCK` and `vm.max_user_wired`) to `EXT_SFBUF` mbufs and defer the `IORING_CQE_F_NOTIF` CQE (`res = 0`) until the network stack frees the mbufs. Smaller or ineligible `SEND_ZC` and `SENDMSG_ZC` requests (or requests that exceed `RLIMIT_MEMLOCK` / `vm.max_user_wired`) copy the data and post the notification CQE immediately (carrying `IORING_NOTIF_USAGE_ZC_COPIED` when `IORING_SEND_ZC_REPORT_USAGE` is set).
-- **`STATX`.** It fills Linux's `struct statx` from `stat(2)`.
+- **Timeouts** complete with `-ETIME`, which the header defines as `ETIMEDOUT`.
+- **`STATX`** fills Linux's `struct statx` from `stat(2)`.
 - **Xattrs.** Names are mapped to `extattr` namespaces: `user.` to user, and `system.` and `trusted.` to system.
-- **`SYNC_FILE_RANGE`.** It syncs the whole file's data.
-- **`SIGPIPE`.** It is never raised.
-- **Registration is owner-only.** Once the ring is enabled, register calls that change it must come from the owner thread (`EEXIST` otherwise), as with enter. Before `IORING_REGISTER_ENABLE_RINGS`, one thread at a time may register. `PROBE` and `SEND_MSG_RING` work from any thread.
+- **`SYNC_FILE_RANGE`** syncs the whole file's data.
+
+**Cancellation and process lifecycle**
+- **Worker cancellation and CQE ordering.** Cancel (`ASYNC_CANCEL`, `POLL_REMOVE`) and `LINK_TIMEOUT` request an interrupt without waiting for running worker I/O.
+  - The cancel, remove or timeout CQE can therefore arrive **before** the target's `-ECANCELED` CQE; Linux posts the target's CQE first.
+  - A cancellation CQE doesn't promise the I/O had no side effects. Wait for the target request's own CQE before freeing its buffers or state.
+  - Ring close detaches running workers without waiting. Final cleanup waits until the last worker returns, and module unload drains any that remain.
+- **`SYNC_CANCEL` and `CLOCK`.** `SYNC_CANCEL` accepts the cancellation but doesn't wait for the target's CQE, and ignores its timeout. `CLOCK` is recorded, but timeouts are relative, so it has no effect.
+- **`execve(2)` disables open rings.** Any ring owned by the calling process is torn down:
+  - its worker pool and `SQPOLL` thread are stopped;
+  - in-flight requests are freed without posting `-ECANCELED` CQEs;
+  - its fixed tables are released.
+
+  A ring descriptor kept open across `execve(2)` then returns `EBADF`. Linux keeps the ring usable and posts `-ECANCELED` for cancelled requests.
+
+**Buffers and memory**
+- **Provided-buffer reservations.** Blocking worker I/O reserves a group's head buffer while it waits. Meanwhile, other selections from that group fail with `-ENOBUFS`, and removing or unregistering the group fails with `EBUSY`. Other groups and registration remain usable. A read at end of file consumes no buffer.
+- **Registered buffers.** `READ_FIXED`, `WRITE_FIXED`, `READV_FIXED` and `WRITEV_FIXED` copy through the user mapping with `uiomove()`, so unmapping a buffer makes them fail with `-EFAULT`. At registration, each buffer's pages (up to 16 MiB per buffer) are held for zero-copy send. They are charged to `RLIMIT_MEMLOCK` and `vm.max_user_wired` (`-ENOMEM` when exceeded) until the slot is unregistered and every in-flight zero-copy mbuf has been freed.
+- **Zero-copy send.**
+  - **Eligibility:** `SEND_ZC` and `SENDMSG_ZC` go zero-copy on connected stream sockets for transfers of at least one page. On AF_UNIX, a send from an unregistered buffer must also reach `kern.kqring.zc_local_min_len` (32 KiB by default), because below that pinning the buffer costs more than copying it.
+  - **Notification:** the buffer's pages are attached to the outgoing mbufs, and the `IORING_CQE_F_NOTIF` CQE (`res = 0`) waits until the network stack frees them.
+  - **Fallback:** other sends copy the data and post the notification at once, with `IORING_NOTIF_USAGE_ZC_COPIED` when `IORING_SEND_ZC_REPORT_USAGE` is set. That includes sends that would exceed `RLIMIT_MEMLOCK` or `vm.max_user_wired`.
+- **Limits.** `PROVIDE_BUFFERS` holds at most 2^18 buffers per ring, and mapped buffer rings at most 16 MiB per ring. Linux leaves both to memory accounting.
+
+**Descriptors and messages**
 - **Fixed files keep Capsicum rights.** A slot carries the rights its descriptor had, and `FIXED_FD_INSTALL` gives them back. A direct descriptor opened relative to a directory with limited rights gets that directory's rights, as `openat(2)` would.
-- **Registered buffers and pinned-memory limits.** `READ_FIXED`, `WRITE_FIXED`, `READV_FIXED`, and `WRITEV_FIXED` copy through the user mapping with `uiomove()`, so unmapping a buffer makes those operations fail with `-EFAULT`. At registration, each buffer's backing pages (up to 16 MiB per buffer) are held for zero-copy `SEND_ZC` (`IORING_RECVSEND_FIXED_BUF`) and charged against the user's `RLIMIT_MEMLOCK` and `vm.max_user_wired` (`-ENOMEM` when exceeded). The charge is tied to the held pages (`kqring_zc_buf`) rather than the ring slot, so it stays charged until the slot is unregistered and all in-flight zero-copy mbufs are freed. FreeBSD's default `RLIMIT_MEMLOCK` is only 64 KiB (Linux's is 8 MiB), so applications that register more than that need a higher `memorylocked` in `login.conf(5)` or `ulimit -l`.
-- **`IORING_MSG_SEND_FD` errors.** If the target cannot install the file (no table, bad slot, no free slot), the error is reported in the target's CQE. Linux reports it to the sender. Only the target's serialized issuer path writes to its table.
+- **Personalities** cannot be used to leave capability mode.
+- **`IORING_MSG_SEND_FD` errors.** If the target ring can't install the file (no table, bad slot, no free slot), the error is reported in the target's CQE. Linux reports it to the sender.
 - **`CLONE_BUFFERS`.** Both rings must have the same owner thread.
-- **Personalities and capability mode.** Personalities cannot be used to leave capability mode.
-- **Eventfd.** It is signalled once per enter that posted CQEs, and when work is queued for an idle ring.
 - **Direct `PIPE`.** The new pipe briefly has descriptors in the process before moving to its fixed slots, because FreeBSD has no way to create a pipe without them.
-- **`SYNC_CANCEL` and `CLOCK`.** `SYNC_CANCEL`'s timeout is ignored, and target completion can be deferred until worker release. `CLOCK` is recorded, but timeouts are relative, so it has no effect.
-- **Limits.** `PROVIDE_BUFFERS` holds at most 2^18 buffers per ring, and mapped buffer rings at most 16 MiB per ring. On Linux, both are left to memory accounting.
+- **Eventfd** is signalled once per enter that posted CQEs, and when work is queued for an idle ring.
 
 ---
 
-## Building & Running on FreeBSD 14 / 15
+## Resource lifetime and security
 
-Ensure kernel sources are installed in `/usr/src` (`freebsd-version -ku`), then run:
+io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was designed against each of those bug classes, as summarised below. This is a description of the design, not a claim of immunity: it has been reviewed internally (including the worker, `SQPOLL` and zero-copy paths), but has not had an independent security audit.
 
-```sh
-# Build kqring.ko, tests/kqring_test and tests/kqring_bench
-make
-
-# Load the kernel module (creates /dev/kqring)
-sudo kldload ./kmod/kqring.ko
-
-# Run the functional tests (and a short kqring vs kqueue ping-pong)
-./tests/kqring_test
-
-# Run the full benchmarks (the send group needs ulimit -l 8192; see BENCHMARK.MD)
-./tests/kqring_bench
-
-# Unload when finished
-sudo kldunload kqring
-```
+| Linux `io_uring` bug class | kqring behaviour |
+|---|---|
+| **`io-wq` async worker use-after-free** | Worker threads run inside the ring owner's process. They never touch the completion queue or the owner's fixed-file and registered-buffer tables. Requests hold references to their resources and credentials. Workers do the I/O and queue the result; the owner (or the `SQPOLL` thread, serialised with it) completes it. |
+| **`IOSQE_FIXED_FILE` reference cycles** | A ring can never be put in a fixed-file table: not by registration, update, direct descriptors or `MSG_RING` `SEND_FD`. A ring's fixed-file table is released when its owning process exits or calls `execve(2)`. That breaks any `AF_UNIX` `SCM_RIGHTS` cycle in which a ring descriptor is in flight on a socket held in its own table. Each slot holds a file reference and the file's Capsicum rights, which every request on it is checked against. Armed sockets hold a socket reference. |
+| **Fixed-file / registered-buffer use-after-free on update** | Slots are reference-counted. A request takes a reference when it is issued and drops it when freed, so replacing or unregistering a slot never affects a request still using it. The tag CQE is posted once the last reference is gone. Table changes are serialised on the owner's path. |
+| **Pinned user-page lifetime bugs** | Ordinary request buffers and buffer rings in user memory are never pinned; they are copied with `uiomove()` and `copyin()`. Registered buffers hold their pages for zero-copy send, charged to `RLIMIT_MEMLOCK` and `vm.max_user_wired`. The charge belongs to a reference-counted page descriptor, released only when the slot and every in-flight zero-copy mbuf have let go. Copy-on-write mappings after `fork(2)` are refreshed before a zero-copy send. |
+| **Mapped buffer-ring use-after-free (CVE-2024-0582)** | `IOU_PBUF_RING_MMAP` rings are VM objects, and each mapping holds its own reference. Unregistering a ring that is still mapped leaves the process with ordinary memory, never freed pages. The wired memory these rings use is capped per ring. |
+| **Credentials outliving their context** | Personalities hold credential references, and so does each request using one. The issuer or worker switches credentials only for that request's work. A personality registered before `cap_enter(2)` is refused once the process is in capability mode. |
+| **`eventfd` use-after-free** | The ring holds a reference to its eventfd, and signals it under the ring lock, which unregistering also takes. |
+| **Buffer-ID leak at end of file** | Linux consumes a provided buffer even when a receive returns 0 at end of file. kqring advances the buffer ring only when bytes were transferred. |
+| **`MSG_RING` cross-ring completion races** | Completions are only ever written by the target ring's own owner path. `MSG_RING` queues the CQE on the target under its lock and wakes the owner, which posts it. |
+| **SQE argument TOCTOU / stale user pointers** | Everything an SQE points to (paths, iovecs, `msghdr`s, socket addresses, `open_how`, xattr names and values, futex vectors, timespecs) is copied in at submission (`IORING_FEAT_SUBMIT_STABLE`). That memory is charged to a per-ring budget, and in-flight requests per ring are capped. Only output buffers are accessed later. |
 
 ---
 
-## Wiring Vega (`Sources/CVega/cvega.c`) to `kqring`
+## Tunables
 
-Because [`include/sys/kqring.h`](include/sys/kqring.h) exposes the exact `struct io_uring_sqe`, `struct io_uring_cqe`, `struct io_uring_params`, `struct io_uring_buf_ring`, and `IORING_*` constants used by `cvega.c`, porting Vega's `io_uring` backend to FreeBSD requires only swapping the three syscall wrappers (`uring_setup`, `uring_enter`, `uring_register`):
+| Name | Default | Meaning |
+|---|---|---|
+| `kern.kqring.zc_local_min_len` (sysctl, loader tunable) | 32768 | Smallest AF_UNIX `SEND_ZC` / `SENDMSG_ZC` from an unregistered buffer that is sent zero-copy; smaller ones are copied. |
 
-```c
-#if defined(__linux__)
-#include <linux/io_uring.h>
-/* existing syscall(__NR_io_uring_*) wrappers */
-#elif defined(__FreeBSD__)
-#include <sys/kqring.h>
-#define uring_setup(entries, params)       kqring_setup((entries), (params))
-#define uring_enter(fd, to_sub, min_c, fl) kqring_enter((fd), (to_sub), (min_c), (fl))
-#define uring_register(fd, op, arg, nr)    kqring_register((fd), (op), (arg), (nr))
-#endif
-```
+---
+
+## Source layout
+
+- [`include/sys/kqring.h`](include/sys/kqring.h) — the io_uring ABI (`io_uring_sqe`, `io_uring_cqe`, `io_uring_params`, `io_uring_buf_ring`, `IORING_*` constants), the `/dev/kqring` ioctls, and the `kqring_setup` / `kqring_enter` / `kqring_register` wrappers. Shared by the kernel and userspace.
+- [`kmod/`](kmod/) — the kernel module (`style(9)` C), split by subsystem:
+  - [`kqring_var.h`](kmod/kqring_var.h) — shared structures, limits and internal prototypes.
+  - [`kqring_dev.c`](kmod/kqring_dev.c) — `/dev/kqring`, ioctls, ring setup and mapping, enter, module load/unload and process exit/exec hooks.
+  - [`kqring_req.c`](kmod/kqring_req.c) — ring memory, SQE preparation and argument copy-in, request lifecycle, links, drains, CQE posting and deferred work.
+  - [`kqring_sock.c`](kmod/kqring_sock.c) — socket operations and upcalls, multishot, `POLL_ADD` and `URING_CMD`.
+  - [`kqring_file.c`](kmod/kqring_file.c) — file, path, xattr, `SPLICE`/`TEE` and other VFS operations, including the inline page-cache read path.
+  - [`kqring_sync.c`](kmod/kqring_sync.c) — timeouts, futexes, `WAITID`, `MSG_RING` and cancellation.
+  - [`kqring_wq.c`](kmod/kqring_wq.c) — worker pools and the `SQPOLL` thread.
+  - [`kqring_rsrc.c`](kmod/kqring_rsrc.c) — fixed files, registered buffers, provided buffers and buffer rings, resource tags and personalities.
+  - [`kqring_register.c`](kmod/kqring_register.c) — `io_uring_register` operations.
+  - [`kqring_zc.c`](kmod/kqring_zc.c) — zero-copy send: page holding, `RLIMIT_MEMLOCK` accounting and mbuf construction.
+- [`tests/kqring_test.c`](tests/kqring_test.c) — functional test suite: 70 test groups covering every supported opcode, registration, setup flags and the lifetime rules above.
+- [`tests/kqring_bench.c`](tests/kqring_bench.c) — benchmarks against `kqueue(2)` and plain system calls; [`tests/bench_report.py`](tests/bench_report.py) turns runs into the tables and charts in [`BENCHMARK.MD`](BENCHMARK.MD).
+
+## Further reading
+
+- [`ARCHITECTURE.MD`](ARCHITECTURE.MD) — how kqring works inside: shared memory layout, execution model, request lifecycle, zero-copy, workers and locking.
+- [`BENCHMARK.MD`](BENCHMARK.MD) — performance against `kqueue(2)` and plain system calls, with method and known gaps.
+- [`TODO.MD`](TODO.MD) — zero-copy roadmap and measured follow-ups.

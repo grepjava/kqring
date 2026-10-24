@@ -48,7 +48,7 @@
 #define MAX_FANIN	1024
 
 /* ------------------------------------------------------------------------
- * A minimal ring (SINGLE_ISSUER | DEFER_TASKRUN, as Vega uses it).
+ * A minimal ring (SINGLE_ISSUER | DEFER_TASKRUN, which kqring requires).
  * ------------------------------------------------------------------------
  */
 

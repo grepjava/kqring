@@ -4,8 +4,9 @@
  * Copyright (c) 2026 The kqring Authors
  *
  * kqring_test.c: Userspace verification & benchmark suite for /dev/kqring.
- * Tests the exact SINGLE_ISSUER | DEFER_TASKRUN + PBUF_RING patterns used by
- * Vega's cvega.c, plus a head-to-head ping-pong benchmark against kqueue(2).
+ * Tests every supported opcode, registration and setup flag, and the
+ * resource-lifetime rules, plus a short ping-pong benchmark against
+ * kqueue(2).
  */
 
 #include <sys/types.h>
@@ -360,7 +361,7 @@ test_probe(struct test_ring *r)
 		assert((probe->ops[op].flags & IO_URING_OP_SUPPORTED) != 0);
 	}
 	free(probe);
-	printf("[PASS] IORING_REGISTER_PROBE verified all Vega opcodes\n");
+	printf("[PASS] IORING_REGISTER_PROBE reports the core opcodes\n");
 }
 
 static void
