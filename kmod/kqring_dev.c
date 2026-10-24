@@ -1421,6 +1421,17 @@ kqring_sys_setup(struct thread *td, struct kqring_setup_args *uap)
 	return (0);
 }
 
+/*
+ * kqring_enter(2) calls in progress, by the CPU each started on.  A
+ * module's system calls are counted in their sysent entry (sy_thrcnt) so
+ * that unload can wait for them, but that is one atomic word every CPU
+ * updates twice per call, and enter is the call threads make in a loop:
+ * it stopped enter scaling past one thread.  So the enter entry is marked
+ * SY_THR_STATIC while loaded, and counted here instead, on a word of the
+ * CPU's own.
+ */
+DPCPU_DEFINE_STATIC(u_int, kqring_sys_busy);
+
 static int
 kqring_sys_enter(struct thread *td, struct kqring_enter_args *uap)
 {
@@ -1432,18 +1443,21 @@ kqring_sys_enter(struct thread *td, struct kqring_enter_args *uap)
 		.argsz = uap->argsz,
 		.ring_fd = uap->fd,
 	};
+	u_int *busy = DPCPU_ID_PTR(PCPU_GET(cpuid), kqring_sys_busy);
 	struct kqring_ctx *ctx;
 	struct file *fp;
 	int error;
 
+	atomic_add_acq_int(busy, 1);
 	error = kqring_sys_ring(td, uap->fd,
 	    (uap->flags & IORING_ENTER_REGISTERED_RING) != 0, true, &fp, &ctx);
-	if (error != 0)
-		return (error);
-	error = kqring_ioc_enter(ctx, &ea, td);
-	fdrop(fp, td);
-	/* SQE ops' kern_*() calls leave their results in td_retval[0]. */
-	td->td_retval[0] = error == 0 ? ea.SUBMITTED_out : 0;
+	if (error == 0) {
+		error = kqring_ioc_enter(ctx, &ea, td);
+		fdrop(fp, td);
+		/* SQE ops' kern_*() calls leave their results in td_retval. */
+		td->td_retval[0] = error == 0 ? ea.SUBMITTED_out : 0;
+	}
+	atomic_subtract_rel_int(busy, 1);
 	return (error);
 }
 
@@ -1503,6 +1517,8 @@ SYSCTL_INT(_kern_kqring, OID_AUTO, sys_enter, CTLFLAG_RD,
 SYSCTL_INT(_kern_kqring, OID_AUTO, sys_register, CTLFLAG_RD,
     &kqring_sysnum[2], 0, "kqring_register(2) system call number");
 
+#define	KQRING_SYS_ENTER	1	/* kqring_sysent[] index */
+
 /* Without free slots, the ioctl interface still works: not an error. */
 static void
 kqring_sys_register_all(void)
@@ -1515,18 +1531,57 @@ kqring_sys_register_all(void)
 			kqring_sysnum[i] = NO_SYSCALL;
 		}
 	}
+	/*
+	 * Enter counts itself (kqring_sys_busy): stop the kernel counting
+	 * it, once no call it counted is in progress.  syscallenter()
+	 * decides per call, so a call ends as it started.
+	 */
+	if (kqring_sysnum[KQRING_SYS_ENTER] != NO_SYSCALL) {
+		while (!atomic_cmpset_32(
+		    &sysent[kqring_sysnum[KQRING_SYS_ENTER]].sy_thrcnt, 0,
+		    SY_THR_STATIC))
+			cpu_spinwait();
+	}
 }
 
 /* Waits for the system calls in progress, as destroy_dev() for ioctls. */
 static void
 kqring_sys_deregister_all(void)
 {
+	u_int cpu, n;
+
+	/*
+	 * Count enter calls in the sysent entry again, so that
+	 * kern_syscall_deregister() drains those that start from now on.
+	 */
+	if (kqring_sysnum[KQRING_SYS_ENTER] != NO_SYSCALL)
+		atomic_store_rel_32(
+		    &sysent[kqring_sysnum[KQRING_SYS_ENTER]].sy_thrcnt, 0);
 	for (int i = 0; i < KQRING_NSYS; i++) {
 		if (kqring_sysnum[i] != NO_SYSCALL)
 			(void)kern_syscall_deregister(sysent, kqring_sysnum[i],
 			    &kqring_old_sysent[i]);
 		kqring_sysnum[i] = NO_SYSCALL;
 	}
+	/*
+	 * Then wait out those that started uncounted.  No new one starts,
+	 * so each CPU's count only falls: one pass reading all zero means
+	 * none is left.
+	 */
+	do {
+		n = 0;
+		CPU_FOREACH(cpu)
+			n += atomic_load_acq_int(DPCPU_ID_PTR(cpu,
+			    kqring_sys_busy));
+		if (n != 0)
+			pause("kqsysdr", 1);
+	} while (n != 0);
+	/*
+	 * A call can be between the sysent dispatch and its count, or
+	 * between the count and its return, for a few instructions: if it
+	 * was preempted there, let it run on before the module goes.
+	 */
+	pause("kqsysun", hz);
 }
 
 /* The object (with a reference) that a mapping at *offset shows. */
