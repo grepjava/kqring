@@ -284,6 +284,22 @@ enum io_uring_op {
 #define IORING_FIXED_FD_NO_CLOEXEC	(1U << 0)
 
 /*
+ * sqe->rw_flags for READ/WRITE(V) (Linux's preadv2(2) RWF_* values):
+ * HIPRI is accepted and ignored, NOWAIT fails with -EAGAIN rather than
+ * waiting or going to a worker, DSYNC/SYNC sync the data (and metadata)
+ * after a write.  Others fail with -EOPNOTSUPP.
+ */
+#define KQRING_RWF_HIPRI		0x00000001
+#define KQRING_RWF_DSYNC		0x00000002
+#define KQRING_RWF_SYNC			0x00000004
+#define KQRING_RWF_NOWAIT		0x00000008
+#define KQRING_RWF_SUPPORTED		(KQRING_RWF_HIPRI | KQRING_RWF_DSYNC | \
+	KQRING_RWF_SYNC | KQRING_RWF_NOWAIT)
+
+/* sqe->nop_flags: complete with (int32_t)sqe->len instead of 0. */
+#define IORING_NOP_INJECT_RESULT	(1U << 0)
+
+/*
  * sqe->ioprio flags for SEND/RECV
  */
 #define IORING_RECVSEND_POLL_FIRST	(1U << 0)

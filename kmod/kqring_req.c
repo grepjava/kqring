@@ -235,10 +235,7 @@ kqring_op_disarm_locked(struct kqring_op *op)
 		 */
 		mtx_unlock(&ctx->mtx);
 		if (op->listening) {
-			SOCK_LOCK(so);
-			if (so->sol_upcallarg == op)
-				solisten_upcall_set(so, NULL, NULL);
-			SOCK_UNLOCK(so);
+			kqring_listen_disarm(op, so);
 		} else {
 			if ((op->dirs & KQ_DIR_RCV) != 0)
 				kqring_sb_disarm(op, so, SO_RCV);
@@ -246,7 +243,7 @@ kqring_op_disarm_locked(struct kqring_op *op)
 				kqring_sb_disarm(op, so, SO_SND);
 		}
 		op->dirs = 0;
-		sorele(so);
+		kqring_sorele(so);
 		mtx_lock(&ctx->mtx);
 	}
 }
@@ -451,7 +448,8 @@ kqring_exec_sync(struct kqring_ctx *ctx, struct kqring_op *op)
 
 	switch (sqe->opcode) {
 	case IORING_OP_NOP:
-		res = 0;
+		res = (sqe->nop_flags & IORING_NOP_INJECT_RESULT) != 0 ?
+		    (int32_t)sqe->len : 0;
 		break;
 	case IORING_OP_READ:
 	case IORING_OP_READV:
@@ -1171,16 +1169,16 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 	case IORING_OP_WRITE:
 	case IORING_OP_READ_FIXED:
 	case IORING_OP_WRITE_FIXED:
-		if (sqe->rw_flags != 0)
-			return (EINVAL);
+		if ((sqe->rw_flags & ~KQRING_RWF_SUPPORTED) != 0)
+			return (EOPNOTSUPP);
 		buf_select_ok = sqe->opcode == IORING_OP_READ;
 		break;
 	case IORING_OP_READV:
 	case IORING_OP_WRITEV:
 	case IORING_OP_READV_FIXED:
 	case IORING_OP_WRITEV_FIXED:
-		if (sqe->rw_flags != 0)
-			return (EINVAL);
+		if ((sqe->rw_flags & ~KQRING_RWF_SUPPORTED) != 0)
+			return (EOPNOTSUPP);
 		/* A provided buffer replaces READV's (single) iovec. */
 		if (sqe->opcode == IORING_OP_READV &&
 		    (sqe->flags & IOSQE_BUFFER_SELECT) != 0) {
@@ -1294,6 +1292,10 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		    (direct && (sqe->off & SOCK_CLOEXEC) != 0))
 			return (EINVAL);
 		break;
+	case IORING_OP_NOP:
+		if ((sqe->nop_flags & ~IORING_NOP_INJECT_RESULT) != 0)
+			return (EINVAL);
+		break;
 	case IORING_OP_PIPE:
 		if (sqe->fd != 0 || sqe->off != 0 || sqe->addr3 != 0 ||
 		    sqe->len != 0 || sqe->buf_index != 0 ||
@@ -1322,6 +1324,9 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		break;
 	case IORING_OP_TIMEOUT:
 	case IORING_OP_LINK_TIMEOUT:
+		/* No ioprio, as for every io_uring op that doesn't take one. */
+		if (sqe->ioprio != 0)
+			return (EINVAL);
 		error = kqring_timeout_prep(op);
 		if (error != 0)
 			return (error);
@@ -1837,11 +1842,16 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 				    op->cflags);
 				return;
 			}
-			if (rw == KQRING_RW_BIO)
+			if (rw == KQRING_RW_BIO) {
 				armed = true;
-			else
+			} else if ((sqe->rw_flags & KQRING_RWF_NOWAIT) != 0) {
+				/* RWF_NOWAIT: no worker, which might block. */
+				kqring_req_complete(ctx, op, -EAGAIN, 0);
+				return;
+			} else {
 				armed = kqring_wq_enqueue(ctx, op,
 				    kqring_op_wq_type(op));
+			}
 			break;
 		}
 		op->sock_rw = true;
@@ -1873,9 +1883,16 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 				return;
 			}
 		}
-		/* IORING_ACCEPT_DONTWAIT: fail rather than wait. */
-		if (sqe->opcode == IORING_OP_ACCEPT &&
-		    (sqe->ioprio & IORING_ACCEPT_DONTWAIT) != 0) {
+		/*
+		 * IORING_ACCEPT_DONTWAIT, RWF_NOWAIT on a READ/WRITE of a
+		 * socket, or MSG_DONTWAIT on a send or receive: fail rather
+		 * than wait, as io_uring does.
+		 */
+		if ((sqe->opcode == IORING_OP_ACCEPT &&
+		    (sqe->ioprio & IORING_ACCEPT_DONTWAIT) != 0) ||
+		    (op->sock_rw && (sqe->rw_flags & KQRING_RWF_NOWAIT) != 0) ||
+		    (!op->sock_rw && kqring_op_msg_flags_ok(sqe->opcode) &&
+		    (sqe->msg_flags & MSG_DONTWAIT) != 0)) {
 			kqring_req_complete(ctx, op, -EAGAIN, 0);
 			return;
 		}

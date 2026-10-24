@@ -28,14 +28,93 @@ static struct cdev *kqring_cdev;
 static d_open_t		kqring_open;
 static d_ioctl_t	kqring_ioctl;
 static d_mmap_single_t	kqring_mmap_single;
+static d_poll_t		kqring_poll;
+static d_kqfilter_t	kqring_kqfilter;
 
 static struct cdevsw kqring_cdevsw = {
 	.d_version =	D_VERSION,
 	.d_open =	kqring_open,
 	.d_ioctl =	kqring_ioctl,
 	.d_mmap_single = kqring_mmap_single,
+	.d_poll =	kqring_poll,
+	.d_kqfilter =	kqring_kqfilter,
 	.d_name =	"kqring",
 };
+
+/*
+ * poll(2) on a ring: POLLIN while kqring_ring_readable(), POLLOUT while
+ * the SQ has room, as io_uring_poll().
+ */
+static int
+kqring_poll(struct cdev *dev __unused, int events, struct thread *td)
+{
+	struct kqring_ctx *ctx;
+	int revents = 0;
+
+	if (devfs_get_cdevpriv((void **)&ctx) != 0)
+		return (events & (POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM));
+	mtx_lock(&ctx->mtx);
+	if (ctx->shm == NULL || ctx->closing) {
+		mtx_unlock(&ctx->mtx);
+		return (POLLHUP);
+	}
+	if (kqring_ring_readable(ctx))
+		revents |= events & (POLLIN | POLLRDNORM);
+	if (atomic_load_acq_32(&ctx->shm->sq_tail) -
+	    atomic_load_acq_32(&ctx->shm->sq_head) < ctx->sq_entries)
+		revents |= events & (POLLOUT | POLLWRNORM);
+	if (revents == 0 && (events & (POLLIN | POLLRDNORM)) != 0) {
+		ctx->pollers = true;
+		selrecord(td, &ctx->rsel);
+	}
+	mtx_unlock(&ctx->mtx);
+	return (revents);
+}
+
+static void
+kqring_kq_detach(struct knote *kn)
+{
+	struct kqring_ctx *ctx = kn->kn_hook;
+
+	knlist_remove(&ctx->rsel.si_note, kn, 0);
+}
+
+/* Called with ctx->mtx (the knote list's lock) held. */
+static int
+kqring_kq_read(struct knote *kn, long hint __unused)
+{
+	struct kqring_ctx *ctx = kn->kn_hook;
+
+	if (ctx->closing) {
+		kn->kn_flags |= EV_EOF;
+		return (1);
+	}
+	return (kqring_ring_readable(ctx));
+}
+
+static const struct filterops kqring_read_filtops = {
+	.f_isfd = 1,
+	.f_detach = kqring_kq_detach,
+	.f_event = kqring_kq_read,
+};
+
+static int
+kqring_kqfilter(struct cdev *dev __unused, struct knote *kn)
+{
+	struct kqring_ctx *ctx;
+
+	if (devfs_get_cdevpriv((void **)&ctx) != 0)
+		return (EBADF);
+	if (kn->kn_filter != EVFILT_READ)
+		return (EINVAL);
+	kn->kn_fop = &kqring_read_filtops;
+	kn->kn_hook = ctx;
+	mtx_lock(&ctx->mtx);
+	ctx->pollers = true;
+	mtx_unlock(&ctx->mtx);
+	knlist_add(&ctx->rsel.si_note, kn, 0);
+	return (0);
+}
 
 /* Whether fp is a /dev/kqring descriptor. */
 bool
@@ -139,6 +218,10 @@ kqring_ctx_free_final(struct kqring_ctx *ctx)
 		kqring_rcqe_free(rc);
 	}
 
+	/* Pollers of a closed ring: poll(2) saw POLLHUP, kevent(2) EV_EOF. */
+	seldrain(&ctx->rsel);
+	knlist_clear(&ctx->rsel.si_note, 0);
+	knlist_destroy(&ctx->rsel.si_note);
 	kqring_free_shm(ctx->ring_obj, ctx->ring_kva, ctx->ring_alloc_len);
 	kqring_free_shm(ctx->sqes_obj, ctx->sqes_kva, ctx->sqes_alloc_len);
 	sx_destroy(&ctx->sq_sx);
@@ -172,6 +255,10 @@ kqring_ctx_cancel_all(struct kqring_ctx *ctx)
 	ctx->closing = true;
 	if (ctx->sleeping)
 		wakeup(&ctx->wakeup_chan);
+	if (ctx->pollers) {
+		selwakeuppri(&ctx->rsel, PZERO);
+		KNOTE_LOCKED(&ctx->rsel.si_note, 0);
+	}
 	if (ctx->sqpoll_waiting)
 		wakeup(&ctx->sqpoll_wait_chan);
 	if (curthread == ctx->sqpoll_td) {
@@ -300,6 +387,7 @@ kqring_open(struct cdev *dev __unused, int oflags __unused, int devtype __unused
 	ctx = malloc(sizeof(*ctx), M_KQRING, M_WAITOK | M_ZERO);
 	refcount_init(&ctx->refs, 1);
 	mtx_init(&ctx->mtx, "kqring", NULL, MTX_DEF);
+	knlist_init_mtx(&ctx->rsel.si_note, &ctx->mtx);
 	callout_init_mtx(&ctx->wq_abort_callout, &ctx->mtx, 0);
 	sx_init(&ctx->bg_sx, "kqring bg");
 	sx_init(&ctx->sq_sx, "kqring sq");
@@ -323,6 +411,7 @@ kqring_open(struct cdev *dev __unused, int oflags __unused, int devtype __unused
 	if (error != 0) {
 		kqring_wq_put(ctx->wq);
 		callout_drain(&ctx->wq_abort_callout);
+		knlist_destroy(&ctx->rsel.si_note);
 		sx_destroy(&ctx->sq_sx);
 		sx_destroy(&ctx->bg_sx);
 		mtx_destroy(&ctx->mtx);
@@ -367,14 +456,17 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	/*
 	 * Reject every flag kqring does not implement, as io_uring_setup(2)
 	 * does, so that callers probing for a feature see EINVAL rather than a
-	 * silently different ring.  Require SINGLE_ISSUER | DEFER_TASKRUN,
-	 * the only semantics kqring implements.  COOP_TASKRUN, TASKRUN_FLAG
-	 * and SUBMIT_ALL describe what kqring always does.
+	 * silently different ring.  Completions always run as DEFER_TASKRUN
+	 * describes, in an enter (liburing enters when IORING_SQ_TASKRUN is
+	 * set).  Without SINGLE_ISSUER, any thread of the process may submit
+	 * and wait (ctx->shared); DEFER_TASKRUN needs SINGLE_ISSUER, as in
+	 * io_uring.  COOP_TASKRUN, TASKRUN_FLAG and SUBMIT_ALL describe what
+	 * kqring always does.
 	 */
 	if ((p.flags & ~KQRING_SETUP_FLAGS) != 0)
 		return (EINVAL);
-	if ((p.flags & IORING_SETUP_SINGLE_ISSUER) == 0 ||
-	    (p.flags & IORING_SETUP_DEFER_TASKRUN) == 0)
+	if ((p.flags & IORING_SETUP_DEFER_TASKRUN) != 0 &&
+	    (p.flags & IORING_SETUP_SINGLE_ISSUER) == 0)
 		return (EINVAL);
 	if ((p.flags & IORING_SETUP_SQ_AFF) != 0 &&
 	    (p.flags & IORING_SETUP_SQPOLL) == 0)
@@ -484,6 +576,9 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	ctx->sq_mask = sq_entries - 1;
 	ctx->cq_mask = cq_entries - 1;
 	ctx->flags = p.flags;
+	ctx->shared = (p.flags & IORING_SETUP_SINGLE_ISSUER) == 0;
+	ctx->taskrun_only = (p.flags & (IORING_SETUP_DEFER_TASKRUN |
+	    IORING_SETUP_SQPOLL)) == 0;
 	if ((p.flags & IORING_SETUP_SQPOLL) != 0) {
 		uint32_t idle_ms = p.sq_thread_idle != 0 ? p.sq_thread_idle :
 		    1000;
@@ -547,8 +642,7 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 		attach_wq = old_wq;
 		wq_swapped = true;
 	}
-	if (error == 0 && ctx->enabled &&
-	    (ctx->flags & IORING_SETUP_SQPOLL) != 0)
+	if (error == 0 && ctx->enabled && kqring_has_kthread(ctx))
 		error = kqring_sqpoll_start(ctx, td);
 	if (error != 0) {
 		if (wq_swapped) {
@@ -656,7 +750,8 @@ kqring_run_checks(struct kqring_ctx *ctx)
 
 /*
  * Whether enter takes sq_sx.  It serializes the issuer with the SQPOLL
- * kthread and with teardown in other threads.  Without SQPOLL, teardown
+ * kthread, the threads sharing a ring without SINGLE_ISSUER, and teardown
+ * in other threads.  Without SQPOLL, teardown
  * can only run concurrently when the process whose worker pool the ring
  * uses (IORING_SETUP_ATTACH_WQ, or a ring set up elsewhere) exits or
  * execs: close(2) waits for the enter's file reference, and the issuer's
@@ -665,7 +760,7 @@ kqring_run_checks(struct kqring_ctx *ctx)
 static inline bool
 kqring_enter_locks(const struct kqring_ctx *ctx, const struct thread *td)
 {
-	return ((ctx->flags & IORING_SETUP_SQPOLL) != 0 ||
+	return (kqring_has_kthread(ctx) || ctx->shared ||
 	    (ctx->wq != NULL && ctx->wq->proc != td->td_proc));
 }
 
@@ -702,8 +797,13 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 
 	if (!ctx->setup_done || !ctx->enabled || ctx->closing)
 		return (EBADF);
-	if (!kqring_is_owner(ctx, td))
-		return (EEXIST); /* SINGLE_ISSUER violation */
+	/*
+	 * SINGLE_ISSUER: only the owner submits.  With SQPOLL the kthread is
+	 * the issuer, so any thread or process may wake it and wait, as in
+	 * io_uring.
+	 */
+	if (!sqpoll && !kqring_is_owner(ctx, td))
+		return (EEXIST);
 
 	/* SQ_WAKEUP/SQ_WAIT need SQPOLL. */
 	if ((ea->flags & ~KQRING_ENTER_FLAGS) != 0)
@@ -749,7 +849,8 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	}
 
 	if (sqpoll) {
-		ea->SUBMITTED_out = 0;
+		/* The kthread submits; report to_submit, as io_uring does. */
+		ea->SUBMITTED_out = ea->to_submit;
 		if ((ea->flags & IORING_ENTER_SQ_WAKEUP) != 0) {
 			mtx_lock(&ctx->mtx);
 			atomic_clear_32(&shm->sq_flags, IORING_SQ_NEED_WAKEUP);
@@ -837,13 +938,18 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 	bool iopoll = (ctx->flags & IORING_SETUP_IOPOLL) != 0;
 	bool may_poll = true;
 	sbintime_t spin = ctx->busy_poll_sbt;
+	uint32_t timeouts = atomic_load_acq_32(&ctx->cq_timeouts);
 	int error;
 
 	for (;;) {
 		uint32_t cq_count = atomic_load_acq_32(&shm->cq_tail) -
 		    atomic_load_acq_32(&shm->cq_head);
-		/* A full CQ with overflow pending must be reaped first. */
-		if (cq_count >= min_complete || !STAILQ_EMPTY(&ctx->ocq))
+		/*
+		 * A full CQ with overflow pending must be reaped first.  A
+		 * TIMEOUT completing also ends the wait, as in io_uring.
+		 */
+		if (cq_count >= min_complete || !STAILQ_EMPTY(&ctx->ocq) ||
+		    atomic_load_acq_32(&ctx->cq_timeouts) != timeouts)
 			return (0);
 
 		if (has_timeout && sbt == 0)
@@ -913,10 +1019,10 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 			sleep_sbt = period;
 
 		/* Timeout is sbintime_t, not ticks: use the _sbt variant. */
-		ctx->sleeping = true;
+		ctx->sleeping++;
 		error = msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, PCATCH,
 		    "kqwait", sleep_sbt, 0, 0);
-		ctx->sleeping = false;
+		ctx->sleeping--;
 		may_poll = true;
 		mtx_unlock(&ctx->mtx);
 

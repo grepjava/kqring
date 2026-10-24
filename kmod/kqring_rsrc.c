@@ -1029,6 +1029,17 @@ kqring_pbuf_register(struct kqring_ctx *ctx,
 			return (EINVAL);
 		if (reg.ring_addr + bytes > VM_MAXUSER_ADDRESS)
 			return (EFAULT);
+		/*
+		 * io_uring pins the ring's pages here, so an unmapped ring
+		 * fails now rather than at the first buffer selection.
+		 */
+		for (uint64_t a = reg.ring_addr; a < reg.ring_addr + bytes;
+		    a += PAGE_SIZE) {
+			char b;
+
+			if (copyin((const void *)(uintptr_t)a, &b, 1) != 0)
+				return (EFAULT);
+		}
 	}
 	/* An empty buffer list may become a ring, as in io_uring. */
 	sx_xlock(&ctx->bg_sx);

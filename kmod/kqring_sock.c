@@ -15,36 +15,102 @@ static int kqring_soupcall(struct socket *so, void *arg, int waitflag);
  * Runs with the socket buffer lock (or, for listening sockets, the listen
  * lock) held when data arrives, space opens, a connection is queued, or a
  * peer closes.
- * Never touches user memory: simply moves `op` onto ctx->taskwork_ops, sets
- * IORING_SQ_TASKRUN in shm->sq_flags, and wakes the owner if sleeping.
+ * Never touches user memory: simply moves each waiting op onto its ring's
+ * taskwork_ops, sets IORING_SQ_TASKRUN in shm->sq_flags, and wakes the
+ * owner if sleeping.  An op that finds nothing to do when it runs (another
+ * waiter took the data or the connection) stays armed.
  */
 
 static int
 kqring_soupcall(struct socket *so __unused, void *arg, int waitflag __unused)
 {
-	struct kqring_op *op = arg;
-	struct kqring_ctx *ctx = op->ctx;
+	struct kqring_sowatch *sw = arg;
+	struct kqring_op *op;
 
-	mtx_lock(&ctx->mtx);
-	kqring_taskwork_add_locked(ctx, op);
-	mtx_unlock(&ctx->mtx);
+	TAILQ_FOREACH(op, &sw->ops, sw_link[sw->idx]) {
+		struct kqring_ctx *ctx = op->ctx;
+
+		mtx_lock(&ctx->mtx);
+		kqring_taskwork_add_locked(ctx, op);
+		mtx_unlock(&ctx->mtx);
+	}
 	return (SU_OK);
 }
 
+/* Take op off sw, under its lock; returns sw if it is now empty. */
+static struct kqring_sowatch *
+kqring_sowatch_leave(struct kqring_op *op, int i)
+{
+	struct kqring_sowatch *sw = op->sw[i];
+
+	TAILQ_REMOVE(&sw->ops, op, sw_link[i]);
+	op->sw[i] = NULL;
+	return (TAILQ_EMPTY(&sw->ops) ? sw : NULL);
+}
 
 /*
- * Remove op's upcall from one socket buffer.  listen(2) may have turned the
- * socket into a listener since it was armed: solisten_proto() then reused
- * the sockbuf storage for the listen queues (wiping our upcall), and it did
- * so holding both sockbuf mutexes, so SOLISTENING() is stable here.
+ * Remove op from one socket buffer's waiters, and the upcall with the
+ * last of them.  listen(2) may have turned the socket into a listener
+ * since it was armed: solisten_proto() then reused the sockbuf storage
+ * for the listen queues (wiping the upcall, not our list), and it did so
+ * holding both sockbuf mutexes, so SOLISTENING() is stable here.
  */
 void
 kqring_sb_disarm(struct kqring_op *op, struct socket *so, int which)
 {
+	struct kqring_sowatch *sw;
+	int i = KQRING_SW_IDX(which);
+
+	if (op->sw[i] == NULL)
+		return;
 	SOCK_BUF_LOCK(so, which);
-	if (!SOLISTENING(so) && kqring_sb(so, which)->sb_upcallarg == op)
+	sw = kqring_sowatch_leave(op, i);
+	if (sw != NULL && !SOLISTENING(so) &&
+	    kqring_sb(so, which)->sb_upcallarg == sw)
 		soupcall_clear(so, which);
 	SOCK_BUF_UNLOCK(so, which);
+	free(sw, M_KQRING);
+}
+
+/* As kqring_sb_disarm(), for an op waiting on a listening socket. */
+void
+kqring_listen_disarm(struct kqring_op *op, struct socket *so)
+{
+	struct kqring_sowatch *sw;
+
+	if (op->sw[0] == NULL)
+		return;
+	SOCK_LOCK(so);
+	sw = kqring_sowatch_leave(op, 0);
+	if (sw != NULL && so->sol_upcallarg == sw)
+		solisten_upcall_set(so, NULL, NULL);
+	SOCK_UNLOCK(so);
+	free(sw, M_KQRING);
+}
+
+/* A new, empty waiter list for slot i (allocated without socket locks). */
+static struct kqring_sowatch *
+kqring_sowatch_new(int i)
+{
+	struct kqring_sowatch *sw;
+
+	sw = malloc(sizeof(*sw), M_KQRING, M_WAITOK);
+	TAILQ_INIT(&sw->ops);
+	sw->idx = i;
+	return (sw);
+}
+
+/* Add op to so's waiters in slot i, which `cur` holds (NULL: use *nsw). */
+static void
+kqring_sowatch_join(struct kqring_op *op, int i, struct kqring_sowatch *cur,
+    struct kqring_sowatch **nsw)
+{
+	if (cur == NULL) {
+		cur = *nsw;
+		*nsw = NULL;
+	}
+	TAILQ_INSERT_TAIL(&cur->ops, op, sw_link[i]);
+	op->sw[i] = cur;
 }
 
 
@@ -462,7 +528,7 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 				error = EWOULDBLOCK;
 		}
 		SOCK_RECVBUF_UNLOCK(so2);
-		sorele(so2);
+		kqring_sorele(so2);
 
 		if (error == 0) {
 			size_t capped = 0, rem_cap = MIN(want, avail);
@@ -1504,6 +1570,34 @@ kqring_seltd_wait(struct kqring_ctx *ctx, struct kqring_op *op,
 	return (error);
 }
 
+/*
+ * Wait for the ring owner to run op's queued taskwork (a multishot poll
+ * reports one event at a time).  Returns false if the process is exiting:
+ * the owner, suspended by exit1(), will never run it.
+ */
+static bool
+kqring_wq_wait_taskwork(struct kqring_ctx *ctx, struct kqring_op *op,
+    const char *wmesg)
+{
+	bool exiting = false;
+
+	mtx_lock(&ctx->mtx);
+	while (op->in_taskwork && !op->cancelled && !op->wq_canceled &&
+	    !ctx->closing) {
+		if (kqring_wq_suspend_pending()) {
+			mtx_unlock(&ctx->mtx);
+			exiting = kqring_wq_suspend_point(ctx);
+			mtx_lock(&ctx->mtx);
+			if (exiting)
+				break;
+		}
+		msleep_sbt(&op->in_taskwork, &ctx->mtx, PCATCH, wmesg,
+		    SBT_1MS, 0, 0);
+	}
+	mtx_unlock(&ctx->mtx);
+	return (!exiting);
+}
+
 void
 kqring_wq_poll_wait(struct kqring_ctx *ctx, struct kqring_op *op)
 {
@@ -1566,12 +1660,8 @@ kqring_wq_poll_wait(struct kqring_ctx *ctx, struct kqring_op *op)
 			kqring_wq_mark_blocking(ctx, op);
 			if (level || no_selq) {
 				kqring_seltd_clear(stp);
-				mtx_lock(&ctx->mtx);
-				while (op->in_taskwork && !op->cancelled &&
-				    !op->wq_canceled && !ctx->closing)
-					msleep_sbt(&op->in_taskwork, &ctx->mtx,
-					    PCATCH, "kqwqlv", SBT_1MS, 0, 0);
-				mtx_unlock(&ctx->mtx);
+				if (!kqring_wq_wait_taskwork(ctx, op, "kqwqlv"))
+					break;
 				if (no_selq && !level)
 					break;
 				continue;
@@ -1585,16 +1675,16 @@ kqring_wq_poll_wait(struct kqring_ctx *ctx, struct kqring_op *op)
 		}
 		error = kqring_seltd_wait(ctx, op, stp);
 		kqring_seltd_clear(stp);
+		if (error == EINTR || error == ERESTART) {
+			/* Signals are masked: a stop or exit request. */
+			if (kqring_wq_suspend_point(ctx))
+				break;
+			continue;
+		}
 		if (error != 0)
 			break;
-		if (multi) {
-			mtx_lock(&ctx->mtx);
-			while (op->in_taskwork && !op->cancelled &&
-			    !op->wq_canceled && !ctx->closing)
-				msleep_sbt(&op->in_taskwork, &ctx->mtx, PCATCH,
-				    "kqwqtw", SBT_1MS, 0, 0);
-			mtx_unlock(&ctx->mtx);
-		}
+		if (multi && !kqring_wq_wait_taskwork(ctx, op, "kqwqtw"))
+			break;
 	}
 	kqring_seltd_clear(stp);
 }
@@ -1871,28 +1961,43 @@ kqring_exec_socket(struct kqring_ctx *ctx, struct kqring_op *op)
  */
 
 /*
- * Install op's upcall on one socket buffer and OR its readiness into *ready.
- * A sockbuf has a single upcall slot that soupcall_set() silently
- * overwrites, so fail with EBUSY if it is taken (another op armed on the
- * same socket and direction, on this ring or another).  ERESTART means the
- * socket became a listener; see kqring_sb_disarm().
+ * Add op to one socket buffer's waiters (installing the upcall for the
+ * first) and OR its readiness into *ready.  A sockbuf has a single upcall
+ * slot that soupcall_set() silently overwrites, so fail with EBUSY if
+ * something other than kqring holds it.  ERESTART means the socket became
+ * a listener; see kqring_sb_disarm().
  */
 static int
 kqring_sb_arm(struct kqring_op *op, struct socket *so, int which, bool *ready)
 {
+	struct kqring_sowatch *nsw = NULL;
 	struct sockbuf *sb;
+	int i = KQRING_SW_IDX(which);
 
+again:
 	SOCK_BUF_LOCK(so, which);
 	if (SOLISTENING(so)) {
 		SOCK_BUF_UNLOCK(so, which);
+		free(nsw, M_KQRING);
 		return (ERESTART);
 	}
 	sb = kqring_sb(so, which);
-	if (sb->sb_upcall != NULL) {
+	if (sb->sb_upcall != NULL && sb->sb_upcall != kqring_soupcall) {
 		SOCK_BUF_UNLOCK(so, which);
+		free(nsw, M_KQRING);
 		return (EBUSY);
 	}
-	soupcall_set(so, which, kqring_soupcall, op);
+	if (sb->sb_upcall == NULL) {
+		if (nsw == NULL) {
+			SOCK_BUF_UNLOCK(so, which);
+			nsw = kqring_sowatch_new(i);
+			goto again;
+		}
+		soupcall_set(so, which, kqring_soupcall, nsw);
+		kqring_sowatch_join(op, i, NULL, &nsw);
+	} else {
+		kqring_sowatch_join(op, i, sb->sb_upcallarg, &nsw);
+	}
 	if (which == SO_RCV) {
 		op->dirs |= KQ_DIR_RCV;
 		if (sbavail(sb) > 0 || (sb->sb_state & SBS_CANTRCVMORE) != 0 ||
@@ -1905,6 +2010,7 @@ kqring_sb_arm(struct kqring_op *op, struct socket *so, int which, bool *ready)
 			*ready = true;
 	}
 	SOCK_BUF_UNLOCK(so, which);
+	free(nsw, M_KQRING);
 	return (0);
 }
 
@@ -1991,17 +2097,28 @@ kqring_arm_socket_op(struct kqring_ctx *ctx, struct kqring_op *op, int dirs)
 	 * (that storage is reused for the listen queues), so they use the
 	 * dedicated listen upcall under the listen lock.
 	 */
+	struct kqring_sowatch *nsw = NULL;
 	bool ready_now;
 retry:
 	ready_now = false;
 	error = 0;
 	SOCK_LOCK(so);
 	if (SOLISTENING(so)) {
-		if (so->sol_upcall != NULL) {
+		if (so->sol_upcall != NULL && so->sol_upcall != kqring_soupcall) {
 			error = EBUSY;
+		} else if (so->sol_upcall == NULL && nsw == NULL) {
+			SOCK_UNLOCK(so);
+			nsw = kqring_sowatch_new(0);
+			goto retry;
 		} else {
 			op->listening = true;
-			solisten_upcall_set(so, kqring_soupcall, op);
+			if (so->sol_upcall == NULL) {
+				solisten_upcall_set(so, kqring_soupcall, nsw);
+				kqring_sowatch_join(op, 0, NULL, &nsw);
+			} else {
+				kqring_sowatch_join(op, 0, so->sol_upcallarg,
+				    &nsw);
+			}
 			ready_now = !TAILQ_EMPTY(&so->sol_comp) ||
 			    so->so_error != 0;
 		}
@@ -2013,11 +2130,13 @@ retry:
 		if (error == 0 && (dirs & KQ_DIR_SND) != 0)
 			error = kqring_sb_arm(op, so, SO_SND, &ready_now);
 		if (error == ERESTART) {
-			/* solisten_proto() wiped any upcall we installed. */
+			/* solisten_proto() wiped the upcall; leave the list. */
+			kqring_sb_disarm(op, so, SO_RCV);
 			op->dirs = 0;
 			goto retry;
 		}
 	}
+	free(nsw, M_KQRING);
 
 	if (error != 0) {
 		/*

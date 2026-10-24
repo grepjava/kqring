@@ -16,7 +16,8 @@ kqring_pipe_readable(const struct file *fp)
 	struct pipe *rpipe;
 	bool ok;
 
-	if (fp->f_type != DTYPE_PIPE || (fp->f_flag & FNONBLOCK) != 0)
+	/* O_NONBLOCK too: io_uring waits for a non-blocking pipe's data. */
+	if (fp->f_type != DTYPE_PIPE)
 		return (true);
 	rpipe = fp->f_data;
 	PIPE_LOCK(rpipe);
@@ -63,8 +64,7 @@ kqring_pipe_wait_read(struct kqring_ctx *ctx, struct file *fp,
 
 	PIPE_LOCK(rpipe);
 	while (rpipe->pipe_buffer.cnt == 0 && rpipe->pipe_pages.cnt == 0 &&
-	    (rpipe->pipe_state & PIPE_EOF) == 0 &&
-	    (fp->f_flag & FNONBLOCK) == 0) {
+	    (rpipe->pipe_state & PIPE_EOF) == 0) {
 		if (op->wq_canceled || op->cancelled || ctx->closing) {
 			error = ECANCELED;
 			break;
@@ -102,6 +102,7 @@ kqring_rw_fget(struct kqring_op *op, bool is_write, struct file **fpp,
 	/* off == -1 means "use the file position", as in io_uring. */
 	if (offset != (off_t)-1)
 		flags = FOF_OFFSET;
+again:
 	if (is_write && flags == 0)
 		cap_rights_init_one(&rights, CAP_WRITE);
 	else if (is_write)
@@ -111,11 +112,26 @@ kqring_rw_fget(struct kqring_op *op, bool is_write, struct file **fpp,
 	else
 		cap_rights_init_one(&rights, CAP_PREAD);
 	error = kqring_op_fget(op, &rights, is_write ? FWRITE : FREAD, &fp);
+	if (error == ENOTCAPABLE && flags != 0) {
+		/* A stream with CAP_READ only: the offset is ignored. */
+		flags = 0;
+		goto again;
+	}
 	if (error != 0)
 		return (error);
+	if (flags == 0 && offset != (off_t)-1 &&
+	    (fp->f_ops->fo_flags & DFLAG_SEEKABLE) != 0) {
+		/* Retried without CAP_SEEK, but the file is seekable. */
+		fdrop(fp, curthread);
+		return (ENOTCAPABLE);
+	}
 	if (flags != 0) {
+		/*
+		 * io_uring ignores the offset on a stream (a pipe, FIFO or
+		 * socket: FMODE_STREAM), rather than failing as pread(2) does.
+		 */
 		if ((fp->f_ops->fo_flags & DFLAG_SEEKABLE) == 0)
-			error = ESPIPE;
+			flags = 0;
 		else if (offset < 0 && (fp->f_vnode == NULL ||
 		    fp->f_vnode->v_type != VCHR))
 			error = EINVAL;
@@ -380,7 +396,14 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 
 	if (kqring_rw_fget(op, is_write, &fp, &flags) != 0)
 		return (KQRING_RW_PUNT);	/* the worker reports the error */
-	if (fp->f_type == DTYPE_PIPE && (fp->f_flag & FNONBLOCK) != 0) {
+	/*
+	 * A pipe that is ready completes here, even blocking (the read or
+	 * write then doesn't wait).  One that isn't waits on a worker, even
+	 * O_NONBLOCK, as io_uring polls rather than fail with EAGAIN; with
+	 * RWF_NOWAIT the issuer fails it instead.
+	 */
+	if (fp->f_type == DTYPE_PIPE && (is_write ?
+	    !kqring_pipe_will_block(fp, true, 1) : kqring_pipe_readable(fp))) {
 		fdrop(fp, td);
 		kqring_exec_file_rw(ctx, op, is_write);
 		return (KQRING_RW_DONE);
@@ -538,9 +561,19 @@ kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 		kqring_wq_mark_blocking(ctx, op);
 	error = is_write ? fo_write(fp, &auio, td->td_ucred, flags, td) :
 	    fo_read(fp, &auio, td->td_ucred, flags, td);
+	bool vnode = fp->f_type == DTYPE_VNODE;
 	fdrop(fp, td);
 
 	size_t done = (size_t)(want - auio.uio_resid);
+	/* RWF_DSYNC / RWF_SYNC: as an O_DSYNC / O_SYNC write. */
+	if (is_write && error == 0 && vnode &&
+	    (sqe->rw_flags & (KQRING_RWF_DSYNC | KQRING_RWF_SYNC)) != 0) {
+		int32_t sres = kqring_exec_fsync(op,
+		    (sqe->rw_flags & KQRING_RWF_SYNC) != 0);
+
+		if (sres < 0)
+			return (kqring_done(op, sres, 0));
+	}
 	if (buf_select) {
 		sx_xlock(&ctx->bg_sx);
 		sel.bg->busy = false;
@@ -592,10 +625,6 @@ kqring_exec_read_multishot(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (fp->f_type != DTYPE_PIPE) {
 		fdrop(fp, td);
 		return (kqring_done(op, -EOPNOTSUPP, 0));
-	}
-	if ((off_t)sqe->off != 0 && (off_t)sqe->off != (off_t)-1) {
-		fdrop(fp, td);
-		return (kqring_done(op, -ESPIPE, 0));
 	}
 	rpipe = fp->f_data;
 	PIPE_LOCK(rpipe);
@@ -1259,6 +1288,13 @@ kqring_exec_fallocate(const struct kqring_op *op)
 		return (-EINVAL);
 	if (off > OFF_MAX - len)
 		return (punch ? -EINVAL : -EFBIG);
+	/*
+	 * RLIMIT_FSIZE, as io_uring's fallocate checks it (from a worker, so
+	 * without the SIGXFSZ write(2) would raise).
+	 */
+	if (!punch && (uint64_t)(off + len) >
+	    (uint64_t)lim_cur_proc(td->td_proc, RLIMIT_FSIZE))
+		return (-EFBIG);
 	error = kqring_op_fget(op, cap_rights_init_one(&rights, CAP_PWRITE),
 	    FWRITE, &fp);
 	if (error != 0)

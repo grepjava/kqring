@@ -117,8 +117,8 @@ MALLOC_DECLARE(M_KQRING);
 MALLOC_DECLARE(M_FADVISE);
 MALLOC_DECLARE(M_SELFD);
 
-#define KQRING_MAX_SQ_ENTRIES	4096U
-#define KQRING_MAX_CQ_ENTRIES	16384U
+#define KQRING_MAX_SQ_ENTRIES	32768U	/* IORING_MAX_ENTRIES */
+#define KQRING_MAX_CQ_ENTRIES	65536U	/* IORING_MAX_CQ_ENTRIES */
 #define KQRING_MAX_PBUF_ENTRIES	32768U
 /* CQEs held in the kernel while the CQ ring is full (IORING_FEAT_NODROP). */
 #define KQRING_MAX_OVERFLOW	16384U
@@ -243,6 +243,9 @@ struct kqring_op {
 	struct kqring_ctx	*ctx;
 	struct socket		*so;		/* soref'd while armed */
 	int			dirs;		/* KQ_DIR_* upcalls installed */
+	/* The waiter lists op is on: so_rcv (or the listener), so_snd. */
+	struct kqring_sowatch	*sw[2];
+	TAILQ_ENTRY(kqring_op)	sw_link[2];
 	bool			listening;	/* armed via solisten_upcall_set */
 	bool			in_taskwork;
 	bool			cancelled;	/* no longer armed; under mtx */
@@ -276,7 +279,9 @@ struct kqring_op {
 	struct kqring_op	*ltarget;	/* LINK_TIMEOUT: request guarded */
 	/* TIMEOUT / LINK_TIMEOUT state (and callout below) */
 	struct timespec		ts;
-	uint32_t		target_seq;	/* completion-count TIMEOUT */
+	/* Completion-count TIMEOUT: done once cq_seq - seq_start >= count. */
+	uint32_t		seq_start;
+	uint32_t		seq_count;
 	uint32_t		repeats;	/* multishot: left, 0 = forever */
 	bool			seq_timeout;	/* counted in ctx->nseqto */
 	/*
@@ -578,6 +583,7 @@ struct kqring_ctx {
 	struct thread		*cancel_td;
 	struct proc		*owner_proc;	/* SINGLE_ISSUER process */
 	lwpid_t			owner_tid;	/* SINGLE_ISSUER thread ID */
+	bool			shared;		/* no SINGLE_ISSUER: any thread */
 
 	uint32_t		flags;
 	uint32_t		sq_entries;
@@ -615,6 +621,12 @@ struct kqring_ctx {
 	bool			sqpoll_running;
 	bool			sqpoll_waiting;
 	int			sqpoll_wait_chan;
+	/*
+	 * No DEFER_TASKRUN (and no SQPOLL): the same kthread runs only
+	 * taskwork, so that completions appear without an enter, as for an
+	 * io_uring ring whose task_work runs on its own.
+	 */
+	bool			taskrun_only;
 
 	/*
 	 * Registered files and buffers (owner thread only).  A NULL slot is
@@ -647,6 +659,15 @@ struct kqring_ctx {
 	bool			evfd_async;
 	bool			submitting;
 	uint32_t		evfd_cqes;
+	/*
+	 * poll(2) / select(2) / kevent(2) on the ring descriptor: readable
+	 * while CQEs or taskwork wait (kqring_ring_readable()), woken with
+	 * the eventfd.  The knote list's lock is mtx.
+	 */
+	struct selinfo		rsel;
+	bool			pollers;	/* someone polls or kevents */
+	/* TIMEOUTs completed; any one ends kqring_wait_cqes(), as Linux. */
+	volatile uint32_t	cq_timeouts;
 
 	struct kqring_restrictions rst;
 	bool			restricted;	/* rst in force */
@@ -703,7 +724,7 @@ struct kqring_ctx {
 	uint32_t		nbio;
 	size_t			bio_held;
 	int			wakeup_chan;
-	bool			sleeping;	/* owner in msleep; under mtx */
+	u_int			sleeping;	/* threads in msleep; under mtx */
 	/*
 	 * Recycled ops (linked via active_link).  Only touched by the owner
 	 * thread (enter) and by kqring_dtor(), so no lock is needed.
@@ -777,11 +798,33 @@ kqring_clear_owner(struct kqring_ctx *ctx)
 	ctx->owner_tid = 0;
 }
 
+/*
+ * Whether td may submit to, wait on and register with ctx: its owner
+ * thread, or for a shared ring (no SINGLE_ISSUER) any thread of the
+ * owner process.  Shared rings serialize those threads with sq_sx.
+ */
 static inline bool
 kqring_is_owner(const struct kqring_ctx *ctx, const struct thread *td)
 {
 	return (ctx->owner_proc == td->td_proc &&
-	    ctx->owner_tid == td->td_tid);
+	    (ctx->shared || ctx->owner_tid == td->td_tid));
+}
+
+/* Ops whose sqe->msg_flags are send(2)/recv(2) flags. */
+static inline bool
+kqring_op_msg_flags_ok(uint8_t opcode)
+{
+	switch (opcode) {
+	case IORING_OP_RECV:
+	case IORING_OP_RECVMSG:
+	case IORING_OP_SEND:
+	case IORING_OP_SENDMSG:
+	case IORING_OP_SEND_ZC:
+	case IORING_OP_SENDMSG_ZC:
+		return (true);
+	default:
+		return (false);
+	}
 }
 
 static inline bool
@@ -822,6 +865,28 @@ kqring_evfd_signal_locked(struct kqring_ctx *ctx)
 	    (atomic_load_32(&ctx->shm->cq_flags) &
 	    IORING_CQ_EVENTFD_DISABLED) == 0)
 		eventfd_signal(ctx->evfd);
+	/* And whoever polls the ring descriptor itself. */
+	if (ctx->pollers) {
+		selwakeuppri(&ctx->rsel, PZERO);
+		KNOTE_LOCKED(&ctx->rsel.si_note, 0);
+	}
+}
+
+/*
+ * The ring descriptor is readable: CQEs to reap, an overflow to flush, or
+ * taskwork that an enter would run (as io_uring_poll() reports
+ * DEFER_TASKRUN work).
+ */
+static inline bool
+kqring_ring_readable(const struct kqring_ctx *ctx)
+{
+	const struct kqring_shm_header *shm = ctx->shm;
+
+	if (shm == NULL)
+		return (false);
+	return (atomic_load_acq_32(&shm->cq_tail) !=
+	    atomic_load_acq_32(&shm->cq_head) || !STAILQ_EMPTY(&ctx->ocq) ||
+	    !TAILQ_EMPTY(&ctx->taskwork_ops) || !STAILQ_EMPTY(&ctx->rcq));
 }
 
 
@@ -857,6 +922,34 @@ kqring_sb(struct socket *so, int which)
 {
 	return (which == SO_RCV ? &so->so_rcv : &so->so_snd);
 }
+
+/*
+ * Drop a soref().  Ours may be the last reference (the descriptor was
+ * closed while the op was armed), and then sofree() runs the protocol's
+ * detach, which needs the socket's vnet (TCP counts its states per vnet);
+ * ring teardown and taskwork have none set.
+ */
+static inline void
+kqring_sorele(struct socket *so)
+{
+	CURVNET_SET(so->so_vnet);
+	sorele(so);
+	CURVNET_RESTORE();
+}
+
+/*
+ * The ops waiting on one socket buffer, or on a listening socket's queue,
+ * installed as the upcall argument: a socket has one upcall slot per
+ * buffer, but any number of requests (on any rings) may wait on it, as in
+ * io_uring.  Protected by that buffer's lock (the listen lock for a
+ * listener); freed by the last op to leave.
+ */
+struct kqring_sowatch {
+	TAILQ_HEAD(, kqring_op)	ops;
+	int			idx;		/* op->sw[] / sw_link[] slot */
+};
+
+#define	KQRING_SW_IDX(which)	((which) == SO_RCV ? 0 : 1)
 
 static inline void
 kqring_op_arm_locked(struct kqring_ctx *ctx, struct kqring_op *op)
@@ -1131,6 +1224,7 @@ int	kqring_ioc_register(struct kqring_ctx *ctx,
 
 /* kqring_sock.c */
 void	kqring_sb_disarm(struct kqring_op *op, struct socket *so, int which);
+void	kqring_listen_disarm(struct kqring_op *op, struct socket *so);
 void	kqring_uio_init(struct uio *auio, struct iovec *iov, u_int iovcnt,
 	    enum uio_rw rw);
 int	kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
@@ -1145,6 +1239,8 @@ int	kqring_exec_connect(struct kqring_op *op, struct socket *expect);
 int	kqring_exec_accept(struct kqring_ctx *ctx, struct kqring_op *op,
 	    struct socket *expect, bool *more_out);
 void	kqring_wq_poll_wait(struct kqring_ctx *ctx, struct kqring_op *op);
+bool	kqring_wq_suspend_pending(void);
+bool	kqring_wq_suspend_point(struct kqring_ctx *ctx);
 int	kqring_exec_poll(struct kqring_op *op, struct socket *expect);
 int32_t	kqring_exec_uring_cmd(const struct kqring_op *op);
 int32_t	kqring_exec_bind(const struct kqring_op *op);
@@ -1263,6 +1359,13 @@ int	kqring_op_wq_type(const struct kqring_op *op);
 bool	kqring_arm_nonsock_op(struct kqring_ctx *ctx, struct kqring_op *op);
 void	kqring_wq_rearm_ready(struct kqring_ctx *ctx, struct kqring_op *op);
 int	kqring_sqpoll_start(struct kqring_ctx *ctx, struct thread *td);
+
+/* Whether the ring has a kthread (SQPOLL, or completions only). */
+static inline bool
+kqring_has_kthread(const struct kqring_ctx *ctx)
+{
+	return ((ctx->flags & IORING_SETUP_SQPOLL) != 0 || ctx->taskrun_only);
+}
 int	kqring_sqpoll_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 	    bool has_timeout, sbintime_t sbt);
 

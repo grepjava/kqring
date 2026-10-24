@@ -76,15 +76,20 @@ now_ns(void)
 	return ((uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec);
 }
 
+/* ring_setup() makes a shared ring (no SINGLE_ISSUER / DEFER_TASKRUN). */
+static bool ring_setup_shared;
+
 /* Set up and map a ring, still disabled (IORING_SETUP_R_DISABLED). */
 static void
 ring_setup(struct test_ring *r)
 {
 	struct io_uring_params p;
 	memset(&p, 0, sizeof(p));
-	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
-	    IORING_SETUP_TASKRUN_FLAG | IORING_SETUP_CQSIZE |
+	p.flags = IORING_SETUP_TASKRUN_FLAG | IORING_SETUP_CQSIZE |
 	    IORING_SETUP_SUBMIT_ALL | IORING_SETUP_R_DISABLED;
+	if (!ring_setup_shared)
+		p.flags |= IORING_SETUP_SINGLE_ISSUER |
+		    IORING_SETUP_DEFER_TASKRUN;
 	p.cq_entries = CQ_ENTRIES;
 
 	memset(r, 0, sizeof(*r));
@@ -475,8 +480,9 @@ test_setup_errors(void)
 	int fd = open("/dev/kqring", O_RDWR | O_CLOEXEC);
 	assert(fd >= 0);
 
-	/* SINGLE_ISSUER | DEFER_TASKRUN are required. */
+	/* DEFER_TASKRUN needs SINGLE_ISSUER, as in io_uring. */
 	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_DEFER_TASKRUN;
 	arg.params = &p;
 	assert(ioctl(fd, KQRING_IOC_SETUP, &arg) == -1 && errno == EINVAL);
 
@@ -504,7 +510,7 @@ test_setup_errors(void)
 	assert(cfd >= 0);
 	p.flags = req | IORING_SETUP_CLAMP;
 	assert(ioctl(cfd, KQRING_IOC_SETUP, &arg) == 0);
-	assert(p.sq_entries == 4096 && p.cq_entries == 8192);
+	assert(p.sq_entries == 32768 && p.cq_entries == 65536);
 	close(cfd);
 	arg.entries = 8;
 	memset(&p, 0, sizeof(p));
@@ -858,36 +864,79 @@ test_futex_wait(struct test_ring *r)
 	    "enter\n");
 }
 
-/* A second op on the same socket and direction gets -EBUSY. */
+/*
+ * Several ops wait on the same socket and direction, as in io_uring: all
+ * are woken, and those that find nothing left stay armed.
+ */
 static void
 test_dup_arm(struct test_ring *r)
 {
-	static char buf[64];
+	static char buf[64], buf2[64];
 	int sv[2];
 	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
 
-	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_RECV, sv[0], 8001);
+	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_POLL_ADD, sv[0], 8002);
+	sqe->poll32_events = POLLIN;
+	ring_push_sqe(r);
+	sqe = ring_prep(r, IORING_OP_RECV, sv[0], 8001);
 	sqe->addr = (uint64_t)(uintptr_t)buf;
 	sqe->len = sizeof(buf);
 	ring_push_sqe(r);
-	sqe = ring_prep(r, IORING_OP_POLL_ADD, sv[0], 8002);
-	sqe->poll32_events = POLLIN;
+	sqe = ring_prep(r, IORING_OP_RECV, sv[0], 8003);
+	sqe->addr = (uint64_t)(uintptr_t)buf2;
+	sqe->len = sizeof(buf2);
 	ring_push_sqe(r);
 	ring_submit(r);
-	assert(ring_cq_ready(r) == 1);
-	struct io_uring_cqe c = ring_pop_cqe(r);
-	assert(c.user_data == 8002 && c.res == -EBUSY);
-
-	/* The first op is still armed and completes normally. */
-	assert(write(sv[1], "x", 1) == 1);
-	assert(ring_wait(r, 1, 2000) == 0);
-	c = ring_pop_cqe(r);
-	assert(c.user_data == 8001 && c.res == 1);
 	assert(ring_cq_ready(r) == 0);
 
+	/* One byte: the poll fires, and the first RECV takes it. */
+	assert(write(sv[1], "x", 1) == 1);
+	assert(ring_wait(r, 2, 2000) == 0);
+	bool got[2] = { false, false };
+	for (int i = 0; i < 2; i++) {
+		struct io_uring_cqe c = ring_pop_cqe(r);
+		if (c.user_data == 8001) {
+			assert(c.res == 1 && buf[0] == 'x');
+			got[0] = true;
+		} else {
+			assert(c.user_data == 8002 && (c.res & POLLIN) != 0);
+			got[1] = true;
+		}
+	}
+	assert(got[0] && got[1]);
+	assert(ring_wait(r, 1, 20) == ETIMEDOUT);
+
+	/* The second RECV is still armed. */
+	assert(write(sv[1], "y", 1) == 1);
+	assert(ring_wait(r, 1, 2000) == 0);
+	struct io_uring_cqe c = ring_pop_cqe(r);
+	assert(c.user_data == 8003 && c.res == 1 && buf2[0] == 'y');
+	assert(ring_cq_ready(r) == 0);
 	close(sv[0]);
 	close(sv[1]);
-	printf("[PASS] second op on same socket+direction -> -EBUSY\n");
+
+	/* Two ACCEPTs on one listener, then two connections. */
+	uint16_t port;
+	int lfd = tcp_listener(&port);
+	ring_prep(r, IORING_OP_ACCEPT, lfd, 8011);
+	ring_push_sqe(r);
+	ring_prep(r, IORING_OP_ACCEPT, lfd, 8012);
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	int c1 = tcp_connect(port), c2 = tcp_connect(port);
+	assert(ring_wait(r, 2, 2000) == 0);
+	for (int i = 0; i < 2; i++) {
+		c = ring_pop_cqe(r);
+		assert((c.user_data == 8011 || c.user_data == 8012) &&
+		    c.res >= 0);
+		close(c.res);
+	}
+	close(c1);
+	close(c2);
+	close(lfd);
+	printf("[PASS] several ops wait on one socket+direction (RECV, POLL, "
+	    "ACCEPT)\n");
 }
 
 /*
@@ -1759,6 +1808,146 @@ test_close_with_timers(void)
 	close(sv[0]);
 	close(sv[1]);
 	printf("[PASS] close() with timers, link timeouts, chains, drains\n");
+}
+
+static void *
+shared_nop_thread(void *arg)
+{
+	struct test_ring *r = arg;
+
+	ring_prep(r, IORING_OP_NOP, -1, 1);
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_wait(r, 1, 2000) == 0);
+	struct io_uring_cqe c = ring_pop_cqe(r);
+	assert(c.user_data == 1 && c.res == 0);
+	return (NULL);
+}
+
+static void *
+shared_wait_thread(void *arg)
+{
+	struct test_ring *r = arg;
+
+	assert(ring_wait(r, 1, 2000) == 0);
+	return (NULL);
+}
+
+/* poll(2) and kevent(2) on a ring descriptor: readable once CQEs wait. */
+static void
+test_ring_fd_poll(void)
+{
+	struct timespec zero = { 0, 0 };
+	struct test_ring r2;
+	struct kevent kev;
+
+	ring_init(&r2);
+	struct pollfd pfd = { .fd = r2.fd, .events = POLLIN };
+	assert(poll(&pfd, 1, 0) == 0);
+	int kq = kqueue();
+	assert(kq >= 0);
+	EV_SET(&kev, r2.fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+	assert(kevent(kq, &kev, 1, NULL, 0, NULL) == 0);
+	assert(kevent(kq, NULL, 0, &kev, 1, &zero) == 0);
+
+	ring_prep(&r2, IORING_OP_NOP, -1, 1);
+	ring_push_sqe(&r2);
+	ring_submit(&r2);
+	assert(poll(&pfd, 1, 1000) == 1 && (pfd.revents & POLLIN) != 0);
+	assert(kevent(kq, NULL, 0, &kev, 1, &zero) == 1 &&
+	    (int)kev.ident == r2.fd);
+	(void)ring_pop_cqe(&r2);
+	assert(poll(&pfd, 1, 0) == 0);
+
+	close(kq);
+	close(r2.fd);
+	munmap(r2.ring_map, r2.ring_map_len);
+	munmap(r2.sqes, r2.sqes_len);
+	printf("[PASS] poll(2) / kevent(2) on the ring descriptor\n");
+}
+
+/*
+ * A ring set up without SINGLE_ISSUER: another thread may submit and wait,
+ * and two threads waiting at once are both woken.
+ */
+static void
+test_shared_ring(void)
+{
+	static char buf[8];
+	struct test_ring r2;
+	pthread_t t;
+	int sv[2];
+
+	ring_setup_shared = true;
+	ring_init(&r2);
+	ring_setup_shared = false;
+
+	assert(pthread_create(&t, NULL, shared_nop_thread, &r2) == 0);
+	assert(pthread_join(t, NULL) == 0);
+
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	struct io_uring_sqe *sqe = ring_prep(&r2, IORING_OP_RECV, sv[0], 2);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	ring_push_sqe(&r2);
+	ring_submit(&r2);
+	assert(ring_cq_ready(&r2) == 0);
+	assert(pthread_create(&t, NULL, shared_wait_thread, &r2) == 0);
+	usleep(20000);
+	assert(write(sv[1], "x", 1) == 1);
+	assert(ring_wait(&r2, 1, 2000) == 0);
+	assert(pthread_join(t, NULL) == 0);
+	struct io_uring_cqe c = ring_pop_cqe(&r2);
+	assert(c.user_data == 2 && c.res == 1);
+
+	close(sv[0]);
+	close(sv[1]);
+	close(r2.fd);
+	munmap(r2.ring_map, r2.ring_map_len);
+	munmap(r2.sqes, r2.sqes_len);
+	printf("[PASS] shared ring (no SINGLE_ISSUER): other threads submit "
+	    "and wait\n");
+}
+
+/*
+ * Close TCP sockets (a listener and a connection) while ops are armed on
+ * them, then the ring: the ring drops the last socket references, and the
+ * TCP detach that follows needs the socket's vnet.
+ */
+static void
+test_close_sockets_then_ring(void)
+{
+	static char buf[64];
+	struct test_ring r2;
+	uint16_t port;
+
+	ring_init(&r2);
+	int lfd = tcp_listener(&port);
+	int c = tcp_connect(port);
+	wait_readable(lfd);
+	int s = accept(lfd, NULL, NULL);
+	assert(s >= 0);
+
+	struct io_uring_sqe *sqe = ring_prep(&r2, IORING_OP_ACCEPT, lfd, 1);
+	ring_push_sqe(&r2);
+	sqe = ring_prep(&r2, IORING_OP_RECV, s, 2);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	ring_push_sqe(&r2);
+	ring_submit(&r2);
+	assert(ring_cq_ready(&r2) == 0);
+
+	/* A connection queued on the listener when it closes, too. */
+	int c2 = tcp_connect(port);
+	usleep(10000);
+	close(lfd);
+	close(s);
+	close(c);
+	close(c2);
+	assert(close(r2.fd) == 0);
+	munmap(r2.ring_map, r2.ring_map_len);
+	munmap(r2.sqes, r2.sqes_len);
+	printf("[PASS] close() TCP listener and socket, then the ring\n");
 }
 
 /*
@@ -4011,9 +4200,9 @@ test_phase2_validation(struct test_ring *r)
 	sqe = ring_prep(r, IORING_OP_READ, 0, 36001);
 	sqe->addr = (uint64_t)(uintptr_t)buf;
 	sqe->len = sizeof(buf);
-	sqe->rw_flags = 1;
+	sqe->rw_flags = 0x100;		/* no such RWF_* flag */
 	ring_push_sqe(r);
-	assert(submit_one(r) == -EINVAL);
+	assert(submit_one(r) == -EOPNOTSUPP);
 	sqe = ring_prep(r, IORING_OP_NOP, -1, 36002);
 	sqe->personality = 1;
 	ring_push_sqe(r);
@@ -5271,13 +5460,16 @@ test_fixed_file_ops(void)
 	sqe->flags = IOSQE_FIXED_FILE;
 	ring_push_sqe(&t);
 	assert(submit_one(&t) == -EINVAL);
+	/* A pipe is a stream: READ ignores the offset, as in io_uring. */
+	char pb;
+	assert(write(pfd[1], "p", 1) == 1);
 	sqe = ring_prep(&t, IORING_OP_READ, 1, 50012);
 	sqe->flags = IOSQE_FIXED_FILE;
-	sqe->addr = (uint64_t)(uintptr_t)dir;
+	sqe->addr = (uint64_t)(uintptr_t)&pb;
 	sqe->len = 1;
-	sqe->off = 0;
+	sqe->off = 12345;
 	ring_push_sqe(&t);
-	assert(submit_one(&t) == -ESPIPE);
+	assert(submit_one(&t) == 1 && pb == 'p');
 	/* A file opened read-only cannot be written. */
 	sqe = ring_prep(&t, IORING_OP_WRITE, 2, 50013);
 	sqe->flags = IOSQE_FIXED_FILE;
@@ -5810,14 +6002,8 @@ test_inline_file_pipe(void)
 	assert(submit_one(&t) == 10);
 	assert(memcmp(buf, data + sizeof(data) - 10, 10) == 0);
 
-	/* Non-blocking pipe: READ and WRITE never wait, so run inline. */
+	/* A pipe that is ready (here non-blocking): READ and WRITE inline. */
 	assert(pipe2(pfd, O_NONBLOCK) == 0);
-	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 62009);
-	sqe->addr = (uint64_t)(uintptr_t)buf;
-	sqe->len = 64;
-	sqe->off = (uint64_t)-1;
-	ring_push_sqe(&t);
-	assert(submit_one(&t) == -EAGAIN);
 	sqe = ring_prep(&t, IORING_OP_WRITE, pfd[1], 62010);
 	sqe->addr = (uint64_t)(uintptr_t)"inline";
 	sqe->len = 6;
@@ -5831,11 +6017,34 @@ test_inline_file_pipe(void)
 	ring_push_sqe(&t);
 	assert(submit_one(&t) == 6);
 	assert(memcmp(buf, "inline", 6) == 0);
-	close(pfd[0]);
-	close(pfd[1]);
 
 	/* None of the above started a worker thread. */
 	assert(count_threads() <= threads);
+
+	/*
+	 * An empty one waits for data even O_NONBLOCK, as io_uring polls it
+	 * (fifo-nonblock-read); RWF_NOWAIT fails it instead.
+	 */
+	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 62012);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 64;
+	sqe->off = (uint64_t)-1;
+	sqe->rw_flags = KQRING_RWF_NOWAIT;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EAGAIN);
+	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 62009);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 64;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 50) == ETIMEDOUT);
+	assert(write(pfd[1], "later", 5) == 5);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 62009, 5);
+	assert(memcmp(buf, "later", 5) == 0);
+	close(pfd[0]);
+	close(pfd[1]);
 
 	/* At end of file: 0.  Where offset + length overflows: as pread(2). */
 	prep_pread(&t, fd, buf, 100, sizeof(data), 62004);
@@ -7256,6 +7465,9 @@ main(int argc, char **argv)
 		test_poll_remove(&r);
 		test_cancel_flags(&r);
 		test_close_with_timers();
+		test_close_sockets_then_ring();
+		test_shared_ring();
+		test_ring_fd_poll();
 		test_vectored_io(&r);
 		test_submit_stable(&r);
 		test_msg_ops(&r);

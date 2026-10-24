@@ -1,0 +1,35 @@
+--- src/syscall.h
++++ src/syscall.h
+@@ -33,7 +33,9 @@
+ 	return uring_unlikely((uintptr_t) ptr >= (uintptr_t) -4095UL);
+ }
+ 
+-#if defined(__x86_64__) || defined(__i386__)
++#if defined(__FreeBSD__)
++#include "arch/freebsd/syscall.h"
++#elif defined(__x86_64__) || defined(__i386__)
+ #include "arch/x86/syscall.h"
+ #elif defined(__aarch64__)
+ #include "arch/aarch64/syscall.h"
+--- src/queue.c
++++ src/queue.c
+@@ -1,5 +1,8 @@
+ /* SPDX-License-Identifier: MIT */
++/* FreeBSD would hide its BSD interfaces (AT_FDCWD, minherit, cpu_set_t). */
++#ifndef __FreeBSD__
+ #define _POSIX_C_SOURCE 200112L
++#endif
+ 
+ #include "lib.h"
+ #include "syscall.h"
+--- src/register.c
++++ src/register.c
+@@ -1,5 +1,8 @@
+ /* SPDX-License-Identifier: MIT */
++/* FreeBSD would hide its BSD interfaces (AT_FDCWD, minherit, cpu_set_t). */
++#ifndef __FreeBSD__
+ #define _POSIX_C_SOURCE 200112L
++#endif
+ 
+ #include "lib.h"
+ #include "syscall.h"

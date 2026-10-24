@@ -440,8 +440,10 @@ kqring_timeout_remove_prep(struct kqring_op *op)
 		return (EINVAL);
 	if ((tflags & IORING_TIMEOUT_UPDATE_MASK) == 0)
 		return (tflags != 0 ? EINVAL : 0);
-	if ((tflags & IORING_TIMEOUT_UPDATE_MASK) == IORING_TIMEOUT_UPDATE_MASK)
-		return (EINVAL);
+	/*
+	 * Both update bits may be set: io_uring_prep_timeout_update() always
+	 * adds IORING_TIMEOUT_UPDATE, and LINK_TIMEOUT_UPDATE then wins.
+	 */
 	if ((tflags & ~(IORING_TIMEOUT_UPDATE_MASK | IORING_TIMEOUT_ABS |
 	    IORING_TIMEOUT_CLOCK_MASK)) != 0)
 		return (EINVAL);
@@ -463,7 +465,9 @@ kqring_timeout_arm(struct kqring_ctx *ctx, struct kqring_op *op)
 	if ((op->sqe.timeout_flags & IORING_TIMEOUT_MULTISHOT) != 0) {
 		op->repeats = (uint32_t)op->sqe.off;
 	} else if (op->sqe.off != 0) {
-		op->target_seq = ctx->cq_seq + (uint32_t)op->sqe.off;
+		/* Unsigned distances: a count of -1U is ~4 billion away. */
+		op->seq_start = ctx->cq_seq;
+		op->seq_count = (uint32_t)op->sqe.off;
 		op->seq_timeout = true;
 		ctx->nseqto++;
 	}
@@ -520,6 +524,8 @@ kqring_timeout_fire(struct kqring_ctx *ctx, struct kqring_op *op)
 		kqring_req_complete(ctx, target, -ECANCELED, 0);
 		return;
 	}
+	/* A TIMEOUT that fires ends a wait for more CQEs, as in io_uring. */
+	atomic_add_32(&ctx->cq_timeouts, 1);
 	if ((op->sqe.timeout_flags & IORING_TIMEOUT_MULTISHOT) != 0 &&
 	    (op->repeats == 0 || --op->repeats > 0)) {
 		kqring_post_cqe_uncounted(ctx, op->sqe.user_data, -ETIME,
@@ -594,7 +600,7 @@ kqring_check_timeouts(struct kqring_ctx *ctx)
 		mtx_lock(&ctx->mtx);
 		TAILQ_FOREACH(op, &ctx->active_ops, active_link) {
 			if (op->seq_timeout &&
-			    (int32_t)(ctx->cq_seq - op->target_seq) >= 0)
+			    ctx->cq_seq - op->seq_start >= op->seq_count)
 				break;
 		}
 		if (op != NULL)
@@ -602,6 +608,7 @@ kqring_check_timeouts(struct kqring_ctx *ctx)
 		mtx_unlock(&ctx->mtx);
 		if (op == NULL)
 			break;
+		atomic_add_32(&ctx->cq_timeouts, 1);
 		kqring_req_complete(ctx, op, 0, 0);
 	}
 }

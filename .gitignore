@@ -16,3 +16,7 @@ tests/kqring_bench
 *.log
 vmcore.*
 graphify-out/
+tests/kqring_mt_bench
+
+# liburing port: fetched release, build output
+liburing/work/

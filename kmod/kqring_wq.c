@@ -223,6 +223,39 @@ kqring_wq_check_suspend(struct kqring_wq *wq)
 	return (false);
 }
 
+/* Whether the worker's process asks it to stop, exit or exec. */
+bool
+kqring_wq_suspend_pending(void)
+{
+	struct thread *td = curthread;
+	struct proc *p = td->td_proc;
+
+	return (P_SHOULDSTOP(p) || (p->p_flag2 & P2_WEXIT) != 0 ||
+	    td_ast_pending(td, TDA_SUSPEND));
+}
+
+/*
+ * A suspension point for a worker waiting inside a request, called without
+ * locks: stop here for SIGSTOP or single-threading, as at the top of the
+ * worker loop.  A wait that only ends when the ring owner runs taskwork
+ * would otherwise keep exit1() (which suspends the owner first) waiting
+ * forever.  Returns true if the process is exiting or exec'ing: the caller
+ * stops waiting, and the worker exits at the top of its loop.
+ */
+bool
+kqring_wq_suspend_point(struct kqring_ctx *ctx)
+{
+	struct kqring_wq *wq = ctx->wq;
+	bool exiting;
+
+	if (wq == NULL || !kqring_wq_suspend_pending())
+		return (false);
+	mtx_lock(&wq->mtx);
+	exiting = kqring_wq_check_suspend(wq);
+	mtx_unlock(&wq->mtx);
+	return (exiting);
+}
+
 static void
 kqring_wq_apply_affinity(struct kqring_wq *wq, uint32_t *genp)
 {
@@ -566,10 +599,10 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 	while (kqring_wq_can_wait_op_locked(ctx, op)) {
 		int error;
 
-		ctx->sleeping = true;
+		ctx->sleeping++;
 		error = msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, PCATCH,
 		    "kqwqsy", 100 * SBT_1US, 0, 0);
-		ctx->sleeping = false;
+		ctx->sleeping--;
 		if ((error == EINTR || error == ERESTART) && !op->wq_done) {
 			op->wq_blocking = true;
 			break;
@@ -612,14 +645,10 @@ kqring_arm_nonsock_op(struct kqring_ctx *ctx, struct kqring_op *op)
 	} else if (sqe->opcode == IORING_OP_READ_MULTISHOT) {
 		error = kqring_op_fget(op,
 		    cap_rights_init_one(&rights, CAP_READ), FREAD, &fp);
+		/* A pipe is a stream: the offset is ignored, as in io_uring. */
 		if (error == 0 && fp->f_type != DTYPE_PIPE) {
 			fdrop(fp, td);
 			error = EOPNOTSUPP;
-		}
-		if (error == 0 && (off_t)sqe->off != 0 &&
-		    (off_t)sqe->off != (off_t)-1) {
-			fdrop(fp, td);
-			error = ESPIPE;
 		}
 	} else {
 		error = ENOTSOCK;
@@ -738,6 +767,8 @@ kqring_sqpoll_thread(void *arg)
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
 	sbintime_t last_active;
+	/* Completions only (no DEFER_TASKRUN): never submits or spins. */
+	bool taskrun = ctx->taskrun_only;
 
 	PROC_LOCK(p);
 	SIGFILLSET(td->td_sigmask);
@@ -766,8 +797,8 @@ kqring_sqpoll_thread(void *arg)
 		uint32_t ocq_before = ctx->nocq;
 
 		kqring_flush_overflow(ctx);
-		uint32_t pending = atomic_load_acq_32(&shm->sq_tail) -
-		    shm->sq_head;
+		uint32_t pending = taskrun ? 0 :
+		    atomic_load_acq_32(&shm->sq_tail) - shm->sq_head;
 		if (pending != 0)
 			kqring_submit_sqes(ctx, pending, &submitted);
 		kqring_run_taskwork(ctx);
@@ -798,8 +829,8 @@ kqring_sqpoll_thread(void *arg)
 			kqring_poll_fallback_locked(ctx);
 		if (!TAILQ_EMPTY(&ctx->retired_ops))
 			(void)kqring_wq_abort_retired_locked(ctx);
-		if (atomic_load_acq_32(&shm->sq_tail) != shm->sq_head ||
-		    !TAILQ_EMPTY(&ctx->taskwork_ops) ||
+		if ((!taskrun && atomic_load_acq_32(&shm->sq_tail) !=
+		    shm->sq_head) || !TAILQ_EMPTY(&ctx->taskwork_ops) ||
 		    !STAILQ_EMPTY(&ctx->rcq)) {
 			mtx_unlock(&ctx->mtx);
 			continue;
@@ -808,22 +839,26 @@ kqring_sqpoll_thread(void *arg)
 		sbintime_t now = getsbinuptime();
 		sbintime_t elapsed = now - last_active;
 		if (elapsed < ctx->sqpoll_idle_sbt) {
-			ctx->sleeping = true;
-			(void)msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, 0,
+			ctx->sleeping++;
+			(void)msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, PCATCH,
 			    "kqsqpl", 50 * SBT_1US, 0, 0);
-			ctx->sleeping = false;
+			ctx->sleeping--;
 			mtx_unlock(&ctx->mtx);
 			continue;
 		}
 
-		atomic_set_32(&shm->sq_flags, IORING_SQ_NEED_WAKEUP);
-		if (atomic_load_acq_32(&shm->sq_tail) != shm->sq_head ||
-		    !TAILQ_EMPTY(&ctx->taskwork_ops) ||
-		    !STAILQ_EMPTY(&ctx->rcq) || ctx->closing) {
-			atomic_clear_32(&shm->sq_flags, IORING_SQ_NEED_WAKEUP);
-			mtx_unlock(&ctx->mtx);
-			last_active = getsbinuptime();
-			continue;
+		/* Only SQPOLL asks to be woken for submissions. */
+		if (!taskrun) {
+			atomic_set_32(&shm->sq_flags, IORING_SQ_NEED_WAKEUP);
+			if (atomic_load_acq_32(&shm->sq_tail) != shm->sq_head ||
+			    !TAILQ_EMPTY(&ctx->taskwork_ops) ||
+			    !STAILQ_EMPTY(&ctx->rcq) || ctx->closing) {
+				atomic_clear_32(&shm->sq_flags,
+				    IORING_SQ_NEED_WAKEUP);
+				mtx_unlock(&ctx->mtx);
+				last_active = getsbinuptime();
+				continue;
+			}
 		}
 		sbintime_t period = 0;
 		if (ctx->nfutex > 0 || ctx->npolled > 0 ||
@@ -831,11 +866,19 @@ kqring_sqpoll_thread(void *arg)
 			period = 50 * SBT_1US;
 		else if (ctx->nwaitid > 0)
 			period = SBT_1MS;
-		ctx->sleeping = true;
-		(void)msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, 0, "kqsqid",
+		/*
+		 * Interruptible, as the workers' sleeps are: thread_single()
+		 * (exit, exec, SIGSTOP) only aborts sleeps with PCATCH, and an
+		 * idle ring sleeps here without a timeout.  Signals are masked,
+		 * so only stop and exit requests interrupt it, and the loop
+		 * then suspends or exits in kqring_sqpoll_check_suspend().
+		 */
+		ctx->sleeping++;
+		(void)msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, PCATCH, "kqsqid",
 		    period, 0, 0);
-		ctx->sleeping = false;
-		atomic_clear_32(&shm->sq_flags, IORING_SQ_NEED_WAKEUP);
+		ctx->sleeping--;
+		if (!taskrun)
+			atomic_clear_32(&shm->sq_flags, IORING_SQ_NEED_WAKEUP);
 		mtx_unlock(&ctx->mtx);
 		last_active = getsbinuptime();
 	}
@@ -874,7 +917,7 @@ kqring_sqpoll_start(struct kqring_ctx *ctx, struct thread *td)
 
 	kqring_worker_hold();
 	error = kthread_add(kqring_sqpoll_thread, ctx, td->td_proc,
-	    &ctx->sqpoll_td, 0, 0, "kqsqp");
+	    &ctx->sqpoll_td, 0, 0, ctx->taskrun_only ? "kqtask" : "kqsqp");
 	if (error != 0) {
 		kqring_worker_rele();
 		mtx_lock(&ctx->mtx);

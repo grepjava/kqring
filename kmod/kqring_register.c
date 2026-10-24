@@ -272,7 +272,7 @@ kqring_evfd_unregister(struct kqring_ctx *ctx)
 void
 kqring_evfd_flush(struct kqring_ctx *ctx)
 {
-	if (ctx->evfd_cqes == 0 || ctx->evfd == NULL)
+	if (ctx->evfd_cqes == 0 || (ctx->evfd == NULL && !ctx->pollers))
 		return;
 	ctx->evfd_cqes = 0;
 	mtx_lock(&ctx->mtx);
@@ -695,7 +695,7 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 		ctx->enabled = true;
 		ctx->restricted = ctx->rst.registered;
 		mtx_unlock(&ctx->mtx);
-		if ((ctx->flags & IORING_SETUP_SQPOLL) != 0) {
+		if (kqring_has_kthread(ctx)) {
 			error = kqring_sqpoll_start(ctx, td);
 			if (error != 0) {
 				mtx_lock(&ctx->mtx);
