@@ -60,11 +60,12 @@ Measured on FreeBSD 15.1 (i5-8250U), as medians of 5 runs; see [`BENCHMARK.MD`](
 
 | Message | AF_UNIX, `SEND_ZC` registered vs `write(2)` | TCP loopback, `SEND_ZC` registered vs `write(2)` |
 |---|---:|---:|
-| 16 KiB | 41% slower | 21% faster |
-| 64 KiB | 6% faster | 15% faster |
-| 256 KiB | 37% faster | 24% faster |
+| 16 KiB | 40% slower | 21% faster |
+| 64 KiB | 7% faster | 15% faster |
+| 256 KiB | 35% faster | 25% faster |
 
-Unregistered buffers (pinned per request) cost a further 3–14%.
+Unregistered buffers (pinned per request) cost a further 5–15%.
 
 - **Raise the zero-copy threshold for AF_UNIX.** Below 64 KiB the page holding and deferred notification cost more than the copy they save. `KQRING_ZC_MIN_LEN` (one page) could be per protocol, for example 64 KiB for `AF_UNIX` and one page for TCP.
 - **Document `RLIMIT_MEMLOCK`.** FreeBSD's default is 64 KiB, so registering buffers for zero-copy needs `memorylocked` raised in `login.conf(5)`. Done in [`README.md`](README.md) and `BENCHMARK.MD`.
+- **Inline non-socket I/O.** Done for positioned page-cache reads (UFS, tmpfs) and `O_NONBLOCK` pipes; see [`BENCHMARK.MD`](BENCHMARK.MD#pipes-and-files-inline-or-through-a-worker). Blocking pipes still need a worker, because `pipe_read()` has no per-call non-blocking mode. Inline file reads at the file position (`off` = −1) would need the file offset lock (`foffset_lock`).

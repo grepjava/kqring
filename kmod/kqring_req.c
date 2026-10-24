@@ -1790,9 +1790,20 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 		/*
 		 * A socket would block the ring owner in read(2); treat it like
 		 * RECV / SEND instead, so it can be armed.  Other descriptors
-		 * (files, pipes, devices) run on the in-process worker pool.
+		 * (files, pipes, devices) run on the in-process worker pool,
+		 * unless they can complete here without blocking.
 		 */
 		if (!kqring_op_is_socket(op)) {
+			if ((sqe->flags & IOSQE_ASYNC) == 0 &&
+			    kqring_file_rw_inline(ctx, op,
+			    sqe->opcode == IORING_OP_WRITE ||
+			    sqe->opcode == IORING_OP_WRITEV ||
+			    sqe->opcode == IORING_OP_WRITE_FIXED ||
+			    sqe->opcode == IORING_OP_WRITEV_FIXED)) {
+				kqring_req_complete(ctx, op, op->res,
+				    op->cflags);
+				return;
+			}
 			armed = kqring_wq_enqueue(ctx, op,
 			    kqring_op_wq_type(op));
 			break;

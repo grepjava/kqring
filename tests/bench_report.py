@@ -228,8 +228,10 @@ def main():
                 ("AF_UNIX 256 KiB send, SEND_ZC vs write", ns("send_unix_256k", "plain_write"), ns("send_unix_256k", "kqring_send_zc_fixed")),
                 ("TCP 64 KiB send, SEND_ZC vs write", ns("send_tcp_64k", "plain_write"), ns("send_tcp_64k", "kqring_send_zc_fixed")),
                 ("AF_UNIX 64 B, RECV armed before data", ns("pingpong_unix_64", "kqueue"), ns("pingpong_unix_64", "kqring_recv_armed")),
-                ("Pipe 64 B READ (worker thread)", ns("pipe", "kqueue"), ns("pipe", "kqring_read")),
-                ("File 4 KiB READ vs pread (worker)", ns("file_4k", "pread"), ns("file_4k", "kqring_read")),
+                ("File 4 KiB, 32 READs per enter vs pread", ns("file_4k", "pread"), ns("file_4k", "kqring_read_batch32")),
+                ("File 4 KiB READ vs pread", ns("file_4k", "pread"), ns("file_4k", "kqring_read")),
+                ("Pipe 64 B READ, O_NONBLOCK", ns("pipe", "kqueue"), ns("pipe", "kqring_read_nonblock")),
+                ("Pipe 64 B READ, blocking (worker)", ns("pipe", "kqueue"), ns("pipe", "kqring_read")),
             ])
 
     grouped(os.path.join(outdir, "fanin.svg"),
@@ -272,18 +274,19 @@ def main():
 
     # Series are roles; each group maps a role to its own variant.
     roles = {
-        "pipe": {"plain": "plain_read", "kqueue": "kqueue", "worker": "kqring_read"},
-        "file_4k": {"plain": "pread", "worker": "kqring_read", "batch": "kqring_read_batch32"},
+        "pipe": {"plain": "plain_read", "kqueue": "kqueue", "inline": "kqring_read_nonblock",
+                 "worker": "kqring_read"},
+        "file_4k": {"plain": "pread", "inline": "kqring_read", "batch": "kqring_read_batch32"},
         "floor": {"kqueue": "kqueue_empty_kevent", "inline": "kqring_nop",
                   "worker": "kqring_nop_async"},
     }
     grouped(os.path.join(outdir, "worker.svg"),
-            "Pipes and files: the worker-thread hand-off",
-            "ns per operation, lower is better",
-            [("Pipe READ, 64 B", "pipe"), ("File READ, 4 KiB", "file_4k"), ("Empty op", "floor")],
+            "Pipes and files: inline vs worker thread",
+            "ns per operation, lower is better; a blocking pipe still goes through a worker",
+            [("Pipe READ, 64 B", "pipe"), ("File READ, 4 KiB", "file_4k"), ("Empty op (NOP)", "floor")],
             [("read(2) / pread(2)", "plain", P), ("kqueue", "kqueue", K),
              ("kqring, inline", "inline", S1), ("kqring, via worker", "worker", S2),
-             ("kqring, 32 per enter", "batch", S3)],
+             ("kqring, inline, 32 per enter", "batch", S3)],
             "ns", lambda g, r: ns(g, roles[g][r]) if r in roles[g] else None)
 
 

@@ -707,7 +707,7 @@ bench_accept(void)
 }
 
 /* ------------------------------------------------------------------------
- * pipe: a message through a pipe.  kqring runs non-socket reads on a
+ * pipe: a message through a pipe.  kqring runs blocking-pipe reads on a
  * worker thread, so this measures that hand-off.
  * ------------------------------------------------------------------------
  */
@@ -761,6 +761,22 @@ bench_pipe(void)
 		assert(ring_pop(&r).res == PIPE_LEN);
 	}
 	row("pipe", "kqring_read", now_ns() - t0, PIPE_ITERS);
+	close(p[0]);
+	close(p[1]);
+
+	/* A non-blocking pipe never waits, so the READ runs inline. */
+	assert(pipe2(p, O_NONBLOCK) == 0);
+	t0 = now_ns();
+	for (int i = 0; i < PIPE_ITERS; i++) {
+		xwrite(p[1], PIPE_LEN);
+		struct io_uring_sqe *sqe = ring_prep(&r, IORING_OP_READ, p[0], 1);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		sqe->off = (uint64_t)-1;
+		ring_enter(&r, 1);
+		assert(ring_pop(&r).res == PIPE_LEN);
+	}
+	row("pipe", "kqring_read_nonblock", now_ns() - t0, PIPE_ITERS);
 	ring_fini(&r);
 	close(p[0]);
 	close(p[1]);
