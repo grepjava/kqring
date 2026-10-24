@@ -223,7 +223,7 @@ sequenceDiagram
 
 ## 6. Zero-Copy Transmit (`SEND_ZC` / `SENDMSG_ZC`)
 
-`kqring` implements true zero-copy transmit for connected `AF_UNIX` and `AF_INET`/`AF_INET6` TCP stream sockets on transfers of at least `PAGE_SIZE` (4 KiB), supporting both **Phase A** (`IORING_RECVSEND_FIXED_BUF` registered buffers) and **Phase B** (unregistered user buffers and multi-segment scatter/gather `SENDMSG_ZC`).
+`kqring` implements true zero-copy transmit for connected `AF_UNIX` and `AF_INET`/`AF_INET6` TCP stream sockets on transfers of at least `PAGE_SIZE` (4 KiB; on `AF_UNIX`, an unregistered buffer must reach `kern.kqring.zc_local_min_len`, 32 KiB by default, below which copying is cheaper than pinning per send), supporting both **Phase A** (`IORING_RECVSEND_FIXED_BUF` registered buffers) and **Phase B** (unregistered user buffers and multi-segment scatter/gather `SENDMSG_ZC`).
 
 ```mermaid
 sequenceDiagram

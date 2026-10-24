@@ -11,6 +11,15 @@ static LIST_HEAD(, kqring_pin_acct) kqring_pin_list =
 
 struct mtx kqring_zc_mtx;
 
+SYSCTL_NODE(_kern, OID_AUTO, kqring, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "kqring io_uring rings");
+
+u_int kqring_zc_local_min_len = KQRING_ZC_LOCAL_MIN_LEN;
+SYSCTL_UINT(_kern_kqring, OID_AUTO, zc_local_min_len, CTLFLAG_RWTUN,
+    &kqring_zc_local_min_len, 0,
+    "Smallest AF_LOCAL SEND_ZC / SENDMSG_ZC from an unregistered buffer "
+    "sent zero-copy (bytes, at least one page); smaller ones copy");
+
 static void kqring_zc_rele_hold(void);
 
 static int

@@ -83,6 +83,7 @@
 #include <sys/time.h>
 #include <sys/umtxvar.h>
 #include <sys/vmmeter.h>
+#include <sys/sysctl.h>
 #include <sys/vnode.h>
 #include <sys/wait.h>
 
@@ -136,6 +137,15 @@ MALLOC_DECLARE(M_SELFD);
 #define KQRING_MAX_BUF_LEN	(1ULL << 30)
 /* Zero-copy registered buffer limits (Phase A SEND_ZC + FIXED_BUF). */
 #define KQRING_ZC_MIN_LEN	PAGE_SIZE
+/*
+ * On AF_LOCAL a copy is one memcpy into the peer's receive buffer, cheaper
+ * than pinning an unregistered buffer for each send plus a deferred
+ * notification until sends are about this large (see BENCHMARK.MD), so
+ * smaller SEND_ZC / SENDMSG_ZC from unregistered buffers copy there.  A
+ * registered buffer's pages are held already: it goes zero-copy from one
+ * page.  The default for sysctl kern.kqring.zc_local_min_len.
+ */
+#define KQRING_ZC_LOCAL_MIN_LEN	(32U * 1024)
 #define KQRING_MAX_ZC_BUF_LEN	(16U * 1024 * 1024)
 #define KQRING_MAX_ZC_PAGES	16384U
 #define KQRING_MAX_PERSONALITIES 1024U
@@ -399,6 +409,7 @@ struct kqring_zc_notif {
 };
 
 extern struct mtx kqring_zc_mtx;
+extern u_int kqring_zc_local_min_len;
 
 struct kqring_rsrc {
 	uint32_t		refs;

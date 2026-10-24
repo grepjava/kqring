@@ -31,12 +31,12 @@ This document tracks the phased implementation of genuine zero-copy transmit pat
 
 ## Phase B — Arbitrary User-Buffer `IORING_OP_SEND_ZC` / `IORING_OP_SENDMSG_ZC` (Implemented)
 
-**Target:** Zero-copy sends from unregistered application buffers and scatter/gather `msghdr.msg_iov` arrays above a copy-vs-pin threshold (`>= 4 KiB`), plus `IORING_RECVSEND_FIXED_BUF` on `IORING_OP_SENDMSG_ZC`.
+**Target:** Zero-copy sends from unregistered application buffers and scatter/gather `msghdr.msg_iov` arrays above a copy-vs-pin threshold (`>= 4 KiB`; on `AF_UNIX`, `kern.kqring.zc_local_min_len`, 32 KiB by default), plus `IORING_RECVSEND_FIXED_BUF` on `IORING_OP_SENDMSG_ZC`.
 
 ### Design
 1. **Per-Request Page Holding & Accounting:**
    - For `IORING_OP_SEND_ZC` and `IORING_OP_SENDMSG_ZC` without `IORING_RECVSEND_FIXED_BUF` where the transfer length is `>= KQRING_ZC_MIN_LEN` (`4096` bytes / `PAGE_SIZE`), pin and hold the backing physical pages per non-empty iovec segment via `vm_fault_quick_hold_pages(..., VM_PROT_READ, ...)` and charge them to the user's `struct kqring_pin_acct` (`RLIMIT_MEMLOCK` and `vm.max_user_wired`).
-   - Payloads `< 4096` bytes (or sends where `RLIMIT_MEMLOCK` / `vm.max_user_wired` is exhausted) fall back to the copy path (`IORING_NOTIF_USAGE_ZC_COPIED` when `IORING_SEND_ZC_REPORT_USAGE` is set).
+   - Payloads `< 4096` bytes (on `AF_UNIX`, below `kern.kqring.zc_local_min_len`), or sends where `RLIMIT_MEMLOCK` / `vm.max_user_wired` is exhausted, fall back to the copy path (`IORING_NOTIF_USAGE_ZC_COPIED` when `IORING_SEND_ZC_REPORT_USAGE` is set).
 2. **Scatter/Gather (`IORING_OP_SENDMSG_ZC`):**
    - Supports both `IORING_RECVSEND_FIXED_BUF` (all `msg_iov` segments validated within `sqe->buf_index`) and unregistered `msg_iov` arrays (`struct kqring_zc_notif` tracks either a single `zbuf` or a `zbufs[]` array across segments).
    - Walks the `msghdr.msg_iov` segments, builds a single `EXT_SFBUF` mbuf chain across all segments (`M_EXT | M_RDONLY`), submits via `pr_send`, and releases all held `struct kqring_zc_buf` references inside `kqring_zc_rele()` when the final mbuf reference drops.
@@ -58,14 +58,17 @@ This document tracks the phased implementation of genuine zero-copy transmit pat
 
 Measured on FreeBSD 15.1 (i5-8250U), as medians of 5 runs; see [`BENCHMARK.MD`](BENCHMARK.MD#bulk-send-one-message-sent-then-read-back-in-full).
 
-| Message | AF_UNIX, `SEND_ZC` registered vs `write(2)` | TCP loopback, `SEND_ZC` registered vs `write(2)` |
-|---|---:|---:|
-| 16 KiB | 40% slower | 21% faster |
-| 64 KiB | 7% faster | 15% faster |
-| 256 KiB | 35% faster | 25% faster |
+| Message | AF_UNIX, registered | AF_UNIX, unregistered | TCP loopback, registered |
+|---|---:|---:|---:|
+| 16 KiB | 19% slower | 25% slower (copied) | 3% faster |
+| 32 KiB | 2% faster | 13% slower | 6% slower |
+| 64 KiB | 15% faster | 1% faster | 16% faster |
+| 256 KiB | 38% faster | 27% faster | 26% faster |
 
-Unregistered buffers (pinned per request) cost a further 5–15%.
+All against `write(2)`. At 16 KiB on AF_UNIX every kqring send, copying `SEND` included, is 18–25% slower than `write(2)`: that's the ring's fixed cost per operation, not zero-copy.
 
-- **Raise the zero-copy threshold for AF_UNIX.** Below 64 KiB the page holding and deferred notification cost more than the copy they save. `KQRING_ZC_MIN_LEN` (one page) could be per protocol, for example 64 KiB for `AF_UNIX` and one page for TCP.
+- **AF_UNIX zero-copy threshold.** Done. `SEND_ZC` / `SENDMSG_ZC` from an unregistered buffer on AF_UNIX copies below `sysctl kern.kqring.zc_local_min_len` (32 KiB by default, the measured crossover), because pinning per send costs more than the `memcpy` there. Registered buffers and TCP go zero-copy from one page.
+- **Carry several pages per mbuf.** Each zero-copy page gets its own mbuf and `sf_buf`. Unmapped `M_EXTPG` mbufs, as `sendfile(2)` and KTLS use, would cut the per-page cost. Check that AF_UNIX accepts them on 15.1 first.
+- **Measure TCP zero-copy with the receiver in its own thread.** Loopback delivers through the netisr thread, so a single-threaded send-then-receive benchmark mostly measures that hand-off for small sends.
 - **Document `RLIMIT_MEMLOCK`.** FreeBSD's default is 64 KiB, so registering buffers for zero-copy needs `memorylocked` raised in `login.conf(5)`. Done in [`README.md`](README.md) and `BENCHMARK.MD`.
 - **Inline non-socket I/O.** Done for positioned page-cache reads (UFS, tmpfs) and `O_NONBLOCK` pipes; see [`BENCHMARK.MD`](BENCHMARK.MD#pipes-and-files-inline-or-through-a-worker). Blocking pipes still need a worker, because `pipe_read()` has no per-call non-blocking mode. Inline file reads at the file position (`off` = −1) would need the file offset lock (`foffset_lock`).

@@ -49,27 +49,27 @@
 <text x="690.0" y="328" class="tick" text-anchor="middle">6,000</text>
 <text x="740" y="328" class="tick" text-anchor="end">ns</text>
 <text x="110.0" y="135.0" class="lab" text-anchor="end">Pipe READ, 64 B</text>
-<path d="M120.0,100.0 H174.4 Q178.4,100.0 178.4,104.0 V110.0 Q178.4,114.0 174.4,114.0 H120.0 Z" fill="var(--plain)"><title>Pipe READ, 64 B — read(2) / pread(2): 615 ns</title></path>
-<text x="183.4" y="111" class="val">615</text>
-<path d="M120.0,116.0 H212.8 Q216.8,116.0 216.8,120.0 V126.0 Q216.8,130.0 212.8,130.0 H120.0 Z" fill="var(--kqueue)"><title>Pipe READ, 64 B — kqueue: 1,019 ns</title></path>
-<text x="221.8" y="127" class="val">1,019</text>
-<path d="M120.0,132.0 H203.7 Q207.7,132.0 207.7,136.0 V142.0 Q207.7,146.0 203.7,146.0 H120.0 Z" fill="var(--s1)"><title>Pipe READ, 64 B — kqring, inline: 923 ns</title></path>
-<text x="212.7" y="143" class="val">923</text>
-<path d="M120.0,148.0 H640.1 Q644.1,148.0 644.1,152.0 V158.0 Q644.1,162.0 640.1,162.0 H120.0 Z" fill="var(--s2)"><title>Pipe READ, 64 B — kqring, via worker: 5,517 ns</title></path>
-<text x="649.1" y="159" class="val">5,517</text>
+<path d="M120.0,100.0 H174.5 Q178.5,100.0 178.5,104.0 V110.0 Q178.5,114.0 174.5,114.0 H120.0 Z" fill="var(--plain)"><title>Pipe READ, 64 B — read(2) / pread(2): 616 ns</title></path>
+<text x="183.5" y="111" class="val">616</text>
+<path d="M120.0,116.0 H212.6 Q216.6,116.0 216.6,120.0 V126.0 Q216.6,130.0 212.6,130.0 H120.0 Z" fill="var(--kqueue)"><title>Pipe READ, 64 B — kqueue: 1,017 ns</title></path>
+<text x="221.6" y="127" class="val">1,017</text>
+<path d="M120.0,132.0 H203.3 Q207.3,132.0 207.3,136.0 V142.0 Q207.3,146.0 203.3,146.0 H120.0 Z" fill="var(--s1)"><title>Pipe READ, 64 B — kqring, inline: 919 ns</title></path>
+<text x="212.3" y="143" class="val">919</text>
+<path d="M120.0,148.0 H639.8 Q643.8,148.0 643.8,152.0 V158.0 Q643.8,162.0 639.8,162.0 H120.0 Z" fill="var(--s2)"><title>Pipe READ, 64 B — kqring, via worker: 5,514 ns</title></path>
+<text x="648.8" y="159" class="val">5,514</text>
 <text x="110.0" y="207.0" class="lab" text-anchor="end">File READ, 4 KiB</text>
-<path d="M120.0,180.0 H221.9 Q225.9,180.0 225.9,184.0 V190.0 Q225.9,194.0 221.9,194.0 H120.0 Z" fill="var(--plain)"><title>File READ, 4 KiB — read(2) / pread(2): 1,115 ns</title></path>
-<text x="230.9" y="191" class="val">1,115</text>
-<path d="M120.0,196.0 H245.3 Q249.3,196.0 249.3,200.0 V206.0 Q249.3,210.0 245.3,210.0 H120.0 Z" fill="var(--s1)"><title>File READ, 4 KiB — kqring, inline: 1,361 ns</title></path>
-<text x="254.3" y="207" class="val">1,361</text>
-<path d="M120.0,212.0 H190.9 Q194.9,212.0 194.9,216.0 V222.0 Q194.9,226.0 190.9,226.0 H120.0 Z" fill="var(--s3)"><title>File READ, 4 KiB — kqring, inline, 32 per enter: 788 ns</title></path>
-<text x="199.9" y="223" class="val">788</text>
+<path d="M120.0,180.0 H220.2 Q224.2,180.0 224.2,184.0 V190.0 Q224.2,194.0 220.2,194.0 H120.0 Z" fill="var(--plain)"><title>File READ, 4 KiB — read(2) / pread(2): 1,097 ns</title></path>
+<text x="229.2" y="191" class="val">1,097</text>
+<path d="M120.0,196.0 H244.8 Q248.8,196.0 248.8,200.0 V206.0 Q248.8,210.0 244.8,210.0 H120.0 Z" fill="var(--s1)"><title>File READ, 4 KiB — kqring, inline: 1,356 ns</title></path>
+<text x="253.8" y="207" class="val">1,356</text>
+<path d="M120.0,212.0 H190.1 Q194.1,212.0 194.1,216.0 V222.0 Q194.1,226.0 190.1,226.0 H120.0 Z" fill="var(--s3)"><title>File READ, 4 KiB — kqring, inline, 32 per enter: 780 ns</title></path>
+<text x="199.1" y="223" class="val">780</text>
 <text x="110.0" y="271.0" class="lab" text-anchor="end">Empty op (NOP)</text>
 <path d="M120.0,244.0 H143.2 Q147.2,244.0 147.2,248.0 V254.0 Q147.2,258.0 143.2,258.0 H120.0 Z" fill="var(--kqueue)"><title>Empty op (NOP) — kqueue: 287 ns</title></path>
 <text x="152.2" y="255" class="val">287</text>
 <path d="M120.0,260.0 H157.7 Q161.7,260.0 161.7,264.0 V270.0 Q161.7,274.0 157.7,274.0 H120.0 Z" fill="var(--s1)"><title>Empty op (NOP) — kqring, inline: 439 ns</title></path>
 <text x="166.7" y="271" class="val">439</text>
-<path d="M120.0,276.0 H547.9 Q551.9,276.0 551.9,280.0 V286.0 Q551.9,290.0 547.9,290.0 H120.0 Z" fill="var(--s2)"><title>Empty op (NOP) — kqring, via worker: 4,546 ns</title></path>
-<text x="556.9" y="287" class="val">4,546</text>
+<path d="M120.0,276.0 H546.5 Q550.5,276.0 550.5,280.0 V286.0 Q550.5,290.0 546.5,290.0 H120.0 Z" fill="var(--s2)"><title>Empty op (NOP) — kqring, via worker: 4,531 ns</title></path>
+<text x="555.5" y="287" class="val">4,531</text>
 <line x1="120.0" y1="94" x2="120.0" y2="312" class="axis"/>
 </svg>
