@@ -175,6 +175,28 @@ kqring_fork(struct filedesc *fdp __unused, struct file *fp, struct file **fp1,
  * ============================================================================
  */
 
+/* Free the rings' memory, from kqring_alloc_shm() or kqring_pin_shm(). */
+static void
+kqring_ring_mem_free(struct kqring_ctx *ctx)
+{
+	if (ctx->ring_pages != NULL)
+		kqring_unpin_shm(ctx->ring_kva, ctx->ring_alloc_len,
+		    ctx->ring_pages);
+	else
+		kqring_free_shm(ctx->ring_obj, ctx->ring_kva,
+		    ctx->ring_alloc_len);
+	if (ctx->sqes_pages != NULL)
+		kqring_unpin_shm(ctx->sqes_kva, ctx->sqes_alloc_len,
+		    ctx->sqes_pages);
+	else
+		kqring_free_shm(ctx->sqes_obj, ctx->sqes_kva,
+		    ctx->sqes_alloc_len);
+	ctx->ring_obj = ctx->sqes_obj = NULL;
+	ctx->ring_pages = ctx->sqes_pages = NULL;
+	ctx->ring_kva = ctx->sqes_kva = 0;
+	ctx->ring_alloc_len = ctx->sqes_alloc_len = 0;
+}
+
 static void
 kqring_ctx_free_final(struct kqring_ctx *ctx)
 {
@@ -251,8 +273,7 @@ kqring_ctx_free_final(struct kqring_ctx *ctx)
 	seldrain(&ctx->rsel);
 	knlist_clear(&ctx->rsel.si_note, 0);
 	knlist_destroy(&ctx->rsel.si_note);
-	kqring_free_shm(ctx->ring_obj, ctx->ring_kva, ctx->ring_alloc_len);
-	kqring_free_shm(ctx->sqes_obj, ctx->sqes_kva, ctx->sqes_alloc_len);
+	kqring_ring_mem_free(ctx);
 	sx_destroy(&ctx->sq_sx);
 	sx_destroy(&ctx->bg_sx);
 	mtx_destroy(&ctx->mtx);
@@ -525,6 +546,10 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	if ((p.flags & IORING_SETUP_SQ_AFF) != 0 &&
 	    (p.flags & IORING_SETUP_SQPOLL) == 0)
 		return (EINVAL);
+	/* A ring with no descriptor has nothing to mmap through. */
+	if ((p.flags & IORING_SETUP_REGISTERED_FD_ONLY) != 0 &&
+	    (p.flags & IORING_SETUP_NO_MMAP) == 0)
+		return (EINVAL);
 	if ((p.flags & IORING_SETUP_SQ_AFF) != 0) {
 		if (p.sq_thread_cpu >= CPU_SETSIZE ||
 		    CPU_ABSENT((int)p.sq_thread_cpu) ||
@@ -597,31 +622,48 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	cqe_shift = (p.flags & IORING_SETUP_CQE32) != 0 ? 1 : 0;
 	sqe_shift = (p.flags & IORING_SETUP_SQE128) != 0 ? 1 : 0;
 	array_off = sizeof(struct kqring_shm_header);
-	cqes_off = array_off + sq_entries * sizeof(uint32_t);
+	cqes_off = array_off;
+	if ((p.flags & IORING_SETUP_NO_SQARRAY) == 0)
+		cqes_off += sq_entries * sizeof(uint32_t);
 	ring_bytes = cqes_off +
 	    ((size_t)cq_entries * sizeof(struct io_uring_cqe) << cqe_shift);
 	sqes_bytes = (size_t)sq_entries * sizeof(struct io_uring_sqe) <<
 	    sqe_shift;
 
-	error = kqring_alloc_shm(ring_bytes, &ctx->ring_obj, &ctx->ring_kva,
-	    &ctx->ring_alloc_len);
-	if (error != 0) {
-		kqring_wq_put(attach_wq);
-		return (error);
+	/*
+	 * NO_MMAP: the rings are in the caller's memory, at cq_off.user_addr
+	 * (header, SQ array, CQEs) and sq_off.user_addr (SQEs), as io_uring
+	 * takes them.
+	 */
+	if ((p.flags & IORING_SETUP_NO_MMAP) != 0) {
+		error = kqring_pin_shm(td, p.cq_off.user_addr, ring_bytes,
+		    &ctx->ring_kva, &ctx->ring_alloc_len, &ctx->ring_pages);
+		if (error == 0) {
+			error = kqring_pin_shm(td, p.sq_off.user_addr,
+			    sqes_bytes, &ctx->sqes_kva, &ctx->sqes_alloc_len,
+			    &ctx->sqes_pages);
+		}
+		if (error == 0 && ctx->ring_kva != 0) {
+			/* As a fresh ring: the caller's bytes mean nothing. */
+			memset((void *)ctx->ring_kva, 0, ring_bytes);
+		}
+	} else {
+		error = kqring_alloc_shm(ring_bytes, &ctx->ring_obj,
+		    &ctx->ring_kva, &ctx->ring_alloc_len);
+		if (error == 0) {
+			error = kqring_alloc_shm(sqes_bytes, &ctx->sqes_obj,
+			    &ctx->sqes_kva, &ctx->sqes_alloc_len);
+		}
 	}
-
-	error = kqring_alloc_shm(sqes_bytes, &ctx->sqes_obj, &ctx->sqes_kva,
-	    &ctx->sqes_alloc_len);
 	if (error != 0) {
-		kqring_free_shm(ctx->ring_obj, ctx->ring_kva,
-		    ctx->ring_alloc_len);
-		ctx->ring_obj = NULL;
+		kqring_ring_mem_free(ctx);
 		kqring_wq_put(attach_wq);
 		return (error);
 	}
 
 	ctx->shm = (struct kqring_shm_header *)ctx->ring_kva;
-	ctx->sq_array = (uint32_t *)(ctx->ring_kva + array_off);
+	ctx->sq_array = (p.flags & IORING_SETUP_NO_SQARRAY) != 0 ? NULL :
+	    (uint32_t *)(ctx->ring_kva + array_off);
 	ctx->cqes = (struct io_uring_cqe *)(ctx->ring_kva + cqes_off);
 	ctx->sqes = (struct io_uring_sqe *)ctx->sqes_kva;
 
@@ -669,7 +711,7 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	    sq_ring_entries);
 	p.sq_off.flags = offsetof(struct kqring_shm_header, sq_flags);
 	p.sq_off.dropped = offsetof(struct kqring_shm_header, sq_dropped);
-	p.sq_off.array = (uint32_t)array_off;
+	p.sq_off.array = ctx->sq_array != NULL ? (uint32_t)array_off : 0;
 
 	p.cq_off.head = offsetof(struct kqring_shm_header, cq_head);
 	p.cq_off.tail = offsetof(struct kqring_shm_header, cq_tail);
@@ -710,11 +752,7 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 			attach_wq = cur_wq;
 		}
 		/* Undo, so that a retried setup does not leak the rings. */
-		kqring_free_shm(ctx->ring_obj, ctx->ring_kva,
-		    ctx->ring_alloc_len);
-		kqring_free_shm(ctx->sqes_obj, ctx->sqes_kva,
-		    ctx->sqes_alloc_len);
-		ctx->ring_obj = ctx->sqes_obj = NULL;
+		kqring_ring_mem_free(ctx);
 		ctx->shm = NULL;
 		ctx->sq_array = NULL;
 		ctx->cqes = NULL;
@@ -1443,6 +1481,22 @@ kqring_sys_setup(struct thread *td, struct kqring_setup_args *uap)
 	error = kqring_sys_ring(td, fd, false, false, &fp, &ctx);
 	if (error == 0) {
 		error = kqring_ioc_setup(ctx, &sa, td);
+		/*
+		 * REGISTERED_FD_ONLY: the ring goes in the registered-ring
+		 * table, with the reference fp holds, and its descriptor is
+		 * closed; the slot is returned instead.
+		 */
+		if (error == 0 &&
+		    (ctx->flags & IORING_SETUP_REGISTERED_FD_ONLY) != 0) {
+			uint32_t slot = IORING_FILE_INDEX_ALLOC;
+
+			error = kqring_ring_fds_insert(td, fp, &slot);
+			if (error == 0) {
+				(void)kern_close(td, fd);
+				td->td_retval[0] = slot;
+				return (0);
+			}
+		}
 		fdrop(fp, td);
 	}
 	if (error != 0) {
@@ -1627,7 +1681,7 @@ kqring_mmap_object(struct kqring_ctx *ctx, vm_ooffset_t *offset,
 		return (EINVAL);
 
 	if (*offset == IORING_OFF_SQ_RING || *offset == IORING_OFF_CQ_RING) {
-		if (size > ctx->ring_alloc_len)
+		if (ctx->ring_obj == NULL || size > ctx->ring_alloc_len)
 			return (EINVAL);
 		vm_object_reference(ctx->ring_obj);
 		*object = ctx->ring_obj;
@@ -1635,7 +1689,7 @@ kqring_mmap_object(struct kqring_ctx *ctx, vm_ooffset_t *offset,
 		return (0);
 	}
 	if (*offset == IORING_OFF_SQES) {
-		if (size > ctx->sqes_alloc_len)
+		if (ctx->sqes_obj == NULL || size > ctx->sqes_alloc_len)
 			return (EINVAL);
 		vm_object_reference(ctx->sqes_obj);
 		*object = ctx->sqes_obj;

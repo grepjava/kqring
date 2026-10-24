@@ -96,6 +96,7 @@ flowchart LR
 ```
 
 - **Cacheline separation:** [`struct kqring_shm_header`](kmod/kqring_var.h#L168-L185) places kernel-written and user-written indices on separate 64-byte cachelines to eliminate false sharing between userspace submission/reaping and kernel completion.
+- **`IORING_SETUP_NO_MMAP`:** the two regions are the caller's memory instead, at `cq_off.user_addr` (header, SQ array, CQEs) and `sq_off.user_addr` (SQEs). `kqring_pin_shm()` holds the pages (`vm_fault_quick_hold_pages()`), maps them at a KVA with `pmap_qenter()`, and sets the range `VM_INHERIT_SHARE`: after a `fork(2)`, copy-on-write would hand the parent new pages at its next write while the ring kept the old ones. The ring descriptor then can't be mmap'd. With `REGISTERED_FD_ONLY` the ring goes straight into the process's registered-ring table and `kqring_setup()` returns the slot; with `NO_SQARRAY` there is no SQ array and SQ entries index the SQEs directly.
 - **Overflow resilience:** If `cq_tail - cq_head >= cq_entries`, completions are queued in `ctx->overflow` (`TAILQ`) and `shm->cq_overflow` is incremented. `kqring_flush_overflow()` drains queued entries into the shared CQ ring as soon as userspace advances `cq_head`.
 
 ---

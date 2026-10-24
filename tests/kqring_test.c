@@ -491,7 +491,7 @@ test_setup_errors(void)
 	    IORING_SETUP_DEFER_TASKRUN;
 	static const uint32_t bad[] = {
 		IORING_SETUP_SQ_AFF,
-		IORING_SETUP_ATTACH_WQ, 1U << 16 /* NO_SQARRAY */,
+		IORING_SETUP_ATTACH_WQ, 1U << 17 /* HYBRID_IOPOLL */,
 	};
 	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
 		p.flags = req | bad[i];
@@ -7073,6 +7073,113 @@ test_min_wait(void)
 	    "min_wait, then on the next CQE or the timeout\n");
 }
 
+/* Submit one NOP through rings in the caller's memory and reap it. */
+static void
+no_mmap_nop(char *ring, char *sqes, const struct io_uring_params *p,
+    int fd, unsigned enter_flags, uint64_t ud)
+{
+	_Atomic unsigned *sq_tail = (_Atomic unsigned *)(ring + p->sq_off.tail);
+	_Atomic unsigned *cq_head = (_Atomic unsigned *)(ring + p->cq_off.head);
+	_Atomic unsigned *cq_tail = (_Atomic unsigned *)(ring + p->cq_off.tail);
+	unsigned smask = *(unsigned *)(ring + p->sq_off.ring_mask);
+	unsigned cmask = *(unsigned *)(ring + p->cq_off.ring_mask);
+	unsigned t = atomic_load(sq_tail), h = atomic_load(cq_head);
+	struct io_uring_sqe *sqe = (struct io_uring_sqe *)sqes + (t & smask);
+	struct io_uring_cqe *cqe;
+
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->opcode = IORING_OP_NOP;
+	sqe->user_data = ud;
+	if (p->sq_off.array != 0)
+		((unsigned *)(ring + p->sq_off.array))[t & smask] = t & smask;
+	atomic_store_explicit(sq_tail, t + 1, memory_order_release);
+	assert(kqring_enter(fd, 1, 1, IORING_ENTER_GETEVENTS | enter_flags,
+	    NULL, 0) == 1);
+	assert(atomic_load_explicit(cq_tail, memory_order_acquire) == h + 1);
+	cqe = (struct io_uring_cqe *)(ring + p->cq_off.cqes) + (h & cmask);
+	assert(cqe->user_data == ud && cqe->res == 0);
+	atomic_store_explicit(cq_head, h + 1, memory_order_release);
+}
+
+/*
+ * IORING_SETUP_NO_MMAP: the rings live in the caller's memory (here
+ * private anonymous memory, which fork(2) must not turn copy-on-write
+ * under the ring), with NO_SQARRAY, and with REGISTERED_FD_ONLY, where
+ * setup returns a registered-ring slot and no descriptor.
+ */
+static void
+test_no_mmap(void)
+{
+	long page = sysconf(_SC_PAGESIZE);
+	struct io_uring_params p;
+	struct io_uring_rsrc_update up;
+	char *mem, *ring, *sqes;
+	int fd, slot, status;
+	pid_t pid;
+
+	mem = mmap(NULL, 4 * page, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(mem != MAP_FAILED);
+	ring = mem;
+	sqes = mem + 2 * page;
+
+	/* 1. No SQE address, an unaligned one, a ring with no descriptor
+	 * but mmap'd rings. */
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_NO_MMAP;
+	p.cq_off.user_addr = (uint64_t)(uintptr_t)ring;
+	assert(kqring_setup(4, &p) == -1 && errno == EFAULT);
+	p.sq_off.user_addr = (uint64_t)(uintptr_t)(sqes + 8);
+	assert(kqring_setup(4, &p) == -1 && errno == EINVAL);
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_REGISTERED_FD_ONLY;
+	assert(kqring_setup(4, &p) == -1 && errno == EINVAL);
+
+	/* 2. NO_MMAP + NO_SQARRAY: the ring can't be mmap'd, NOPs work. */
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_NO_MMAP | IORING_SETUP_NO_SQARRAY |
+	    IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+	p.cq_off.user_addr = (uint64_t)(uintptr_t)ring;
+	p.sq_off.user_addr = (uint64_t)(uintptr_t)sqes;
+	fd = (int)kqring_setup(4, &p);
+	assert(fd >= 0 && p.sq_off.array == 0);
+	assert(mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+	    IORING_OFF_SQ_RING) == MAP_FAILED);
+	assert(mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+	    IORING_OFF_SQES) == MAP_FAILED);
+	no_mmap_nop(ring, sqes, &p, fd, 0, 75001);
+
+	/* 3. After a fork, the parent's writes still reach the ring. */
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0)
+		_exit(0);
+	assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status));
+	for (int i = 0; i < 6; i++)
+		no_mmap_nop(ring, sqes, &p, fd, 0, 75002 + i);
+	close(fd);
+
+	/* 4. REGISTERED_FD_ONLY: a slot, entered as a registered ring. */
+	memset(mem, 0, 4 * page);
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_NO_MMAP | IORING_SETUP_REGISTERED_FD_ONLY;
+	p.cq_off.user_addr = (uint64_t)(uintptr_t)ring;
+	p.sq_off.user_addr = (uint64_t)(uintptr_t)sqes;
+	slot = (int)kqring_setup(4, &p);
+	assert(slot >= 0 && slot < 16 && p.sq_off.array != 0);
+	no_mmap_nop(ring, sqes, &p, slot, IORING_ENTER_REGISTERED_RING,
+	    75010);
+	memset(&up, 0, sizeof(up));
+	up.offset = (uint32_t)slot;
+	assert(kqring_register(slot, IORING_UNREGISTER_RING_FDS |
+	    IORING_REGISTER_USE_REGISTERED_RING, &up, 1) == 1);
+	assert(kqring_enter(slot, 0, 0, IORING_ENTER_REGISTERED_RING, NULL,
+	    0) == -1);
+	munmap(mem, 4 * page);
+	printf("[PASS] NO_MMAP rings in the caller's memory (NO_SQARRAY, "
+	    "after fork), REGISTERED_FD_ONLY\n");
+}
+
 static void
 test_sqe128_cqe32_attach_wq(void)
 {
@@ -7843,6 +7950,7 @@ main(int argc, char **argv)
 		test_kpoll();
 		test_pipe_nowait();
 		test_min_wait();
+		test_no_mmap();
 		test_sqe128_cqe32_attach_wq();
 		test_registered_rings();
 		test_sqpoll_and_iopoll();

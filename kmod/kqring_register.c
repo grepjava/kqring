@@ -6,22 +6,17 @@
 
 #include "kqring_var.h"
 
-static int
-kqring_ring_fds_register(struct thread *td,
-    const struct kqring_register_arg *ra, int *resp)
+/*
+ * Put fp (a reference the table takes over) in the process's registered-
+ * ring table, at *slotp or, for IORING_FILE_INDEX_ALLOC, in the first free
+ * slot, which *slotp is set to.
+ */
+int
+kqring_ring_fds_insert(struct thread *td, struct file *fp, uint32_t *slotp)
 {
-	struct io_uring_rsrc_update up;
 	struct kqring_proc_rings *pr, *alloc_pr;
-	struct kqring_ctx *rctx;
-	struct file *fp;
-	cap_rights_t rights;
-	uint32_t i, slot;
+	uint32_t slot = *slotp;
 	int error = 0;
-
-	if (ra->arg == NULL || ra->nr_args == 0)
-		return (EINVAL);
-	if (ra->nr_args > KQRING_MAX_REG_RINGS)
-		return (EMFILE);
 
 	alloc_pr = malloc(sizeof(*alloc_pr), M_KQRING, M_WAITOK | M_ZERO);
 	alloc_pr->proc = td->td_proc;
@@ -34,8 +29,44 @@ kqring_ring_fds_register(struct thread *td,
 		LIST_INSERT_HEAD(kqring_proc_bucket(td->td_proc), pr, link);
 		rm_wunlock(&kqring_rings_rm);
 	}
+	if (slot == IORING_FILE_INDEX_ALLOC) {
+		for (slot = 0; slot < KQRING_MAX_REG_RINGS; slot++) {
+			if (pr->rings[slot] == NULL)
+				break;
+		}
+		if (slot == KQRING_MAX_REG_RINGS)
+			error = ENFILE;
+	} else if (pr->rings[slot] != NULL) {
+		error = EBUSY;
+	}
+	if (error == 0) {
+		rm_wlock(&kqring_rings_rm);
+		pr->rings[slot] = fp;
+		rm_wunlock(&kqring_rings_rm);
+		pr->nrings++;
+		*slotp = slot;
+	}
 	mtx_unlock(&kqring_proc_mtx);
 	free(alloc_pr, M_KQRING);
+	return (error);
+}
+
+static int
+kqring_ring_fds_register(struct thread *td,
+    const struct kqring_register_arg *ra, int *resp)
+{
+	struct io_uring_rsrc_update up;
+	struct kqring_proc_rings *pr;
+	struct kqring_ctx *rctx;
+	struct file *fp;
+	cap_rights_t rights;
+	uint32_t i, slot;
+	int error = 0;
+
+	if (ra->arg == NULL || ra->nr_args == 0)
+		return (EINVAL);
+	if (ra->nr_args > KQRING_MAX_REG_RINGS)
+		return (EMFILE);
 
 	for (i = 0; i < ra->nr_args; i++) {
 		uint8_t *uptr = (uint8_t *)ra->arg + i * sizeof(up);
@@ -63,25 +94,8 @@ kqring_ring_fds_register(struct thread *td,
 			fdrop(fp, td);
 			break;
 		}
-		mtx_lock(&kqring_proc_mtx);
 		slot = up.offset;
-		if (slot == IORING_FILE_INDEX_ALLOC) {
-			for (slot = 0; slot < KQRING_MAX_REG_RINGS; slot++) {
-				if (pr->rings[slot] == NULL)
-					break;
-			}
-			if (slot == KQRING_MAX_REG_RINGS)
-				error = ENFILE;
-		} else if (pr->rings[slot] != NULL) {
-			error = EBUSY;
-		}
-		if (error == 0) {
-			rm_wlock(&kqring_rings_rm);
-			pr->rings[slot] = fp;
-			rm_wunlock(&kqring_rings_rm);
-			pr->nrings++;
-		}
-		mtx_unlock(&kqring_proc_mtx);
+		error = kqring_ring_fds_insert(td, fp, &slot);
 		if (error != 0) {
 			fdrop(fp, td);
 			break;
@@ -91,7 +105,8 @@ kqring_ring_fds_register(struct thread *td,
 			error = copyout(&up.offset, uptr, sizeof(up.offset));
 			if (error != 0) {
 				mtx_lock(&kqring_proc_mtx);
-				if (pr->rings[slot] == fp) {
+				pr = kqring_proc_find_locked(td->td_proc);
+				if (pr != NULL && pr->rings[slot] == fp) {
 					rm_wlock(&kqring_rings_rm);
 					pr->rings[slot] = NULL;
 					rm_wunlock(&kqring_rings_rm);

@@ -63,6 +63,59 @@ kqring_alloc_shm(size_t bytes, vm_object_t *obj_out, vm_offset_t *kva_out,
 	return (0);
 }
 
+/*
+ * IORING_SETUP_NO_MMAP: the owner's memory at uaddr instead, its pages
+ * held and mapped into the kernel.  The range is made to be shared rather
+ * than copied on fork(2): copy-on-write would give the parent new pages
+ * at its next write, and the ring would go on using the child's.
+ */
+int
+kqring_pin_shm(struct thread *td, uint64_t uaddr, size_t bytes,
+    vm_offset_t *kva_out, size_t *alloc_len_out, vm_page_t **pages_out)
+{
+	vm_map_t map = &td->td_proc->p_vmspace->vm_map;
+	vm_offset_t va = (vm_offset_t)uaddr, kva;
+	size_t size = round_page(bytes);
+	int npages = (int)atop(size);
+	vm_page_t *ma;
+
+	if (uaddr == 0)
+		return (EFAULT);
+	if ((va & PAGE_MASK) != 0)
+		return (EINVAL);
+	if (va + size < va || va + size > vm_map_max(map))
+		return (EFAULT);
+	ma = malloc(npages * sizeof(*ma), M_KQRING, M_WAITOK);
+	if (vm_fault_quick_hold_pages(map, va, size,
+	    VM_PROT_READ | VM_PROT_WRITE, ma, npages) != npages) {
+		free(ma, M_KQRING);
+		return (EFAULT);
+	}
+	kva = kva_alloc(size);
+	if (kva == 0) {
+		vm_page_unhold_pages(ma, npages);
+		free(ma, M_KQRING);
+		return (ENOMEM);
+	}
+	pmap_qenter(kva, ma, npages);
+	(void)vm_map_inherit(map, va, va + size, VM_INHERIT_SHARE);
+	*kva_out = kva;
+	*alloc_len_out = size;
+	*pages_out = ma;
+	return (0);
+}
+
+void
+kqring_unpin_shm(vm_offset_t kva, size_t alloc_len, vm_page_t *pages)
+{
+	if (pages == NULL)
+		return;
+	pmap_qremove(kva, atop(alloc_len));
+	kva_free(kva, alloc_len);
+	vm_page_unhold_pages(pages, (int)atop(alloc_len));
+	free(pages, M_KQRING);
+}
+
 void
 kqring_free_shm(vm_object_t obj, vm_offset_t kva, size_t alloc_len)
 {
@@ -2244,7 +2297,8 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 	/* CQEs posted inline here are not "async" (EVENTFD_ASYNC). */
 	ctx->submitting = true;
 	while (consumed < max_submit) {
-		uint32_t sqe_idx = ctx->sq_array[head & ctx->sq_mask];
+		uint32_t sqe_idx = ctx->sq_array != NULL ?
+		    ctx->sq_array[head & ctx->sq_mask] : head & ctx->sq_mask;
 		head++;
 		consumed++;
 		if (sqe_idx >= ctx->sq_entries) {

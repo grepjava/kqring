@@ -187,7 +187,9 @@ MALLOC_DECLARE(M_SELFD);
 	IORING_SETUP_R_DISABLED | IORING_SETUP_SUBMIT_ALL |		\
 	IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG |		\
 	IORING_SETUP_SQE128 | IORING_SETUP_CQE32 |			\
-	IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)
+	IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |	\
+	IORING_SETUP_NO_MMAP | IORING_SETUP_REGISTERED_FD_ONLY |	\
+	IORING_SETUP_NO_SQARRAY)
 
 /* KQRING_IOC_ENTER flags implemented. */
 #define	KQRING_ENTER_FLAGS						\
@@ -614,10 +616,15 @@ struct kqring_ctx {
 	uint32_t		sq_mask;
 	uint32_t		cq_mask;
 
-	/* Shared memory regions (wired VM objects + KVA mappings) */
+	/*
+	 * Shared memory regions: wired VM objects that the owner mmaps, or
+	 * with IORING_SETUP_NO_MMAP the owner's own pages, held (*_pages).
+	 * Either way mapped at *_kva.  sq_array is NULL with NO_SQARRAY.
+	 */
 	vm_object_t		ring_obj;
 	vm_offset_t		ring_kva;
 	size_t			ring_alloc_len;
+	vm_page_t		*ring_pages;
 	struct kqring_shm_header *shm;
 	uint32_t		*sq_array;
 	struct io_uring_cqe	*cqes;
@@ -625,6 +632,7 @@ struct kqring_ctx {
 	vm_object_t		sqes_obj;
 	vm_offset_t		sqes_kva;
 	size_t			sqes_alloc_len;
+	vm_page_t		*sqes_pages;
 	struct io_uring_sqe	*sqes;
 
 	/* Provided buffer groups by bgid; see struct kqring_bgroup. */
@@ -1161,6 +1169,11 @@ int	kqring_reg_ring_fget(struct thread *td, uint32_t slot, bool is_enter,
 int	kqring_alloc_shm(size_t bytes, vm_object_t *obj_out,
 	    vm_offset_t *kva_out, size_t *alloc_len_out);
 void	kqring_free_shm(vm_object_t obj, vm_offset_t kva, size_t alloc_len);
+int	kqring_ring_fds_insert(struct thread *td, struct file *fp,
+	    uint32_t *slotp);
+int	kqring_pin_shm(struct thread *td, uint64_t uaddr, size_t bytes,
+	    vm_offset_t *kva_out, size_t *alloc_len_out, vm_page_t **pages_out);
+void	kqring_unpin_shm(vm_offset_t kva, size_t alloc_len, vm_page_t *pages);
 void	kqring_flush_overflow(struct kqring_ctx *ctx);
 void	kqring_post_cqe_extra(struct kqring_ctx *ctx, uint64_t user_data,
 	    int32_t res, uint32_t flags, const uint64_t *extra);

@@ -201,6 +201,9 @@ _Static_assert(sizeof(struct io_uring_cqe) == 16, "io_uring_cqe must be 16 bytes
 #define IORING_SETUP_CQE32		(1U << 11)
 #define IORING_SETUP_SINGLE_ISSUER	(1U << 12)	/* required */
 #define IORING_SETUP_DEFER_TASKRUN	(1U << 13)	/* required */
+#define IORING_SETUP_NO_MMAP		(1U << 14)
+#define IORING_SETUP_REGISTERED_FD_ONLY	(1U << 15)
+#define IORING_SETUP_NO_SQARRAY		(1U << 16)
 
 /*
  * Opcodes (sqe->opcode)
