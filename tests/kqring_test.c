@@ -2929,6 +2929,172 @@ test_send_zc(struct test_ring *r)
 	c = expect_cqe(r, 30546, 0);
 	assert(c.flags == IORING_CQE_F_NOTIF);
 	assert(kqring_register(r->fd, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+
+	/*
+	 * Unaligned and short iovecs under multi-send mbuf pressure: queue 4
+	 * unread scatter/gather SENDMSG_ZC requests (each spanning an unaligned
+	 * cross-page iovec, a short 251-byte iovec, and a trailing unaligned
+	 * iovec = 4 pages/send, 16 pages total), mutate the pinned memory while
+	 * all 4 multi-mbuf EXT_SFBUF chains sit in the socket buffer, then
+	 * drain and verify every CQE.
+	 */
+	int sndbuf_big = 256 * 1024;
+	(void)setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf_big,
+	    sizeof(sndbuf_big));
+	(void)setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &sndbuf_big,
+	    sizeof(sndbuf_big));
+	memset(zbuf, 'U', zlen);
+	memset(zbuf2, 'S', page);
+	struct iovec unaligned_iov[3] = {
+		{ .iov_base = zbuf + 137, .iov_len = page + 511 },
+		{ .iov_base = zbuf2 + 73, .iov_len = 251 },
+		{ .iov_base = zbuf + page + 19, .iov_len = 700 },
+	};
+	size_t unaligned_tot = (page + 511) + 251 + 700;
+	struct msghdr unaligned_msg = {
+		.msg_iov = unaligned_iov,
+		.msg_iovlen = 3,
+	};
+	for (int i = 0; i < 4; i++) {
+		sqe = ring_prep(r, IORING_OP_SENDMSG_ZC, sv[0], 30550 + i);
+		sqe->addr = (uint64_t)(uintptr_t)&unaligned_msg;
+		sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
+		ring_push_sqe(r);
+	}
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 4);
+	for (int i = 0; i < 4; i++) {
+		c = expect_cqe(r, 30550 + i, (int32_t)unaligned_tot);
+		assert((c.flags & IORING_CQE_F_MORE) != 0);
+	}
+	/* Mutate both pinned buffers while all 4 chains are unread in sv[1]. */
+	zbuf[137] = 'J';
+	zbuf2[73] = 'K';
+	char *ubuf = malloc(unaligned_tot);
+	assert(ubuf != NULL);
+	for (int i = 0; i < 4; i++) {
+		assert(read(sv[1], ubuf, unaligned_tot) ==
+		    (ssize_t)unaligned_tot);
+		assert(ubuf[0] == 'J' && ubuf[1] == 'U');
+		assert(ubuf[page + 511] == 'K' && ubuf[page + 512] == 'S');
+	}
+	free(ubuf);
+	assert(ring_wait(r, 4, 2000) == 0);
+	for (int i = 0; i < 4; i++) {
+		c = expect_cqe(r, 30550 + i, 0);
+		assert(c.flags == IORING_CQE_F_NOTIF);
+	}
+
+	/*
+	 * Failure while pinning a later segment:
+	 * 1) RLIMIT_MEMLOCK cap of 1 page allows iov[0] (1 page) to pin, then
+	 *    fails iov[1] (1 page) with ENOMEM; kqring_send_zc_iov must unpin
+	 *    and uncharge iov[0] and fall back to copy (ZC_COPIED).
+	 * 2) Unmapped second segment (PROT_NONE / munmapped) after valid iov[0]
+	 *    must unpin iov[0] without leaking wired pages.
+	 */
+	rl.rlim_cur = (rlim_t)page;
+	rl.rlim_max = old_rl.rlim_max;
+	assert(setrlimit(RLIMIT_MEMLOCK, &rl) == 0);
+	sqe = ring_prep(r, IORING_OP_SENDMSG_ZC, sv[0], 30560);
+	sqe->addr = (uint64_t)(uintptr_t)&sgmsg;
+	sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	c = expect_cqe(r, 30560, (int32_t)zlen);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	c = expect_cqe(r, 30560, (int32_t)IORING_NOTIF_USAGE_ZC_COPIED);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	assert(read(sv[1], rbuf, zlen) == (ssize_t)zlen);
+	/* Verify iov[0]'s 1-page charge was released on segment-1 failure. */
+	assert(kqring_register(r->fd, IORING_REGISTER_BUFFERS, &one_page,
+	    1) == 0);
+	assert(kqring_register(r->fd, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+	assert(setrlimit(RLIMIT_MEMLOCK, &old_rl) == 0);
+
+	char *bad_seg = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANON,
+	    -1, 0);
+	assert(bad_seg != MAP_FAILED);
+	struct iovec fault_iov[2] = {
+		{ .iov_base = zbuf, .iov_len = page },
+		{ .iov_base = bad_seg, .iov_len = page },
+	};
+	struct msghdr fault_msg = { .msg_iov = fault_iov, .msg_iovlen = 2 };
+	sqe = ring_prep(r, IORING_OP_SENDMSG_ZC, sv[0], 30561);
+	sqe->addr = (uint64_t)(uintptr_t)&fault_msg;
+	sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	c = ring_pop_cqe(r);
+	assert(c.user_data == 30561);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	if (c.res > 0) {
+		assert(read(sv[1], rbuf, (size_t)c.res) == (ssize_t)c.res);
+	} else {
+		assert(c.res == -EFAULT);
+	}
+	c = ring_pop_cqe(r);
+	assert(c.user_data == 30561 && c.flags == IORING_CQE_F_NOTIF);
+	munmap(bad_seg, page);
+
+	/*
+	 * TCP partial zero-copy send: constrain SO_SNDBUF on a non-blocking TCP
+	 * socket so a multi-iovec SENDMSG_ZC (without MSG_WAITALL) sends a
+	 * partial byte count (>= PAGE_SIZE and < total), pins only the sent
+	 * range, and posts IORING_CQE_F_NOTIF once the peer drains it.
+	 */
+	lfd = tcp_listener(&port);
+	cfd = tcp_connect(port);
+	wait_readable(lfd);
+	afd = accept(lfd, NULL, NULL);
+	assert(afd >= 0);
+	int small_snd = (int)(4 * page);
+	(void)setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &small_snd,
+	    sizeof(small_snd));
+	/* Fill part of cfd's send buffer so the next ZC send is clamped. */
+	memset(zbuf, 'P', zlen);
+	memset(zbuf2, 'Q', page);
+	struct iovec tcp_iov[6] = {
+		{ .iov_base = zbuf, .iov_len = zlen },
+		{ .iov_base = zbuf2, .iov_len = page },
+		{ .iov_base = zbuf, .iov_len = zlen },
+		{ .iov_base = zbuf2, .iov_len = page },
+		{ .iov_base = zbuf, .iov_len = zlen },
+		{ .iov_base = zbuf2, .iov_len = page },
+	};
+	size_t tcp_want = 3 * (zlen + page);
+	struct msghdr tcp_msg = { .msg_iov = tcp_iov, .msg_iovlen = 6 };
+	sqe = ring_prep(r, IORING_OP_SENDMSG_ZC, cfd, 30562);
+	sqe->addr = (uint64_t)(uintptr_t)&tcp_msg;
+	sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) >= 1);
+	c = ring_pop_cqe(r);
+	assert(c.user_data == 30562);
+	assert(c.res >= (int32_t)page && (size_t)c.res < tcp_want);
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	size_t tcp_sent = (size_t)c.res;
+	char *tbuf = malloc(tcp_sent);
+	assert(tbuf != NULL);
+	got = 0;
+	while (got < tcp_sent) {
+		wait_readable(afd);
+		ssize_t n = read(afd, tbuf + got, tcp_sent - got);
+		assert(n > 0);
+		got += (size_t)n;
+	}
+	assert(tbuf[0] == 'P');
+	free(tbuf);
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = expect_cqe(r, 30562, 0);
+	assert(c.flags == IORING_CQE_F_NOTIF);
+	close(afd);
+	close(cfd);
+	close(lfd);
+
 	munmap(zbuf2, page);
 	close(sv[0]);
 	close(sv[1]);
