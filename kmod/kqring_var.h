@@ -1464,6 +1464,9 @@ void	kqring_worker_rele(void);
 /* kqring_kpoll.c */
 #define	KQRING_KP_READ	0x01
 #define	KQRING_KP_WRITE	0x02
+/* The return-to-user hook kqring_kpoll_ast() runs from (subr_trap.c). */
+#define	KQRING_TDA	TDA_MOD1
+void	kqring_kpoll_ast(struct thread *td);
 int	kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	    const struct file *fp);
 void	kqring_kpoll_disarm_locked(struct kqring_ctx *ctx,

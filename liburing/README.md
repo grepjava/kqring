@@ -33,9 +33,9 @@ liburing's test suite, run on FreeBSD 15.1 with `kqring.ko` from this tree (Octo
 | | Tests |
 |---|---|
 | Built | 168 (32 more need Linux-only headers or system calls) |
-| Passed | **142** (144 with `RLIMIT_MEMLOCK` raised) |
+| Passed | **143** (145 with `RLIMIT_MEMLOCK` raised) |
 | Skipped | 7 (the test found a feature missing and said so) |
-| Failed | 19, explained below |
+| Failed | 18, explained below |
 
 liburing's two AddressSanitizer tests (`xfail_*`) aren't built. liburing itself only builds them with ASan, and without it they wait forever by design.
 
@@ -57,7 +57,6 @@ liburing's two AddressSanitizer tests (`xfail_*`) aren't built. liburing itself 
 | Tests | Why they fail |
 |---|---|
 | `io-cancel`, `timeout` | A forked child submits to, or cancels on, its parent's ring. kqring rings belong to one process: workers resolve descriptors in the owner's table, so allowing another process could let it reach files it can't see, for example from inside a Capsicum sandbox. The child gets `EEXIST`. |
-| `poll` | Its "lazy" test expects a poll on another ring's descriptor to complete inside the waker's system call. kqring's wakeup arrives through a kernel thread, a moment later. |
 | `waitid` | Expects Linux's result for a `WAITID` cancelled by a link timeout, which reflects an implementation detail of Linux rather than a documented rule. |
 
 ### Skipped tests

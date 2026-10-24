@@ -1672,6 +1672,18 @@ kqring_sys_setup(struct thread *td, struct kqring_setup_args *uap)
  */
 DPCPU_DEFINE_STATIC(u_int, kqring_sys_busy);
 
+/* KQRING_TDA, counted as enter calls are for unload. */
+static void
+kqring_ast(struct thread *td, int asts __unused)
+{
+	u_int *busy = DPCPU_ID_PTR(PCPU_GET(cpuid), kqring_sys_busy);
+
+	atomic_add_acq_int(busy, 1);
+	if (!kqring_unloading)
+		kqring_kpoll_ast(td);
+	atomic_subtract_rel_int(busy, 1);
+}
+
 static int
 kqring_sys_enter(struct thread *td, struct kqring_enter_args *uap)
 {
@@ -1950,6 +1962,7 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			return (ENOMEM);
 		}
 		kqring_sys_register_all();
+		ast_register(KQRING_TDA, ASTR_ASTF_REQUIRED, 0, kqring_ast);
 		printf("kqring: loaded (/dev/kqring)\n");
 		return (0);
 
@@ -1983,9 +1996,11 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 		}
 		mtx_unlock(&kqring_proc_mtx);
 		/*
-		 * The system calls go first, waiting for those in progress:
-		 * after destroy_dev() their rings would be gone.
+		 * The system calls go first, waiting for those in progress
+		 * (and for kqring_ast() calls, counted with them): after
+		 * destroy_dev() their rings would be gone.
 		 */
+		ast_deregister(KQRING_TDA);
 		kqring_sys_deregister_all();
 		/*
 		 * No ring is open, and destroy_dev() waits for opens in

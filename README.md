@@ -182,7 +182,7 @@ Except for the thread scaling, these are single-threaded loopback measurements. 
 - **Eventfd** is signalled once per enter that posted CQEs, and when work is queued for an idle ring. A multishot `POLL_ADD` on the ring's own registered eventfd ends after its first CQE; Linux ends it only when the wakeup came from the ring's own signal.
 
 **Polling**
-- **Wakeups are seen by a kernel thread.** A `POLL_ADD` on a non-socket file is reported by the ring's poller thread, not in the waker's context, so its CQE appears a moment after the wakeup. Linux posts it before the waker's system call returns. Each wakeup still gets its CQE, even if the file is drained again before the poller looks.
+- **Wakeups from other processes are seen by a kernel thread.** A `POLL_ADD` on a non-socket file woken by a thread of the ring's own process gets its CQE before that thread's system call returns, as on Linux; on a `DEFER_TASKRUN` ring, at the owner's next enter. A wakeup from another process, or from a kernel thread, is reported by the ring's poller thread a moment later. Each wakeup gets its CQE, even if the file is drained again before the poller looks.
 
 **Module**
 - **`kldunload` waits for open rings.** Unloading fails with `EBUSY` while any ring descriptor is open, and no ring can be opened while an unload is in progress.
@@ -232,7 +232,7 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
   - [`kqring_rsrc.c`](kmod/kqring_rsrc.c) — fixed files, registered buffers, provided buffers and buffer rings, resource tags and personalities.
   - [`kqring_register.c`](kmod/kqring_register.c) — `io_uring_register` operations.
   - [`kqring_zc.c`](kmod/kqring_zc.c) — zero-copy send: page holding, `RLIMIT_MEMLOCK` accounting and mbuf construction.
-- [`tests/kqring_test.c`](tests/kqring_test.c) — functional test suite: 77 test groups covering every supported opcode, registration, setup flags and the lifetime rules above.
+- [`tests/kqring_test.c`](tests/kqring_test.c) — functional test suite: 81 test groups covering every supported opcode, registration, setup flags and the lifetime rules above.
 - [`tests/kqring_bench.c`](tests/kqring_bench.c) — benchmarks against `kqueue(2)` and plain system calls; [`tests/bench_report.py`](tests/bench_report.py) turns runs into the tables and charts in [`BENCHMARK.MD`](BENCHMARK.MD).
 
 ## Further reading

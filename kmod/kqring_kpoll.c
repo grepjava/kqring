@@ -85,6 +85,13 @@ kqring_kp_copyout(void *arg, struct kevent *kevp, int count)
  * counts and activates the knote, as io_uring's poll sees only the
  * wakeups meant for it.  A scan reports the knote while the file is
  * ready or wakeups came since the last one.
+ *
+ * A wakeup in a user thread of the ring's own process (the kqueue's
+ * descriptor table is that thread's) also schedules kqring_kpoll_ast()
+ * for when the thread returns to user space, which takes the event and
+ * posts the CQE then, as io_uring runs a poll's task_work when the task
+ * returns: a thread that wakes a file one of its rings polls sees the CQE
+ * when its system call returns, not when the poller gets to it.
  */
 static struct file *kqring_kp_getfp(struct kqring_ctx *ctx);
 
@@ -98,6 +105,13 @@ static struct kqring_kp_fops kqring_kp_fops[16];
 static struct mtx kqring_kp_fops_mtx;
 MTX_SYSINIT(kqring_kp_fops, &kqring_kp_fops_mtx, "kqring kpoll fops",
     MTX_DEF);
+
+/*
+ * The thread in kqring_kpoll_ast() on this CPU (pinned there): wakeups it
+ * causes itself, such as a ring polling its own descriptor, don't schedule
+ * it again.
+ */
+DPCPU_DEFINE_STATIC(struct thread *, kqring_kp_in_ast);
 
 #define	KQRING_KP_NOTREADY	UINT32_MAX
 #define	KQRING_KP_EOF		((uint32_t)INT32_MAX + 1)	/* above any kn_data */
@@ -125,6 +139,10 @@ kqring_kp_filt_event(struct knote *kn, long hint)
 		if (!ready || (prev != KQRING_KP_NOTREADY && last <= prev))
 			return (0);
 		ext[2]++;
+		if ((curthread->td_pflags & TDP_KTHREAD) == 0 &&
+		    kn->kn_kq->kq_fdp == curthread->td_proc->p_fd &&
+		    DPCPU_GET(kqring_kp_in_ast) != curthread)
+			ast_sched(curthread, KQRING_TDA);
 		return (1);
 	}
 	pending = (uint32_t)ext[2] != (uint32_t)(ext[3] >> 32);
@@ -518,8 +536,7 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	    (!level ? EV_CLEAR : 0));
 	error = kqring_kp_change(ctx, kev, n);
 	if (error == 0) {
-		if (multi)
-			kqring_kp_wrap(ctx, kev, n);
+		kqring_kp_wrap(ctx, kev, n);
 		return (0);
 	}
 	mtx_lock(&ctx->mtx);
@@ -605,6 +622,86 @@ last:
 	kqring_op_unarm_locked(ctx, op);
 	mtx_unlock(&ctx->mtx);
 	kqring_req_complete(ctx, op, rev, 0);
+}
+
+/*
+ * The events waiting on ctx's kqueue, taken now (without waiting) as the
+ * poller would take them.
+ */
+static void
+kqring_kp_scan(struct kqring_ctx *ctx, struct thread *td)
+{
+	struct kevent kev[KQRING_KP_NEVENTS];
+	struct kqring_kp_io io = { .kev = kev, .max = nitems(kev) };
+	struct kevent_copyops ops = {
+		.arg = &io,
+		.k_copyin = kqring_kp_copyin,
+		.k_copyout = kqring_kp_copyout,
+		.kevent_size = sizeof(struct kevent),
+	};
+	struct timespec zero = { 0, 0 };
+	register_t saved[2] = { td->td_retval[0], td->td_retval[1] };
+	struct file *fp;
+
+	if ((fp = kqring_kp_getfp(ctx)) == NULL)
+		return;
+	(void)kern_kevent_fp(td, fp, 0, nitems(kev), &ops, &zero);
+	td->td_retval[0] = saved[0];
+	td->td_retval[1] = saved[1];
+	fdrop(fp, td);
+	for (int i = 0; i < io.n; i++)
+		kqring_kp_event(ctx, &kev[i]);
+}
+
+/*
+ * KQRING_TDA, on td's return to user space after it woke a file a ring of
+ * its process polls (kqring_kp_filt_event()): take the rings' events, and
+ * on a ring whose completions a kernel thread would otherwise post (no
+ * DEFER_TASKRUN) and td may enter, post them now.  A DEFER_TASKRUN ring
+ * posts them at its owner's next enter, as io_uring does.
+ */
+void
+kqring_kpoll_ast(struct thread *td)
+{
+	struct kqring_ctx *rings[8], *ctx;
+	struct thread *prev;
+	int n = 0;
+
+	mtx_lock(&kqring_proc_mtx);
+	LIST_FOREACH(ctx, &kqring_ctx_list, proc_link) {
+		if (n == nitems(rings))
+			break;
+		if (ctx->owner_proc == td->td_proc && ctx->kp_running &&
+		    !ctx->closing) {
+			refcount_acquire(&ctx->refs);
+			rings[n++] = ctx;
+		}
+	}
+	mtx_unlock(&kqring_proc_mtx);
+
+	sched_pin();
+	prev = DPCPU_GET(kqring_kp_in_ast);
+	DPCPU_SET(kqring_kp_in_ast, td);
+	for (int i = 0; i < n; i++) {
+		ctx = rings[i];
+		kqring_kp_scan(ctx, td);
+		if (ctx->taskrun_only && (ctx->shared ||
+		    kqring_is_owner(ctx, td)) && sx_try_xlock(&ctx->sq_sx)) {
+			if (!ctx->closing) {
+				kqring_run_taskwork(ctx);
+				kqring_flush_overflow(ctx);
+				kqring_evfd_flush(ctx);
+			}
+			sx_xunlock(&ctx->sq_sx);
+			mtx_lock(&ctx->mtx);
+			if (ctx->sleeping)
+				wakeup(&ctx->wakeup_chan);
+			mtx_unlock(&ctx->mtx);
+		}
+		kqring_ctx_rele(ctx);
+	}
+	DPCPU_SET(kqring_kp_in_ast, prev);
+	sched_unpin();
 }
 
 /* Ring teardown: wait for the poller to see ctx->closing and exit. */

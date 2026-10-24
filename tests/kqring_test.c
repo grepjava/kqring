@@ -7274,6 +7274,79 @@ test_resize_rings(void)
 	    "DEFER_TASKRUN only\n");
 }
 
+/*
+ * A thread that wakes a file one of its rings polls sees the CQE when its
+ * system call returns (on a ring without DEFER_TASKRUN), as with io_uring's
+ * task_work: here a write(2) to a pipe, and a NOP on a ring whose
+ * descriptor another ring polls.  A ring polling its own descriptor
+ * doesn't loop.
+ */
+static void
+test_poll_same_thread(void)
+{
+	struct io_uring_sqe *sqe;
+	struct test_ring t, t2;
+	struct io_uring_cqe c;
+	int p[2];
+	char ch;
+
+	ring_setup_shared = true;
+	ring_init(&t);
+	ring_setup_shared = false;
+	ring_init(&t2);
+	assert(pipe(p) == 0);
+
+	/* 1. write(2) to a polled pipe: the CQE is there when it returns. */
+	for (int round = 0; round < 50; round++) {
+		sqe = ring_prep(&t, IORING_OP_POLL_ADD, p[0], 77000 + round);
+		sqe->poll32_events = POLLIN;
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		assert(ring_cq_ready(&t) == 0);
+		assert(write(p[1], "q", 1) == 1);
+		assert(ring_cq_ready(&t) == 1);
+		c = ring_pop_cqe(&t);
+		assert(c.user_data == 77000 + (uint64_t)round &&
+		    (c.res & POLLIN) != 0);
+		assert(read(p[0], &ch, 1) == 1);
+	}
+
+	/* 2. A NOP on t2, whose descriptor t polls: t's CQE is there. */
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, t2.fd, 77100);
+	sqe->poll32_events = POLLIN;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+	(void)ring_prep(&t2, IORING_OP_NOP, -1, 77101);
+	ring_push_sqe(&t2);
+	ring_submit(&t2);
+	assert(ring_cq_ready(&t) == 1);
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 77100 && (c.res & POLLIN) != 0);
+	expect_cqe(&t2, 77101, 0);
+
+	/* 3. Multishot POLLIN on t's own descriptor: CQEs, then quiet. */
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, t.fd, 77200);
+	sqe->poll32_events = POLLIN;
+	sqe->len = IORING_POLL_ADD_MULTI;
+	ring_push_sqe(&t);
+	(void)ring_prep(&t, IORING_OP_NOP, -1, 77201);
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_wait(&t, 2, 2000) == 0);
+	usleep(20 * 1000);
+	ring_drain_cqes(&t);
+	usleep(20 * 1000);
+	ring_drain_cqes(&t);
+
+	close(t.fd);
+	close(t2.fd);
+	close(p[0]);
+	close(p[1]);
+	printf("[PASS] Poll CQE posted before the waking thread's system "
+	    "call returns; self-poll doesn't loop\n");
+}
+
 static void
 test_sqe128_cqe32_attach_wq(void)
 {
@@ -8046,6 +8119,7 @@ main(int argc, char **argv)
 		test_min_wait();
 		test_no_mmap();
 		test_resize_rings();
+		test_poll_same_thread();
 		test_sqe128_cqe32_attach_wq();
 		test_registered_rings();
 		test_sqpoll_and_iopoll();
