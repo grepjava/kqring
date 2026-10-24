@@ -11,7 +11,7 @@ The kernel module (`kmod/`) is split into nine translation units sharing a singl
 ```mermaid
 flowchart TB
     subgraph Userspace["Userspace Process"]
-        App["Application / Vega Runtime"]
+        App["Application"]
         UAPI["include/sys/kqring.h<br/>(kqring_setup / kqring_enter / kqring_register)"]
         App --> UAPI
     end
