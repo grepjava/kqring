@@ -264,8 +264,7 @@ struct kqring_op {
 	struct kqring_op	*link;		/* next request in the chain */
 	struct kqring_op	*ltimeout;	/* LINK_TIMEOUT guarding this */
 	struct kqring_op	*ltarget;	/* LINK_TIMEOUT: request guarded */
-	/* TIMEOUT / LINK_TIMEOUT state */
-	struct callout		callout;	/* uses ctx->mtx */
+	/* TIMEOUT / LINK_TIMEOUT state (and callout below) */
 	struct timespec		ts;
 	uint32_t		target_seq;	/* completion-count TIMEOUT */
 	uint32_t		repeats;	/* multishot: left, 0 = forever */
@@ -293,6 +292,13 @@ struct kqring_op {
 	struct kqring_rsrc	*fbuf;
 	struct kqring_zc_notif	*zc_notif;
 	struct ucred		*cred;
+	struct file		*sock_fp;	/* socket held while retried */
+	/*
+	 * Not cleared when the op is reused (kqring_op_alloc()): the
+	 * callout is initialized once timer_init is set, and the SQE copied
+	 * in at submission (sqe_extra only on IORING_SETUP_SQE128 rings).
+	 */
+	struct callout		callout;	/* uses ctx->mtx */
 	struct io_uring_sqe	sqe;
 	uint8_t			sqe_extra[64];
 };
@@ -409,6 +415,7 @@ struct kqring_zc_notif {
 };
 
 extern struct mtx kqring_zc_mtx;
+SYSCTL_DECL(_kern_kqring);
 extern u_int kqring_zc_local_min_len;
 
 struct kqring_rsrc {

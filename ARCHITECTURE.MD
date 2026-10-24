@@ -17,7 +17,7 @@ flowchart TB
     end
 
     subgraph KMOD["kqring.ko (FreeBSD Kernel Module)"]
-        DEV["kqring_dev.c<br/>Device, ioctl, mmap, setup,<br/>enter/wait, process hooks"]
+        DEV["kqring_dev.c<br/>Device, system calls, ioctl, mmap,<br/>setup, enter/wait, process hooks"]
         REG["kqring_register.c<br/>IORING_REGISTER_* dispatch,<br/>eventfd"]
         REQ["kqring_req.c<br/>SHM, CQ posting, SQE prep,<br/>lifecycle, chains, taskwork"]
         RSRC["kqring_rsrc.c<br/>Fixed files, reg bufs,<br/>PBUF_RING, personalities"]
@@ -28,7 +28,7 @@ flowchart TB
         ZC["kqring_zc.c<br/>Page wiring, RLIMIT_MEMLOCK,<br/>EXT_SFBUF, ZC notif"]
     end
 
-    UAPI -- "ioctl / mmap" --> DEV
+    UAPI -- "system calls (ioctl fallback) / mmap" --> DEV
     DEV --> REG
     DEV --> REQ
     REG --> RSRC
@@ -49,9 +49,9 @@ flowchart TB
 
 | File | Responsibility |
 |---|---|
-| [`include/sys/kqring.h`](include/sys/kqring.h) | Dual kernel/userspace UAPI header: `io_uring_sqe`, `io_uring_cqe`, `io_uring_params`, `io_uring_buf_ring`, `/dev/kqring` ioctls, opcode/flag constants, and inline userspace wrappers. |
+| [`include/sys/kqring.h`](include/sys/kqring.h) | Dual kernel/userspace UAPI header: `io_uring_sqe`, `io_uring_cqe`, `io_uring_params`, `io_uring_buf_ring`, `/dev/kqring` ioctls, opcode/flag constants, and inline userspace wrappers (native system calls, found through `kern.kqring.sys_*`, with the ioctls as fallback). |
 | [`kmod/kqring_var.h`](kmod/kqring_var.h) | Kernel-internal structs (`kqring_ctx`, `kqring_op`, `kqring_wq`, `kqring_rsrc`, `kqring_bgroup`, `kqring_zc_buf`, `kqring_zc_notif`), limits, cross-TU prototypes, and hot-path `static inline` helpers. |
-| [`kmod/kqring_dev.c`](kmod/kqring_dev.c) | `/dev/kqring` `cdevsw`, `kqring_open`, `kqring_ioctl`, `kqring_mmap_single`, ring setup/teardown, `kqring_wait_cqes`, process `exit`/`exec`/`fork` eventhandlers, and module load/unload. |
+| [`kmod/kqring_dev.c`](kmod/kqring_dev.c) | `/dev/kqring` `cdevsw`, `kqring_open`, `kqring_ioctl`, the `kqring_setup(2)` / `kqring_enter(2)` / `kqring_register(2)` system calls (registered in free `sysent` slots at load and drained at unload), `kqring_mmap_single`, ring setup/teardown, `kqring_wait_cqes`, process `exit`/`exec`/`fork` eventhandlers, and module load/unload. |
 | [`kmod/kqring_req.c`](kmod/kqring_req.c) | OBJT_DEFAULT shared memory allocation, CQ ring posting and overflow queue, SQE preparation (`SUBMIT_STABLE` copyin), request allocation/free, chain/drain scheduling, and deferred taskwork execution. |
 | [`kmod/kqring_rsrc.c`](kmod/kqring_rsrc.c) | Reference-counted fixed files (`ctx->files`) with Capsicum rights, registered buffers (`ctx->bufs`), classic & mmap provided-buffer rings (`ctx->bgroups`), and credential personalities. |
 | [`kmod/kqring_register.c`](kmod/kqring_register.c) | `KQRING_IOC_REGISTER` dispatcher (`IORING_REGISTER_*`), restrictions, `IORING_REGISTER_PROBE`, and `eventfd` registration/signalling. |
@@ -100,7 +100,7 @@ flowchart LR
 
 1. **Asynchronous contexts never write CQEs or mutate resource tables.** Socket upcalls, `callout` timer callbacks, `MSG_RING` senders, and in-process worker threads only enqueue work onto `ctx->taskwork_ops` (or `ctx->rcq` for `MSG_RING`), set `IORING_SQ_TASKRUN`, and wake the ring sleeper (`&ctx->cq_wait` / `ctx->sqpoll_Wait` / `ctx->evfd`).
 2. **All completions and table mutations run on the serialized issuer path:**
-   - **Standard mode:** The owning thread (`ctx->owner_tid`) inside `KQRING_IOC_ENTER`.
+   - **Standard mode:** The owning thread (`ctx->owner_tid`) inside `kqring_enter(2)` (or `KQRING_IOC_ENTER`).
    - **`IORING_SETUP_SQPOLL` mode:** Either the in-process `kqring_sqpoll_thread` or the owning thread, mutually serialized by `sx_xlock(&ctx->sq_sx)`.
 
 ```mermaid
@@ -190,7 +190,7 @@ sequenceDiagram
     participant Sock as kqring_sock.c
     participant SB as FreeBSD Socket Buffer (so_rcv / so_snd)
 
-    App->>Req: KQRING_IOC_ENTER (submit RECV)
+    App->>Req: kqring_enter(2) (submit RECV)
     Req->>Sock: kqring_op_attempt(ctx, op, NULL)
     Sock->>SB: soreceive(MSG_DONTWAIT)
     alt Data already in so_rcv
@@ -207,7 +207,7 @@ sequenceDiagram
         Note over SB: Peer writes data to socket
         SB->>Sock: kqring_soupcall(so, op, ...)
         Sock->>Req: kqring_taskwork_add_locked(ctx, op)<br/>+ wakeup(&ctx->cq_wait)
-        App->>Req: Next KQRING_IOC_ENTER (or wakeup from wait)
+        App->>Req: Next kqring_enter(2) (or wakeup from wait)
         Req->>Sock: kqring_taskwork_run_one() -> kqring_op_attempt()
         Sock->>SB: soreceive(MSG_DONTWAIT)
         SB-->>Sock: bytes > 0
@@ -217,6 +217,7 @@ sequenceDiagram
 ```
 
 - **One-op-per-direction guard:** FreeBSD sockets provide a single `so_upcall` slot per sockbuf (`so_rcv`, `so_snd`). `kqring_arm_socket_op()` checks `sb->sb_upcall != NULL` under `SOCK_BUF_LOCK` and fails a conflicting second armed request on the same socket and direction with `-EBUSY` rather than silently overwriting the existing upcall.
+- **The socket's file is held across retries:** a `RECV`, `RECVMSG`, `SEND` or `SENDMSG` attempt that would block keeps the file reference it looked up (`op->sock_fp`, taken with the operation's own Capsicum rights). Arming and every later attempt use it instead of looking up `sqe->fd` again, and `kqring_op_free()` releases it. As with io_uring's `req->file`, closing the descriptor or `dup2(2)` over it no longer affects the request: it completes from its original socket, or on cancellation.
 - **`listen(2)` race protection:** On FreeBSD 15, `solisten_proto()` converts a socket's `so_rcv`/`so_snd` union into listen queues under both sockbuf locks. Every sockbuf lock acquisition in `kqring_sock.c` re-checks `SOLISTENING(so)` before touching `so_rcv` or `so_snd`.
 
 ---
@@ -346,7 +347,7 @@ flowchart TD
 | Lock | Type | Protects | Ordering Rules |
 |---|---|---|---|
 | `kqring_proc_mtx` | `MTX_DEF` | `kqring_proc_hash`, `kqring_ctx_list`, `kqring_live_workers`, `kqring_live_zc`, `kqring_unloading` | Acquired before `ctx->mtx` or `wq->mtx` during process `exit`/`exec`/`fork` and module unload. |
-| `ctx->sq_sx` | `struct sx` | Serializes `kqring_sqpoll_thread`, `KQRING_IOC_ENTER` submission/taskwork, and `KQRING_IOC_REGISTER` | Sleepable outer lock; never held by upcalls, callouts, or workers. |
+| `ctx->sq_sx` | `struct sx` | Serializes `kqring_sqpoll_thread`, enter submission/taskwork, register, setup, and teardown (`kqring_ctx_cancel_all`) | Sleepable outer lock; never held by upcalls, callouts, or workers. Enter skips it when the ring has no SQPOLL thread and its worker pool belongs to the caller's process: then nothing else can run that code concurrently (close waits for the enter's file reference, and the owner's own exit or exec waits for the owner to leave the kernel). |
 | `ctx->bg_sx` | `struct sx` | `ctx->bgroups` hash, `PROVIDED_BUFFERS`, `PBUF_RING` selection/commit | Sleepable lock; nests inside `ctx->sq_sx` and outside `SOCK_BUF_LOCK` / `ctx->mtx`. |
 | `SOCK_IO_SEND_LOCK` | `struct sx` | Serializes socket send operations (`kqring_send_zc_iov`, `sosend`) | Acquired before `SOCK_BUF_LOCK`, `kqring_zc_mtx`, and `ctx->mtx`. |
 | `SOCK_BUF_LOCK` | `MTX_DEF` | Socket buffer state (`so_rcv` / `so_snd`) and `sb_upcall` | Acquired **before** `ctx->mtx` (matching the order in which `sowakeup` -> `kqring_soupcall` enters `kqring`). |

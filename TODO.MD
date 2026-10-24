@@ -60,12 +60,12 @@ Measured on FreeBSD 15.1 (i5-8250U), as medians of 5 runs; see [`BENCHMARK.MD`](
 
 | Message | AF_UNIX, registered | AF_UNIX, unregistered | TCP loopback, registered |
 |---|---:|---:|---:|
-| 16 KiB | 19% slower | 25% slower (copied) | 3% faster |
-| 32 KiB | 2% faster | 13% slower | 6% slower |
-| 64 KiB | 15% faster | 1% faster | 16% faster |
-| 256 KiB | 38% faster | 27% faster | 26% faster |
+| 16 KiB | 13% slower | 20% slower (copied) | 2% faster |
+| 32 KiB | 5% faster | 9% slower | 9% slower |
+| 64 KiB | 17% faster | 3% faster | 15% faster |
+| 256 KiB | 37% faster | 27% faster | 23% faster |
 
-All against `write(2)`. At 16 KiB on AF_UNIX every kqring send, copying `SEND` included, is 18–25% slower than `write(2)`: that's the ring's fixed cost per operation, not zero-copy.
+All against `write(2)`. At 16 KiB on AF_UNIX every kqring send, copying `SEND` included, is 12–20% slower than `write(2)`: that's the ring's fixed cost per operation, not zero-copy.
 
 - **AF_UNIX zero-copy threshold.** Done. `SEND_ZC` / `SENDMSG_ZC` from an unregistered buffer on AF_UNIX copies below `sysctl kern.kqring.zc_local_min_len` (32 KiB by default, the measured crossover), because pinning per send costs more than the `memcpy` there. Registered buffers and TCP go zero-copy from one page.
 - **Carry several pages per mbuf.** Each zero-copy page gets its own mbuf and `sf_buf`. Unmapped `M_EXTPG` mbufs, as `sendfile(2)` and KTLS use, would cut the per-page cost. Check that AF_UNIX accepts them on 15.1 first.

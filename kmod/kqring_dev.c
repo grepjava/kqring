@@ -6,6 +6,8 @@
 
 #include "kqring_var.h"
 
+#include <sys/sysent.h>
+
 MALLOC_DEFINE(M_KQRING, "kqring", "FreeBSD kqring I/O ring state");
 
 struct kqring_proc_list kqring_proc_hash[KQRING_PROC_HASH];
@@ -642,8 +644,37 @@ kqring_run_checks(struct kqring_ctx *ctx)
 	kqring_flush_ready(ctx);
 }
 
+/*
+ * Whether enter takes sq_sx.  It serializes the issuer with the SQPOLL
+ * kthread and with teardown in other threads.  Without SQPOLL, teardown
+ * can only run concurrently when the process whose worker pool the ring
+ * uses (IORING_SETUP_ATTACH_WQ, or a ring set up elsewhere) exits or
+ * execs: close(2) waits for the enter's file reference, and the issuer's
+ * own process exits or execs only once the issuer has left the kernel.
+ */
+static inline bool
+kqring_enter_locks(const struct kqring_ctx *ctx, const struct thread *td)
+{
+	return ((ctx->flags & IORING_SETUP_SQPOLL) != 0 ||
+	    (ctx->wq != NULL && ctx->wq->proc != td->td_proc));
+}
+
+static inline void
+kqring_enter_lock(struct kqring_ctx *ctx, bool lock)
+{
+	if (lock)
+		sx_xlock(&ctx->sq_sx);
+}
+
+static inline void
+kqring_enter_unlock(struct kqring_ctx *ctx, bool lock)
+{
+	if (lock)
+		sx_xunlock(&ctx->sq_sx);
+}
+
 static int kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
-    bool has_timeout, sbintime_t sbt);
+    bool has_timeout, sbintime_t sbt, bool lock);
 
 static int
 kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
@@ -655,6 +686,7 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	bool has_timeout = false;
 	bool sqpoll = (ctx->flags & IORING_SETUP_SQPOLL) != 0;
 	bool iopoll = (ctx->flags & IORING_SETUP_IOPOLL) != 0;
+	bool lock = kqring_enter_locks(ctx, td);
 	bool wait;
 	int error = 0;
 
@@ -750,9 +782,9 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	/*
 	 * 2. Drain and submit queued SQEs.
 	 */
-	sx_xlock(&ctx->sq_sx);
+	kqring_enter_lock(ctx, lock);
 	if (ctx->closing) {
-		sx_xunlock(&ctx->sq_sx);
+		kqring_enter_unlock(ctx, lock);
 		return (EBADF);
 	}
 	kqring_submit_sqes(ctx, ea->to_submit, &submitted);
@@ -762,7 +794,7 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	kqring_run_taskwork(ctx);
 	kqring_run_checks(ctx);
 	kqring_flush_overflow(ctx);
-	sx_xunlock(&ctx->sq_sx);
+	kqring_enter_unlock(ctx, lock);
 
 	if (!wait) {
 		kqring_evfd_flush(ctx);
@@ -775,7 +807,8 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	 * then times out or is interrupted: an ioctl error would make
 	 * sys_ioctl() skip copying SUBMITTED_out back to userspace.
 	 */
-	error = kqring_wait_cqes(ctx, ea->min_complete, has_timeout, sbt);
+	error = kqring_wait_cqes(ctx, ea->min_complete, has_timeout, sbt,
+	    lock);
 	kqring_evfd_flush(ctx);
 	if (error != 0 && submitted > 0)
 		error = 0;
@@ -788,7 +821,7 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
  */
 static int
 kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
-    bool has_timeout, sbintime_t sbt)
+    bool has_timeout, sbintime_t sbt, bool lock)
 {
 	struct kqring_shm_header *shm = ctx->shm;
 	bool iopoll = (ctx->flags & IORING_SETUP_IOPOLL) != 0;
@@ -850,13 +883,13 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 			return (EINTR);
 		if (error == EWOULDBLOCK && has_timeout) {
 			if (sbt <= sleep_sbt) {
-				sx_xlock(&ctx->sq_sx);
+				kqring_enter_lock(ctx, lock);
 				if (!ctx->closing) {
 					kqring_run_taskwork(ctx);
 					kqring_run_checks(ctx);
 					kqring_flush_overflow(ctx);
 				}
-				sx_xunlock(&ctx->sq_sx);
+				kqring_enter_unlock(ctx, lock);
 				cq_count = atomic_load_acq_32(&shm->cq_tail) -
 				    atomic_load_acq_32(&shm->cq_head);
 				if (cq_count >= min_complete ||
@@ -867,15 +900,15 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 			sbt -= sleep_sbt;
 		}
 drain:
-		sx_xlock(&ctx->sq_sx);
+		kqring_enter_lock(ctx, lock);
 		if (ctx->closing) {
-			sx_xunlock(&ctx->sq_sx);
+			kqring_enter_unlock(ctx, lock);
 			return (EBADF);
 		}
 		kqring_run_taskwork(ctx);
 		kqring_run_checks(ctx);
 		kqring_flush_overflow(ctx);
-		sx_xunlock(&ctx->sq_sx);
+		kqring_enter_unlock(ctx, lock);
 	}
 }
 
@@ -1058,6 +1091,218 @@ kqring_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 	return (error);
 }
 
+/* ============================================================================
+ * Native System Calls
+ * ============================================================================
+ *
+ * kqring_setup(2), kqring_enter(2) and kqring_register(2) take the
+ * arguments of io_uring_setup(2), io_uring_enter(2) and
+ * io_uring_register(2) in registers.  They skip the devfs ioctl path
+ * (cdev thread accounting, the argument copyin/copyout), which costs about
+ * as much as a NOP enter itself.  They are registered in free sysent slots
+ * at load; kern.kqring.sys_{setup,enter,register} give their numbers, or
+ * -1 where only the ioctl interface exists.
+ */
+
+/* As sys/sysproto.h, which #undefs its own. */
+#define	PAD_(t)	(sizeof(syscallarg_t) <= sizeof(t) ? \
+		0 : sizeof(syscallarg_t) - sizeof(t))
+#if BYTE_ORDER == LITTLE_ENDIAN
+#define	PADL_(t)	0
+#define	PADR_(t)	PAD_(t)
+#else
+#define	PADL_(t)	PAD_(t)
+#define	PADR_(t)	0
+#endif
+
+struct kqring_setup_args {
+	char entries_l_[PADL_(u_int)]; u_int entries; char entries_r_[PADR_(u_int)];
+	char params_l_[PADL_(struct io_uring_params *)]; struct io_uring_params * params; char params_r_[PADR_(struct io_uring_params *)];
+};
+struct kqring_enter_args {
+	char fd_l_[PADL_(int)]; int fd; char fd_r_[PADR_(int)];
+	char to_submit_l_[PADL_(u_int)]; u_int to_submit; char to_submit_r_[PADR_(u_int)];
+	char min_complete_l_[PADL_(u_int)]; u_int min_complete; char min_complete_r_[PADR_(u_int)];
+	char flags_l_[PADL_(u_int)]; u_int flags; char flags_r_[PADR_(u_int)];
+	char arg_l_[PADL_(void *)]; void * arg; char arg_r_[PADR_(void *)];
+	char argsz_l_[PADL_(size_t)]; size_t argsz; char argsz_r_[PADR_(size_t)];
+};
+struct kqring_register_args {
+	char fd_l_[PADL_(int)]; int fd; char fd_r_[PADR_(int)];
+	char opcode_l_[PADL_(u_int)]; u_int opcode; char opcode_r_[PADR_(u_int)];
+	char arg_l_[PADL_(void *)]; void * arg; char arg_r_[PADR_(void *)];
+	char nr_args_l_[PADL_(u_int)]; u_int nr_args; char nr_args_r_[PADR_(u_int)];
+};
+#undef PAD_
+#undef PADL_
+#undef PADR_
+
+/*
+ * The ring a system call names: a /dev/kqring descriptor, or with
+ * `registered` a slot of the IORING_REGISTER_RING_FDS table.
+ */
+static int
+kqring_sys_ring(struct thread *td, int fd, bool registered, bool is_enter,
+    struct file **fpp, struct kqring_ctx **ctxp)
+{
+	struct file *fp;
+	cap_rights_t rights;
+	int error;
+
+	if (registered)
+		error = kqring_reg_ring_fget(td, (uint32_t)fd, is_enter, &fp);
+	else
+		error = fget(td, fd, cap_rights_init_one(&rights, CAP_IOCTL),
+		    &fp);
+	if (error != 0)
+		return (error);
+	/* As io_uring_enter(2) on a descriptor that is not a ring. */
+	error = kqring_fp_is_ring(fp) ? kqring_fp_ctx(fp, ctxp) : EOPNOTSUPP;
+	if (error != 0) {
+		fdrop(fp, td);
+		return (error);
+	}
+	*fpp = fp;
+	return (0);
+}
+
+static int
+kqring_sys_setup(struct thread *td, struct kqring_setup_args *uap)
+{
+	struct kqring_setup_arg sa = {
+		.entries = uap->entries,
+		.params = uap->params,
+	};
+	struct kqring_ctx *ctx;
+	struct file *fp;
+	int error, fd;
+
+	error = kern_openat(td, AT_FDCWD, "/dev/kqring", UIO_SYSSPACE,
+	    O_RDWR | O_CLOEXEC, 0);
+	if (error != 0)
+		return (error);
+	fd = (int)td->td_retval[0];
+	error = kqring_sys_ring(td, fd, false, false, &fp, &ctx);
+	if (error == 0) {
+		error = kqring_ioc_setup(ctx, &sa, td);
+		fdrop(fp, td);
+	}
+	if (error != 0) {
+		(void)kern_close(td, fd);
+		return (error);
+	}
+	td->td_retval[0] = fd;
+	return (0);
+}
+
+static int
+kqring_sys_enter(struct thread *td, struct kqring_enter_args *uap)
+{
+	struct kqring_enter_arg ea = {
+		.to_submit = uap->to_submit,
+		.min_complete = uap->min_complete,
+		.flags = uap->flags,
+		.arg = uap->arg,
+		.argsz = uap->argsz,
+		.ring_fd = uap->fd,
+	};
+	struct kqring_ctx *ctx;
+	struct file *fp;
+	int error;
+
+	error = kqring_sys_ring(td, uap->fd,
+	    (uap->flags & IORING_ENTER_REGISTERED_RING) != 0, true, &fp, &ctx);
+	if (error != 0)
+		return (error);
+	error = kqring_ioc_enter(ctx, &ea, td);
+	fdrop(fp, td);
+	/* SQE ops' kern_*() calls leave their results in td_retval[0]. */
+	td->td_retval[0] = error == 0 ? ea.SUBMITTED_out : 0;
+	return (error);
+}
+
+static int
+kqring_sys_register(struct thread *td, struct kqring_register_args *uap)
+{
+	struct kqring_register_arg ra = {
+		.opcode = uap->opcode & ~IORING_REGISTER_USE_REGISTERED_RING,
+		.nr_args = uap->nr_args,
+		.arg = uap->arg,
+		.ring_fd = uap->fd,
+	};
+	struct kqring_ctx *ctx;
+	struct file *fp;
+	int error, res = 0;
+
+	error = kqring_sys_ring(td, uap->fd,
+	    (uap->opcode & IORING_REGISTER_USE_REGISTERED_RING) != 0, false,
+	    &fp, &ctx);
+	if (error != 0)
+		return (error);
+	error = kqring_ioc_register(ctx, &ra, td, &res);
+	fdrop(fp, td);
+	td->td_retval[0] = error == 0 ? res : 0;
+	return (error);
+}
+
+#define	KQRING_NSYS	3
+#define	KQRING_AS(name)	(sizeof(struct name) / sizeof(syscallarg_t))
+
+static struct sysent kqring_sysent[KQRING_NSYS] = {
+	{
+		.sy_narg = KQRING_AS(kqring_setup_args),
+		.sy_call = (sy_call_t *)kqring_sys_setup,
+		.sy_auevent = AUE_NULL,
+	},
+	{
+		.sy_narg = KQRING_AS(kqring_enter_args),
+		.sy_call = (sy_call_t *)kqring_sys_enter,
+		.sy_auevent = AUE_NULL,
+		.sy_flags = SYF_CAPENABLED,
+	},
+	{
+		.sy_narg = KQRING_AS(kqring_register_args),
+		.sy_call = (sy_call_t *)kqring_sys_register,
+		.sy_auevent = AUE_NULL,
+		.sy_flags = SYF_CAPENABLED,
+	},
+};
+static struct sysent kqring_old_sysent[KQRING_NSYS];
+static int kqring_sysnum[KQRING_NSYS] = { NO_SYSCALL, NO_SYSCALL, NO_SYSCALL };
+
+SYSCTL_INT(_kern_kqring, OID_AUTO, sys_setup, CTLFLAG_RD,
+    &kqring_sysnum[0], 0, "kqring_setup(2) system call number");
+SYSCTL_INT(_kern_kqring, OID_AUTO, sys_enter, CTLFLAG_RD,
+    &kqring_sysnum[1], 0, "kqring_enter(2) system call number");
+SYSCTL_INT(_kern_kqring, OID_AUTO, sys_register, CTLFLAG_RD,
+    &kqring_sysnum[2], 0, "kqring_register(2) system call number");
+
+/* Without free slots, the ioctl interface still works: not an error. */
+static void
+kqring_sys_register_all(void)
+{
+	for (int i = 0; i < KQRING_NSYS; i++) {
+		kqring_sysnum[i] = NO_SYSCALL;
+		if (kern_syscall_register(sysent, &kqring_sysnum[i],
+		    &kqring_sysent[i], &kqring_old_sysent[i], 0) != 0) {
+			printf("kqring: no free system call slot\n");
+			kqring_sysnum[i] = NO_SYSCALL;
+		}
+	}
+}
+
+/* Waits for the system calls in progress, as destroy_dev() for ioctls. */
+static void
+kqring_sys_deregister_all(void)
+{
+	for (int i = 0; i < KQRING_NSYS; i++) {
+		if (kqring_sysnum[i] != NO_SYSCALL)
+			(void)kern_syscall_deregister(sysent, kqring_sysnum[i],
+			    &kqring_old_sysent[i]);
+		kqring_sysnum[i] = NO_SYSCALL;
+	}
+}
+
 static int
 kqring_mmap_single(struct cdev *cdev __unused, vm_ooffset_t *offset,
     vm_size_t size, vm_object_t *object, int nprot)
@@ -1145,6 +1390,7 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			mtx_destroy(&kqring_futex_mtx);
 			return (ENOMEM);
 		}
+		kqring_sys_register_all();
 		printf("kqring: loaded (/dev/kqring, SINGLE_ISSUER | DEFER_TASKRUN)\n");
 		return (0);
 
@@ -1168,6 +1414,11 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			}
 		}
 		mtx_unlock(&kqring_proc_mtx);
+		/*
+		 * The system calls go first, waiting for those in progress:
+		 * after destroy_dev() their rings would be gone.
+		 */
+		kqring_sys_deregister_all();
 		/*
 		 * destroy_dev() runs the destructor of every ring still open,
 		 * so no futex is hashed after it, and waits for ioctls in

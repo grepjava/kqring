@@ -882,6 +882,7 @@ struct kqring_register_arg {
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 static inline int
@@ -904,12 +905,78 @@ kqring_ctl_fd(void)
 }
 
 /*
+ * The native system calls' numbers (kern.kqring.sys_*), looked up once;
+ * -1 where the module could not register them.
+ */
+enum { KQRING_SYS_SETUP, KQRING_SYS_ENTER, KQRING_SYS_REGISTER };
+
+static inline long
+kqring_sysnum(int which)
+{
+	static const char *const names[] = {
+		"kern.kqring.sys_setup",
+		"kern.kqring.sys_enter",
+		"kern.kqring.sys_register",
+	};
+	static int nums[] = { -2, -2, -2 };	/* -2: not looked up yet */
+	int n = __atomic_load_n(&nums[which], __ATOMIC_RELAXED);
+
+	if (n == -2) {
+		size_t len = sizeof(n);
+		int e = errno;
+
+		if (sysctlbyname(names[which], &n, &len, NULL, 0) != 0 ||
+		    n <= 0)
+			n = -1;
+		errno = e;
+		__atomic_store_n(&nums[which], n, __ATOMIC_RELAXED);
+	}
+	return (n);
+}
+
+/*
+ * syscall(2) passes the number as an argument and fetches a sixth one from
+ * the stack; on amd64 the call is made directly instead.
+ */
+static inline long
+kqring_syscall(long num, long a1, long a2, long a3, long a4, long a5,
+    long a6)
+{
+#if defined(__amd64__)
+	register long r10 __asm__("r10") = a4;
+	register long r8 __asm__("r8") = a5;
+	register long r9 __asm__("r9") = a6;
+	unsigned char failed;
+
+	__asm__ __volatile__("syscall; setc %1"
+	    : "+a"(num), "=r"(failed), "+D"(a1), "+S"(a2), "+d"(a3),
+	      "+r"(r10), "+r"(r8), "+r"(r9)
+	    :
+	    : "rcx", "r11", "memory", "cc");
+	if (failed) {
+		errno = (int)num;
+		return (-1);
+	}
+	return (num);
+#else
+	return (syscall((int)num, a1, a2, a3, a4, a5, a6));
+#endif
+}
+
+/*
  * Userspace wrappers with the arguments of Linux's io_uring_setup(2),
- * io_uring_enter(2) and io_uring_register(2).
+ * io_uring_enter(2) and io_uring_register(2): the native system calls,
+ * or the /dev/kqring ioctls where those are not registered.
  */
 static inline long
 kqring_setup(unsigned entries, struct io_uring_params *p)
 {
+	long num = kqring_sysnum(KQRING_SYS_SETUP);
+
+	if (num > 0)
+		return (kqring_syscall(num, (long)entries, (long)p, 0, 0, 0,
+		    0));
+
 	int fd = open("/dev/kqring", O_RDWR | O_CLOEXEC);
 	if (fd < 0)
 		return (-1);
@@ -931,6 +998,12 @@ static inline long
 kqring_enter(int fd, unsigned submit, unsigned wait, unsigned flags,
     void *arg, size_t argsz)
 {
+	long num = kqring_sysnum(KQRING_SYS_ENTER);
+
+	if (num > 0)
+		return (kqring_syscall(num, (long)fd, (long)submit,
+		    (long)wait, (long)flags, (long)arg, (long)argsz));
+
 	struct kqring_enter_arg ea = {
 		.to_submit = submit,
 		.min_complete = wait,
@@ -955,6 +1028,12 @@ kqring_enter(int fd, unsigned submit, unsigned wait, unsigned flags,
 static inline long
 kqring_register(int fd, unsigned op, void *arg, unsigned n)
 {
+	long num = kqring_sysnum(KQRING_SYS_REGISTER);
+
+	if (num > 0)
+		return (kqring_syscall(num, (long)fd, (long)op, (long)arg,
+		    (long)n, 0, 0));
+
 	struct kqring_register_arg ra = {
 		.opcode = op,
 		.nr_args = n,
