@@ -1,6 +1,6 @@
 # `kqring` Architecture
 
-`kqring.ko` is a loadable FreeBSD 14/15 kernel module implementing the Linux `io_uring` ABI over `/dev/kqring`. Its fast path is the **`IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN`** execution model; rings shared by the threads of a process and rings without `DEFER_TASKRUN` are built on the same serialized issuer (section 3).
+`kqring.ko` is a loadable FreeBSD 15.1 kernel module implementing the Linux `io_uring` ABI over `/dev/kqring`. Its fast path is the **`IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN`** execution model; rings shared by the threads of a process and rings without `DEFER_TASKRUN` are built on the same serialized issuer (section 3).
 
 ---
 

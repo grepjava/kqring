@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
 """Turn kqring_bench runs into median tables and SVG charts.
 
 usage: bench_report.py OUTDIR RUN.out [RUN.out ...]

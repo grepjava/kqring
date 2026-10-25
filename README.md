@@ -1,6 +1,6 @@
 # kqring — io_uring for FreeBSD
 
-`kqring` brings Linux's [`io_uring`](https://kernel.dk/io_uring.pdf) asynchronous I/O interface to FreeBSD, as a loadable kernel module (`kqring.ko`) for FreeBSD 14 and 15.
+`kqring` brings Linux's [`io_uring`](https://kernel.dk/io_uring.pdf) asynchronous I/O interface to FreeBSD, as a loadable kernel module (`kqring.ko`) for FreeBSD 15.1 (amd64).
 
 It uses the io_uring ABI as-is, with the same structure layouts and `IORING_*` constants:
 - submission and completion queues shared with the kernel through `mmap(2)`;
@@ -20,7 +20,7 @@ It has its own functional test suite and benchmarks, and has been reviewed again
 
 ## Quick start
 
-Kernel sources must be installed in `/usr/src` and match the running kernel (`freebsd-version -ku`).
+Built and tested on FreeBSD 15.1-RELEASE, amd64, `GENERIC` kernel; other versions are untested. Kernel sources must be installed in `/usr/src` and match the running kernel (`freebsd-version -ku`). Version 0.1.0 is an experimental preview; see [`CHANGELOG.md`](CHANGELOG.md).
 
 ```sh
 make                                   # builds kmod/kqring.ko, tests/kqring_test, tests/kqring_bench
@@ -243,3 +243,8 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
 - [`ARCHITECTURE.MD`](ARCHITECTURE.MD) — how kqring works inside: shared memory layout, execution model, request lifecycle, zero-copy, workers and locking.
 - [`BENCHMARK.MD`](BENCHMARK.MD) — performance against `kqueue(2)` and plain system calls, with method and known gaps.
 - [`TODO.MD`](TODO.MD) — zero-copy roadmap and measured follow-ups.
+- [`CHANGELOG.md`](CHANGELOG.md) — releases and their known limits.
+
+## License
+
+BSD-2-Clause; see [`LICENSE`](LICENSE).
