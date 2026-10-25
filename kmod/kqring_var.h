@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Copyright (c) 2026 The kqring Authors
+ * Copyright (c) 2026 Jayakumar Thanakodi
  *
  * kqring: FreeBSD kernel module implementing io_uring.
  *

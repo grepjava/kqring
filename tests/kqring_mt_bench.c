@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Copyright (c) 2026 The kqring Authors
+ * Copyright (c) 2026 Jayakumar Thanakodi
  *
  * kqring_mt_bench: multi-threaded scaling of kqring against kqueue(2) and
  * plain system calls.  Each thread has its own ring (or kqueue), as in the

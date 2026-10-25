@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Copyright (c) 2026 The kqring Authors
+ * Copyright (c) 2026 Jayakumar Thanakodi
  *
  * kqring_bench: kqring compared with kqueue(2) (and plain syscalls where
  * kqueue has nothing to offer) on the same workloads.

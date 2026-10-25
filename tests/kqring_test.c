@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Copyright (c) 2026 The kqring Authors
+ * Copyright (c) 2026 Jayakumar Thanakodi
  *
  * kqring_test.c: Userspace verification & benchmark suite for /dev/kqring.
  * Tests every supported opcode, registration and setup flag, and the
