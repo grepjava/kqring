@@ -127,10 +127,13 @@ MALLOC_DECLARE(M_SELFD);
  * From KQRING_OCQ_BUSY on, enters submit nothing (EBUSY) and multishot
  * requests end rather than post more, so what is still to come is at most
  * a few CQEs per live request plus queued MSG_RING CQEs; KQRING_MAX_
- * OVERFLOW leaves room for all of them.  Only past it (for instance
- * resource tags from unregistering many tagged slots at once) is a CQE
- * dropped: counted in cq_overflow and reported as EOVERFLOW (Linux's
- * EBADR, which FreeBSD lacks) by the next enter that waits.
+ * OVERFLOW leaves room for all of them.  Resource tag CQEs don't count
+ * against it (kqring_post_cqe_nodrop()): there is at most one per tagged
+ * slot, and the register calls that release slots fail with EBUSY from
+ * KQRING_OCQ_BUSY on, as submission does, so they can't be cycled to queue
+ * more.  Past the ceiling (which the bounds above should make unreachable)
+ * a CQE would be dropped: counted in cq_overflow and reported as EOVERFLOW
+ * (Linux's EBADR, which FreeBSD lacks) by the next enter that waits.
  */
 #define KQRING_OCQ_BUSY		16384U
 #define KQRING_MAX_OVERFLOW	(KQRING_OCQ_BUSY + 3 * KQRING_MAX_REQS + \
@@ -1235,6 +1238,9 @@ kqring_post_cqe(struct kqring_ctx *ctx, uint64_t user_data, int32_t res,
 	ctx->cq_seq++;
 	kqring_post_cqe_uncounted(ctx, user_data, res, flags);
 }
+
+void	kqring_post_cqe_nodrop(struct kqring_ctx *ctx, uint64_t user_data,
+	    int32_t res, uint32_t flags);
 
 void	kqring_op_disarm_locked(struct kqring_op *op);
 void	kqring_op_unarm_locked(struct kqring_ctx *ctx, struct kqring_op *op);

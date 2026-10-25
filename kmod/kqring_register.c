@@ -329,6 +329,8 @@ kqring_sync_cancel(struct kqring_ctx *ctx,
 {
 	struct io_uring_sync_cancel_reg sc;
 	struct io_uring_sqe sqe;
+	struct timespec ts;
+	bool forever;
 	int32_t res;
 	int error;
 
@@ -346,6 +348,13 @@ kqring_sync_cancel(struct kqring_ctx *ctx,
 	error = kqring_cancel_flags_ok(sc.flags);
 	if (error != 0)
 		return (error);
+	/* The whole request is checked before anything is cancelled. */
+	ts.tv_sec = sc.timeout.tv_sec;
+	ts.tv_nsec = sc.timeout.tv_nsec;
+	forever = ts.tv_sec == -1 && ts.tv_nsec == -1;
+	if (!forever &&
+	    (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000))
+		return (EINVAL);
 	bzero(&sqe, sizeof(sqe));
 	sqe.opcode = IORING_OP_ASYNC_CANCEL;
 	sqe.cancel_flags = sc.flags;
@@ -357,19 +366,8 @@ kqring_sync_cancel(struct kqring_ctx *ctx,
 	kqring_flush_ready(ctx);
 	if (res < 0 && res != -EALREADY)
 		return (-res);
-	if (sc.timeout.tv_sec == -1 && sc.timeout.tv_nsec == -1) {
-		error = kqring_cancel_wait(ctx, &sqe, false, 0);
-	} else {
-		struct timespec ts = {
-			.tv_sec = sc.timeout.tv_sec,
-			.tv_nsec = sc.timeout.tv_nsec,
-		};
-
-		if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000)
-			return (EINVAL);
-		error = kqring_cancel_wait(ctx, &sqe, true,
-		    kqring_ts_to_sbt(&ts));
-	}
+	error = kqring_cancel_wait(ctx, &sqe, !forever,
+	    forever ? 0 : kqring_ts_to_sbt(&ts));
 	kqring_flush_ready(ctx);
 	if (error != 0)
 		return (error);
@@ -721,6 +719,23 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 	int32_t res;
 	int error;
 
+	switch (ra->opcode) {
+	case IORING_UNREGISTER_FILES:
+	case IORING_UNREGISTER_BUFFERS:
+	case IORING_REGISTER_FILES_UPDATE:
+	case IORING_REGISTER_FILES_UPDATE2:
+	case IORING_REGISTER_BUFFERS_UPDATE:
+	case IORING_REGISTER_CLONE_BUFFERS:
+		/*
+		 * Released slots post their tags' CQEs, which are never
+		 * dropped: hold these back while many CQEs overflow, as
+		 * submission is (KQRING_OCQ_BUSY).
+		 */
+		kqring_flush_overflow(ctx);
+		if (ctx->nocq >= KQRING_OCQ_BUSY)
+			return (EBUSY);
+		break;
+	}
 	switch (ra->opcode) {
 	case IORING_REGISTER_ENABLE_RINGS:
 		if (ra->arg != NULL || ra->nr_args != 0)

@@ -305,9 +305,9 @@ kqring_flush_overflow(struct kqring_ctx *ctx)
  * this directly; everything else goes through kqring_post_cqe(), which also
  * advances the sequence that completion-count TIMEOUTs wait on.
  */
-void
-kqring_post_cqe_extra(struct kqring_ctx *ctx, uint64_t user_data,
-    int32_t res, uint32_t flags, const uint64_t *extra)
+static void
+kqring_post_cqe_common(struct kqring_ctx *ctx, uint64_t user_data,
+    int32_t res, uint32_t flags, const uint64_t *extra, bool bounded)
 {
 	struct io_uring_cqe cqe = {
 		.user_data = user_data,
@@ -322,7 +322,7 @@ kqring_post_cqe_extra(struct kqring_ctx *ctx, uint64_t user_data,
 	if (STAILQ_EMPTY(&ctx->ocq) && kqring_cq_push(ctx, &cqe, extra))
 		return;
 
-	if (ctx->nocq >= KQRING_MAX_OVERFLOW) {
+	if (bounded && ctx->nocq >= KQRING_MAX_OVERFLOW) {
 		atomic_add_32(&ctx->shm->cq_overflow, 1);
 		ctx->cq_dropped = true;
 		return;
@@ -336,6 +336,25 @@ kqring_post_cqe_extra(struct kqring_ctx *ctx, uint64_t user_data,
 	STAILQ_INSERT_TAIL(&ctx->ocq, ocqe, link);
 	ctx->nocq++;
 	atomic_set_32(&ctx->shm->sq_flags, IORING_SQ_CQ_OVERFLOW);
+}
+
+void
+kqring_post_cqe_extra(struct kqring_ctx *ctx, uint64_t user_data,
+    int32_t res, uint32_t flags, const uint64_t *extra)
+{
+	kqring_post_cqe_common(ctx, user_data, res, flags, extra, true);
+}
+
+/*
+ * A resource tag CQE, never dropped: one per tagged slot, and the calls
+ * that release slots are held back from KQRING_OCQ_BUSY on.
+ */
+void
+kqring_post_cqe_nodrop(struct kqring_ctx *ctx, uint64_t user_data,
+    int32_t res, uint32_t flags)
+{
+	ctx->cq_seq++;
+	kqring_post_cqe_common(ctx, user_data, res, flags, NULL, false);
 }
 
 void

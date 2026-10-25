@@ -1822,23 +1822,20 @@ static void
 kqring_sys_register_all(void)
 {
 	for (int i = 0; i < KQRING_NSYS; i++) {
+		/*
+		 * Enter counts itself (kqring_sys_busy), so it is registered
+		 * SY_THR_STATIC: the slot goes from absent to static in one
+		 * store, and the kernel never counts a call to it.  (A
+		 * counted call can't be made static later: a thread may have
+		 * read it as counted and not yet counted itself.)
+		 */
 		kqring_sysnum[i] = NO_SYSCALL;
 		if (kern_syscall_register(sysent, &kqring_sysnum[i],
-		    &kqring_sysent[i], &kqring_old_sysent[i], 0) != 0) {
+		    &kqring_sysent[i], &kqring_old_sysent[i],
+		    i == KQRING_SYS_ENTER ? SY_THR_STATIC : 0) != 0) {
 			printf("kqring: no free system call slot\n");
 			kqring_sysnum[i] = NO_SYSCALL;
 		}
-	}
-	/*
-	 * Enter counts itself (kqring_sys_busy): stop the kernel counting
-	 * it, once no call it counted is in progress.  syscallenter()
-	 * decides per call, so a call ends as it started.
-	 */
-	if (kqring_sysnum[KQRING_SYS_ENTER] != NO_SYSCALL) {
-		while (!atomic_cmpset_32(
-		    &sysent[kqring_sysnum[KQRING_SYS_ENTER]].sy_thrcnt, 0,
-		    SY_THR_STATIC))
-			cpu_spinwait();
 	}
 }
 

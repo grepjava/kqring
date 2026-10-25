@@ -7385,6 +7385,14 @@ test_cq_backpressure(void)
 
 	ring_init(&t);
 	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	int fds[1] = { sv[1] }, none[1] = { -1 };
+	uint64_t tags[1] = { 0x78f0 };
+	struct io_uring_rsrc_register rr = { .nr = 1,
+	    .data = (uint64_t)(uintptr_t)fds,
+	    .tags = (uint64_t)(uintptr_t)tags };
+	struct io_uring_rsrc_update2 up2 = { .offset = 0,
+	    .data = (uint64_t)(uintptr_t)none, .nr = 1 };
+	assert(reg(&t, IORING_REGISTER_FILES2, &rr, sizeof(rr)) == 0);
 
 	/* 1. A multishot RECV while the CQ is full ends at once. */
 	sqe = ring_prep(&t, IORING_OP_RECV, sv[0], 78000);
@@ -7420,6 +7428,10 @@ test_cq_backpressure(void)
 		assert(++rounds < 16384 / SQ_ENTRIES + 4);
 	}
 	assert(rounds >= 16384 / SQ_ENTRIES - 4);
+	/* Register calls that would post tag CQEs are held back too. */
+	assert(reg(&t, IORING_REGISTER_FILES_UPDATE2, &up2, sizeof(up2)) ==
+	    -EBUSY);
+	assert(reg(&t, IORING_UNREGISTER_FILES, NULL, 0) == -EBUSY);
 
 	/* 3. Reaping lifts it; the multishot RECV's last CQE had no MORE. */
 	for (int spins = 0; spins < 100000; spins++) {
@@ -7448,11 +7460,15 @@ test_cq_backpressure(void)
 	r = kqring_enter(t.fd, SQ_ENTRIES, 1, IORING_ENTER_GETEVENTS, NULL, 0);
 	assert(r == SQ_ENTRIES);
 	ring_drain_cqes(&t);
+	/* Once reaped, the slot is released and its tag CQE comes. */
+	assert(reg(&t, IORING_REGISTER_FILES_UPDATE2, &up2, sizeof(up2)) == 1);
+	expect_cqe(&t, 0x78f0, 0);
+	assert(reg(&t, IORING_UNREGISTER_FILES, NULL, 0) == 0);
 	close(sv[0]);
 	close(sv[1]);
 	close(t.fd);
 	printf("[PASS] NODROP: EBUSY while %u CQEs overflowed, multishot ends "
-	    "on a full CQ, nothing dropped\n", total);
+	    "on a full CQ, tag updates held back, nothing dropped\n", total);
 }
 
 /*
@@ -7481,6 +7497,15 @@ test_sync_cancel_worker(void)
 	assert(ring_cq_ready(&t) == 0);
 	memset(&sc, 0, sizeof(sc));
 	sc.addr = 79000;
+	/* A bad timeout is EINVAL, and nothing is cancelled. */
+	sc.timeout.tv_sec = 0;
+	sc.timeout.tv_nsec = 1000000000;
+	assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == -EINVAL);
+	sc.timeout.tv_sec = -1;
+	sc.timeout.tv_nsec = 0;
+	assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == -EINVAL);
+	usleep(20 * 1000);
+	assert(ring_cq_ready(&t) == 0);
 	sc.timeout.tv_sec = -1;
 	sc.timeout.tv_nsec = -1;
 	assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == 0);

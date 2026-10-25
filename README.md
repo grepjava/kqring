@@ -158,7 +158,7 @@ Except for the thread scaling, these are single-threaded loopback measurements. 
   - `IORING_REGISTER_SYNC_CANCEL` does wait: it returns once the requests it cancelled have stopped, or `ETIME` after its timeout, as on Linux.
   - Ring close detaches running workers without waiting. Final cleanup waits until the last worker returns, and module unload drains any that remain.
 - **`CLOCK`** is recorded, but timeouts are relative, so it has no effect.
-- **Completion overflow.** Completions that don't fit the CQ wait in the kernel (`IORING_FEAT_NODROP`). Once 16,384 are waiting, enters submit nothing and fail with `EBUSY`, and multishot requests end rather than post more, as on Linux; reaping lifts it. A completion is dropped only past a much larger bound, and the next enter that reaps then fails once with `EOVERFLOW` (Linux's `EBADR`, which FreeBSD lacks).
+- **Completion overflow.** Completions that don't fit the CQ wait in the kernel (`IORING_FEAT_NODROP`). Once 16,384 are waiting, enters submit nothing and fail with `EBUSY`, and multishot requests end rather than post more, as on Linux; reaping lifts it. Register calls that release tagged slots (and so post tag CQEs) fail with `EBUSY` meanwhile too. What is still to come is bounded, and the kernel keeps room for it; should a completion ever be dropped, the next enter that reaps fails once with `EOVERFLOW` (Linux's `EBADR`, which FreeBSD lacks).
 - **`execve(2)` disables open rings.** Any ring owned by the calling process is torn down:
   - its worker pool and `SQPOLL` thread are stopped;
   - in-flight requests are freed without posting `-ECANCELED` CQEs;

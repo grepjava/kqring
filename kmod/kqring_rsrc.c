@@ -260,7 +260,7 @@ kqring_rsrc_put(struct kqring_ctx *ctx, struct kqring_rsrc *r)
 	if (--r->refs != 0)
 		return;
 	if (r->tag != 0 && !ctx->closing)
-		kqring_post_cqe(ctx, r->tag, 0, 0);
+		kqring_post_cqe_nodrop(ctx, r->tag, 0, 0);
 	if (r->fp != NULL) {
 		filecaps_free(&r->caps);
 		fdrop(r->fp, curthread);
