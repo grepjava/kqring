@@ -128,10 +128,11 @@ MALLOC_DECLARE(M_SELFD);
  * requests end rather than post more, so what is still to come is at most
  * a few CQEs per live request plus queued MSG_RING CQEs; KQRING_MAX_
  * OVERFLOW leaves room for all of them.  Resource tag CQEs don't count
- * against it (kqring_post_cqe_nodrop()): there is at most one per tagged
- * slot, and the register calls that release slots fail with EBUSY from
- * KQRING_OCQ_BUSY on, as submission does, so they can't be cycled to queue
- * more.  Past the ceiling (which the bounds above should make unreachable)
+ * against it (kqring_post_cqe_nodrop(), counted apart in nocq_tags), so
+ * they never take that room: there is at most one per slot a call
+ * published with a tag (a failed registration posts none), and the
+ * register calls that release slots fail with EBUSY from KQRING_OCQ_BUSY
+ * on, as submission does, so they can't be cycled to queue more.  Past the ceiling (which the bounds above should make unreachable)
  * a CQE would be dropped: counted in cq_overflow and reported as EOVERFLOW
  * (Linux's EBADR, which FreeBSD lacks) by the next enter that waits.
  */
@@ -592,6 +593,7 @@ struct kqring_ocqe {
 	STAILQ_ENTRY(kqring_ocqe) link;
 	struct io_uring_cqe	cqe;
 	uint64_t		extra[2];
+	bool			tag;	/* counted in nocq_tags */
 };
 
 /*
@@ -788,6 +790,8 @@ struct kqring_ctx {
 	 */
 	STAILQ_HEAD(, kqring_ocqe) ocq;
 	uint32_t		nocq;
+	/* Of those, resource tag CQEs, outside KQRING_MAX_OVERFLOW. */
+	uint32_t		nocq_tags;
 	/*
 	 * Armed SO_SND ops on AF_UNIX stream sockets, whose writer wakeup
 	 * never calls the so_snd upcall; the wait loop polls them.

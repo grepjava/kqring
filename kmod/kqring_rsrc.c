@@ -788,6 +788,20 @@ kqring_remove_buffers(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
  * ============================================================================
  */
 
+/*
+ * A registration that fails was never published: its slots are released
+ * without tag CQEs (nothing references them yet), so failed calls can't
+ * queue CQEs.
+ */
+static void
+kqring_rsrc_untag(struct kqring_rsrc **tab, uint32_t n)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		if (tab[i] != NULL)
+			tab[i]->tag = 0;
+	}
+}
+
 /* Release the fixed file table (UNREGISTER_FILES, teardown). */
 void
 kqring_files_free(struct kqring_ctx *ctx)
@@ -881,8 +895,10 @@ kqring_files_register(struct kqring_ctx *ctx, uint64_t ufds, uint64_t utags,
 		if (error != 0)
 			break;
 	}
-	if (error != 0)
+	if (error != 0) {
+		kqring_rsrc_untag(ctx->files, ctx->nfiles);
 		kqring_files_free(ctx);
+	}
 	return (error);
 }
 
@@ -913,8 +929,10 @@ kqring_bufs_register(struct kqring_ctx *ctx, uint64_t uiov, uint64_t utags,
 		if (error != 0)
 			break;
 	}
-	if (error != 0)
+	if (error != 0) {
+		kqring_rsrc_untag(ctx->bufs, ctx->nbufs);
 		kqring_bufs_free(ctx);
+	}
 	return (error);
 }
 

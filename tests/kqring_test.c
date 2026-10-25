@@ -7519,6 +7519,138 @@ test_sync_cancel_worker(void)
 	    "request\n");
 }
 
+/*
+ * A registration that fails posts no tag CQEs for the slots it had filled:
+ * it was never published, so repeating it can't queue CQEs.
+ */
+static void
+test_tag_failed_register(void)
+{
+	struct test_ring t;
+	static char buf[64];
+	int sv[2];
+
+	ring_init(&t);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	int fds[2] = { sv[0], 1000000 };
+	uint64_t tags[2] = { 0x7c01, 0x7c02 };
+	struct io_uring_rsrc_register rr = { .nr = 2,
+	    .data = (uint64_t)(uintptr_t)fds,
+	    .tags = (uint64_t)(uintptr_t)tags };
+	struct iovec iov[2] = { { buf, sizeof(buf) }, { (void *)8, 4096 } };
+	struct io_uring_rsrc_register rb = { .nr = 2,
+	    .data = (uint64_t)(uintptr_t)iov,
+	    .tags = (uint64_t)(uintptr_t)tags };
+
+	for (int i = 0; i < 3; i++) {
+		assert(reg(&t, IORING_REGISTER_FILES2, &rr, sizeof(rr)) ==
+		    -EBADF);
+		assert(reg(&t, IORING_REGISTER_BUFFERS2, &rb, sizeof(rb)) < 0);
+	}
+	assert(kqring_enter(t.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) ==
+	    0);
+	assert(ring_cq_ready(&t) == 0);
+	/* The tables weren't left behind. */
+	fds[1] = sv[1];
+	assert(reg(&t, IORING_REGISTER_FILES2, &rr, sizeof(rr)) == 0);
+	assert(reg(&t, IORING_UNREGISTER_FILES, NULL, 0) == 0);
+	expect_cqe(&t, 0x7c01, 0);
+	expect_cqe(&t, 0x7c02, 0);
+	close(sv[0]);
+	close(sv[1]);
+	close(t.fd);
+	printf("[PASS] A failed tagged registration posts no tag CQEs\n");
+}
+
+/*
+ * Releasing more tagged slots at once than the overflow ceiling holds
+ * doesn't crowd out other CQEs: a timeout that fires afterwards, while
+ * all those tags still overflow, is kept.  Needs a descriptor limit above
+ * the ceiling (kern.maxfilesperproc); skipped otherwise.
+ */
+static void
+test_tag_release_no_drop(void)
+{
+	const unsigned n = 440000;	/* > KQRING_MAX_OVERFLOW */
+	struct __kernel_timespec t50 = { .tv_nsec = 50000000 };
+	struct test_ring t;
+	struct rlimit rl;
+	unsigned ntags = 0, total = 0;
+	bool timed_out = false;
+	int sv[2];
+
+	assert(getrlimit(RLIMIT_NOFILE, &rl) == 0);
+	rl.rlim_cur = rl.rlim_max;
+	(void)setrlimit(RLIMIT_NOFILE, &rl);
+	if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur < n) {
+		printf("[SKIP] Tag release past the overflow ceiling (needs "
+		    "RLIMIT_NOFILE >= %u)\n", n);
+		return;
+	}
+	ring_init(&t);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	int *fds = malloc(n * sizeof(*fds));
+	uint64_t *tags = malloc(n * sizeof(*tags));
+
+	assert(fds != NULL && tags != NULL);
+	for (unsigned i = 0; i < n; i++) {
+		fds[i] = sv[0];
+		tags[i] = 0x7d000000 + i;
+	}
+	struct io_uring_rsrc_register rr = { .nr = n,
+	    .data = (uint64_t)(uintptr_t)fds,
+	    .tags = (uint64_t)(uintptr_t)tags };
+	assert(reg(&t, IORING_REGISTER_FILES2, &rr, sizeof(rr)) == 0);
+
+	/* A pending timeout, then a full CQ, then all the tags. */
+	prep_timeout(&t, IORING_OP_TIMEOUT, 0x7e000, &t50, 0, 0, 0);
+	ring_submit(&t);
+	for (int i = 0; i < CQ_ENTRIES; i++) {
+		(void)ring_prep(&t, IORING_OP_NOP, -1, 0x7e001);
+		ring_push_sqe(&t);
+		if (ring_pending(&t) == SQ_ENTRIES)
+			ring_submit(&t);
+	}
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == CQ_ENTRIES);
+	assert(reg(&t, IORING_UNREGISTER_FILES, NULL, 0) == 0);
+	usleep(150 * 1000);
+	assert(kqring_enter(t.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) ==
+	    0);
+
+	/* Every CQE comes, and no enter reports a drop (EOVERFLOW). */
+	for (;;) {
+		unsigned h = atomic_load(t.cq_khead), tl = atomic_load(t.cq_ktail);
+
+		for (; h != tl; h++) {
+			struct io_uring_cqe *c = &t.cqes[h & t.cq_mask];
+
+			if (c->user_data == 0x7e000) {
+				assert(c->res == -ETIME);
+				timed_out = true;
+			} else if (c->user_data >= 0x7d000000 &&
+			    c->user_data < 0x7d000000 + n) {
+				ntags++;
+			}
+			total++;
+		}
+		atomic_store(t.cq_khead, h);
+		if ((atomic_load(t.sq_kflags) & IORING_SQ_CQ_OVERFLOW) == 0 &&
+		    h == atomic_load(t.cq_ktail))
+			break;
+		assert(kqring_enter(t.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL,
+		    0) == 0);
+	}
+	assert(timed_out && ntags == n && total == n + 1 + CQ_ENTRIES);
+	free(fds);
+	free(tags);
+	close(sv[0]);
+	close(sv[1]);
+	close(t.fd);
+	printf("[PASS] %u tag CQEs past the overflow ceiling; a later "
+	    "timeout's CQE is kept\n", n);
+}
+
 static void
 test_sqe128_cqe32_attach_wq(void)
 {
@@ -8294,6 +8426,8 @@ main(int argc, char **argv)
 		test_poll_same_thread();
 		test_cq_backpressure();
 		test_sync_cancel_worker();
+		test_tag_failed_register();
+		test_tag_release_no_drop();
 		test_sqe128_cqe32_attach_wq();
 		test_registered_rings();
 		test_sqpoll_and_iopoll();

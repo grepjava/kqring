@@ -292,6 +292,8 @@ kqring_flush_overflow(struct kqring_ctx *ctx)
 			return;
 		STAILQ_REMOVE_HEAD(&ctx->ocq, link);
 		ctx->nocq--;
+		if (ocqe->tag)
+			ctx->nocq_tags--;
 		free(ocqe, M_KQRING);
 	}
 	atomic_clear_32(&ctx->shm->sq_flags, IORING_SQ_CQ_OVERFLOW);
@@ -322,7 +324,7 @@ kqring_post_cqe_common(struct kqring_ctx *ctx, uint64_t user_data,
 	if (STAILQ_EMPTY(&ctx->ocq) && kqring_cq_push(ctx, &cqe, extra))
 		return;
 
-	if (bounded && ctx->nocq >= KQRING_MAX_OVERFLOW) {
+	if (bounded && ctx->nocq - ctx->nocq_tags >= KQRING_MAX_OVERFLOW) {
 		atomic_add_32(&ctx->shm->cq_overflow, 1);
 		ctx->cq_dropped = true;
 		return;
@@ -335,6 +337,10 @@ kqring_post_cqe_common(struct kqring_ctx *ctx, uint64_t user_data,
 	}
 	STAILQ_INSERT_TAIL(&ctx->ocq, ocqe, link);
 	ctx->nocq++;
+	if (!bounded) {
+		ocqe->tag = true;
+		ctx->nocq_tags++;
+	}
 	atomic_set_32(&ctx->shm->sq_flags, IORING_SQ_CQ_OVERFLOW);
 }
 
