@@ -51,6 +51,8 @@ Against the previous published build:
 
 The functional suite ([`tests/kqring_test.c`](tests/kqring_test.c)) passed 76/76 in each of 10 passes on the same build, with the module reloaded before each pass. After every pass and every benchmark run, `vmstat -m` showed no kqring memory in use, and `vm.stats.vm.v_user_wire_count` and `kern.openfiles` were back to their starting values.
 
+Rechecked on `a94ff6d` with the same method: every single-threaded row is within 4.3% of these medians, most within 3%. A `NOP` enter costs 5–15 ns more (1.5–3%) at every thread count, and socket receive round trips 1–2% more, from the per-enter checks added since: CQ backpressure, and posting polls woken during the enter. The tables are from the earlier build.
+
 ## Method
 
 - Each figure is the **median of 5 runs**. The module was unloaded and reloaded before each run.
