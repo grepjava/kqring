@@ -20,3 +20,4 @@ tests/kqring_mt_bench
 
 # liburing port: fetched release, build output
 liburing/work/
+journal/
