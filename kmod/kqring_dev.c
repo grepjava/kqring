@@ -511,6 +511,8 @@ kqring_ctx_free_final(struct kqring_ctx *ctx)
 		TAILQ_REMOVE(&ctx->free_ops, op, active_link);
 		free(op, M_KQRING);
 	}
+	free(ctx->sw_cache[0], M_KQRING);
+	free(ctx->sw_cache[1], M_KQRING);
 
 	/* Every request (and its references) is gone: drop the tables. */
 	kqring_kpoll_close(ctx);
@@ -1216,8 +1218,12 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 		kqring_enter_unlock(ctx, lock);
 		return (EBADF);
 	}
-	kqring_submit_sqes(ctx, ea->to_submit, &submitted);
-	ea->SUBMITTED_out = submitted;
+	if (ea->to_submit > 0) {
+		kqring_submit_sqes(ctx, ea->to_submit, &submitted);
+		ea->SUBMITTED_out = submitted;
+	} else {
+		ea->SUBMITTED_out = 0;
+	}
 
 	/* 3. Run pending DEFER_TASKRUN completions, futex and timeout checks */
 	kqring_run_taskwork(ctx);
@@ -1243,6 +1249,18 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	kqring_enter_unlock(ctx, lock);
 
 	if (!wait) {
+		kqring_evfd_flush(ctx);
+		return (0);
+	}
+
+	/*
+	 * Fast path: if min_complete CQEs are already available (from inline
+	 * submission or taskwork drained above) and min_sbt == 0, return
+	 * immediately without entering kqring_enter_wait().
+	 */
+	if (min_sbt == 0 && !iopoll &&
+	    shm->cq_tail - atomic_load_acq_32(&shm->cq_head) >=
+	    ea->min_complete) {
 		kqring_evfd_flush(ctx);
 		return (0);
 	}

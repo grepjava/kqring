@@ -291,6 +291,7 @@ struct kqring_op {
 	int			dirs;		/* KQ_DIR_* upcalls installed */
 	/* The waiter lists op is on: so_rcv (or the listener), so_snd. */
 	struct kqring_sowatch	*sw[2];
+	struct kqring_sowatch	*reap_sw;	/* empty sw detached in upcall */
 	TAILQ_ENTRY(kqring_op)	sw_link[2];
 	/*
 	 * POLL_ADD on a non-socket file, as knotes on the ring's kqueue
@@ -309,6 +310,7 @@ struct kqring_op {
 	u_int			kp_nev;
 	uint32_t		kp_seen[2];	/* read, write: kqring_kp_filt_event() */
 	bool			listening;	/* armed via solisten_upcall_set */
+	bool			oneshot_sb;	/* one-shot single-dir sockbuf op */
 	bool			in_taskwork;
 	bool			cancelled;	/* no longer armed; under mtx */
 	bool			polled;		/* no upcall; see npolled */
@@ -548,8 +550,9 @@ struct kqring_bgroup {
 	bool			busy;		/* worker reserves head, bg_sx */
 	uint16_t		ring_flags;	/* IOU_PBUF_RING_* */
 	uint64_t		ring_uaddr;	/* user memory ring */
-	struct io_uring_buf_ring *ring_kva;	/* IOU_PBUF_RING_MMAP ring */
+	struct io_uring_buf_ring *ring_kva;	/* kernel mapping of ring */
 	vm_object_t		ring_obj;
+	vm_page_t		*ring_pages;	/* held user pages (!MMAP) */
 	vm_offset_t		ring_kva_base;
 	size_t			ring_alloc_len;
 	struct uidinfo		*ring_uip;	/* charged for ring_obj */
@@ -616,6 +619,7 @@ struct kqring_wq {
 	uint32_t		total[KQRING_WQ_TYPES];
 	uint32_t		busy[KQRING_WQ_TYPES];
 	uint32_t		pending[KQRING_WQ_TYPES];
+	uint32_t		spinning[KQRING_WQ_TYPES];
 	struct cpuset		*base_cpuset;
 	cpuset_t		cpumask;
 	bool			aff_set;
@@ -811,6 +815,7 @@ struct kqring_ctx {
 	 */
 	struct kqring_op_list	free_ops;
 	int			nfree;
+	struct kqring_sowatch	*sw_cache[2];
 };
 
 #define	KQRING_OP_CACHE_MAX	32
@@ -1362,6 +1367,7 @@ int	kqring_ioc_register(struct kqring_ctx *ctx,
 	    struct kqring_register_arg *ra, struct thread *td, int *resp);
 
 /* kqring_sock.c */
+void	kqring_sowatch_free(struct kqring_ctx *ctx, struct kqring_sowatch *sw);
 void	kqring_sb_disarm(struct kqring_op *op, struct socket *so, int which);
 void	kqring_listen_disarm(struct kqring_op *op, struct socket *so);
 void	kqring_uio_init(struct uio *auio, struct iovec *iov, u_int iovcnt,
@@ -1523,6 +1529,20 @@ kqring_has_kthread(const struct kqring_ctx *ctx)
 {
 	return ((ctx->flags & IORING_SETUP_SQPOLL) != 0 || ctx->taskrun_only);
 }
+
+/*
+ * Whether provided-buffer selection on the issuer needs bg_sx: only when
+ * another thread (shared ring, SQPOLL/taskrun kthread, or a spawned worker)
+ * could concurrently access ctx->bgroups.
+ */
+static inline bool
+kqring_bg_locks(const struct kqring_ctx *ctx)
+{
+	return (ctx->shared || kqring_has_kthread(ctx) ||
+	    (ctx->wq != NULL &&
+	    (ctx->wq->total[0] != 0 || ctx->wq->total[1] != 0)));
+}
+
 int	kqring_sqpoll_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 	    bool has_timeout, sbintime_t sbt);
 

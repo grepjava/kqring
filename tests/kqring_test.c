@@ -17,6 +17,7 @@
 #include <sys/eventfd.h>
 #include <sys/linker.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -6026,8 +6027,35 @@ test_inline_file_pipe(void)
 	assert(submit_one(&t) == 6);
 	assert(memcmp(buf, "inline", 6) == 0);
 
-	/* None of the above started a worker thread. */
-	assert(count_threads() <= threads);
+	/*
+	 * None of the above started a worker thread when the filesystem
+	 * supports VOP_READ_PGCACHE (UFS, tmpfs).  ZFS does not implement
+	 * VOP_READ_PGCACHE, so file reads go through a worker while ready
+	 * pipe I/O still completes inline.
+	 */
+	struct statfs sfs;
+	assert(fstatfs(fd, &sfs) == 0);
+	if (strcmp(sfs.f_fstypename, "zfs") != 0)
+		assert(count_threads() <= threads);
+	else {
+		struct test_ring tp;
+		ring_init(&tp);
+		int pthreads = count_threads();
+		sqe = ring_prep(&tp, IORING_OP_WRITE, pfd[1], 62010);
+		sqe->addr = (uint64_t)(uintptr_t)"inline";
+		sqe->len = 6;
+		sqe->off = (uint64_t)-1;
+		ring_push_sqe(&tp);
+		assert(submit_one(&tp) == 6);
+		sqe = ring_prep(&tp, IORING_OP_READ, pfd[0], 62011);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = 64;
+		sqe->off = (uint64_t)-1;
+		ring_push_sqe(&tp);
+		assert(submit_one(&tp) == 6);
+		assert(count_threads() <= pthreads);
+		close(tp.fd);
+	}
 
 	/*
 	 * An empty one waits for data even O_NONBLOCK, as io_uring polls it

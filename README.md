@@ -79,18 +79,32 @@ Programs that use liburing build against the port in [`liburing/`](liburing/), w
 
 ![kqring vs kqueue: speed-up per operation](docs/bench/summary.svg)
 
-Compared with `kqueue(2)`, or the plain system call where kqueue has no role, on a 4-core i5-8250U running FreeBSD 15.1 (medians of 5 runs):
+Compared with `kqueue(2)`, or the plain system call where kqueue has no role, on a 4-core i5-8250U running FreeBSD 15.1 (medians across runs):
 
-- **Many ready sockets:** 14–17% faster than kqueue, from 16 up to 1,024 connections, because one enter reaps every message.
-- **One connection:** multishot `RECV` is 4–15% faster than kqueue on AF_UNIX, and receiving into one reused buffer is 19–22% faster.
-- **Cached file reads:** 32 `READ`s per enter cost 30% less than `pread(2)`, served inline from the page cache. One `READ` per enter costs 14% more.
-- **Zero-copy send:** `SEND_ZC` from a registered buffer is 38% faster than `write(2)` for 256 KiB messages on AF_UNIX and 27% faster on TCP loopback, and 17–19% faster at 64 KiB.
-- **Batching and timers:** 32 `NOP`s per enter cost 64 ns each, and a single `NOP` enter 324 ns (an empty `kevent` costs 289 ns). `TIMEOUT` is 45% faster; multishot `ACCEPT` is on par with kqueue.
-- **Disk devices:** 4 KiB random reads on an md(4) disk cost 41% less than through a worker, and 32 per enter run 4.5× faster than `pread(2)`.
-- **Pipes:** a `READ` on a pipe with data runs inline, blocking or not, and is 17–19% faster than kqueue. A read that has to wait goes through a worker thread.
+- **Many ready sockets:** 17–22% faster than kqueue (`1.17×–1.28×`), from 16 up to 1,024 connections, because one enter reaps every message (`647–742 ns` vs `826–871 ns`).
+- **One connection:** multishot `RECV` is 4–18% faster than kqueue on AF_UNIX (`912 ns` vs `1,111 ns` at 64 B), receiving with a provided-buffer ring is up to 14% faster (`958 ns`), and receiving into one reused buffer is 20–22% faster (`865 ns`).
+- **Armed one-shot `RECV` before data arrives:** 22% slower than kqueue at 64 B on AF_UNIX (`1,352 ns` vs `1,111 ns`, cut down from 37% slower in earlier builds) and 8% slower on TCP loopback (`6,427 ns` vs `5,928 ns`), because each one-shot pre-armed receive takes an extra enter and installs and removes a socket upcall. Use multishot `RECV` for steady-state receive.
+- **Cached file reads:** on UFS/tmpfs (`VOP_READ_PGCACHE`), 32 `READ`s per enter cost 30% less than `pread(2)` (`786 ns` vs `1,116 ns`), served inline from the page cache. On ZFS (which caches in the ARC rather than `VOP_READ_PGCACHE`), reads go through a worker thread and cost 30% more than `pread(2)` when batched (`2,184 ns` vs `1,684 ns`) and 46% more unbatched (`2,461 ns`).
+- **Zero-copy send:** `SEND_ZC` from a registered buffer is 35–39% faster than `write(2)` for 256 KiB messages on AF_UNIX (`16.7 µs` vs `25.8 µs`) and 25–27% faster on TCP loopback (`38.2 µs` vs `50.9 µs`), and 15–17% faster at 64 KiB.
+- **Batching, timers, and workers:** 32 `NOP`s per enter cost 62 ns each, and a single `NOP` enter 321 ns (an empty `kevent` costs 297 ns). A worker round trip (`NOP` with `IOSQE_ASYNC`) takes `1.02 µs` (down from `4.37 µs` with bounded adaptive spinning). `TIMEOUT` is 30–45% faster (`4.82 µs`); multishot `ACCEPT` is on par with kqueue (and 8% faster with `IORING_REGISTER_NAPI` busy-polling).
+- **Disk devices:** 4 KiB random reads on an md(4) disk cost 41% less than through a worker, and 32 per enter run 4.5× faster than `pread(2)` (`975 ns` vs `4,371 ns`).
+- **Pipes:** a `READ` on a pipe with data runs inline, blocking or not, and is 18–19% faster than kqueue (`830–836 ns` vs `1,021 ns`).
 - **Threads:** with one ring per thread, enters scale across CPUs: 12.5 M single-`NOP` enters per second on 8 threads, against 3.1 M on one.
 
 Except for the thread scaling, these are single-threaded loopback measurements. See [`BENCHMARK.MD`](BENCHMARK.MD) for the method, every result, and the known gaps.
+
+### When to use kqring vs. kqueue
+
+| Scenario | Recommendation | Why |
+|---|---|---|
+| **High-concurrency servers, proxies, and gateways** (many active sockets, HTTP/gRPC/Redis/MQTT brokers) | **Use `kqring`** with `IORING_RECV_MULTISHOT` + provided buffer rings (`PBUF_RING`) | Reaps completions from N sockets and submits outbound responses in **1 syscall** instead of `1 kevent + N recv + N send` (**17–22% faster**). |
+| **Bulk / streaming socket sends (`≥ 32 KiB` AF_UNIX, `≥ 64 KiB` TCP)** | **Use `kqring`** with `IORING_OP_SEND_ZC` + registered buffers | Page-holding zero-copy mbufs (`M_EXTPG`) avoid copying user buffers into kernel mbuf clusters (**17–39% faster** than `write(2)`). |
+| **Batched operations, raw block devices, pipes, and short timers** | **Use `kqring`** | Batched enters amortise syscall overhead to ~62 ns/op; direct GEOM `bio` submission on raw disks is **4.5× faster** than `pread(2)`; timers and ready pipes beat `kqueue` by **18–45%**. |
+| **Existing Linux `io_uring` applications** (Tokio, Seastar, liburing apps) | **Use `kqring`** | Recompiles against `<sys/kqring.h>` or [`liburing/`](liburing/) without rewriting a proactor codebase into a `kqueue` reactor. |
+| **Pre-arming one-shot `RECV`s on idle sockets (1 enter per op)** | **Avoid one-shot pre-arming** — switch to **multishot `RECV`** or use `kqueue` | Submitting a one-shot `RECV` before data arrives and waiting in a second enter pays an extra syscall plus socket-upcall install/teardown (**8–31% slower** than `kqueue`). Multishot `RECV` arms the upcall once and turns this into a **4–18% win**. |
+| **Small (`< 32 KiB`) unbatched sends** | **Avoid `SEND_ZC`** — use batched `IORING_OP_SEND` or plain `write(2)` | Pinning pages and posting a second `IORING_CQE_F_NOTIF` CQE costs more than copying `< 32 KiB` in L1/L2 cache (**~9% slower** at 16 KiB). |
+| **Unbatched small (`4 KiB`) cached file reads on ZFS** | **Avoid unbatched `kqring` file reads** — use `pread(2)` or UFS/raw disk | ZFS caches in the ARC rather than `VOP_READ_PGCACHE`, so regular-file reads on ZFS hand off to a worker thread (**30–46% slower** than an inline warm-cache `pread(2)`). On UFS/tmpfs, batched `kqring` reads run inline and beat `pread(2)` by **30%**. |
+| **Kernel TLS (`KTLS` + `sendfile(2)`) video/CDN serving** | **Keep `sendfile(2)` + `kqueue` for the media path** | FreeBSD's `sendfile(2)` + in-kernel TLS (`KTLS`) encrypts and DMA-transfers file pages straight from the filesystem cache to the NIC with zero userspace data path. `kqring` can still help on control-plane sockets, multishot `ACCEPT`, and timers, and integrates into an existing `kqueue` loop via its ring descriptor (`EVFILT_READ`). |
 
 ---
 

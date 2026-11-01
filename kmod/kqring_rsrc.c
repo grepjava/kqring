@@ -174,7 +174,8 @@ kqring_buf_none(struct kqring_ctx *ctx, uint16_t bgid)
 	struct kqring_bgroup *bg;
 	uint16_t tail;
 
-	sx_assert(&ctx->bg_sx, SA_LOCKED);
+	if (kqring_bg_locks(ctx))
+		sx_assert(&ctx->bg_sx, SA_LOCKED);
 	bg = kqring_bgroup_find(ctx, bgid);
 	if (bg == NULL)
 		return (true);
@@ -850,7 +851,10 @@ kqring_bgroup_free(struct kqring_ctx *ctx, struct kqring_bgroup *bg)
 		free(kb, M_KQRING);
 	}
 	ctx->nprovided -= bg->nbufs;
-	if (bg->ring_obj != NULL) {
+	if (bg->ring_pages != NULL) {
+		kqring_unpin_shm(bg->ring_kva_base, bg->ring_alloc_len,
+		    bg->ring_pages);
+	} else if (bg->ring_obj != NULL) {
 		/* Mappings userspace still has keep their own reference. */
 		ctx->ring_mem -= bg->ring_alloc_len;
 		kqring_mem_uncharge(bg->ring_uip, bg->ring_alloc_len, false);
@@ -1136,6 +1140,11 @@ kqring_pbuf_register(struct kqring_ctx *ctx,
 		ctx->ring_mem += bg->ring_alloc_len;
 	} else {
 		bg->ring_uaddr = reg.ring_addr;
+		if (kqring_pin_shm(curthread, reg.ring_addr, bytes,
+		    &bg->ring_kva_base, &bg->ring_alloc_len,
+		    &bg->ring_pages) == 0)
+			bg->ring_kva =
+			    (struct io_uring_buf_ring *)bg->ring_kva_base;
 	}
 	mtx_lock(&ctx->mtx);
 	if (old != NULL)

@@ -421,6 +421,22 @@ kqring_wq_thread(void *arg)
 			continue;
 		}
 
+		if (mp_ncpus > 1) {
+			wq->spinning[type]++;
+			mtx_unlock(&wq->mtx);
+			for (int s = 0; s < 2048; s++) {
+				if (atomic_load_32(&wq->pending[type]) != 0 ||
+				    wq->closing ||
+				    kqring_wq_suspend_pending())
+					break;
+				cpu_spinwait();
+			}
+			mtx_lock(&wq->mtx);
+			wq->spinning[type]--;
+			if (!TAILQ_EMPTY(&wq->ops[type]) || wq->closing ||
+			    kqring_wq_check_suspend(wq))
+				continue;
+		}
 		error = msleep_sbt(&wq->ops[type], &wq->mtx, PCATCH,
 		    "kqwqid", KQRING_WQ_IDLE_SBT, 0, 0);
 		if (error == EWOULDBLOCK &&
@@ -581,7 +597,8 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 		wq->refs++;
 		need_spawn = true;
 	}
-	wakeup_one(&wq->ops[type]);
+	if (wq->spinning[type] == 0)
+		wakeup_one(&wq->ops[type]);
 	mtx_unlock(&wq->mtx);
 	if (need_spawn) {
 		mtx_unlock(&ctx->mtx);
@@ -593,6 +610,16 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 			mtx_lock(&wq->mtx);
 			wq->total[type]--;
 			kqring_wq_rele_locked(wq);
+		}
+		mtx_lock(&ctx->mtx);
+	}
+	if (mp_ncpus > 1 && kqring_wq_can_wait_op_locked(ctx, op)) {
+		mtx_unlock(&ctx->mtx);
+		for (int s = 0; s < 2048; s++) {
+			if (op->wq_done || op->wq_blocking || op->cancelled ||
+			    ctx->closing)
+				break;
+			cpu_spinwait();
 		}
 		mtx_lock(&ctx->mtx);
 	}

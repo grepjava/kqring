@@ -363,12 +363,36 @@ kqring_post_cqe_nodrop(struct kqring_ctx *ctx, uint64_t user_data,
 	kqring_post_cqe_common(ctx, user_data, res, flags, NULL, false);
 }
 
+static void
+kqring_sock_disarm(struct kqring_op *op)
+{
+	struct socket *so = op->so;
+
+	if (op->reap_sw != NULL) {
+		kqring_sowatch_free(op->ctx, op->reap_sw);
+		op->reap_sw = NULL;
+	}
+	if (so == NULL)
+		return;
+	op->so = NULL;
+	if (op->listening) {
+		kqring_listen_disarm(op, so);
+	} else {
+		if ((op->dirs & KQ_DIR_RCV) != 0)
+			kqring_sb_disarm(op, so, SO_RCV);
+		if ((op->dirs & KQ_DIR_SND) != 0)
+			kqring_sb_disarm(op, so, SO_SND);
+	}
+	op->dirs = 0;
+	if (op->sock_fp == NULL)
+		kqring_sorele(so);
+}
+
 void
 kqring_op_disarm_locked(struct kqring_op *op)
 {
 	struct kqring_ctx *ctx = op->ctx;
 	struct kqring_wq *wq = ctx->wq;
-	struct socket *so = op->so;
 
 	mtx_assert(&ctx->mtx, MA_OWNED);
 	if (op->polled) {
@@ -413,23 +437,13 @@ kqring_op_disarm_locked(struct kqring_op *op)
 	op->wq_wait_ready = false;
 	kqring_timer_stop_locked(op);
 	kqring_futex_unhash_locked(op);
-	if (so != NULL) {
-		op->so = NULL;
+	if (op->so != NULL || op->reap_sw != NULL) {
 		/*
 		 * Drop ctx->mtx before acquiring the socket lock to respect
 		 * lock ordering (socket lock -> ctx->mtx in kqring_soupcall).
 		 */
 		mtx_unlock(&ctx->mtx);
-		if (op->listening) {
-			kqring_listen_disarm(op, so);
-		} else {
-			if ((op->dirs & KQ_DIR_RCV) != 0)
-				kqring_sb_disarm(op, so, SO_RCV);
-			if ((op->dirs & KQ_DIR_SND) != 0)
-				kqring_sb_disarm(op, so, SO_SND);
-		}
-		op->dirs = 0;
-		kqring_sorele(so);
+		kqring_sock_disarm(op);
 		mtx_lock(&ctx->mtx);
 	}
 }
@@ -569,6 +583,10 @@ kqring_op_free(struct kqring_op *op)
 	 */
 	if (op->timer_init)
 		callout_drain(&op->callout);
+	if (op->reap_sw != NULL) {
+		kqring_sowatch_free(ctx, op->reap_sw);
+		op->reap_sw = NULL;
+	}
 	if (op->wq_fp != NULL) {
 		filecaps_free(&op->wq_caps);
 		fdrop(op->wq_fp, curthread);
@@ -2204,6 +2222,8 @@ kqring_flush_ready(struct kqring_ctx *ctx)
 {
 	struct kqring_op *op;
 
+	if (TAILQ_EMPTY(&ctx->ready_q) && TAILQ_EMPTY(&ctx->defer_q))
+		return;
 	for (;;) {
 		if ((op = TAILQ_FIRST(&ctx->ready_q)) != NULL) {
 			TAILQ_REMOVE(&ctx->ready_q, op, q_link);
@@ -2248,8 +2268,9 @@ kqring_chain_submit(struct kqring_ctx *ctx, struct kqring_op *head,
 	}
 	if (head->drain)
 		ctx->drain_barrier = true;
-	TAILQ_INSERT_TAIL(&ctx->ready_q, head, q_link);
-	kqring_flush_ready(ctx);
+	kqring_req_issue(ctx, head);
+	if (!TAILQ_EMPTY(&ctx->ready_q) || !TAILQ_EMPTY(&ctx->defer_q))
+		kqring_flush_ready(ctx);
 }
 
 /* Free a request that will never complete (ring teardown). */
@@ -2330,14 +2351,26 @@ kqring_taskwork_run_one(struct kqring_ctx *ctx, struct kqring_op *op)
 	struct ucred *saved = kqring_cred_enter(op);
 
 	if (kqring_op_attempt(ctx, op, op->so) == EAGAIN) {
-		if (op->wq_wait_ready)
+		if (!op->armed) {
+			if (op->reap_sw != NULL) {
+				kqring_sowatch_free(ctx, op->reap_sw);
+				op->reap_sw = NULL;
+			}
+			op->dirs = 0;
+			(void)kqring_arm_socket_op(ctx, op,
+			    kqring_op_dirs(&op->sqe));
+		} else if (op->wq_wait_ready) {
 			kqring_wq_rearm_ready(ctx, op);
+		}
 		kqring_cred_exit(saved);
 		return;
 	}
-	mtx_lock(&ctx->mtx);
-	kqring_op_unarm_locked(ctx, op);
-	mtx_unlock(&ctx->mtx);
+	kqring_sock_disarm(op);
+	if (op->armed) {
+		mtx_lock(&ctx->mtx);
+		kqring_op_unarm_locked(ctx, op);
+		mtx_unlock(&ctx->mtx);
+	}
 	kqring_req_complete(ctx, op, op->res, op->cflags);
 	kqring_cred_exit(saved);
 }
@@ -2388,10 +2421,15 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 		 * seen by the wait loop, which re-checks taskwork_ops under
 		 * ctx->mtx before sleeping.
 		 */
-		if (TAILQ_EMPTY(&ctx->taskwork_ops) && (ctx->shm == NULL ||
-		    (atomic_load_32(&ctx->shm->sq_flags) &
-		    IORING_SQ_TASKRUN) == 0))
+		if (TAILQ_EMPTY(&ctx->taskwork_ops) &&
+		    STAILQ_EMPTY(&ctx->rcq)) {
+			if (ctx->shm != NULL &&
+			    (atomic_load_32(&ctx->shm->sq_flags) &
+			    IORING_SQ_TASKRUN) != 0)
+				atomic_clear_32(&ctx->shm->sq_flags,
+				    IORING_SQ_TASKRUN);
 			break;
+		}
 
 		mtx_lock(&ctx->mtx);
 		for (;;) {
@@ -2402,6 +2440,39 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 				if (ctx->closing || (op->cancelled &&
 				    !op->wq_retired))
 					continue;
+				/*
+				 * Fast path for one-shot socket ops already
+				 * detached from their sockbuf waiter list in
+				 * kqring_soupcall: unarm under this same
+				 * ctx->mtx acquisition and, if taskwork_ops
+				 * is now empty, clear IORING_SQ_TASKRUN and
+				 * return without re-acquiring ctx->mtx.
+				 */
+				if (op->oneshot_sb && op->armed &&
+				    op->sw[0] == NULL && op->sw[1] == NULL &&
+				    op->ltimeout == NULL && !op->polled &&
+				    !op->timer_pending &&
+				    op->sqe.opcode != IORING_OP_POLL_ADD) {
+					op->cancelled = true;
+					op->armed = false;
+					TAILQ_REMOVE(&ctx->active_ops, op,
+					    active_link);
+					if (TAILQ_EMPTY(&ctx->taskwork_ops) &&
+					    (STAILQ_EMPTY(&ctx->rcq) ||
+					    ctx->nocq >= KQRING_OCQ_BUSY)) {
+						if (ctx->shm != NULL &&
+						    (atomic_load_32(
+						    &ctx->shm->sq_flags) &
+						    IORING_SQ_TASKRUN) != 0)
+							atomic_clear_32(
+							    &ctx->shm->sq_flags,
+							    IORING_SQ_TASKRUN);
+						mtx_unlock(&ctx->mtx);
+						kqring_taskwork_run_one(ctx,
+						    op);
+						goto flush;
+					}
+				}
 				mtx_unlock(&ctx->mtx);
 				kqring_taskwork_run_one(ctx, op);
 				mtx_lock(&ctx->mtx);
@@ -2416,9 +2487,12 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 				break;
 			kqring_post_remote_locked(ctx);
 		}
-		if (ctx->shm != NULL)
+		if (ctx->shm != NULL &&
+		    (atomic_load_32(&ctx->shm->sq_flags) &
+		    IORING_SQ_TASKRUN) != 0)
 			atomic_clear_32(&ctx->shm->sq_flags, IORING_SQ_TASKRUN);
 		mtx_unlock(&ctx->mtx);
+flush:
 		kqring_flush_ready(ctx);
 	}
 }
@@ -2525,7 +2599,8 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 		}
 		submitted++;
 	}
-	atomic_store_rel_32(&shm->sq_head, head);
+	if (shm->sq_head != head)
+		atomic_store_rel_32(&shm->sq_head, head);
 	if (chain_head != NULL)
 		kqring_chain_submit(ctx, chain_head, chain_failed);
 	ctx->submitting = false;

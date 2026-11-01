@@ -22,17 +22,39 @@ static int kqring_soupcall(struct socket *so, void *arg, int waitflag);
  */
 
 static int
-kqring_soupcall(struct socket *so __unused, void *arg, int waitflag __unused)
+kqring_soupcall(struct socket *so, void *arg, int waitflag __unused)
 {
 	struct kqring_sowatch *sw = arg;
-	struct kqring_op *op;
+	struct kqring_op *op, *tmp, *last = NULL;
+	int i = sw->idx;
 
-	TAILQ_FOREACH(op, &sw->ops, sw_link[sw->idx]) {
+	TAILQ_FOREACH_SAFE(op, &sw->ops, sw_link[i], tmp) {
 		struct kqring_ctx *ctx = op->ctx;
 
+		if (op->oneshot_sb) {
+			TAILQ_REMOVE(&sw->ops, op, sw_link[i]);
+			op->sw[i] = NULL;
+			last = op;
+		}
 		mtx_lock(&ctx->mtx);
 		kqring_taskwork_add_locked(ctx, op);
 		mtx_unlock(&ctx->mtx);
+	}
+	if (last != NULL && TAILQ_EMPTY(&sw->ops)) {
+		int which = i == 0 ? SO_RCV : SO_SND;
+
+		if (!SOLISTENING(so) &&
+		    kqring_sb(so, which)->sb_upcallarg == sw)
+			soupcall_clear(so, which);
+		mtx_lock(&last->ctx->mtx);
+		if (!last->cancelled && !last->ctx->closing &&
+		    last->reap_sw == NULL) {
+			last->reap_sw = sw;
+			sw = NULL;
+		}
+		mtx_unlock(&last->ctx->mtx);
+		if (sw != NULL)
+			free(sw, M_KQRING);
 	}
 	return (SU_OK);
 }
@@ -46,6 +68,20 @@ kqring_sowatch_leave(struct kqring_op *op, int i)
 	TAILQ_REMOVE(&sw->ops, op, sw_link[i]);
 	op->sw[i] = NULL;
 	return (TAILQ_EMPTY(&sw->ops) ? sw : NULL);
+}
+
+/* Recycle or free an empty waiter list (sw may be NULL). */
+void
+kqring_sowatch_free(struct kqring_ctx *ctx, struct kqring_sowatch *sw)
+{
+	if (sw == NULL)
+		return;
+	if (!ctx->closing && !ctx->cancelling &&
+	    ctx->sw_cache[sw->idx] == NULL) {
+		ctx->sw_cache[sw->idx] = sw;
+		return;
+	}
+	free(sw, M_KQRING);
 }
 
 /*
@@ -69,7 +105,7 @@ kqring_sb_disarm(struct kqring_op *op, struct socket *so, int which)
 	    kqring_sb(so, which)->sb_upcallarg == sw)
 		soupcall_clear(so, which);
 	SOCK_BUF_UNLOCK(so, which);
-	free(sw, M_KQRING);
+	kqring_sowatch_free(op->ctx, sw);
 }
 
 /* As kqring_sb_disarm(), for an op waiting on a listening socket. */
@@ -85,15 +121,19 @@ kqring_listen_disarm(struct kqring_op *op, struct socket *so)
 	if (sw != NULL && so->sol_upcallarg == sw)
 		solisten_upcall_set(so, NULL, NULL);
 	SOCK_UNLOCK(so);
-	free(sw, M_KQRING);
+	kqring_sowatch_free(op->ctx, sw);
 }
 
 /* A new, empty waiter list for slot i (allocated without socket locks). */
 static struct kqring_sowatch *
-kqring_sowatch_new(int i)
+kqring_sowatch_new(struct kqring_ctx *ctx, int i)
 {
 	struct kqring_sowatch *sw;
 
+	if ((sw = ctx->sw_cache[i]) != NULL) {
+		ctx->sw_cache[i] = NULL;
+		return (sw);
+	}
 	sw = malloc(sizeof(*sw), M_KQRING, M_WAITOK);
 	TAILQ_INIT(&sw->ops);
 	sw->idx = i;
@@ -133,8 +173,6 @@ kqring_getsock(const struct kqring_op *op, struct socket *expect,
 	int error;
 
 	if (op->sock_fp != NULL) {
-		if (!fhold(op->sock_fp))
-			return (EBADF);
 		*fpp = op->sock_fp;
 		return (0);
 	}
@@ -161,10 +199,12 @@ kqring_getsock(const struct kqring_op *op, struct socket *expect,
 static void
 kqring_put_sock(struct kqring_op *op, struct file *fp, int rc)
 {
-	if (rc == EAGAIN && op->sock_fp == NULL)
-		op->sock_fp = fp;
-	else
+	if (rc == EAGAIN) {
+		if (op->sock_fp == NULL)
+			op->sock_fp = fp;
+	} else if (fp != op->sock_fp) {
 		fdrop(fp, curthread);
+	}
 }
 
 
@@ -176,6 +216,13 @@ kqring_put_sock(struct kqring_op *op, struct file *fp, int rc)
 static int
 kqring_so_readable(struct socket *so, bool *readable)
 {
+	if (!SOLISTENING(so) && (atomic_load_int(&so->so_rcv.sb_acc) > 0 ||
+	    atomic_load_int(&so->so_rcv.sb_ctl) > 0 ||
+	    (atomic_load_short(&so->so_rcv.sb_state) & SBS_CANTRCVMORE) != 0 ||
+	    atomic_load_short(&so->so_error) != 0)) {
+		*readable = true;
+		return (0);
+	}
 	SOCK_RECVBUF_LOCK(so);
 	/* Checked under the sockbuf lock; see kqring_sb_disarm(). */
 	if (SOLISTENING(so)) {
@@ -327,6 +374,7 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	    (sqe->ioprio & IORING_RECV_MULTISHOT) != 0);
 	bool bundle = sqe->opcode == IORING_OP_RECV &&
 	    (sqe->ioprio & IORING_RECVSEND_BUNDLE) != 0;
+	bool bg_lock = buf_select && kqring_bg_locks(ctx);
 	bool drained = false, waitall;
 	size_t n;
 	int error, flags, rc;
@@ -345,7 +393,7 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 #ifdef KQRING_MAC
 	error = mac_socket_check_receive(td->td_ucred, so);
 	if (error != 0) {
-		fdrop(fp, td);
+		kqring_put_sock(op, fp, error);
 		return (kqring_done(op, -error, 0));
 	}
 #endif
@@ -360,9 +408,11 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 
 		/* An empty group fails even so, as kqring_recv_pick_buf(). */
 		if (buf_select) {
-			sx_slock(&ctx->bg_sx);
+			if (bg_lock)
+				sx_slock(&ctx->bg_sx);
 			none = kqring_buf_none(ctx, sqe->buf_group);
-			sx_sunlock(&ctx->bg_sx);
+			if (bg_lock)
+				sx_sunlock(&ctx->bg_sx);
 		}
 		if (none) {
 			kqring_put_sock(op, fp, ENOBUFS);
@@ -373,11 +423,13 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	}
 
 	if (buf_select) {
-		sx_xlock(&ctx->bg_sx);
+		if (bg_lock)
+			sx_xlock(&ctx->bg_sx);
 		error = kqring_recv_pick_buf(ctx, op, so, kqring_buf_cap(op),
 		    biov, bundle ? KQRING_MAX_BUNDLE : 1, &sel);
 		if (error != 0) {
-			sx_xunlock(&ctx->bg_sx);
+			if (bg_lock)
+				sx_xunlock(&ctx->bg_sx);
 			kqring_put_sock(op, fp, error);
 			if (error == EAGAIN)
 				return (EAGAIN);
@@ -406,7 +458,7 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	n = (size_t)(want - auio.uio_resid);
 
 	if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
-		if (buf_select)
+		if (bg_lock)
 			sx_xunlock(&ctx->bg_sx);
 		kqring_put_sock(op, fp, rc);
 		return (rc);
@@ -421,7 +473,8 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 			cqe_flags |= kqring_buf_commit(ctx, &sel, n);
 		if (multishot)
 			drained = kqring_buf_drained(&sel);
-		sx_xunlock(&ctx->bg_sx);
+		if (bg_lock)
+			sx_xunlock(&ctx->bg_sx);
 	}
 	if (multishot && n > 0) {
 		cqe_flags |= IORING_CQE_F_MORE;
@@ -434,7 +487,7 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 		kqring_put_sock(op, fp, EAGAIN);
 		return (EAGAIN);
 	}
-	fdrop(fp, td);
+	kqring_put_sock(op, fp, multishot ? EAGAIN : 0);
 	return (kqring_done(op, kqring_xfer_res(n), cqe_flags));
 }
 
@@ -784,6 +837,7 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 	u_int iovcnt = 1;
 	uint32_t cqe_flags = 0;
 	bool buf_select = (sqe->flags & IOSQE_BUFFER_SELECT) != 0;
+	bool bg_lock = buf_select && kqring_bg_locks(ctx);
 	bool bundle = false, waitall = false;
 	size_t n;
 	int error, flags = MSG_DONTWAIT | MSG_NOSIGNAL, rc;
@@ -809,19 +863,21 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (error == 0)
 		error = mac_socket_check_send(td->td_ucred, so);
 	if (error != 0) {
-		fdrop(fp, td);
+		kqring_put_sock(op, fp, error);
 		return (kqring_done(op, -error, 0));
 	}
 #endif
 
 	if (buf_select) {
-		sx_xlock(&ctx->bg_sx);
+		if (bg_lock)
+			sx_xlock(&ctx->bg_sx);
 		error = kqring_buf_select(ctx, sqe->buf_group, sqe->len, biov,
 		    (sqe->ioprio & IORING_RECVSEND_BUNDLE) != 0 ?
 		    KQRING_MAX_BUNDLE : 1, &sel);
 		if (error != 0) {
-			sx_xunlock(&ctx->bg_sx);
-			fdrop(fp, td);
+			if (bg_lock)
+				sx_xunlock(&ctx->bg_sx);
+			kqring_put_sock(op, fp, error);
 			return (kqring_done(op, -error, 0));
 		}
 		iov = biov;
@@ -852,9 +908,11 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 		error = kqring_send_zc_iov(ctx, op, so, iov, iovcnt,
 		    (size_t)want, flags, td, &n);
 		if (error != EOPNOTSUPP) {
-			fdrop(fp, td);
-			if ((rc = kqring_xfer_end(op, error, n)) >= 0)
+			if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
+				kqring_put_sock(op, fp, rc);
 				return (rc);
+			}
+			kqring_put_sock(op, fp, 0);
 			return (kqring_done(op, kqring_xfer_res(n), 0));
 		}
 	}
@@ -869,15 +927,17 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (bundle) {
 		if (auio.uio_resid > 0 && (error == 0 || error == EWOULDBLOCK)) {
 			op->done_io += n;
-			sx_xunlock(&ctx->bg_sx);
+			if (bg_lock)
+				sx_xunlock(&ctx->bg_sx);
 			kqring_put_sock(op, fp, EAGAIN);
 			return (EAGAIN);
 		}
 		n += op->done_io;
 		op->done_io = 0;
 		if (n == 0) {
-			sx_xunlock(&ctx->bg_sx);
-			fdrop(fp, td);
+			if (bg_lock)
+				sx_xunlock(&ctx->bg_sx);
+			kqring_put_sock(op, fp, error);
 			return (kqring_done(op, -error, 0));
 		}
 		cqe_flags = kqring_buf_commit(ctx, &sel, n);
@@ -887,24 +947,29 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 		 */
 		if (error == 0 && !kqring_buf_drained(&sel))
 			cqe_flags |= IORING_CQE_F_MORE;
-		sx_xunlock(&ctx->bg_sx);
-		fdrop(fp, td);
+		if (bg_lock)
+			sx_xunlock(&ctx->bg_sx);
+		kqring_put_sock(op, fp,
+		    (cqe_flags & IORING_CQE_F_MORE) != 0 ? EAGAIN : 0);
 		return (kqring_done(op, kqring_xfer_res(n), cqe_flags));
 	}
 
 	if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
-		if (buf_select)
+		if (bg_lock)
 			sx_xunlock(&ctx->bg_sx);
 		kqring_put_sock(op, fp, rc);
 		return (rc);
 	}
-	fdrop(fp, td);
 	if (buf_select) {
 		cqe_flags = kqring_buf_commit(ctx, &sel, n);
-		sx_xunlock(&ctx->bg_sx);
+		if (bg_lock)
+			sx_xunlock(&ctx->bg_sx);
 	}
-	if (waitall && kqring_waitall(op, n, sqe->len, &n) == EAGAIN)
+	if (waitall && kqring_waitall(op, n, sqe->len, &n) == EAGAIN) {
+		kqring_put_sock(op, fp, EAGAIN);
 		return (EAGAIN);
+	}
+	kqring_put_sock(op, fp, 0);
 	return (kqring_done(op, kqring_xfer_res(n), cqe_flags));
 }
 
@@ -1124,6 +1189,7 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 	cap_rights_t rights;
 	uint32_t cqe_flags = 0;
 	bool buf_select = (sqe->flags & IOSQE_BUFFER_SELECT) != 0;
+	bool bg_lock = kqring_bg_locks(ctx);
 	bool waitall;
 	size_t n;
 	int error, rc;
@@ -1136,20 +1202,24 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 	so = fp->f_data;
 
 	if ((sqe->ioprio & IORING_RECV_MULTISHOT) != 0) {
-		sx_xlock(&ctx->bg_sx);
+		if (bg_lock)
+			sx_xlock(&ctx->bg_sx);
 		rc = kqring_exec_recvmsg_multi(ctx, op, so, more_out);
-		sx_xunlock(&ctx->bg_sx);
-		fdrop(fp, td);
+		if (bg_lock)
+			sx_xunlock(&ctx->bg_sx);
+		kqring_put_sock(op, fp, rc);
 		return (rc);
 	}
 
 	msg = ma->msg;
 	if (buf_select) {
-		sx_xlock(&ctx->bg_sx);
+		if (bg_lock)
+			sx_xlock(&ctx->bg_sx);
 		error = kqring_recv_pick_buf(ctx, op, so,
 		    kqring_msg_buf_cap(ma), &aiov, 1, &sel);
 		if (error != 0) {
-			sx_xunlock(&ctx->bg_sx);
+			if (bg_lock)
+				sx_xunlock(&ctx->bg_sx);
 			kqring_put_sock(op, fp, error);
 			if (error == EAGAIN)
 				return (EAGAIN);
@@ -1165,7 +1235,7 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 	n = 0;
 	error = kqring_recvit(td, so, &msg, UIO_USERSPACE, NULL, &n);
 	if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
-		if (buf_select)
+		if (buf_select && bg_lock)
 			sx_xunlock(&ctx->bg_sx);
 		kqring_put_sock(op, fp, rc);
 		return (rc);
@@ -1183,10 +1253,11 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (buf_select) {
 		if (n > 0)
 			cqe_flags |= kqring_buf_commit(ctx, &sel, n);
-		sx_xunlock(&ctx->bg_sx);
+		if (bg_lock)
+			sx_xunlock(&ctx->bg_sx);
 	}
 	if (error != 0) {
-		fdrop(fp, td);
+		kqring_put_sock(op, fp, error);
 		return (kqring_done(op, -error, cqe_flags));
 	}
 	if (kqring_so_rcv_pending(so, false))
@@ -1196,7 +1267,7 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 		kqring_put_sock(op, fp, EAGAIN);
 		return (EAGAIN);
 	}
-	fdrop(fp, td);
+	kqring_put_sock(op, fp, 0);
 	return (kqring_done(op, kqring_xfer_res(n), cqe_flags));
 }
 
@@ -1279,9 +1350,11 @@ kqring_exec_sendmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 			error = kqring_send_zc_iov(ctx, op, so, msg.msg_iov,
 			    (u_int)msg.msg_iovlen, want, flags, td, &n);
 		if (error != EOPNOTSUPP) {
-			fdrop(fp, td);
-			if ((rc = kqring_xfer_end(op, error, n)) >= 0)
+			if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
+				kqring_put_sock(op, fp, rc);
 				return (rc);
+			}
+			kqring_put_sock(op, fp, 0);
 			return (kqring_done(op, kqring_xfer_res(n), 0));
 		}
 	}
@@ -1293,16 +1366,20 @@ kqring_exec_sendmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 		    msg.msg_controllen);
 	}
 	error = kqring_sendit(td, so, &msg, flags, control, &n);
-	fdrop(fp, td);
 
-	if ((rc = kqring_xfer_end(op, error, n)) >= 0)
+	if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
+		kqring_put_sock(op, fp, rc);
 		return (rc);
+	}
 	/* The control data went with the first part, as in io_uring. */
 	if (n > 0)
 		ma->msg.msg_controllen = 0;
 	if (waitall && kqring_waitall(op, n, want + op->done_io, &n) ==
-	    EAGAIN)
+	    EAGAIN) {
+		kqring_put_sock(op, fp, EAGAIN);
 		return (EAGAIN);
+	}
+	kqring_put_sock(op, fp, 0);
 	return (kqring_done(op, kqring_xfer_res(n), 0));
 }
 
@@ -1331,19 +1408,19 @@ kqring_exec_connect(struct kqring_op *op, struct socket *expect)
 
 	if (!op->connecting) {
 		if ((so->so_state & SS_ISCONNECTING) != 0) {
-			fdrop(fp, td);
+			kqring_put_sock(op, fp, EALREADY);
 			return (kqring_done(op, -EALREADY, 0));
 		}
 #ifdef KQRING_MAC
 		error = mac_socket_check_connect(td->td_ucred, so, sa);
 		if (error != 0) {
-			fdrop(fp, td);
+			kqring_put_sock(op, fp, error);
 			return (kqring_done(op, -error, 0));
 		}
 #endif
 		error = soconnect(so, sa, td);
 		if (error != 0) {
-			fdrop(fp, td);
+			kqring_put_sock(op, fp, error);
 			return (kqring_done(op, -error, 0));
 		}
 		op->connecting = true;
@@ -1352,13 +1429,13 @@ kqring_exec_connect(struct kqring_op *op, struct socket *expect)
 	SOCK_LOCK(so);
 	if ((so->so_state & SS_ISCONNECTING) != 0 && so->so_error == 0) {
 		SOCK_UNLOCK(so);
-		fdrop(fp, td);
+		kqring_put_sock(op, fp, EAGAIN);
 		return (EAGAIN);
 	}
 	error = so->so_error;
 	so->so_error = 0;
 	SOCK_UNLOCK(so);
-	fdrop(fp, td);
+	kqring_put_sock(op, fp, error);
 	return (kqring_done(op, -error, 0));
 }
 
@@ -2050,6 +2127,7 @@ kqring_exec_socket(struct kqring_ctx *ctx, struct kqring_op *op)
 static int
 kqring_sb_arm(struct kqring_op *op, struct socket *so, int which, bool *ready)
 {
+	struct kqring_ctx *ctx = op->ctx;
 	struct kqring_sowatch *nsw = NULL;
 	struct sockbuf *sb;
 	int i = KQRING_SW_IDX(which);
@@ -2058,21 +2136,24 @@ again:
 	SOCK_BUF_LOCK(so, which);
 	if (SOLISTENING(so)) {
 		SOCK_BUF_UNLOCK(so, which);
-		free(nsw, M_KQRING);
+		kqring_sowatch_free(ctx, nsw);
 		return (ERESTART);
 	}
 	sb = kqring_sb(so, which);
 	if (sb->sb_upcall != NULL && sb->sb_upcall != kqring_soupcall) {
 		SOCK_BUF_UNLOCK(so, which);
-		free(nsw, M_KQRING);
+		kqring_sowatch_free(ctx, nsw);
 		return (EBUSY);
 	}
 	if (sb->sb_upcall == NULL) {
+		if (nsw == NULL)
+			nsw = ctx->sw_cache[i];
 		if (nsw == NULL) {
 			SOCK_BUF_UNLOCK(so, which);
-			nsw = kqring_sowatch_new(i);
+			nsw = kqring_sowatch_new(ctx, i);
 			goto again;
 		}
+		ctx->sw_cache[i] = NULL;
 		soupcall_set(so, which, kqring_soupcall, nsw);
 		kqring_sowatch_join(op, i, NULL, &nsw);
 	} else {
@@ -2090,7 +2171,7 @@ again:
 			*ready = true;
 	}
 	SOCK_BUF_UNLOCK(so, which);
-	free(nsw, M_KQRING);
+	kqring_sowatch_free(ctx, nsw);
 	return (0);
 }
 
@@ -2148,7 +2229,6 @@ kqring_arm_socket_op(struct kqring_ctx *ctx, struct kqring_op *op, int dirs)
 	if (op->sock_fp != NULL) {
 		/* Kept by an attempt that would have blocked. */
 		so = op->sock_fp->f_data;
-		soref(so);
 	} else {
 		error = kqring_op_fget(op,
 		    cap_rights_init_one(&rights, CAP_EVENT), 0, &fp);
@@ -2169,6 +2249,20 @@ kqring_arm_socket_op(struct kqring_ctx *ctx, struct kqring_op *op, int dirs)
 	/* A re-armed op (POLL_REMOVE update) was cancelled when unarmed. */
 	op->cancelled = false;
 	op->listening = false;
+	op->oneshot_sb = (dirs == KQ_DIR_RCV || dirs == KQ_DIR_SND) &&
+	    !op->wq_wait_ready &&
+	    op->sqe.opcode != IORING_OP_READ_MULTISHOT &&
+	    !(op->sqe.opcode == IORING_OP_RECV &&
+	    (op->sqe.ioprio & (IORING_RECV_MULTISHOT |
+	    IORING_RECVSEND_BUNDLE)) != 0) &&
+	    !(op->sqe.opcode == IORING_OP_RECVMSG &&
+	    (op->sqe.ioprio & IORING_RECV_MULTISHOT) != 0) &&
+	    !(op->sqe.opcode == IORING_OP_SEND &&
+	    (op->sqe.ioprio & IORING_RECVSEND_BUNDLE) != 0) &&
+	    !(op->sqe.opcode == IORING_OP_ACCEPT &&
+	    (op->sqe.ioprio & IORING_ACCEPT_MULTISHOT) != 0) &&
+	    !(op->sqe.opcode == IORING_OP_POLL_ADD &&
+	    (op->sqe.len & IORING_POLL_ADD_MULTI) != 0);
 	op->so = so;
 
 	/*
@@ -2179,6 +2273,19 @@ kqring_arm_socket_op(struct kqring_ctx *ctx, struct kqring_op *op, int dirs)
 	 */
 	struct kqring_sowatch *nsw = NULL;
 	bool ready_now;
+	if (!SOLISTENING(so)) {
+		ready_now = false;
+		error = 0;
+		if ((dirs & KQ_DIR_RCV) != 0)
+			error = kqring_sb_arm(op, so, SO_RCV, &ready_now);
+		if (error == 0 && (dirs & KQ_DIR_SND) != 0)
+			error = kqring_sb_arm(op, so, SO_SND, &ready_now);
+		if (error != ERESTART)
+			goto armed;
+		/* solisten_proto() wiped the upcall; leave the list. */
+		kqring_sb_disarm(op, so, SO_RCV);
+		op->dirs = 0;
+	}
 retry:
 	ready_now = false;
 	error = 0;
@@ -2186,12 +2293,18 @@ retry:
 	if (SOLISTENING(so)) {
 		if (so->sol_upcall != NULL && so->sol_upcall != kqring_soupcall) {
 			error = EBUSY;
-		} else if (so->sol_upcall == NULL && nsw == NULL) {
-			SOCK_UNLOCK(so);
-			nsw = kqring_sowatch_new(0);
-			goto retry;
 		} else {
+			if (so->sol_upcall == NULL && nsw == NULL) {
+				nsw = ctx->sw_cache[0];
+				ctx->sw_cache[0] = NULL;
+			}
+			if (so->sol_upcall == NULL && nsw == NULL) {
+				SOCK_UNLOCK(so);
+				nsw = kqring_sowatch_new(ctx, 0);
+				goto retry;
+			}
 			op->listening = true;
+			op->oneshot_sb = false;
 			if (so->sol_upcall == NULL) {
 				solisten_upcall_set(so, kqring_soupcall, nsw);
 				kqring_sowatch_join(op, 0, NULL, &nsw);
@@ -2216,7 +2329,8 @@ retry:
 			goto retry;
 		}
 	}
-	free(nsw, M_KQRING);
+	kqring_sowatch_free(ctx, nsw);
+armed:
 
 	if (error != 0) {
 		/*
