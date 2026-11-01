@@ -159,7 +159,7 @@ def speedup(path, title, subtitle, items, width=760):
     label_w = max(len(i[0]) for i in items) * FONT_W + 24
     top = 70
     plot_x0 = label_w + 10
-    plot_w = width - plot_x0 - 30
+    plot_w = width - plot_x0 - 80
     lo, hi = math.log2(1 / 6), math.log2(6)
     height = top + len(items) * step + 46
 

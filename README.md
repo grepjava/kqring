@@ -85,30 +85,59 @@ Programs that use liburing build against the port in [`liburing/`](liburing/), w
 
 Compared with `kqueue(2)`, or the plain system call where kqueue has no role, on a 4-core i5-8250U running FreeBSD 15.1 (medians across runs):
 
-- **Many ready sockets:** 17–22% faster than kqueue (`1.17×–1.28×`), from 16 up to 1,024 connections, because one enter reaps every message (`647–742 ns` vs `826–871 ns`).
-- **One connection:** multishot `RECV` is 4–18% faster than kqueue on AF_UNIX (`912 ns` vs `1,111 ns` at 64 B), receiving with a provided-buffer ring is up to 14% faster (`958 ns`), and receiving into one reused buffer is 20–22% faster (`865 ns`).
-- **Armed one-shot `RECV` before data arrives:** 22% slower than kqueue at 64 B on AF_UNIX (`1,352 ns` vs `1,111 ns`, cut down from 37% slower in earlier builds) and 8% slower on TCP loopback (`6,427 ns` vs `5,928 ns`), because each one-shot pre-armed receive takes an extra enter and installs and removes a socket upcall. Use multishot `RECV` for steady-state receive.
-- **Cached file reads:** on UFS/tmpfs (`VOP_READ_PGCACHE`), 32 `READ`s per enter cost 30% less than `pread(2)` (`786 ns` vs `1,116 ns`), served inline from the page cache. On ZFS (which caches in the ARC rather than `VOP_READ_PGCACHE`), reads go through a worker thread and cost 30% more than `pread(2)` when batched (`2,184 ns` vs `1,684 ns`) and 46% more unbatched (`2,461 ns`).
-- **Zero-copy send:** `SEND_ZC` from a registered buffer is 35–39% faster than `write(2)` for 256 KiB messages on AF_UNIX (`16.7 µs` vs `25.8 µs`) and 25–27% faster on TCP loopback (`38.2 µs` vs `50.9 µs`), and 15–17% faster at 64 KiB.
-- **Batching, timers, and workers:** 32 `NOP`s per enter cost 62 ns each, and a single `NOP` enter 321 ns (an empty `kevent` costs 297 ns). A worker round trip (`NOP` with `IOSQE_ASYNC`) takes `1.02 µs` (down from `4.37 µs` with bounded adaptive spinning). `TIMEOUT` is 30–45% faster (`4.82 µs`); multishot `ACCEPT` is on par with kqueue (and 8% faster with `IORING_REGISTER_NAPI` busy-polling).
-- **Disk devices:** 4 KiB random reads on an md(4) disk cost 41% less than through a worker, and 32 per enter run 4.5× faster than `pread(2)` (`975 ns` vs `4,371 ns`).
-- **Pipes:** a `READ` on a pipe with data runs inline, blocking or not, and is 18–19% faster than kqueue (`830–836 ns` vs `1,021 ns`).
-- **Threads:** with one ring per thread, enters scale across CPUs: 12.5 M single-`NOP` enters per second on 8 threads, against 3.1 M on one.
+### Side-by-side comparison (`ns/op`, lower is better)
 
-Except for the thread scaling, these are single-threaded loopback measurements. See [`BENCHMARK.MD`](BENCHMARK.MD) for the method, every result, and the known gaps.
+| Workload | `kqueue` (or syscall baseline) | `kqring` (best idiom) | `kqring` (other variants) | Delta (`ns`) | Result |
+|---|---:|---:|---|---:|---:|
+| **Empty syscall floor** | `296.4 ns` (`kevent`) | **`62.6 ns`** (`NOP` × 32) | `326.0 ns` (`NOP` × 1)<br>`1,048.8 ns` (`NOP` `IOSQE_ASYNC`) | `−233.8 ns`<br>`+29.6 ns` | **4.7× faster** batched<br>10% slower unbatched |
+| **Fan-in: 16 sockets (64 B)** | `823.4 ns` | **`647.7 ns`** (multishot) | `666.0 ns` (batched 1-shot) | `−175.7 ns` | **21% faster (1.27×)** |
+| **Fan-in: 256 sockets (64 B)** | `854.7 ns` | **`672.3 ns`** (multishot) | `686.4 ns` (batched 1-shot) | `−182.4 ns` | **21% faster (1.27×)** |
+| **Fan-in: 1,024 sockets (64 B)** | `864.9 ns` | **`705.2 ns`** (batched 1-shot)<br>**`710.0 ns`** (multishot) | — | `−159.7 ns` | **18% faster (1.23×)** |
+| **AF_UNIX ping-pong (64 B)** | `1,117.5 ns` | **`868.7 ns`** (reused buf)<br>**`915.2 ns`** (multishot) | `953.8 ns` (provided buf)<br>`1,377.6 ns` (pre-armed 1-shot) | `−248.8 ns`<br>`−202.3 ns` | **22% faster** (reused)<br>**18% faster** (multishot)<br>23% slower (pre-armed 1-shot) |
+| **AF_UNIX ping-pong (1 KiB)** | `1,156.3 ns` | **`908.4 ns`** (reused buf)<br>**`1,021.9 ns`** (multishot) | `1,060.0 ns` (provided buf)<br>`1,516.3 ns` (pre-armed 1-shot) | `−247.9 ns`<br>`−134.4 ns` | **21% faster** (reused)<br>**12% faster** (multishot)<br>31% slower (pre-armed 1-shot) |
+| **AF_UNIX ping-pong (4 KiB)** | `1,269.5 ns` | **`1,019.0 ns`** (reused buf)<br>**`1,213.9 ns`** (multishot) | `1,242.4 ns` (provided buf)<br>`1,701.6 ns` (pre-armed 1-shot) | `−250.5 ns`<br>`−55.6 ns` | **20% faster** (reused)<br>**4% faster** (multishot)<br>34% slower (pre-armed 1-shot) |
+| **TCP loopback ping-pong (64 B)** | `5,904.1 ns` | **`5,824.1 ns`** (multishot) | `6,006.7 ns` (reused buf)<br>`6,089.4 ns` (provided buf)<br>`6,493.6 ns` (pre-armed 1-shot) | `−80.0 ns` | **1.4% faster** (multishot)<br>10% slower (pre-armed 1-shot) |
+| **Pipe read (64 B, data ready)** | `1,024.4 ns` | **`831.7 ns`** (`O_NONBLOCK`)<br>**`839.6 ns`** (blocking) | — | `−192.7 ns` | **19% faster (1.23×)** |
+| **TCP loopback `ACCEPT`** | `19,280.7 ns` | **`17,686.4 ns`** (multishot + 50 µs busy-poll)<br>**`19,257.0 ns`** (multishot) | — | `−1,594.3 ns`<br>`−23.7 ns` | **8% faster** (busy-poll)<br>**On par** (multishot) |
+| **1 µs one-shot timer** | `10,185.4 ns` (`EVFILT_TIMER`) | **`4,903.5 ns`** (`TIMEOUT`) | — | `−5,281.9 ns` | **52% faster (2.08×)** |
+| **AF_UNIX bulk send (16 KiB)** | `1,726.5 ns` (`write`) | `1,917.7 ns` (`SEND`) | `1,921.1 ns` (`SEND_ZC` reg)<br>`2,048.2 ns` (`SEND_ZC` unreg) | `+191.2 ns` | 11% slower |
+| **AF_UNIX bulk send (32 KiB)** | `2,931.0 ns` (`write`) | **`2,744.0 ns`** (`SEND_ZC` reg) | `3,146.5 ns` (`SEND`)<br>`3,157.7 ns` (`SEND_ZC` unreg) | `−187.0 ns` | **6% faster** |
+| **AF_UNIX bulk send (64 KiB)** | `5,509.1 ns` (`write`) | **`4,372.4 ns`** (`SEND_ZC` reg) | `5,114.9 ns` (`SEND_ZC` unreg)<br>`5,736.2 ns` (`SEND`) | `−1,136.7 ns` | **21% faster (1.26×)** |
+| **AF_UNIX bulk send (256 KiB)** | `25,896.1 ns` (`write`) | **`16,037.6 ns`** (`SEND_ZC` reg) | `18,585.2 ns` (`SEND_ZC` unreg)<br>`26,227.0 ns` (`SEND`) | `−9,858.5 ns` | **38% faster (1.61×)** |
+| **TCP loopback send (16 KiB)** | `7,531.0 ns` (`write`) | **`7,438.8 ns`** (`SEND_ZC` reg) | `7,747.8 ns` (`SEND_ZC` unreg)<br>`7,774.2 ns` (`SEND`) | `−92.2 ns` | **1.2% faster** |
+| **TCP loopback send (32 KiB)** | `8,539.5 ns` (`write`) | **`8,517.7 ns`** (`SEND`) | `8,771.3 ns` (`SEND_ZC` reg)<br>`8,967.8 ns` (`SEND_ZC` unreg) | `−21.8 ns` | **On par** |
+| **TCP loopback send (64 KiB)** | `15,068.4 ns` (`write`) | **`12,668.7 ns`** (`SEND_ZC` reg) | `13,527.5 ns` (`SEND_ZC` unreg)<br>`15,387.8 ns` (`SEND`) | `−2,399.7 ns` | **16% faster (1.19×)** |
+| **TCP loopback send (256 KiB)** | `56,709.8 ns` (`write`) | **`41,369.0 ns`** (`SEND_ZC` reg) | `43,282.6 ns` (`SEND_ZC` unreg)<br>`55,911.7 ns` (`SEND`) | `−15,340.8 ns` | **27% faster (1.37×)** |
+| **4 KiB cached file read (UFS)** | `1,217.2 ns` (`pread`) | **`1,041.4 ns`** (`READ` × 32) | `1,366.2 ns` (`READ` × 1, fixed)<br>`1,385.9 ns` (`READ` × 1) | `−175.8 ns` | **14% faster** batched<br>12–14% slower unbatched |
+| **4 KiB cached file read (ZFS ARC)** | `1,657.1 ns` (`pread`) | `2,150.8 ns` (`READ` × 32) | `2,343.1 ns` (`READ` × 1, fixed)<br>`2,431.7 ns` (`READ` × 1) | `+493.7 ns` | 30% slower batched<br>41–47% slower unbatched |
+| **4 KiB raw `md(4)` disk read** | `4,371.0 ns` (`pread`) | **`975.0 ns`** (`READ` × 32, direct bio) | `4,908.0 ns` (`READ` × 1, direct bio) | `−3,396.0 ns` | **78% faster (4.5×)** batched |
+| **4 KiB raw `md(4)` disk write** | `5,504.0 ns` (`pwrite`) | **`2,301.0 ns`** (`WRITE` × 32, direct bio) | `6,124.0 ns` (`WRITE` × 1, direct bio) | `−3,203.0 ns` | **58% faster (2.4×)** batched |
 
-### When to use kqring vs. kqueue
+<p align="center">
+  <img src="docs/bench/fanin.svg" alt="Fan-in across N sockets" width="49%">
+  <img src="docs/bench/pingpong.svg" alt="Single-connection ping-pong" width="49%">
+</p>
+<p align="center">
+  <img src="docs/bench/send_unix.svg" alt="Bulk send over AF_UNIX" width="49%">
+  <img src="docs/bench/worker.svg" alt="Pipes and files: inline vs worker" width="49%">
+</p>
 
-| Scenario | Recommendation | Why |
-|---|---|---|
-| **High-concurrency servers, proxies, and gateways** (many active sockets, HTTP/gRPC/Redis/MQTT brokers) | **Use `kqring`** with `IORING_RECV_MULTISHOT` + provided buffer rings (`PBUF_RING`) | Reaps completions from N sockets and submits outbound responses in **1 syscall** instead of `1 kevent + N recv + N send` (**17–22% faster**). |
-| **Bulk / streaming socket sends (`≥ 32 KiB` AF_UNIX, `≥ 64 KiB` TCP)** | **Use `kqring`** with `IORING_OP_SEND_ZC` + registered buffers | Page-holding zero-copy mbufs (`M_EXTPG`) avoid copying user buffers into kernel mbuf clusters (**17–39% faster** than `write(2)`). |
-| **Batched operations, raw block devices, pipes, and short timers** | **Use `kqring`** | Batched enters amortise syscall overhead to ~62 ns/op; direct GEOM `bio` submission on raw disks is **4.5× faster** than `pread(2)`; timers and ready pipes beat `kqueue` by **18–45%**. |
-| **Existing Linux `io_uring` applications** (Tokio, Seastar, liburing apps) | **Use `kqring`** | Recompiles against `<sys/kqring.h>` or [`liburing/`](liburing/) without rewriting a proactor codebase into a `kqueue` reactor. |
-| **Pre-arming one-shot `RECV`s on idle sockets (1 enter per op)** | **Avoid one-shot pre-arming** — switch to **multishot `RECV`** or use `kqueue` | Submitting a one-shot `RECV` before data arrives and waiting in a second enter pays an extra syscall plus socket-upcall install/teardown (**8–31% slower** than `kqueue`). Multishot `RECV` arms the upcall once and turns this into a **4–18% win**. |
-| **Small (`< 32 KiB`) unbatched sends** | **Avoid `SEND_ZC`** — use batched `IORING_OP_SEND` or plain `write(2)` | Pinning pages and posting a second `IORING_CQE_F_NOTIF` CQE costs more than copying `< 32 KiB` in L1/L2 cache (**~9% slower** at 16 KiB). |
-| **Unbatched small (`4 KiB`) cached file reads on ZFS** | **Avoid unbatched `kqring` file reads** — use `pread(2)` or UFS/raw disk | ZFS caches in the ARC rather than `VOP_READ_PGCACHE`, so regular-file reads on ZFS hand off to a worker thread (**30–46% slower** than an inline warm-cache `pread(2)`). On UFS/tmpfs, batched `kqring` reads run inline and beat `pread(2)` by **30%**. |
-| **Kernel TLS (`KTLS` + `sendfile(2)`) video/CDN serving** | **Keep `sendfile(2)` + `kqueue` for the media path** | FreeBSD's `sendfile(2)` + in-kernel TLS (`KTLS`) encrypts and DMA-transfers file pages straight from the filesystem cache to the NIC with zero userspace data path. `kqring` can still help on control-plane sockets, multishot `ACCEPT`, and timers, and integrates into an existing `kqueue` loop via its ring descriptor (`EVFILT_READ`). |
+Except for multi-threaded scaling (12.5 M single-`NOP` enters/s on 8 threads vs 3.1 M on 1 thread), these are single-threaded loopback measurements. See [`BENCHMARK.MD`](BENCHMARK.MD) for the method, every result, and the known gaps.
+
+### When `kqring` is faster vs. when `kqueue` (or direct syscalls) is faster
+
+#### Where `kqring` is faster
+1. **High-concurrency servers, proxies, and message brokers (`16–1,024+` active sockets):** **18–21% faster (`648–705 ns` vs `823–865 ns`)**. With `IORING_RECV_MULTISHOT` + provided buffer rings (`PBUF_RING`), one `kqring_enter(2)` reaps incoming payloads from all ready connections and submits outbound writes, replacing `1 kevent + N recv + N send` syscalls.
+2. **Steady-state socket receive (`RECV` into a reused buffer or multishot `RECV`):** **4–22% faster (`869–1,214 ns` vs `1,118–1,270 ns` on AF_UNIX, `5,824 ns` vs `5,904 ns` on TCP)** because data Transfer + event notification happen in one step without a separate `kevent(2)` wakeup before `recv(2)`.
+3. **Bulk socket transmit (`≥ 32 KiB` on AF_UNIX, `≥ 64 KiB` on TCP):** **16–38% faster (`16.0 µs` vs `25.9 µs` on AF_UNIX 256 KiB; `41.4 µs` vs `56.7 µs` on TCP 256 KiB)** using `IORING_OP_SEND_ZC` with registered buffers (`M_EXTPG` multi-page zero-copy mbufs avoid copying user memory into kernel mbuf clusters).
+4. **Raw block / NVMe devices (`/dev/nda*`, `/dev/ada*`, `/dev/md*`):** **4.5× faster (`975 ns` vs `4,371 ns` read, `2,301 ns` vs `5,504 ns` write)** when batching 32 4 KiB requests per enter directly to the GEOM driver as unmapped `bio`s.
+5. **Batched operations, ready pipes, and short timers:** **4.7× faster** per-op syscall floor when batching (`62.6 ns` vs `296.4 ns`), **52% faster** 1 µs timers (`4,904 ns` vs `10,185 ns`), **18–19% faster** ready pipe reads (`832–840 ns` vs `1,024 ns`), **14% faster** batched cached file reads on UFS (`1,041 ns` vs `1,217 ns`), and **8% faster** TCP `ACCEPT` with `IORING_REGISTER_NAPI` busy-polling (`17.7 µs` vs `19.3 µs`).
+
+#### Where `kqueue` (or direct syscalls) is faster
+1. **Pre-arming one-shot `RECV`s on idle sockets (1 enter per op):** **10–34% slower than `kqueue` (`1,378 ns` vs `1,118 ns` at 64 B AF_UNIX; `6,494 ns` vs `5,904 ns` on TCP)**. Submitting a one-shot `RECV` before data arrives and waiting in a second enter pays two `kqring_enter(2)` calls plus socket-upcall install/remove per message. **Fix:** use `IORING_RECV_MULTISHOT` (which arms the upcall once and turns this into an **18% win**) or wait for readiness first.
+2. **Unbatched small (`< 32 KiB`) socket sends:** **11% slower than `write(2)` at 16 KiB on AF_UNIX (`1,918 ns` vs `1,727 ns`)**. When a socket send buffer already has room, a single unbatched `write(2)` avoids the ~190 ns SQE/CQE ring overhead, and below 32 KiB `memcpy` in L1/L2 cache is cheaper than zero-copy page pinning + `IORING_CQE_F_NOTIF` delivery. **Fix:** batch multiple `SEND` SQEs per enter or use `SEND_ZC` only at `≥ 32–64 KiB`.
+3. **Cached regular-file reads on ZFS (or unbatched 1-at-a-time file reads):** **30–47% slower than `pread(2)` on ZFS (`2,151–2,432 ns` vs `1,657 ns`)** and **12–14% slower unbatched on UFS (`1,366–1,386 ns` vs `1,217 ns`)**. ZFS caches data in the ARC rather than FreeBSD's `VOP_READ_PGCACHE`, so file reads on ZFS hand off to a worker thread (~1.05 µs hand-off overhead). **Fix:** use `pread(2)` for synchronous warm-ARC ZFS reads, or batch `READ`s on UFS/raw block devices.
+4. **Kernel TLS (`KTLS` + `sendfile(2)`) static media / CDN serving:** **Keep `sendfile(2)` + `kqueue`** for the file-to-NIC media path. FreeBSD's `sendfile(2)` + in-kernel TLS (`KTLS`) transfers and encrypts file pages directly from the filesystem cache to the NIC without touching userspace buffers. `kqring` can still run alongside it for control-plane RPCs, multishot `ACCEPT`, and timers (or be polled from an existing `kqueue` loop via its ring descriptor).
 
 ---
 
@@ -206,7 +235,7 @@ Except for the thread scaling, these are single-threaded loopback measurements. 
 
 **Module**
 - **`kldunload` waits for open rings.** Unloading fails with `EBUSY` while any ring descriptor is open, and no ring can be opened while an unload is in progress. It also waits for every thread that called into kqring to get back to user space, and fails with `EBUSY` if one doesn't within 10 s (its process is stopped).
-- **Ring memory is limited per user.** Rings, mmap'd buffer rings and `NO_MMAP` ring pages are wired memory, charged to the user who made them: at most `sysctl kern.kqring.user_ring_mem` bytes over all their rings (1/16 of physical memory by default, 0 for no limit). Past it, setup fails with `ENOMEM`.
+- **Ring memory is limited per user.** Rings, provided-buffer rings (both `IOU_PBUF_RING_MMAP` and user-backed `PBUF_RING`s) and `NO_MMAP` ring pages are wired memory, charged to the user who made them: at most `sysctl kern.kqring.user_ring_mem` bytes over all their rings (1/16 of physical memory by default, 0 for no limit). Past it, setup or registration fails with `ENOMEM`.
 
 ---
 
@@ -219,7 +248,7 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
 | **`io-wq` async worker use-after-free** | Worker threads run inside the ring owner's process. They never touch the completion queue or the owner's fixed-file and registered-buffer tables. Requests hold references to their resources and credentials. Workers do the I/O and queue the result; the owner (or the `SQPOLL` thread, serialised with it) completes it. |
 | **`IOSQE_FIXED_FILE` reference cycles** | A ring can never be put in a fixed-file table: not by registration, update, direct descriptors or `MSG_RING` `SEND_FD`. A ring descriptor can't be sent over a UNIX socket either (as in Linux 6.7 and later), so it can't be in flight on a socket held in its own table. A ring's fixed-file table is also released when its owning process exits or calls `execve(2)`. Each slot holds a file reference and the file's Capsicum rights, which every request on it is checked against. Armed sockets hold a socket reference. |
 | **Fixed-file / registered-buffer use-after-free on update** | Slots are reference-counted. A request takes a reference when it is issued and drops it when freed, so replacing or unregistering a slot never affects a request still using it. The tag CQE is posted once the last reference is gone; a registration that fails posts none. Table changes are serialised on the owner's path. |
-| **Pinned user-page lifetime bugs** | Ordinary request buffers and buffer rings in user memory are never pinned; they are copied with `uiomove()` and `copyin()`. Registered buffers hold their pages for zero-copy send, charged to `RLIMIT_MEMLOCK` and `vm.max_user_wired`. The charge belongs to a reference-counted page descriptor, released only when the slot and every in-flight zero-copy mbuf have let go. Copy-on-write mappings after `fork(2)` are refreshed before a zero-copy send. |
+| **Pinned user-page lifetime bugs** | Ordinary request buffers are never pinned; they are copied with `uiomove()` and `copyin()`. Registered buffers hold their pages for zero-copy send, charged to `RLIMIT_MEMLOCK` and `vm.max_user_wired`. The charge belongs to a reference-counted page descriptor, released only when the slot and every in-flight zero-copy mbuf have let go. Copy-on-write mappings after `fork(2)` are refreshed before a zero-copy send. User-backed provided-buffer rings pin their pages into KVA (charged to `kern.kqring.user_ring_mem` and `vm.max_user_wired`, without `VM_INHERIT_SHARE`) and fall back to user-space copies after `fork(2)`. |
 | **Mapped buffer-ring use-after-free (CVE-2024-0582)** | `IOU_PBUF_RING_MMAP` rings are VM objects, and each mapping holds its own reference. Unregistering a ring that is still mapped leaves the process with ordinary memory, never freed pages. The wired memory these rings use is capped per ring. |
 | **Credentials outliving their context** | Personalities hold credential references, and so does each request using one. The issuer or worker switches credentials only for that request's work. A personality registered before `cap_enter(2)` is refused once the process is in capability mode. |
 | **`eventfd` use-after-free** | The ring holds a reference to its eventfd, and signals it under the ring lock, which unregistering also takes. |

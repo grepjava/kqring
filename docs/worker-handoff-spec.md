@@ -1,6 +1,6 @@
 # Spec: cheaper worker hand-off
 
-**Status:** not implemented. This is for the implementer of the worker-pool changes.
+**Status:** implemented (`kmod/kqring_wq.c`). Changes 1 and 2 reduced `kqring_nop_async` from `4,443 ns` to `1,049 ns` (−76%), and inline ready-pipe reads reduced blocking-pipe `READ` from `5,410 ns` to `840 ns` (−84%).
 
 A request that runs on a kqring worker thread (blocking pipes, page-cache misses, `IOSQE_ASYNC`, and the other worker-only operations) costs about 4.4 µs more than running it on the issuer. This spec measures where that time goes and proposes how to cut it. It touches only the hand-off: how work reaches an idle worker and how the issuer learns it's done. Worker signal, suspend and exit handling must not change.
 

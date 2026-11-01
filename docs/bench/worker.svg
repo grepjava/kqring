@@ -40,38 +40,38 @@
 <line x1="120.0" y1="94" x2="120.0" y2="312" class="grid"/>
 <text x="120.0" y="328" class="tick" text-anchor="middle">0</text>
 <line x1="234.0" y1="94" x2="234.0" y2="312" class="grid"/>
-<text x="234.0" y="328" class="tick" text-anchor="middle">500</text>
+<text x="234.0" y="328" class="tick" text-anchor="middle">300</text>
 <line x1="348.0" y1="94" x2="348.0" y2="312" class="grid"/>
-<text x="348.0" y="328" class="tick" text-anchor="middle">1,000</text>
+<text x="348.0" y="328" class="tick" text-anchor="middle">600</text>
 <line x1="462.0" y1="94" x2="462.0" y2="312" class="grid"/>
-<text x="462.0" y="328" class="tick" text-anchor="middle">1,500</text>
+<text x="462.0" y="328" class="tick" text-anchor="middle">900</text>
 <line x1="576.0" y1="94" x2="576.0" y2="312" class="grid"/>
-<text x="576.0" y="328" class="tick" text-anchor="middle">2,000</text>
+<text x="576.0" y="328" class="tick" text-anchor="middle">1,200</text>
 <line x1="690.0" y1="94" x2="690.0" y2="312" class="grid"/>
-<text x="690.0" y="328" class="tick" text-anchor="middle">2,500</text>
+<text x="690.0" y="328" class="tick" text-anchor="middle">1,500</text>
 <text x="740" y="328" class="tick" text-anchor="end">ns</text>
 <text x="110.0" y="135.0" class="lab" text-anchor="end">Pipe READ, 64 B</text>
-<path d="M120.0,100.0 H257.3 Q261.3,100.0 261.3,104.0 V110.0 Q261.3,114.0 257.3,114.0 H120.0 Z" fill="var(--plain)"><title>Pipe READ, 64 B — read(2) / pread(2): 620 ns</title></path>
-<text x="266.3" y="111" class="val">620</text>
-<path d="M120.0,116.0 H348.9 Q352.9,116.0 352.9,120.0 V126.0 Q352.9,130.0 348.9,130.0 H120.0 Z" fill="var(--kqueue)"><title>Pipe READ, 64 B — kqueue: 1,021 ns</title></path>
-<text x="357.9" y="127" class="val">1,021</text>
-<path d="M120.0,132.0 H305.3 Q309.3,132.0 309.3,136.0 V142.0 Q309.3,146.0 305.3,146.0 H120.0 Z" fill="var(--s1)"><title>Pipe READ, 64 B — kqring, inline: 830 ns</title></path>
-<text x="314.3" y="143" class="val">830</text>
-<path d="M120.0,148.0 H306.6 Q310.6,148.0 310.6,152.0 V158.0 Q310.6,162.0 306.6,162.0 H120.0 Z" fill="var(--s4)"><title>Pipe READ, 64 B — kqring, blocking pipe, inline: 836 ns</title></path>
-<text x="315.6" y="159" class="val">836</text>
+<path d="M120.0,100.0 H350.0 Q354.0,100.0 354.0,104.0 V110.0 Q354.0,114.0 350.0,114.0 H120.0 Z" fill="var(--plain)"><title>Pipe READ, 64 B — read(2) / pread(2): 616 ns</title></path>
+<text x="359.0" y="111" class="val">616</text>
+<path d="M120.0,116.0 H505.3 Q509.3,116.0 509.3,120.0 V126.0 Q509.3,130.0 505.3,130.0 H120.0 Z" fill="var(--kqueue)"><title>Pipe READ, 64 B — kqueue: 1,024 ns</title></path>
+<text x="514.3" y="127" class="val">1,024</text>
+<path d="M120.0,132.0 H432.0 Q436.0,132.0 436.0,136.0 V142.0 Q436.0,146.0 432.0,146.0 H120.0 Z" fill="var(--s1)"><title>Pipe READ, 64 B — kqring, inline: 832 ns</title></path>
+<text x="441.0" y="143" class="val">832</text>
+<path d="M120.0,148.0 H435.0 Q439.0,148.0 439.0,152.0 V158.0 Q439.0,162.0 435.0,162.0 H120.0 Z" fill="var(--s4)"><title>Pipe READ, 64 B — kqring, blocking pipe, inline: 840 ns</title></path>
+<text x="444.0" y="159" class="val">840</text>
 <text x="110.0" y="207.0" class="lab" text-anchor="end">File READ, 4 KiB</text>
-<path d="M120.0,180.0 H499.9 Q503.9,180.0 503.9,184.0 V190.0 Q503.9,194.0 499.9,194.0 H120.0 Z" fill="var(--plain)"><title>File READ, 4 KiB — read(2) / pread(2): 1,684 ns</title></path>
-<text x="508.9" y="191" class="val">1,684</text>
-<path d="M120.0,196.0 H677.1 Q681.1,196.0 681.1,200.0 V206.0 Q681.1,210.0 677.1,210.0 H120.0 Z" fill="var(--s1)"><title>File READ, 4 KiB — kqring, inline: 2,461 ns</title></path>
-<text x="686.1" y="207" class="val">2,461</text>
-<path d="M120.0,212.0 H613.9 Q617.9,212.0 617.9,216.0 V222.0 Q617.9,226.0 613.9,226.0 H120.0 Z" fill="var(--s3)"><title>File READ, 4 KiB — kqring, inline, 32 per enter: 2,184 ns</title></path>
-<text x="622.9" y="223" class="val">2,184</text>
+<path d="M120.0,180.0 H578.5 Q582.5,180.0 582.5,184.0 V190.0 Q582.5,194.0 578.5,194.0 H120.0 Z" fill="var(--plain)"><title>File READ, 4 KiB — read(2) / pread(2): 1,217 ns</title></path>
+<text x="587.5" y="191" class="val">1,217</text>
+<path d="M120.0,196.0 H642.6 Q646.6,196.0 646.6,200.0 V206.0 Q646.6,210.0 642.6,210.0 H120.0 Z" fill="var(--s1)"><title>File READ, 4 KiB — kqring, inline: 1,386 ns</title></path>
+<text x="651.6" y="207" class="val">1,386</text>
+<path d="M120.0,212.0 H511.7 Q515.7,212.0 515.7,216.0 V222.0 Q515.7,226.0 511.7,226.0 H120.0 Z" fill="var(--s3)"><title>File READ, 4 KiB — kqring, inline, 32 per enter: 1,041 ns</title></path>
+<text x="520.7" y="223" class="val">1,041</text>
 <text x="110.0" y="271.0" class="lab" text-anchor="end">Empty op (NOP)</text>
-<path d="M120.0,244.0 H183.8 Q187.8,244.0 187.8,248.0 V254.0 Q187.8,258.0 183.8,258.0 H120.0 Z" fill="var(--kqueue)"><title>Empty op (NOP) — kqueue: 297 ns</title></path>
-<text x="192.8" y="255" class="val">297</text>
-<path d="M120.0,260.0 H189.1 Q193.1,260.0 193.1,264.0 V270.0 Q193.1,274.0 189.1,274.0 H120.0 Z" fill="var(--s1)"><title>Empty op (NOP) — kqring, inline: 321 ns</title></path>
-<text x="198.1" y="271" class="val">321</text>
-<path d="M120.0,276.0 H347.9 Q351.9,276.0 351.9,280.0 V286.0 Q351.9,290.0 347.9,290.0 H120.0 Z" fill="var(--s2)"><title>Empty op (NOP) — kqring, via worker: 1,017 ns</title></path>
-<text x="356.9" y="287" class="val">1,017</text>
+<path d="M120.0,244.0 H228.6 Q232.6,244.0 232.6,248.0 V254.0 Q232.6,258.0 228.6,258.0 H120.0 Z" fill="var(--kqueue)"><title>Empty op (NOP) — kqueue: 296 ns</title></path>
+<text x="237.6" y="255" class="val">296</text>
+<path d="M120.0,260.0 H239.9 Q243.9,260.0 243.9,264.0 V270.0 Q243.9,274.0 239.9,274.0 H120.0 Z" fill="var(--s1)"><title>Empty op (NOP) — kqring, inline: 326 ns</title></path>
+<text x="248.9" y="271" class="val">326</text>
+<path d="M120.0,276.0 H514.5 Q518.5,276.0 518.5,280.0 V286.0 Q518.5,290.0 514.5,290.0 H120.0 Z" fill="var(--s2)"><title>Empty op (NOP) — kqring, via worker: 1,049 ns</title></path>
+<text x="523.5" y="287" class="val">1,049</text>
 <line x1="120.0" y1="94" x2="120.0" y2="312" class="axis"/>
 </svg>

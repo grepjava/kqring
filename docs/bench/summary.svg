@@ -25,65 +25,65 @@
 <rect width="760" height="558" rx="8" fill="var(--surface)"/>
 <text x="20" y="28" class="title">kqring vs kqueue: speed-up per operation</text>
 <text x="20" y="48" class="sub">Median of 5 runs; baseline is kqueue, or the plain syscall where kqueue has no role</text>
-<line x1="291.5" y1="64" x2="291.5" y2="524" class="grid"/>
-<text x="291.5" y="542" class="tick" text-anchor="middle">5× slower</text>
-<line x1="409.6" y1="64" x2="409.6" y2="524" class="grid"/>
-<text x="409.6" y="542" class="tick" text-anchor="middle">2× slower</text>
-<line x1="499.0" y1="64" x2="499.0" y2="524" class="axis"/>
-<text x="499.0" y="542" class="tick" text-anchor="middle">same</text>
-<line x1="588.4" y1="64" x2="588.4" y2="524" class="grid"/>
-<text x="588.4" y="542" class="tick" text-anchor="middle">2× faster</text>
-<line x1="706.5" y1="64" x2="706.5" y2="524" class="grid"/>
-<text x="706.5" y="542" class="tick" text-anchor="middle">5× faster</text>
+<line x1="289.0" y1="64" x2="289.0" y2="524" class="grid"/>
+<text x="289.0" y="542" class="tick" text-anchor="middle">5× slower</text>
+<line x1="394.3" y1="64" x2="394.3" y2="524" class="grid"/>
+<text x="394.3" y="542" class="tick" text-anchor="middle">2× slower</text>
+<line x1="474.0" y1="64" x2="474.0" y2="524" class="axis"/>
+<text x="474.0" y="542" class="tick" text-anchor="middle">same</text>
+<line x1="553.7" y1="64" x2="553.7" y2="524" class="grid"/>
+<text x="553.7" y="542" class="tick" text-anchor="middle">2× faster</text>
+<line x1="659.0" y1="64" x2="659.0" y2="524" class="grid"/>
+<text x="659.0" y="542" class="tick" text-anchor="middle">5× faster</text>
 <text x="258.0" y="83" class="lab" text-anchor="end">Fan-in, 1,024 sockets (multishot RECV)</text>
-<path d="M499.0,70.0 H515.7 Q519.7,70.0 519.7,74.0 V82.0 Q519.7,86.0 515.7,86.0 H499.0 Z" fill="var(--faster)"><title>Fan-in, 1,024 sockets (multishot RECV): 1.17× faster (871 → 742 ns)</title></path>
-<text x="525.7" y="83" class="val" text-anchor="start">1.17× faster</text>
+<path d="M474.0,70.0 H492.7 Q496.7,70.0 496.7,74.0 V82.0 Q496.7,86.0 492.7,86.0 H474.0 Z" fill="var(--faster)"><title>Fan-in, 1,024 sockets (multishot RECV): 1.22× faster (865 → 710 ns)</title></path>
+<text x="502.7" y="83" class="val" text-anchor="start">1.22× faster</text>
 <text x="258.0" y="109" class="lab" text-anchor="end">Fan-in, 16 sockets (multishot RECV)</text>
-<path d="M499.0,96.0 H526.5 Q530.5,96.0 530.5,100.0 V108.0 Q530.5,112.0 526.5,112.0 H499.0 Z" fill="var(--faster)"><title>Fan-in, 16 sockets (multishot RECV): 1.28× faster (826 → 646 ns)</title></path>
-<text x="536.5" y="109" class="val" text-anchor="start">1.28× faster</text>
+<path d="M474.0,96.0 H497.6 Q501.6,96.0 501.6,100.0 V108.0 Q501.6,112.0 497.6,112.0 H474.0 Z" fill="var(--faster)"><title>Fan-in, 16 sockets (multishot RECV): 1.27× faster (823 → 648 ns)</title></path>
+<text x="507.6" y="109" class="val" text-anchor="start">1.27× faster</text>
 <text x="258.0" y="135" class="lab" text-anchor="end">AF_UNIX 64 B, RECV into one buffer</text>
-<path d="M499.0,122.0 H527.3 Q531.3,122.0 531.3,126.0 V134.0 Q531.3,138.0 527.3,138.0 H499.0 Z" fill="var(--faster)"><title>AF_UNIX 64 B, RECV into one buffer: 1.29× faster (1,111 → 865 ns)</title></path>
-<text x="537.3" y="135" class="val" text-anchor="start">1.29× faster</text>
+<path d="M474.0,122.0 H499.0 Q503.0,122.0 503.0,126.0 V134.0 Q503.0,138.0 499.0,138.0 H474.0 Z" fill="var(--faster)"><title>AF_UNIX 64 B, RECV into one buffer: 1.29× faster (1,118 → 869 ns)</title></path>
+<text x="509.0" y="135" class="val" text-anchor="start">1.29× faster</text>
 <text x="258.0" y="161" class="lab" text-anchor="end">AF_UNIX 64 B, multishot RECV</text>
-<path d="M499.0,148.0 H520.5 Q524.5,148.0 524.5,152.0 V160.0 Q524.5,164.0 520.5,164.0 H499.0 Z" fill="var(--faster)"><title>AF_UNIX 64 B, multishot RECV: 1.22× faster (1,111 → 912 ns)</title></path>
-<text x="530.5" y="161" class="val" text-anchor="start">1.22× faster</text>
+<path d="M474.0,148.0 H493.0 Q497.0,148.0 497.0,152.0 V160.0 Q497.0,164.0 493.0,164.0 H474.0 Z" fill="var(--faster)"><title>AF_UNIX 64 B, multishot RECV: 1.22× faster (1,118 → 915 ns)</title></path>
+<text x="503.0" y="161" class="val" text-anchor="start">1.22× faster</text>
 <text x="258.0" y="187" class="lab" text-anchor="end">AF_UNIX 4 KiB, multishot RECV</text>
-<path d="M499.0,174.0 H500.3 Q504.3,174.0 504.3,178.0 V186.0 Q504.3,190.0 500.3,190.0 H499.0 Z" fill="var(--faster)"><title>AF_UNIX 4 KiB, multishot RECV: 1.04× faster (1,269 → 1,218 ns)</title></path>
-<text x="510.3" y="187" class="val" text-anchor="start">1.04× faster</text>
+<path d="M474.0,174.0 H475.1 Q479.1,174.0 479.1,178.0 V186.0 Q479.1,190.0 475.1,190.0 H474.0 Z" fill="var(--faster)"><title>AF_UNIX 4 KiB, multishot RECV: 1.05× faster (1,270 → 1,214 ns)</title></path>
+<text x="485.1" y="187" class="val" text-anchor="start">1.05× faster</text>
 <text x="258.0" y="213" class="lab" text-anchor="end">TCP 64 B, multishot RECV</text>
-<path d="M499.0,200.0 H499.0 Q501.3,200.0 501.3,202.3 V213.7 Q501.3,216.0 499.0,216.0 H499.0 Z" fill="var(--faster)"><title>TCP 64 B, multishot RECV: 1.02× faster (5,928 → 5,823 ns)</title></path>
-<text x="507.3" y="213" class="val" text-anchor="start">1.02× faster</text>
+<path d="M474.0,200.0 H474.0 Q475.6,200.0 475.6,201.6 V214.4 Q475.6,216.0 474.0,216.0 H474.0 Z" fill="var(--faster)"><title>TCP 64 B, multishot RECV: 1.01× faster (5,904 → 5,824 ns)</title></path>
+<text x="481.6" y="213" class="val" text-anchor="start">1.01× faster</text>
 <text x="258.0" y="239" class="lab" text-anchor="end">TCP accept (multishot ACCEPT)</text>
 
-<text x="505.1" y="239" class="val" text-anchor="start">1.00× faster</text>
+<text x="480.1" y="239" class="val" text-anchor="start">1.00× faster</text>
 <text x="258.0" y="265" class="lab" text-anchor="end">1 µs timer (TIMEOUT)</text>
-<path d="M499.0,252.0 H540.6 Q544.6,252.0 544.6,256.0 V264.0 Q544.6,268.0 540.6,268.0 H499.0 Z" fill="var(--faster)"><title>1 µs timer (TIMEOUT): 1.42× faster (6,867 → 4,821 ns)</title></path>
-<text x="550.6" y="265" class="val" text-anchor="start">1.42× faster</text>
+<path d="M474.0,252.0 H554.0 Q558.0,252.0 558.0,256.0 V264.0 Q558.0,268.0 554.0,268.0 H474.0 Z" fill="var(--faster)"><title>1 µs timer (TIMEOUT): 2.08× faster (10,185 → 4,904 ns)</title></path>
+<text x="564.0" y="265" class="val" text-anchor="start">2.08× faster</text>
 <text x="258.0" y="291" class="lab" text-anchor="end">Empty kevent vs 32 NOPs per enter</text>
-<path d="M499.0,278.0 H697.3 Q701.3,278.0 701.3,282.0 V290.0 Q701.3,294.0 697.3,294.0 H499.0 Z" fill="var(--faster)"><title>Empty kevent vs 32 NOPs per enter: 4.80× faster (297 → 62 ns)</title></path>
-<text x="707.3" y="291" class="val" text-anchor="start">4.80× faster</text>
+<path d="M474.0,278.0 H648.8 Q652.8,278.0 652.8,282.0 V290.0 Q652.8,294.0 648.8,294.0 H474.0 Z" fill="var(--faster)"><title>Empty kevent vs 32 NOPs per enter: 4.73× faster (296 → 63 ns)</title></path>
+<text x="658.8" y="291" class="val" text-anchor="start">4.73× faster</text>
 <text x="258.0" y="317" class="lab" text-anchor="end">AF_UNIX 256 KiB send, SEND_ZC vs write</text>
-<path d="M499.0,304.0 H550.8 Q554.8,304.0 554.8,308.0 V316.0 Q554.8,320.0 550.8,320.0 H499.0 Z" fill="var(--faster)"><title>AF_UNIX 256 KiB send, SEND_ZC vs write: 1.54× faster (25,777 → 16,718 ns)</title></path>
-<text x="560.8" y="317" class="val" text-anchor="start">1.54× faster</text>
+<path d="M474.0,304.0 H525.1 Q529.1,304.0 529.1,308.0 V316.0 Q529.1,320.0 525.1,320.0 H474.0 Z" fill="var(--faster)"><title>AF_UNIX 256 KiB send, SEND_ZC vs write: 1.61× faster (25,896 → 16,038 ns)</title></path>
+<text x="535.1" y="317" class="val" text-anchor="start">1.61× faster</text>
 <text x="258.0" y="343" class="lab" text-anchor="end">TCP 64 KiB send, SEND_ZC vs write</text>
-<path d="M499.0,330.0 H518.3 Q522.3,330.0 522.3,334.0 V342.0 Q522.3,346.0 518.3,346.0 H499.0 Z" fill="var(--faster)"><title>TCP 64 KiB send, SEND_ZC vs write: 1.20× faster (13,919 → 11,620 ns)</title></path>
-<text x="528.3" y="343" class="val" text-anchor="start">1.20× faster</text>
+<path d="M474.0,330.0 H489.9 Q493.9,330.0 493.9,334.0 V342.0 Q493.9,346.0 489.9,346.0 H474.0 Z" fill="var(--faster)"><title>TCP 64 KiB send, SEND_ZC vs write: 1.19× faster (15,068 → 12,669 ns)</title></path>
+<text x="499.9" y="343" class="val" text-anchor="start">1.19× faster</text>
 <text x="258.0" y="369" class="lab" text-anchor="end">AF_UNIX 16 KiB send, SEND_ZC vs write</text>
-<path d="M499.0,356.0 H491.5 Q487.5,356.0 487.5,360.0 V368.0 Q487.5,372.0 491.5,372.0 H499.0 Z" fill="var(--slower)"><title>AF_UNIX 16 KiB send, SEND_ZC vs write: 1.09× slower (1,719 → 1,879 ns)</title></path>
-<text x="505.0" y="369" class="val" text-anchor="start">1.09× slower</text>
+<path d="M474.0,356.0 H465.7 Q461.7,356.0 461.7,360.0 V368.0 Q461.7,372.0 465.7,372.0 H474.0 Z" fill="var(--slower)"><title>AF_UNIX 16 KiB send, SEND_ZC vs write: 1.11× slower (1,726 → 1,921 ns)</title></path>
+<text x="480.0" y="369" class="val" text-anchor="start">1.11× slower</text>
 <text x="258.0" y="395" class="lab" text-anchor="end">AF_UNIX 64 B, RECV armed before data</text>
-<path d="M499.0,382.0 H477.7 Q473.7,382.0 473.7,386.0 V394.0 Q473.7,398.0 477.7,398.0 H499.0 Z" fill="var(--slower)"><title>AF_UNIX 64 B, RECV armed before data: 1.22× slower (1,111 → 1,352 ns)</title></path>
-<text x="505.0" y="395" class="val" text-anchor="start">1.22× slower</text>
+<path d="M474.0,382.0 H453.9 Q449.9,382.0 449.9,386.0 V394.0 Q449.9,398.0 453.9,398.0 H474.0 Z" fill="var(--slower)"><title>AF_UNIX 64 B, RECV armed before data: 1.23× slower (1,118 → 1,378 ns)</title></path>
+<text x="480.0" y="395" class="val" text-anchor="start">1.23× slower</text>
 <text x="258.0" y="421" class="lab" text-anchor="end">File 4 KiB, 32 READs per enter vs pread</text>
-<path d="M499.0,408.0 H469.5 Q465.5,408.0 465.5,412.0 V420.0 Q465.5,424.0 469.5,424.0 H499.0 Z" fill="var(--slower)"><title>File 4 KiB, 32 READs per enter vs pread: 1.30× slower (1,684 → 2,184 ns)</title></path>
-<text x="505.0" y="421" class="val" text-anchor="start">1.30× slower</text>
+<path d="M474.0,408.0 H487.9 Q491.9,408.0 491.9,412.0 V420.0 Q491.9,424.0 487.9,424.0 H474.0 Z" fill="var(--faster)"><title>File 4 KiB, 32 READs per enter vs pread: 1.17× faster (1,217 → 1,041 ns)</title></path>
+<text x="497.9" y="421" class="val" text-anchor="start">1.17× faster</text>
 <text x="258.0" y="447" class="lab" text-anchor="end">File 4 KiB READ vs pread</text>
-<path d="M499.0,434.0 H454.1 Q450.1,434.0 450.1,438.0 V446.0 Q450.1,450.0 454.1,450.0 H499.0 Z" fill="var(--slower)"><title>File 4 KiB READ vs pread: 1.46× slower (1,684 → 2,461 ns)</title></path>
-<text x="505.0" y="447" class="val" text-anchor="start">1.46× slower</text>
+<path d="M474.0,434.0 H463.1 Q459.1,434.0 459.1,438.0 V446.0 Q459.1,450.0 463.1,450.0 H474.0 Z" fill="var(--slower)"><title>File 4 KiB READ vs pread: 1.14× slower (1,217 → 1,386 ns)</title></path>
+<text x="480.0" y="447" class="val" text-anchor="start">1.14× slower</text>
 <text x="258.0" y="473" class="lab" text-anchor="end">Pipe 64 B READ, O_NONBLOCK</text>
-<path d="M499.0,460.0 H521.7 Q525.7,460.0 525.7,464.0 V472.0 Q525.7,476.0 521.7,476.0 H499.0 Z" fill="var(--faster)"><title>Pipe 64 B READ, O_NONBLOCK: 1.23× faster (1,021 → 830 ns)</title></path>
-<text x="531.7" y="473" class="val" text-anchor="start">1.23× faster</text>
+<path d="M474.0,460.0 H494.0 Q498.0,460.0 498.0,464.0 V472.0 Q498.0,476.0 494.0,476.0 H474.0 Z" fill="var(--faster)"><title>Pipe 64 B READ, O_NONBLOCK: 1.23× faster (1,024 → 832 ns)</title></path>
+<text x="504.0" y="473" class="val" text-anchor="start">1.23× faster</text>
 <text x="258.0" y="499" class="lab" text-anchor="end">Pipe 64 B READ, blocking pipe</text>
-<path d="M499.0,486.0 H520.8 Q524.8,486.0 524.8,490.0 V498.0 Q524.8,502.0 520.8,502.0 H499.0 Z" fill="var(--faster)"><title>Pipe 64 B READ, blocking pipe: 1.22× faster (1,021 → 836 ns)</title></path>
-<text x="530.8" y="499" class="val" text-anchor="start">1.22× faster</text>
+<path d="M474.0,486.0 H492.9 Q496.9,486.0 496.9,490.0 V498.0 Q496.9,502.0 492.9,502.0 H474.0 Z" fill="var(--faster)"><title>Pipe 64 B READ, blocking pipe: 1.22× faster (1,024 → 840 ns)</title></path>
+<text x="502.9" y="499" class="val" text-anchor="start">1.22× faster</text>
 </svg>

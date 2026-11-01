@@ -60,15 +60,15 @@ Measured on FreeBSD 15.1 (i5-8250U), as medians of 5 runs; see [`BENCHMARK.MD`](
 
 | Message | AF_UNIX, registered | AF_UNIX, unregistered | TCP loopback, registered |
 |---|---:|---:|---:|
-| 16 KiB | 13% slower | 20% slower (copied) | 2% faster |
-| 32 KiB | 5% faster | 9% slower | 9% slower |
-| 64 KiB | 17% faster | 3% faster | 15% faster |
-| 256 KiB | 37% faster | 27% faster | 23% faster |
+| 16 KiB | 10% slower | 16% slower (copied) | 1% faster |
+| 32 KiB | 7% faster | 7% slower | 3% slower |
+| 64 KiB | 26% faster | 8% faster | 19% faster |
+| 256 KiB | 62% faster (−38% time) | 39% faster (−28% time) | 37% faster (−27% time) |
 
-All against `write(2)`. At 16 KiB on AF_UNIX every kqring send, copying `SEND` included, is 12–20% slower than `write(2)`: that's the ring's fixed cost per operation, not zero-copy.
+All against `write(2)`. At 16 KiB on AF_UNIX every kqring send, copying `SEND` included, is 10–16% slower than `write(2)`: that's the ring's fixed cost per operation, not zero-copy.
 
 - **AF_UNIX zero-copy threshold.** Done. `SEND_ZC` / `SENDMSG_ZC` from an unregistered buffer on AF_UNIX copies below `sysctl kern.kqring.zc_local_min_len` (32 KiB by default, the measured crossover), because pinning per send costs more than the `memcpy` there. Registered buffers and TCP go zero-copy from one page.
-- **Carry several pages per mbuf.** Each zero-copy page gets its own mbuf and `sf_buf`. Unmapped `M_EXTPG` mbufs, as `sendfile(2)` and KTLS use, would cut the per-page cost. Check that AF_UNIX accepts them on 15.1 first.
+- **Carry several pages per mbuf (`M_EXTPG`).** Done. `kqring_send_zc_iov()` builds multi-page unmapped `M_EXTPG` mbufs (`mb_alloc_ext_pgs`, up to `MBUF_PEXT_MAX_PGS` pages per mbuf) instead of one `sf_buf` + `EXT_SFBUF` mbuf per page.
 - **Measure TCP zero-copy with the receiver in its own thread.** Loopback delivers through the netisr thread, so a single-threaded send-then-receive benchmark mostly measures that hand-off for small sends.
 - **Document `RLIMIT_MEMLOCK`.** FreeBSD's default is 64 KiB, so registering buffers for zero-copy needs `memorylocked` raised in `login.conf(5)`. Done in [`README.md`](README.md) and `BENCHMARK.MD`.
 - **Inline non-socket I/O.** Done for positioned page-cache reads (UFS, tmpfs) and pipes, blocking or not (a pipe is read or written through a non-blocking `struct file` of kqring's own, so the issuer never waits); see [`BENCHMARK.MD`](BENCHMARK.MD#pipes-and-files-inline-or-through-a-worker). Inline file reads at the file position (`off` = −1) would need the file offset lock (`foffset_lock`).
