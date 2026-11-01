@@ -1,5 +1,9 @@
 # kqring — io_uring for FreeBSD
 
+<p align="center">
+  <img src="docs/kqring-hero.jpg" alt="BSD daemon as Sméagol with the Ring of Power" width="100%">
+</p>
+
 `kqring` brings Linux's [`io_uring`](https://kernel.dk/io_uring.pdf) asynchronous I/O interface to FreeBSD, as a loadable kernel module (`kqring.ko`) for FreeBSD 15.1 (amd64).
 
 It uses the io_uring ABI as-is, with the same structure layouts and `IORING_*` constants:
