@@ -390,7 +390,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	struct vnode *vp;
 	vm_object_t obj;
 	struct uio auio;
-	struct iovec aiov, tiov[16], *iov = &aiov;
+	struct iovec aiov, tiov[16], *hiov = NULL, *iov = &aiov;
 	u_int iovcnt = 1;
 	ssize_t want;
 	size_t done;
@@ -428,13 +428,15 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 		return (KQRING_RW_PUNT);
 	}
 	if (kqring_op_readv(sqe->opcode)) {
-		if (sqe->len > nitems(tiov)) {
-			fdrop(fp, td);
-			return (KQRING_RW_PUNT);
-		}
 		iovcnt = sqe->len;
-		memcpy(tiov, op->args, iovcnt * sizeof(tiov[0]));
-		iov = tiov;
+		if (iovcnt <= nitems(tiov)) {
+			iov = tiov;
+		} else {
+			hiov = malloc(iovcnt * sizeof(*hiov), M_KQRING,
+			    M_WAITOK);
+			iov = hiov;
+		}
+		memcpy(iov, op->args, iovcnt * sizeof(*iov));
 	} else {
 		aiov.iov_base = (void *)(uintptr_t)sqe->addr;
 		aiov.iov_len = sqe->len;
@@ -443,6 +445,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	auio.uio_offset = (off_t)sqe->off;
 	want = auio.uio_resid;
 	if (want == 0 || auio.uio_offset > OFF_MAX - want) {
+		free(hiov, M_KQRING);
 		fdrop(fp, td);
 		return (KQRING_RW_PUNT);
 	}
@@ -456,6 +459,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	 */
 	rl = vn_rangelock_tryrlock(vp, auio.uio_offset, auio.uio_offset + want);
 	if (rl == NULL) {
+		free(hiov, M_KQRING);
 		fdrop(fp, td);
 		return (KQRING_RW_PUNT);
 	}
@@ -463,6 +467,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	error = VOP_READ_PGCACHE(vp, &auio, 0, fp->f_cred);
 	vm_fault_enable_pagefaults(save);
 	vn_rangelock_unlock(vp, rl);
+	free(hiov, M_KQRING);
 	done = (size_t)(want - auio.uio_resid);
 	if (error == EFAULT) {
 		fdrop(fp, td);

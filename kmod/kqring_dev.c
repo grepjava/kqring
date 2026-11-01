@@ -731,7 +731,7 @@ kqring_fdopen(struct cdev *dev __unused, int fflags __unused,
 	knlist_init_mtx(&ctx->rsel.si_note, &ctx->mtx);
 	callout_init_mtx(&ctx->wq_abort_callout, &ctx->mtx, 0);
 	sx_init(&ctx->bg_sx, "kqring bg");
-	sx_init(&ctx->sq_sx, "kqring sq");
+	sx_init_flags(&ctx->sq_sx, "kqring sq", SX_DUPOK);
 	ctx->wq = kqring_wq_alloc(td);
 	TAILQ_INIT(&ctx->retired_ops);
 	TAILQ_INIT(&ctx->active_ops);
