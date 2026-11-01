@@ -2557,6 +2557,39 @@ test_recvmsg_multishot(struct test_ring *r)
 		assert(c.res == (int32_t)(sizeof(out) + sizeof(name) + plen));
 		ring_offer_buf(r, bid);
 	}
+	/*
+	 * A payload larger than half the provided buffer (3,000 bytes in a
+	 * 4,096-byte buffer): CQE res must report hdr + 3000, not hdr + the
+	 * residual iov_len left after uiomove().
+	 */
+	char *big3k = malloc(3000);
+	assert(big3k != NULL);
+	for (int i = 0; i < 3000; i++)
+		big3k[i] = (char)(i * 13 + 7);
+	assert(sendto(ub, big3k, 3000, 0,
+	    (struct sockaddr *)&aaddr, sizeof(aaddr)) == 3000);
+	if (ring_cq_ready(r) == 0)
+		assert(ring_wait(r, 1, 2000) == 0);
+	{
+		struct io_uring_cqe bc = ring_pop_cqe(r);
+		assert(bc.user_data == 30301);
+		assert((bc.flags & IORING_CQE_F_MORE) != 0);
+		assert((bc.flags & IORING_CQE_F_BUFFER) != 0);
+		uint16_t bid = bc.flags >> IORING_CQE_BUFFER_SHIFT;
+		char *buf = r->bufs + (size_t)bid * BUF_SIZE;
+		struct io_uring_recvmsg_out out;
+		memcpy(&out, buf, sizeof(out));
+		assert(out.namelen == sizeof(struct sockaddr_in));
+		assert(out.controllen == 0);
+		assert(out.payloadlen == 3000);
+		assert(bc.res == (int32_t)(sizeof(out) +
+		    sizeof(struct sockaddr_in) + 3000));
+		assert(memcmp(buf + sizeof(out) + sizeof(struct sockaddr_in),
+		    big3k, 3000) == 0);
+		ring_offer_buf(r, bid);
+	}
+	free(big3k);
+
 	sqe = ring_prep(r, IORING_OP_ASYNC_CANCEL, -1, 30302);
 	sqe->addr = 30301;
 	ring_push_sqe(r);
@@ -4654,6 +4687,37 @@ test_rsrc_tags(void)
 	    "on update and unregister\n");
 }
 
+struct clone_race_ctx {
+	struct test_ring	*src;
+	char			*mem;
+	size_t			page;
+	_Atomic bool		stop;
+};
+
+static void *
+clone_race_mutator(void *arg)
+{
+	struct clone_race_ctx *cr = arg;
+	struct io_uring_rsrc_update2 up2;
+	struct iovec iov[2] = {
+		{ cr->mem, cr->page },
+		{ cr->mem + cr->page, cr->page },
+	};
+
+	while (!atomic_load_explicit(&cr->stop, memory_order_relaxed)) {
+		up2 = (struct io_uring_rsrc_update2){
+			.offset = 0,
+			.data = (uint64_t)(uintptr_t)&iov[0],
+			.nr = 2,
+		};
+		(void)reg(cr->src, IORING_REGISTER_BUFFERS_UPDATE, &up2,
+		    sizeof(up2));
+		(void)reg(cr->src, IORING_UNREGISTER_BUFFERS, NULL, 0);
+		(void)reg(cr->src, IORING_REGISTER_BUFFERS, iov, 2);
+	}
+	return (NULL);
+}
+
 static void
 test_registered_buffers(void)
 {
@@ -4807,6 +4871,59 @@ test_registered_buffers(void)
 	    .flags = IORING_REGISTER_DST_REPLACE };
 	assert(reg(&t2, IORING_REGISTER_CLONE_BUFFERS, &cb, 1) == -EINVAL);
 	close(t2.fd);
+
+	/*
+	 * Concurrent CLONE_BUFFERS from a shared source ring while another
+	 * thread updates, unregisters, and re-registers the source's buffer
+	 * table (also testing both ctx < sctx and sctx < ctx lock orders).
+	 */
+	{
+		struct test_ring sring, cring;
+		struct clone_race_ctx cr;
+		pthread_t mut_td;
+		struct iovec siov[2] = {
+			{ m, (size_t)page },
+			{ m + page, (size_t)page },
+		};
+
+		ring_setup_shared = true;
+		ring_init(&sring);
+		ring_init(&cring);
+		ring_setup_shared = false;
+		assert(reg(&sring, IORING_REGISTER_BUFFERS, siov, 2) == 0);
+		cr = (struct clone_race_ctx){
+			.src = &sring,
+			.mem = m,
+			.page = (size_t)page,
+			.stop = false,
+		};
+		assert(pthread_create(&mut_td, NULL, clone_race_mutator,
+		    &cr) == 0);
+		for (int i = 0; i < 200; i++) {
+			cb = (struct io_uring_clone_buffers){
+				.src_fd = (uint32_t)sring.fd,
+				.flags = IORING_REGISTER_DST_REPLACE,
+			};
+			int rc = reg(&cring, IORING_REGISTER_CLONE_BUFFERS,
+			    &cb, 1);
+			assert(rc == 0 || rc == -ENXIO);
+			if ((i & 3) == 0)
+				(void)reg(&cring, IORING_UNREGISTER_BUFFERS,
+				    NULL, 0);
+		}
+		atomic_store_explicit(&cr.stop, true, memory_order_relaxed);
+		assert(pthread_join(mut_td, NULL) == 0);
+		munmap(sring.br, (size_t)page);
+		munmap(sring.bufs, NBUFS * BUF_SIZE);
+		munmap(sring.sqes, sring.sqes_len);
+		munmap(sring.ring_map, sring.ring_map_len);
+		close(sring.fd);
+		munmap(cring.br, (size_t)page);
+		munmap(cring.bufs, NBUFS * BUF_SIZE);
+		munmap(cring.sqes, cring.sqes_len);
+		munmap(cring.ring_map, cring.ring_map_len);
+		close(cring.fd);
+	}
 
 	assert(reg(&t, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
 	assert(reg(&t, IORING_UNREGISTER_BUFFERS, NULL, 0) == -ENXIO);
@@ -5040,6 +5157,85 @@ test_buffer_groups(void)
 	munmap(kr, (size_t)page);
 	assert(mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_SHARED,
 	    t.fd, moff) == MAP_FAILED);
+
+	/*
+	 * User-backed provided-buffer rings (without IOU_PBUF_RING_MMAP) pin
+	 * user pages and must be accounted in vm.stats.vm.v_user_wire_count
+	 * and kern.kqring.user_ring_mem, uncharged on unregister, and must NOT
+	 * set VM_INHERIT_SHARE on the user page across fork(2).
+	 */
+	{
+		u_long wired0 = 0, wired1 = 0, wired2 = 0;
+		size_t wlen = sizeof(wired0);
+		uint8_t *ubr2 = mmap(NULL, (size_t)page * 2,
+		    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+		assert(ubr2 != MAP_FAILED);
+		volatile uint64_t *canary = (volatile uint64_t *)(ubr2 + 512);
+		*canary = 0x1122334455667788ULL;
+		assert(sysctlbyname("vm.stats.vm.v_user_wire_count",
+		    &wired0, &wlen, NULL, 0) == 0);
+		br = (struct io_uring_buf_reg){
+			.ring_addr = (uint64_t)(uintptr_t)ubr2,
+			.ring_entries = 16,
+			.bgid = 12,
+		};
+		assert(reg(&t, IORING_REGISTER_PBUF_RING, &br, 1) == 0);
+		wlen = sizeof(wired1);
+		assert(sysctlbyname("vm.stats.vm.v_user_wire_count",
+		    &wired1, &wlen, NULL, 0) == 0);
+		assert(wired1 == wired0 + 1);
+
+		/* Fork while registered: child writes to same page do not leak to parent. */
+		pid_t fpid = fork();
+		assert(fpid >= 0);
+		if (fpid == 0) {
+			*canary = 0xdeadbeefcafebabeULL;
+			_exit(0);
+		}
+		int fstatus = 0;
+		assert(waitpid(fpid, &fstatus, 0) == fpid);
+		assert(WIFEXITED(fstatus) && WEXITSTATUS(fstatus) == 0);
+		assert(*canary == 0x1122334455667788ULL);
+
+		/* Parent's user-backed PBUF_RING still works after fork (COW fallback). */
+		struct io_uring_buf_ring *ubring =
+		    (struct io_uring_buf_ring *)ubr2;
+		char fbuf[16];
+		ubring->bufs[0].addr = (uint64_t)(uintptr_t)fbuf;
+		ubring->bufs[0].len = sizeof(fbuf);
+		ubring->bufs[0].bid = 9;
+		atomic_store_explicit((_Atomic uint16_t *)&ubring->tail, 1,
+		    memory_order_release);
+		assert(write(sv[1], "postfork", 8) == 8);
+		sqe = ring_prep(&t, IORING_OP_RECV, sv[0], 44990);
+		sqe->flags = IOSQE_BUFFER_SELECT;
+		sqe->buf_group = 12;
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		c = ring_pop_cqe(&t);
+		assert(c.user_data == 44990 && c.res == 8 &&
+		    (c.flags >> IORING_CQE_BUFFER_SHIFT) == 9);
+		assert(memcmp(fbuf, "postfork", 8) == 0);
+
+		br = (struct io_uring_buf_reg){ .bgid = 12 };
+		assert(reg(&t, IORING_UNREGISTER_PBUF_RING, &br, 1) == 0);
+		wlen = sizeof(wired2);
+		assert(sysctlbyname("vm.stats.vm.v_user_wire_count",
+		    &wired2, &wlen, NULL, 0) == 0);
+		assert(wired2 == wired0);
+
+		/* Fork after unregister: page still has private inheritance. */
+		fpid = fork();
+		assert(fpid >= 0);
+		if (fpid == 0) {
+			*canary = 0xfeedface12345678ULL;
+			_exit(0);
+		}
+		assert(waitpid(fpid, &fstatus, 0) == fpid);
+		assert(WIFEXITED(fstatus) && WEXITSTATUS(fstatus) == 0);
+		assert(*canary == 0x1122334455667788ULL);
+		munmap(ubr2, (size_t)page * 2);
+	}
 
 	munmap(ub, (size_t)page);
 	munmap(ib, (size_t)page);
@@ -6965,6 +7161,38 @@ test_pipe_nowait(void)
 	assert(memcmp(in, out, BIG) == 0);
 	alarm(0);
 
+	/*
+	 * 1b. WRITEV of 256 KiB (4 x 64 KiB iovecs), no reader yet: the
+	 * issuer's non-blocking partial pipe write advances op->args in
+	 * place, and the worker must transfer the remaining 192 KiB without
+	 * double-skipping op->done_io.
+	 */
+	alarm(10);
+	struct iovec wiov[4];
+	for (int i = 0; i < 4; i++) {
+		wiov[i].iov_base = out + i * (BIG / 4);
+		wiov[i].iov_len = BIG / 4;
+	}
+	memset(in, 0, BIG);
+	got = 0;
+	sqe = ring_prep(&t, IORING_OP_WRITEV, p[1], 73011);
+	sqe->addr = (uintptr_t)wiov;
+	sqe->len = 4;
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	while (got < BIG) {
+		ssize_t r = read(p[0], in + got, BIG - got);
+
+		assert(r > 0);
+		got += (size_t)r;
+	}
+	assert(ring_wait(&t, 1, 2000) == 0);
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 73011 && c.res == BIG);
+	assert(memcmp(in, out, BIG) == 0);
+	alarm(0);
+
 	/* 2. Multishot POLLIN, then 8 writes each drained at once: 8 CQEs. */
 	sqe = ring_prep(&t, IORING_OP_POLL_ADD, p[0], 73002);
 	sqe->poll32_events = POLLIN;
@@ -8364,6 +8592,78 @@ test_phase5_security_audit(void)
 	munmap(rt.sqes, rt.sqes_len);
 	munmap(rt.ring_map, rt.ring_map_len);
 	close(rt.fd);
+
+	/*
+	 * 5. IOSQE_ASYNC multishot RECV arms before sock_fp is populated, then
+	 * populates sock_fp on EAGAIN; disarming must still release soref so
+	 * the bound port is freed immediately upon close(2).
+	 */
+	struct test_ring st;
+	ring_init(&st);
+	int usock = socket(AF_INET, SOCK_DGRAM, 0);
+	assert(usock >= 0);
+	struct sockaddr_in sin;
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	sin.sin_port = 0;
+	assert(bind(usock, (struct sockaddr *)&sin, sizeof(sin)) == 0);
+	socklen_t slen = sizeof(sin);
+	assert(getsockname(usock, (struct sockaddr *)&sin, &slen) == 0);
+
+	rsqe = ring_prep(&st, IORING_OP_RECV, usock, 81010);
+	rsqe->flags = IOSQE_ASYNC | IOSQE_BUFFER_SELECT;
+	rsqe->ioprio = IORING_RECV_MULTISHOT;
+	rsqe->buf_group = 0;
+	ring_push_sqe(&st);
+	ring_submit(&st);
+	assert(sendto(usock, "pkt", 3, 0, (struct sockaddr *)&sin,
+	    sizeof(sin)) == 3);
+	assert(ring_wait(&st, 1, 2000) == 0);
+	struct io_uring_cqe rcqe = ring_pop_cqe(&st);
+	assert(rcqe.user_data == 81010 && rcqe.res == 3 &&
+	    (rcqe.flags & IORING_CQE_F_MORE) != 0);
+	close(usock);
+
+	/*
+	 * 6. Detached one-shot RECV (MSG_WAITALL + LINK_TIMEOUT) re-arms
+	 * after a partial wakeup (EAGAIN) and completes when remaining bytes
+	 * arrive.
+	 */
+	int svw[2];
+	char wbuf[8];
+	struct __kernel_timespec lts = { .tv_sec = 2, .tv_nsec = 0 };
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, svw) == 0);
+	rsqe = ring_prep(&st, IORING_OP_RECV, svw[0], 81020);
+	rsqe->addr = (uint64_t)(uintptr_t)wbuf;
+	rsqe->len = 6;
+	rsqe->msg_flags = MSG_WAITALL;
+	rsqe->flags = IOSQE_IO_LINK;
+	ring_push_sqe(&st);
+	prep_timeout(&st, IORING_OP_LINK_TIMEOUT, 81021, &lts, 0, 0, 0);
+	ring_submit(&st);
+	assert(write(svw[1], "abc", 3) == 3);
+	assert(kqring_enter(st.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) == 0);
+	assert(ring_cq_ready(&st) == 0);
+	assert(write(svw[1], "def", 3) == 3);
+	assert(ring_wait(&st, 2, 2000) == 0);
+	expect_cqe(&st, 81020, 6);
+	expect_cqe(&st, 81021, -ECANCELED);
+	assert(memcmp(wbuf, "abcdef", 6) == 0);
+	close(svw[0]);
+	close(svw[1]);
+
+	munmap(st.br, sysconf(_SC_PAGESIZE));
+	munmap(st.bufs, NBUFS * BUF_SIZE);
+	munmap(st.sqes, st.sqes_len);
+	munmap(st.ring_map, st.ring_map_len);
+	close(st.fd);
+
+	/* Verify the UDP port from step 5 was not leaked by soref/sorele mismatch. */
+	int usock2 = socket(AF_INET, SOCK_DGRAM, 0);
+	assert(usock2 >= 0);
+	assert(bind(usock2, (struct sockaddr *)&sin, sizeof(sin)) == 0);
+	close(usock2);
 
 	printf("[PASS] Phase 5 security: AF_UNIX SCM_RIGHTS cycle broken on "
 	    "exit, execve(2) ring teardown, forged sq_tail bound, owner check\n");

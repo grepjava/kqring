@@ -25,36 +25,30 @@ static int
 kqring_soupcall(struct socket *so, void *arg, int waitflag __unused)
 {
 	struct kqring_sowatch *sw = arg;
-	struct kqring_op *op, *tmp, *last = NULL;
+	struct kqring_op *op, *tmp;
 	int i = sw->idx;
 
 	TAILQ_FOREACH_SAFE(op, &sw->ops, sw_link[i], tmp) {
 		struct kqring_ctx *ctx = op->ctx;
 
-		if (op->oneshot_sb) {
+		mtx_lock(&ctx->mtx);
+		if (op->oneshot_sb && !op->cancelled && !ctx->closing) {
 			TAILQ_REMOVE(&sw->ops, op, sw_link[i]);
 			op->sw[i] = NULL;
-			last = op;
+			if (TAILQ_EMPTY(&sw->ops)) {
+				int which = i == 0 ? SO_RCV : SO_SND;
+
+				if (!SOLISTENING(so) &&
+				    kqring_sb(so, which)->sb_upcallarg == sw)
+					soupcall_clear(so, which);
+				if (op->reap_sw == NULL)
+					op->reap_sw = sw;
+				else
+					free(sw, M_KQRING);
+			}
 		}
-		mtx_lock(&ctx->mtx);
 		kqring_taskwork_add_locked(ctx, op);
 		mtx_unlock(&ctx->mtx);
-	}
-	if (last != NULL && TAILQ_EMPTY(&sw->ops)) {
-		int which = i == 0 ? SO_RCV : SO_SND;
-
-		if (!SOLISTENING(so) &&
-		    kqring_sb(so, which)->sb_upcallarg == sw)
-			soupcall_clear(so, which);
-		mtx_lock(&last->ctx->mtx);
-		if (!last->cancelled && !last->ctx->closing &&
-		    last->reap_sw == NULL) {
-			last->reap_sw = sw;
-			sw = NULL;
-		}
-		mtx_unlock(&last->ctx->mtx);
-		if (sw != NULL)
-			free(sw, M_KQRING);
 	}
 	return (SU_OK);
 }
@@ -65,6 +59,8 @@ kqring_sowatch_leave(struct kqring_op *op, int i)
 {
 	struct kqring_sowatch *sw = op->sw[i];
 
+	if (sw == NULL)
+		return (NULL);
 	TAILQ_REMOVE(&sw->ops, op, sw_link[i]);
 	op->sw[i] = NULL;
 	return (TAILQ_EMPTY(&sw->ops) ? sw : NULL);
@@ -216,13 +212,6 @@ kqring_put_sock(struct kqring_op *op, struct file *fp, int rc)
 static int
 kqring_so_readable(struct socket *so, bool *readable)
 {
-	if (!SOLISTENING(so) && (atomic_load_int(&so->so_rcv.sb_acc) > 0 ||
-	    atomic_load_int(&so->so_rcv.sb_ctl) > 0 ||
-	    (atomic_load_short(&so->so_rcv.sb_state) & SBS_CANTRCVMORE) != 0 ||
-	    atomic_load_short(&so->so_error) != 0)) {
-		*readable = true;
-		return (0);
-	}
 	SOCK_RECVBUF_LOCK(so);
 	/* Checked under the sockbuf lock; see kqring_sb_disarm(). */
 	if (SOLISTENING(so)) {
@@ -1163,7 +1152,7 @@ kqring_exec_recvmsg_multi(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (error != 0)
 		return (kqring_done(op, -error, 0));
 
-	n = hdr + MIN(n, aiov.iov_len);
+	n = hdr + MIN(n, biov.iov_len - hdr);
 	rc = kqring_done(op, kqring_xfer_res(n),
 	    kqring_buf_commit(ctx, &sel, n) | IORING_CQE_F_MORE);
 	/* Out of buffers: go again, to end with ENOBUFS. */
@@ -2226,9 +2215,17 @@ kqring_arm_socket_op(struct kqring_ctx *ctx, struct kqring_op *op, int dirs)
 	cap_rights_t rights;
 	int error;
 
-	if (op->sock_fp != NULL) {
+	if (op->reap_sw != NULL) {
+		kqring_sowatch_free(ctx, op->reap_sw);
+		op->reap_sw = NULL;
+	}
+	if (op->so != NULL) {
+		/* Re-arming a detached one-shot op after EAGAIN. */
+		so = op->so;
+	} else if (op->sock_fp != NULL) {
 		/* Kept by an attempt that would have blocked. */
 		so = op->sock_fp->f_data;
+		op->so_soref = false;
 	} else {
 		error = kqring_op_fget(op,
 		    cap_rights_init_one(&rights, CAP_EVENT), 0, &fp);
@@ -2243,12 +2240,14 @@ kqring_arm_socket_op(struct kqring_ctx *ctx, struct kqring_op *op, int dirs)
 		}
 		so = fp->f_data;
 		soref(so);
+		op->so_soref = true;
 		fdrop(fp, td);
 	}
 
 	/* A re-armed op (POLL_REMOVE update) was cancelled when unarmed. */
 	op->cancelled = false;
 	op->listening = false;
+	op->dirs = 0;
 	op->oneshot_sb = (dirs == KQ_DIR_RCV || dirs == KQ_DIR_SND) &&
 	    !op->wq_wait_ready &&
 	    op->sqe.opcode != IORING_OP_READ_MULTISHOT &&
@@ -2273,9 +2272,10 @@ kqring_arm_socket_op(struct kqring_ctx *ctx, struct kqring_op *op, int dirs)
 	 */
 	struct kqring_sowatch *nsw = NULL;
 	bool ready_now;
+retry:
+	ready_now = false;
+	error = 0;
 	if (!SOLISTENING(so)) {
-		ready_now = false;
-		error = 0;
 		if ((dirs & KQ_DIR_RCV) != 0)
 			error = kqring_sb_arm(op, so, SO_RCV, &ready_now);
 		if (error == 0 && (dirs & KQ_DIR_SND) != 0)
@@ -2286,9 +2286,6 @@ kqring_arm_socket_op(struct kqring_ctx *ctx, struct kqring_op *op, int dirs)
 		kqring_sb_disarm(op, so, SO_RCV);
 		op->dirs = 0;
 	}
-retry:
-	ready_now = false;
-	error = 0;
 	SOCK_LOCK(so);
 	if (SOLISTENING(so)) {
 		if (so->sol_upcall != NULL && so->sol_upcall != kqring_soupcall) {
@@ -2318,16 +2315,7 @@ retry:
 		SOCK_UNLOCK(so);
 	} else {
 		SOCK_UNLOCK(so);
-		if ((dirs & KQ_DIR_RCV) != 0)
-			error = kqring_sb_arm(op, so, SO_RCV, &ready_now);
-		if (error == 0 && (dirs & KQ_DIR_SND) != 0)
-			error = kqring_sb_arm(op, so, SO_SND, &ready_now);
-		if (error == ERESTART) {
-			/* solisten_proto() wiped the upcall; leave the list. */
-			kqring_sb_disarm(op, so, SO_RCV);
-			op->dirs = 0;
-			goto retry;
-		}
+		goto retry;
 	}
 	kqring_sowatch_free(ctx, nsw);
 armed:
@@ -2339,20 +2327,30 @@ armed:
 		 * that, and disarm unqueues it and drops the socket.
 		 */
 		mtx_lock(&ctx->mtx);
-		op->cancelled = true;
-		kqring_op_disarm_locked(op);
+		if (op->armed) {
+			kqring_op_unarm_locked(ctx, op);
+		} else {
+			op->cancelled = true;
+			kqring_op_disarm_locked(op);
+		}
 		mtx_unlock(&ctx->mtx);
 		kqring_req_complete(ctx, op, -error, 0);
 		return (false);
 	}
-	op->polled = (op->dirs & KQ_DIR_SND) != 0 &&
+	bool want_polled = (op->dirs & KQ_DIR_SND) != 0 &&
 	    so->so_proto->pr_domain->dom_family == AF_LOCAL &&
 	    so->so_type != SOCK_DGRAM;
 
 	mtx_lock(&ctx->mtx);
-	kqring_op_arm_locked(ctx, op);
-	if (op->polled)
+	if (!op->armed) {
+		kqring_op_arm_locked(ctx, op);
+		op->polled = want_polled;
+		if (op->polled)
+			ctx->npolled++;
+	} else if (want_polled && !op->polled) {
+		op->polled = true;
 		ctx->npolled++;
+	}
 	if (ready_now)
 		kqring_taskwork_add_locked(ctx, op);
 	mtx_unlock(&ctx->mtx);

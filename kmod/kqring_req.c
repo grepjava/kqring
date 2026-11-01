@@ -12,13 +12,14 @@
  */
 
 /*
- * Ring memory (the SQ and CQ rings, SQEs and IOU_PBUF_RING_MMAP rings, all
- * wired, and the pages IORING_SETUP_NO_MMAP holds) is charged to the user
+ * Ring memory (the SQ and CQ rings, SQEs and provided-buffer rings, all
+ * wired, and the user pages IORING_SETUP_NO_MMAP and user-backed
+ * PBUF_RINGs hold) is charged to the user
  * whose credentials made it (real uid): at most kern.kqring.user_ring_mem
  * bytes per user over all their rings (0: no limit; by default 1/16 of
  * physical memory), so that many rings can't wire unbounded memory.  The
- * pages NO_MMAP holds are the user's memory wired on their behalf, and
- * also count in vm.max_user_wired as mlock(2)'d pages do.
+ * user pages NO_MMAP and user-backed PBUF_RINGs hold are wired on the
+ * user's behalf, and also count in vm.max_user_wired as mlock(2)'d pages do.
  */
 struct kqring_mem_acct {
 	LIST_ENTRY(kqring_mem_acct) link;
@@ -176,7 +177,8 @@ kqring_alloc_shm(size_t bytes, vm_object_t *obj_out, vm_offset_t *kva_out,
  */
 int
 kqring_pin_shm(struct thread *td, uint64_t uaddr, size_t bytes,
-    vm_offset_t *kva_out, size_t *alloc_len_out, vm_page_t **pages_out)
+    bool share_on_fork, vm_offset_t *kva_out, size_t *alloc_len_out,
+    vm_page_t **pages_out)
 {
 	vm_map_t map = &td->td_proc->p_vmspace->vm_map;
 	vm_offset_t va = (vm_offset_t)uaddr, kva;
@@ -203,7 +205,8 @@ kqring_pin_shm(struct thread *td, uint64_t uaddr, size_t bytes,
 		return (ENOMEM);
 	}
 	pmap_qenter(kva, ma, npages);
-	(void)vm_map_inherit(map, va, va + size, VM_INHERIT_SHARE);
+	if (share_on_fork)
+		(void)vm_map_inherit(map, va, va + size, VM_INHERIT_SHARE);
 	*kva_out = kva;
 	*alloc_len_out = size;
 	*pages_out = ma;
@@ -384,8 +387,10 @@ kqring_sock_disarm(struct kqring_op *op)
 			kqring_sb_disarm(op, so, SO_SND);
 	}
 	op->dirs = 0;
-	if (op->sock_fp == NULL)
+	if (op->so_soref) {
+		op->so_soref = false;
 		kqring_sorele(so);
+	}
 }
 
 void
@@ -2351,12 +2356,8 @@ kqring_taskwork_run_one(struct kqring_ctx *ctx, struct kqring_op *op)
 	struct ucred *saved = kqring_cred_enter(op);
 
 	if (kqring_op_attempt(ctx, op, op->so) == EAGAIN) {
-		if (!op->armed) {
-			if (op->reap_sw != NULL) {
-				kqring_sowatch_free(ctx, op->reap_sw);
-				op->reap_sw = NULL;
-			}
-			op->dirs = 0;
+		if (op->so != NULL && (!op->armed || (!op->listening &&
+		    op->sw[0] == NULL && op->sw[1] == NULL))) {
 			(void)kqring_arm_socket_op(ctx, op,
 			    kqring_op_dirs(&op->sqe));
 		} else if (op->wq_wait_ready) {
@@ -2417,19 +2418,18 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 	/* Successors issued below may queue more taskwork; bound the loop. */
 	for (int pass = 0; pass < 64; pass++) {
 		/*
-		 * Unlocked fast path: a racing upcall that is missed here is
-		 * seen by the wait loop, which re-checks taskwork_ops under
-		 * ctx->mtx before sleeping.
+		 * Unlocked fast path when nothing is queued and IORING_SQ_TASKRUN
+		 * is already clear: a racing upcall that queues work is caught
+		 * by the wait loop under ctx->mtx before sleeping, or leaves
+		 * IORING_SQ_TASKRUN set for the next enter.
 		 */
 		if (TAILQ_EMPTY(&ctx->taskwork_ops) &&
-		    STAILQ_EMPTY(&ctx->rcq)) {
-			if (ctx->shm != NULL &&
-			    (atomic_load_32(&ctx->shm->sq_flags) &
-			    IORING_SQ_TASKRUN) != 0)
-				atomic_clear_32(&ctx->shm->sq_flags,
-				    IORING_SQ_TASKRUN);
+		    (STAILQ_EMPTY(&ctx->rcq) ||
+		    ctx->nocq >= KQRING_OCQ_BUSY) &&
+		    (ctx->shm == NULL ||
+		    (atomic_load_32(&ctx->shm->sq_flags) &
+		    IORING_SQ_TASKRUN) == 0))
 			break;
-		}
 
 		mtx_lock(&ctx->mtx);
 		for (;;) {
@@ -2440,39 +2440,6 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 				if (ctx->closing || (op->cancelled &&
 				    !op->wq_retired))
 					continue;
-				/*
-				 * Fast path for one-shot socket ops already
-				 * detached from their sockbuf waiter list in
-				 * kqring_soupcall: unarm under this same
-				 * ctx->mtx acquisition and, if taskwork_ops
-				 * is now empty, clear IORING_SQ_TASKRUN and
-				 * return without re-acquiring ctx->mtx.
-				 */
-				if (op->oneshot_sb && op->armed &&
-				    op->sw[0] == NULL && op->sw[1] == NULL &&
-				    op->ltimeout == NULL && !op->polled &&
-				    !op->timer_pending &&
-				    op->sqe.opcode != IORING_OP_POLL_ADD) {
-					op->cancelled = true;
-					op->armed = false;
-					TAILQ_REMOVE(&ctx->active_ops, op,
-					    active_link);
-					if (TAILQ_EMPTY(&ctx->taskwork_ops) &&
-					    (STAILQ_EMPTY(&ctx->rcq) ||
-					    ctx->nocq >= KQRING_OCQ_BUSY)) {
-						if (ctx->shm != NULL &&
-						    (atomic_load_32(
-						    &ctx->shm->sq_flags) &
-						    IORING_SQ_TASKRUN) != 0)
-							atomic_clear_32(
-							    &ctx->shm->sq_flags,
-							    IORING_SQ_TASKRUN);
-						mtx_unlock(&ctx->mtx);
-						kqring_taskwork_run_one(ctx,
-						    op);
-						goto flush;
-					}
-				}
 				mtx_unlock(&ctx->mtx);
 				kqring_taskwork_run_one(ctx, op);
 				mtx_lock(&ctx->mtx);
@@ -2487,13 +2454,16 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 				break;
 			kqring_post_remote_locked(ctx);
 		}
-		if (ctx->shm != NULL &&
+		if (TAILQ_EMPTY(&ctx->taskwork_ops) &&
+		    STAILQ_EMPTY(&ctx->rcq) && ctx->shm != NULL &&
 		    (atomic_load_32(&ctx->shm->sq_flags) &
 		    IORING_SQ_TASKRUN) != 0)
 			atomic_clear_32(&ctx->shm->sq_flags, IORING_SQ_TASKRUN);
 		mtx_unlock(&ctx->mtx);
-flush:
 		kqring_flush_ready(ctx);
+		if (TAILQ_EMPTY(&ctx->taskwork_ops) &&
+		    (STAILQ_EMPTY(&ctx->rcq) || ctx->nocq >= KQRING_OCQ_BUSY))
+			break;
 	}
 }
 

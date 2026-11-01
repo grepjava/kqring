@@ -213,10 +213,10 @@ kqring_rmem_alloc(struct thread *td, const struct io_uring_params *p,
 		return (error);
 	if (nommap) {
 		error = kqring_pin_shm(td, p->cq_off.user_addr, ring_bytes,
-		    &m->ring_kva, &m->ring_len, &m->ring_pages);
+		    true, &m->ring_kva, &m->ring_len, &m->ring_pages);
 		if (error == 0)
 			error = kqring_pin_shm(td, p->sq_off.user_addr,
-			    sqes_bytes, &m->sqes_kva, &m->sqes_len,
+			    sqes_bytes, true, &m->sqes_kva, &m->sqes_len,
 			    &m->sqes_pages);
 		if (error == 0)
 			memset((void *)m->ring_kva, 0, ring_bytes);
@@ -1222,6 +1222,7 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 		kqring_submit_sqes(ctx, ea->to_submit, &submitted);
 		ea->SUBMITTED_out = submitted;
 	} else {
+		kqring_flush_overflow(ctx);
 		ea->SUBMITTED_out = 0;
 	}
 
@@ -1254,18 +1255,6 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	}
 
 	/*
-	 * Fast path: if min_complete CQEs are already available (from inline
-	 * submission or taskwork drained above) and min_sbt == 0, return
-	 * immediately without entering kqring_enter_wait().
-	 */
-	if (min_sbt == 0 && !iopoll &&
-	    shm->cq_tail - atomic_load_acq_32(&shm->cq_head) >=
-	    ea->min_complete) {
-		kqring_evfd_flush(ctx);
-		return (0);
-	}
-
-	/*
 	 * 4. Wait.  As with io_uring_enter(2), once SQEs have been consumed
 	 * the call reports success (the submitted count) even if the wait
 	 * then times out or is interrupted: an ioctl error would make
@@ -1289,19 +1278,15 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 {
 	struct kqring_shm_header *shm = ctx->shm;
 	bool iopoll = (ctx->flags & IORING_SETUP_IOPOLL) != 0;
-	bool may_poll = true;
-	sbintime_t spin = ctx->busy_poll_sbt;
+	bool may_poll = true, deadline_set = false;
+	sbintime_t spin = ctx->busy_poll_sbt, deadline = 0;
 	uint32_t timeouts = atomic_load_acq_32(&ctx->cq_timeouts);
-	/* The timeout counts from here, however often the wait is woken. */
-	sbintime_t deadline = has_timeout ? kqring_deadline(sbt) : 0;
 	int error;
 
 	for (;;) {
 		uint32_t cq_count = atomic_load_acq_32(&shm->cq_tail) -
 		    atomic_load_acq_32(&shm->cq_head);
 
-		if (has_timeout)
-			sbt = kqring_until(deadline);
 		/*
 		 * A full CQ with overflow pending must be reaped first.  A
 		 * TIMEOUT completing also ends the wait, as in io_uring.
@@ -1309,6 +1294,16 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		if (cq_count >= min_complete || !STAILQ_EMPTY(&ctx->ocq) ||
 		    atomic_load_acq_32(&ctx->cq_timeouts) != timeouts)
 			return (0);
+
+		/* The timeout counts from the first wait, however often woken. */
+		if (has_timeout) {
+			if (!deadline_set) {
+				deadline = kqring_deadline(sbt);
+				deadline_set = true;
+			} else {
+				sbt = kqring_until(deadline);
+			}
+		}
 
 		/* Timed out with CQEs (if fewer): success, as io_uring. */
 		if (has_timeout && sbt == 0)

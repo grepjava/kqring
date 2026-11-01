@@ -31,13 +31,21 @@ kqring_bgroup_find(struct kqring_ctx *ctx, uint16_t bgid)
 	return (NULL);
 }
 
+static inline bool
+kqring_bring_kva_ok(const struct kqring_ctx *ctx, const struct kqring_bgroup *bg)
+{
+	return (bg->ring_kva != NULL && (bg->ring_obj != NULL ||
+	    bg->cow_gen == atomic_load_int(&ctx->cow_gen)));
+}
+
 /* A ring's tail, which userspace publishes after filling entries. */
 static int
-kqring_bring_tail(const struct kqring_bgroup *bg, uint16_t *tail)
+kqring_bring_tail(const struct kqring_ctx *ctx, const struct kqring_bgroup *bg,
+    uint16_t *tail)
 {
 	int32_t v;
 
-	if (bg->ring_kva != NULL) {
+	if (kqring_bring_kva_ok(ctx, bg)) {
 		*tail = atomic_load_acq_16(&bg->ring_kva->tail);
 		return (0);
 	}
@@ -51,11 +59,11 @@ kqring_bring_tail(const struct kqring_bgroup *bg, uint16_t *tail)
 }
 
 static int
-kqring_bring_get(const struct kqring_bgroup *bg, uint16_t idx,
-    struct io_uring_buf *b)
+kqring_bring_get(const struct kqring_ctx *ctx, const struct kqring_bgroup *bg,
+    uint16_t idx, struct io_uring_buf *b)
 {
 	idx &= bg->ring_mask;
-	if (bg->ring_kva != NULL) {
+	if (kqring_bring_kva_ok(ctx, bg)) {
 		/* Userspace may be writing it: a torn entry only faults. */
 		*b = ((volatile struct io_uring_buf *)bg->ring_kva)[idx];
 		return (0);
@@ -66,13 +74,13 @@ kqring_bring_get(const struct kqring_bgroup *bg, uint16_t idx,
 
 /* IOU_PBUF_RING_INC: store what is left of entry idx (addr, len). */
 static int
-kqring_bring_put(const struct kqring_bgroup *bg, uint16_t idx,
-    const struct io_uring_buf *b)
+kqring_bring_put(const struct kqring_ctx *ctx, const struct kqring_bgroup *bg,
+    uint16_t idx, const struct io_uring_buf *b)
 {
 	volatile struct io_uring_buf *e;
 
 	idx &= bg->ring_mask;
-	if (bg->ring_kva != NULL) {
+	if (kqring_bring_kva_ok(ctx, bg)) {
 		e = &((volatile struct io_uring_buf *)bg->ring_kva)[idx];
 		e->addr = b->addr;
 		e->len = b->len;
@@ -109,7 +117,7 @@ kqring_buf_select(struct kqring_ctx *ctx, uint16_t bgid, size_t max,
 	if (max == 0 || max > (size_t)INT32_MAX)
 		max = INT32_MAX;
 	if (bg->is_ring) {
-		error = kqring_bring_tail(bg, &tail);
+		error = kqring_bring_tail(ctx, bg, &tail);
 		if (error != 0)
 			return (error);
 		sel->tail = tail;
@@ -117,7 +125,7 @@ kqring_buf_select(struct kqring_ctx *ctx, uint16_t bgid, size_t max,
 		if ((bg->ring_flags & IOU_PBUF_RING_INC) != 0)
 			nmax = 1;
 		for (uint16_t h = bg->head; h != tail && n < nmax; h++) {
-			error = kqring_bring_get(bg, h, &b);
+			error = kqring_bring_get(ctx, bg, h, &b);
 			if (error != 0)
 				return (error);
 			if (b.len > (uint32_t)INT32_MAX)
@@ -174,8 +182,6 @@ kqring_buf_none(struct kqring_ctx *ctx, uint16_t bgid)
 	struct kqring_bgroup *bg;
 	uint16_t tail;
 
-	if (kqring_bg_locks(ctx))
-		sx_assert(&ctx->bg_sx, SA_LOCKED);
 	bg = kqring_bgroup_find(ctx, bgid);
 	if (bg == NULL)
 		return (true);
@@ -184,7 +190,7 @@ kqring_buf_none(struct kqring_ctx *ctx, uint16_t bgid)
 	if (!bg->is_ring)
 		return (STAILQ_EMPTY(&bg->bufs));
 	/* A fault is reported by the selection that follows. */
-	return (kqring_bring_tail(bg, &tail) == 0 && tail == bg->head);
+	return (kqring_bring_tail(ctx, bg, &tail) == 0 && tail == bg->head);
 }
 
 /*
@@ -242,7 +248,7 @@ kqring_buf_commit(struct kqring_ctx *ctx, const struct kqring_sel *sel,
 		};
 
 		/* If the ring cannot be updated, use the buffer up. */
-		if (kqring_bring_put(bg, bg->head, &b) == 0)
+		if (kqring_bring_put(ctx, bg, bg->head, &b) == 0)
 			return (cflags | IORING_CQE_F_BUF_MORE);
 	}
 	bg->head += used;
@@ -852,6 +858,8 @@ kqring_bgroup_free(struct kqring_ctx *ctx, struct kqring_bgroup *bg)
 	}
 	ctx->nprovided -= bg->nbufs;
 	if (bg->ring_pages != NULL) {
+		ctx->ring_mem -= bg->ring_alloc_len;
+		kqring_mem_uncharge(bg->ring_uip, bg->ring_alloc_len, true);
 		kqring_unpin_shm(bg->ring_kva_base, bg->ring_alloc_len,
 		    bg->ring_pages);
 	} else if (bg->ring_obj != NULL) {
@@ -1010,19 +1018,43 @@ kqring_bufs_clone(struct kqring_ctx *ctx, const struct kqring_register_arg *ra)
 	error = kqring_fp_ctx(fp, &sctx);
 	if (error == 0 && sctx == ctx)
 		error = EINVAL;
-	else if (error == 0 && !kqring_is_owner(sctx, td))
-		error = EEXIST;
-	else if (error == 0 && sctx->closing)
-		error = EBADF;
-	else if (error == 0 && sctx->bufs == NULL)
-		error = ENXIO;
 	if (error != 0)
 		goto out;
+	/*
+	 * Lock sctx->sq_sx so another thread on a shared ring (or teardown)
+	 * cannot modify or free sctx->bufs while we clone it; order the two
+	 * sq_sx locks by address so opposing clones cannot deadlock.
+	 */
+	if ((uintptr_t)ctx < (uintptr_t)sctx) {
+		sx_xlock(&sctx->sq_sx);
+	} else {
+		sx_xunlock(&ctx->sq_sx);
+		sx_xlock(&sctx->sq_sx);
+		sx_xlock(&ctx->sq_sx);
+		if (ctx->closing) {
+			error = EBADF;
+			goto out_unlock;
+		}
+		kqring_flush_overflow(ctx);
+		if (ctx->nocq >= KQRING_OCQ_BUSY || (ctx->bufs != NULL &&
+		    (cb.flags & IORING_REGISTER_DST_REPLACE) == 0)) {
+			error = EBUSY;
+			goto out_unlock;
+		}
+	}
+	if (!kqring_is_owner(sctx, td))
+		error = EEXIST;
+	else if (sctx->closing)
+		error = EBADF;
+	else if (sctx->bufs == NULL)
+		error = ENXIO;
+	if (error != 0)
+		goto out_unlock;
 	nr = cb.nr != 0 ? cb.nr : sctx->nbufs;
 	if (cb.src_off > sctx->nbufs || nr > sctx->nbufs - cb.src_off ||
 	    cb.dst_off > KQRING_MAX_BUFS || nr > KQRING_MAX_BUFS - cb.dst_off) {
 		error = EINVAL;
-		goto out;
+		goto out_unlock;
 	}
 	n = MAX(ctx->nbufs, cb.dst_off + nr);
 	tab = mallocarray(n, sizeof(*tab), M_KQRING, M_WAITOK | M_ZERO);
@@ -1050,6 +1082,8 @@ kqring_bufs_clone(struct kqring_ctx *ctx, const struct kqring_register_arg *ra)
 		if (old != NULL)
 			kqring_rsrc_put(ctx, old);
 	}
+out_unlock:
+	sx_xunlock(&sctx->sq_sx);
 out:
 	fdrop(fp, td);
 	return (error);
@@ -1087,8 +1121,6 @@ kqring_pbuf_register(struct kqring_ctx *ctx,
 	if ((reg.flags & IOU_PBUF_RING_MMAP) != 0) {
 		if (reg.ring_addr != 0)
 			return (EINVAL);
-		if (round_page(bytes) > KQRING_MAX_RING_MEM - ctx->ring_mem)
-			return (ENOMEM);
 	} else {
 		if (reg.ring_addr == 0)
 			return (EFAULT);
@@ -1108,6 +1140,8 @@ kqring_pbuf_register(struct kqring_ctx *ctx,
 				return (EFAULT);
 		}
 	}
+	if (round_page(bytes) > KQRING_MAX_RING_MEM - ctx->ring_mem)
+		return (ENOMEM);
 	/* An empty buffer list may become a ring, as in io_uring. */
 	sx_xlock(&ctx->bg_sx);
 	old = kqring_bgroup_find(ctx, reg.bgid);
@@ -1131,21 +1165,27 @@ kqring_pbuf_register(struct kqring_ctx *ctx,
 				kqring_mem_uncharge(bg->ring_uip, bytes,
 				    false);
 		}
-		if (error != 0) {
-			sx_xunlock(&ctx->bg_sx);
-			free(bg, M_KQRING);
-			return (error);
-		}
-		bg->ring_kva = (struct io_uring_buf_ring *)bg->ring_kva_base;
-		ctx->ring_mem += bg->ring_alloc_len;
 	} else {
 		bg->ring_uaddr = reg.ring_addr;
-		if (kqring_pin_shm(curthread, reg.ring_addr, bytes,
-		    &bg->ring_kva_base, &bg->ring_alloc_len,
-		    &bg->ring_pages) == 0)
-			bg->ring_kva =
-			    (struct io_uring_buf_ring *)bg->ring_kva_base;
+		bg->cow_gen = atomic_load_int(&ctx->cow_gen);
+		error = kqring_mem_charge(curthread->td_ucred, bytes, true,
+		    &bg->ring_uip);
+		if (error == 0) {
+			error = kqring_pin_shm(curthread, reg.ring_addr,
+			    bytes, false, &bg->ring_kva_base,
+			    &bg->ring_alloc_len, &bg->ring_pages);
+			if (error != 0)
+				kqring_mem_uncharge(bg->ring_uip, bytes,
+				    true);
+		}
 	}
+	if (error != 0) {
+		sx_xunlock(&ctx->bg_sx);
+		free(bg, M_KQRING);
+		return (error);
+	}
+	bg->ring_kva = (struct io_uring_buf_ring *)bg->ring_kva_base;
+	ctx->ring_mem += bg->ring_alloc_len;
 	mtx_lock(&ctx->mtx);
 	if (old != NULL)
 		LIST_REMOVE(old, link);

@@ -390,7 +390,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	struct vnode *vp;
 	vm_object_t obj;
 	struct uio auio;
-	struct iovec aiov, *iov = &aiov;
+	struct iovec aiov, tiov[16], *iov = &aiov;
 	u_int iovcnt = 1;
 	ssize_t want;
 	size_t done;
@@ -428,8 +428,13 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 		return (KQRING_RW_PUNT);
 	}
 	if (kqring_op_readv(sqe->opcode)) {
-		iov = op->args;
+		if (sqe->len > nitems(tiov)) {
+			fdrop(fp, td);
+			return (KQRING_RW_PUNT);
+		}
 		iovcnt = sqe->len;
+		memcpy(tiov, op->args, iovcnt * sizeof(tiov[0]));
+		iov = tiov;
 	} else {
 		aiov.iov_base = (void *)(uintptr_t)sqe->addr;
 		aiov.iov_len = sqe->len;
@@ -596,15 +601,16 @@ again:
 		sx_xunlock(&ctx->bg_sx);
 	} else if (kqring_op_readv(sqe->opcode) ||
 	    kqring_op_writev(sqe->opcode)) {
+		/*
+		 * What the issuer wrote before the pipe filled (below) has
+		 * already advanced op->args in place through uiomove().
+		 */
 		iov = op->args;
 		iovcnt = sqe->len;
 	} else {
-		aiov.iov_base = (void *)(uintptr_t)sqe->addr;
-		aiov.iov_len = sqe->len;
+		aiov.iov_base = (char *)(uintptr_t)sqe->addr + op->done_io;
+		aiov.iov_len = sqe->len - op->done_io;
 	}
-	/* What the issuer wrote before the pipe filled (below). */
-	if (is_write && op->done_io != 0)
-		kqring_iov_skip(&iov, &iovcnt, op->done_io);
 	kqring_uio_init(&auio, iov, iovcnt, is_write ? UIO_WRITE : UIO_READ);
 	ssize_t want = auio.uio_resid;
 	auio.uio_offset = offset;

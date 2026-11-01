@@ -311,6 +311,7 @@ struct kqring_op {
 	uint32_t		kp_seen[2];	/* read, write: kqring_kp_filt_event() */
 	bool			listening;	/* armed via solisten_upcall_set */
 	bool			oneshot_sb;	/* one-shot single-dir sockbuf op */
+	bool			so_soref;	/* soref(so) held by op->so */
 	bool			in_taskwork;
 	bool			cancelled;	/* no longer armed; under mtx */
 	bool			polled;		/* no upcall; see npolled */
@@ -556,6 +557,7 @@ struct kqring_bgroup {
 	vm_offset_t		ring_kva_base;
 	size_t			ring_alloc_len;
 	struct uidinfo		*ring_uip;	/* charged for ring_obj */
+	uint32_t		cow_gen;	/* ctx->cow_gen at pin (!MMAP) */
 	uint32_t		ring_entries;
 	uint32_t		ring_mask;
 	uint16_t		head;		/* kernel consumer index */
@@ -1227,7 +1229,8 @@ int	kqring_resize_rings(struct kqring_ctx *ctx,
 int	kqring_ring_fds_insert(struct thread *td, struct file *fp,
 	    uint32_t *slotp);
 int	kqring_pin_shm(struct thread *td, uint64_t uaddr, size_t bytes,
-	    vm_offset_t *kva_out, size_t *alloc_len_out, vm_page_t **pages_out);
+	    bool share_on_fork, vm_offset_t *kva_out, size_t *alloc_len_out,
+	    vm_page_t **pages_out);
 void	kqring_unpin_shm(vm_offset_t kva, size_t alloc_len, vm_page_t *pages);
 void	kqring_flush_overflow(struct kqring_ctx *ctx);
 void	kqring_post_cqe_extra(struct kqring_ctx *ctx, uint64_t user_data,

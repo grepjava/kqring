@@ -430,6 +430,7 @@ kqring_wq_thread(void *arg)
 				    kqring_wq_suspend_pending())
 					break;
 				cpu_spinwait();
+				__compiler_membar();
 			}
 			mtx_lock(&wq->mtx);
 			wq->spinning[type]--;
@@ -597,7 +598,7 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 		wq->refs++;
 		need_spawn = true;
 	}
-	if (wq->spinning[type] == 0)
+	if (wq->spinning[type] < wq->pending[type])
 		wakeup_one(&wq->ops[type]);
 	mtx_unlock(&wq->mtx);
 	if (need_spawn) {
@@ -620,6 +621,7 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 			    ctx->closing)
 				break;
 			cpu_spinwait();
+			__compiler_membar();
 		}
 		mtx_lock(&ctx->mtx);
 	}
