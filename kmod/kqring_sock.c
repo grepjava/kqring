@@ -390,8 +390,10 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	 * Nothing to read: say so without soreceive() or taking a provided
 	 * buffer, as soreceive() would end (EWOULDBLOCK, nothing moved).
 	 * Out-of-band data is not in the receive buffer, so MSG_OOB asks.
+	 * A readiness retry goes straight to the locked check below (provided
+	 * buffers) or soreceive(), which also handles spurious wakeups.
 	 */
-	if ((sqe->opcode != IORING_OP_RECV ||
+	if (expect == NULL && (sqe->opcode != IORING_OP_RECV ||
 	    (sqe->msg_flags & MSG_OOB) == 0) && kqring_so_rcv_idle(so)) {
 		bool none = false;
 
@@ -501,7 +503,7 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 	struct mbuf *top = NULL, *mtail = NULL;
 	vm_offset_t cur;
 	size_t avail = 0, send_len = 0, rem;
-	u_int nzbufs = 0;
+	u_int nzbufs = 0, nmbufs = 0;
 	bool fixed = (sqe->ioprio & IORING_RECVSEND_FIXED_BUF) != 0;
 	int dom = so->so_proto->pr_domain->dom_family;
 	size_t min_len = dom == AF_LOCAL && !fixed ?
@@ -742,11 +744,32 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 
 			KASSERT(pg_idx < (size_t)seg_zb->npages,
 			    ("kqring: zc page index out of bounds"));
+#ifdef __amd64__
+			/*
+			 * sf_buf_kva() is the direct map on amd64.  Consecutive
+			 * physical pages can share one mbuf; every page remains
+			 * held by seg_zb until the notification's last reference.
+			 * Keep TCP's existing page-sized chain and cap local runs
+			 * to 64 KiB to bound individual mbuf sizes.
+			 */
+			if (dom == AF_LOCAL) {
+				while (chunk < seg_rem && pg_off + chunk < 65536) {
+					size_t next = pg_idx + atop(pg_off + chunk);
+
+					if (next >= (size_t)seg_zb->npages ||
+					    VM_PAGE_TO_PHYS(seg_zb->pages[next]) !=
+					    VM_PAGE_TO_PHYS(seg_zb->pages[next - 1]) +
+					    PAGE_SIZE)
+						break;
+					chunk += MIN((size_t)PAGE_SIZE,
+					    MIN(seg_rem - chunk, 65536 - pg_off - chunk));
+				}
+			}
+#endif
 			sf = sf_buf_alloc(seg_zb->pages[pg_idx], SFB_DEFAULT);
 			m0 = m_get(M_WAITOK, MT_DATA);
-			refcount_acquire(&zc->refs);
 			m0->m_ext.ext_buf = (char *)sf_buf_kva(sf);
-			m0->m_ext.ext_size = PAGE_SIZE;
+			m0->m_ext.ext_size = round_page(pg_off + chunk);
 			m0->m_ext.ext_arg1 = zc;
 			m0->m_ext.ext_arg2 = sf;
 			m0->m_ext.ext_type = EXT_SFBUF;
@@ -762,12 +785,15 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 			else
 				top = m0;
 			mtail = m0;
+			nmbufs++;
 			cur += chunk;
 			seg_rem -= chunk;
 			rem -= chunk;
 		}
 	}
 
+	/* The chain is private until pr_send(), so reserve its references once. */
+	refcount_acquiren(&zc->refs, nmbufs);
 	pr_flags = (flags & MSG_MORETOCOME) != 0 ? PRUS_MORETOCOME : 0;
 	CURVNET_SET(so->so_vnet);
 	error = so->so_proto->pr_send(so, pr_flags, top, NULL, NULL, td);

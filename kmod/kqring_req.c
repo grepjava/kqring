@@ -2094,12 +2094,16 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 		 * (files, pipes, devices) run on the in-process worker pool,
 		 * unless they can complete here without blocking.
 		 */
-		if (!kqring_op_is_socket(op)) {
+		{
 			int rw = KQRING_RW_PUNT;
 
 			if ((sqe->flags & IOSQE_ASYNC) == 0)
 				rw = kqring_file_rw_inline(ctx, op,
 				    kqring_op_is_write(sqe->opcode));
+			else if (kqring_op_is_socket(op))
+				rw = KQRING_RW_SOCKET;
+			if (rw == KQRING_RW_SOCKET)
+				goto socket_rw;
 			if (rw == KQRING_RW_DONE) {
 				kqring_req_complete(ctx, op, op->res,
 				    op->cflags);
@@ -2117,6 +2121,7 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 			}
 			break;
 		}
+	socket_rw:
 		op->sock_rw = true;
 		/* FALLTHROUGH */
 	case IORING_OP_RECV:
@@ -2440,6 +2445,22 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 				if (ctx->closing || (op->cancelled &&
 				    !op->wq_retired))
 					continue;
+				/*
+				 * The upcall already detached this one-shot receive.
+				 * Transfer it from active_ops to the issuer while we
+				 * hold mtx for dequeue, avoiding a second lock round
+				 * trip at completion.  No timer or worker needs disarm.
+				 * A spurious readiness event rearms it normally.
+				 */
+				if (op->sqe.opcode == IORING_OP_RECV &&
+				    op->oneshot_sb && op->armed && op->so != NULL &&
+				    !op->listening && !op->polled &&
+				    !op->wq_wait_ready && !op->timer_init &&
+				    op->ltimeout == NULL &&
+				    op->sw[0] == NULL && op->sw[1] == NULL) {
+					TAILQ_REMOVE(&ctx->active_ops, op, active_link);
+					op->armed = false;
+				}
 				mtx_unlock(&ctx->mtx);
 				kqring_taskwork_run_one(ctx, op);
 				mtx_lock(&ctx->mtx);

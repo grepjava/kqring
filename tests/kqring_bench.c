@@ -815,14 +815,18 @@ bench_pipe(void)
 static void
 bench_file(void)
 {
-	char path[] = "/tmp/kqring_bench.XXXXXX";
+	char path[PATH_MAX];
+	const char *dir = getenv("KQRING_BENCH_FILE_DIR");
 	static char buf[FILE_BATCH][FILE_BLK];
 	uint32_t seed = 12345;
 	struct ring r;
 	uint64_t t0;
 	off_t off;
-	int fd;
+	int fd, n;
 
+	n = snprintf(path, sizeof(path), "%s/kqring_bench.XXXXXX",
+	    dir != NULL ? dir : "/tmp");
+	assert(n > 0 && (size_t)n < sizeof(path));
 	fd = mkstemp(path);
 	assert(fd >= 0);
 	unlink(path);
@@ -1054,7 +1058,7 @@ send_run(const char *transport, int rx, int tx)
 }
 
 static void
-bench_send(void)
+bench_send_common(bool unix_only)
 {
 	int sv[2];
 
@@ -1067,11 +1071,25 @@ bench_send(void)
 	send_run("unix", sv[0], sv[1]);
 	close(sv[0]);
 	close(sv[1]);
-	tcp_pair(&sv[0], &sv[1]);
-	send_run("tcp", sv[0], sv[1]);
-	close(sv[0]);
-	close(sv[1]);
+	if (!unix_only) {
+		tcp_pair(&sv[0], &sv[1]);
+		send_run("tcp", sv[0], sv[1]);
+		close(sv[0]);
+		close(sv[1]);
+	}
 	munmap(send_src, (size_t)ZC_SLOTS * SEND_MAX);
+}
+
+static void
+bench_send(void)
+{
+	bench_send_common(false);
+}
+
+static void
+bench_send_unix(void)
+{
+	bench_send_common(true);
 }
 
 /* ------------------------------------------------------------------------
@@ -1222,6 +1240,7 @@ static const struct {
 	{ "pipe",	bench_pipe },
 	{ "file",	bench_file },
 	{ "send",	bench_send },
+	{ "send-unix",	bench_send_unix },
 	{ "timer",	bench_timer },
 	{ "disk",	bench_disk },
 };
@@ -1231,7 +1250,7 @@ main(int argc, char **argv)
 {
 	memset(payload, 'x', sizeof(payload));
 	for (size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); i++) {
-		bool want = argc < 2;
+		bool want = argc < 2 && strcmp(groups[i].name, "send-unix") != 0;
 
 		for (int j = 1; j < argc; j++)
 			want |= strcmp(argv[j], groups[i].name) == 0;

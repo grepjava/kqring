@@ -375,7 +375,8 @@ kqring_file_bio_try(struct kqring_ctx *ctx, struct kqring_op *op,
  * (kqring_file_bio()).
  *
  * Returns KQRING_RW_DONE with op->res set if the request completed, or
- * KQRING_RW_BIO if it was sent to a disk driver.  Otherwise
+ * KQRING_RW_BIO if it was sent to a disk driver, or KQRING_RW_SOCKET
+ * if the descriptor needs nonblocking socket dispatch.  Otherwise
  * (KQRING_RW_PUNT) op is unchanged and goes to a worker; a read that
  * copied only part of a range (a page was not resident) is redone there in
  * full, so the result is the same as if it had never been tried.
@@ -399,6 +400,10 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 
 	if (kqring_rw_fget(op, is_write, &fp, &flags) != 0)
 		return (KQRING_RW_PUNT);	/* the worker reports the error */
+	if (fp->f_type == DTYPE_SOCKET) {
+		fdrop(fp, td);
+		return (KQRING_RW_SOCKET);
+	}
 	/*
 	 * A pipe that is ready completes here, even blocking (the read or
 	 * write then doesn't wait).  One that isn't waits on a worker, even

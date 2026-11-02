@@ -2712,6 +2712,73 @@ zc_local_min_set(unsigned v)
 	assert(zc_local_min_get() == v);
 }
 
+/* Exercise partial end pages and a deliberately noncontiguous physical run. */
+static void
+test_send_zc_spans(void)
+{
+	size_t page = (size_t)sysconf(_SC_PAGESIZE), size = 4 * page;
+	struct test_ring r;
+	struct rlimit lim;
+
+	assert(getrlimit(RLIMIT_MEMLOCK, &lim) == 0);
+	/* With the benchmark's larger limit, also cross the 64 KiB run cap. */
+	if (lim.rlim_cur >= (rlim_t)(33 * page))
+		size = 33 * page;
+	ring_init(&r);
+	for (int repeated = 0; repeated < 2; repeated++) {
+		char *src = mmap(NULL, size, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANON, -1, 0);
+		size_t len = size - 7;
+		char *dst = malloc(len);
+		int sv[2], fd = -1;
+
+		assert(src != MAP_FAILED && dst != NULL);
+		if (repeated) {
+			/* Adjacent virtual pages alias one physical page, so the
+			 * direct map cannot represent them as a single mbuf. */
+			fd = shm_open(SHM_ANON, O_RDWR, 0600);
+			assert(fd >= 0 && ftruncate(fd, (off_t)page) == 0);
+			for (size_t off = 0; off < size; off += page)
+				assert(mmap(src + off, page, PROT_READ | PROT_WRITE,
+				    MAP_SHARED | MAP_FIXED, fd, 0) == src + off);
+		}
+		for (size_t i = 0; i < size; i++)
+			src[i] = (char)(i % 251);
+		struct iovec iov = { .iov_base = src, .iov_len = size };
+		assert(kqring_register(r.fd, IORING_REGISTER_BUFFERS, &iov, 1) == 0);
+		assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+		int socksize = (int)(4 * size);
+		assert(setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &socksize,
+		    sizeof(socksize)) == 0);
+		assert(setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &socksize,
+		    sizeof(socksize)) == 0);
+		struct io_uring_sqe *sqe = ring_prep(&r, IORING_OP_SEND_ZC,
+		    sv[0], 30573 + repeated);
+		sqe->addr = (uint64_t)(uintptr_t)(src + 3);
+		sqe->len = (uint32_t)len;
+		sqe->ioprio = IORING_RECVSEND_FIXED_BUF | IORING_SEND_ZC_REPORT_USAGE;
+		ring_push_sqe(&r);
+		ring_submit(&r);
+		assert(ring_cq_ready(&r) == 1);
+		struct io_uring_cqe c = expect_cqe(&r, 30573 + repeated, (int32_t)len);
+		assert(c.flags == IORING_CQE_F_MORE);
+		src[3] ^= 0x5a; /* The unread data must still reference the held pages. */
+		assert(read(sv[1], dst, len) == (ssize_t)len);
+		assert(memcmp(src + 3, dst, len) == 0);
+		assert(ring_wait(&r, 1, 2000) == 0);
+		c = expect_cqe(&r, 30573 + repeated, 0);
+		assert(c.flags == IORING_CQE_F_NOTIF);
+		assert(kqring_register(r.fd, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+		close(sv[0]);
+		close(sv[1]);
+		if (fd >= 0)
+			close(fd);
+		munmap(src, size);
+		free(dst);
+	}
+	close(r.fd);
+}
+
 static void
 test_send_zc(struct test_ring *r)
 {
@@ -3503,6 +3570,8 @@ test_send_zc(struct test_ring *r)
 	free(tr);
 	close(sv[0]);
 	close(sv[1]);
+	zc_local_min_set((unsigned)page);
+	test_send_zc_spans();
 	zc_local_min_set(zc_local_min);
 	printf("[PASS] SEND_ZC/SENDMSG_ZC notifications (incl. FIXED_BUF ZC), "
 	    "SEND to an address, AF_UNIX copy threshold\n");

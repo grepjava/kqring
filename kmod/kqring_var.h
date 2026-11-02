@@ -1409,6 +1409,7 @@ int	kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 #define	KQRING_RW_PUNT	0	/* not run: give it to a worker */
 #define	KQRING_RW_DONE	1	/* completed; op->res is set */
 #define	KQRING_RW_BIO	2	/* sent to the disk driver; op is armed */
+#define	KQRING_RW_SOCKET	3	/* dispatch through nonblocking socket I/O */
 int	kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	    bool is_write);
 bool	kqring_file_bio_try(struct kqring_ctx *ctx, struct kqring_op *op,

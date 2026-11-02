@@ -2,6 +2,8 @@
 
 How `kqring` compares with FreeBSD's `kqueue(2)` on the same workloads. Where kqueue has no role (regular files, bulk sends into a socket with room), the comparison is the plain syscall.
 
+> Follow-up (2026-11-02): [targeted optimization measurements](docs/bench/red-cases/README.md) show registered AF_UNIX 16 KiB sends now beating write(2); armed one-shot receives improve modestly, and single file reads remain slower than pread. The full results below predate that follow-up.
+
 ![kqring vs kqueue: speed-up per operation](docs/bench/summary.svg)
 
 ## Summary
