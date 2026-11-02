@@ -81,6 +81,7 @@
 #include <sys/resourcevar.h>
 #include <sys/signal.h>
 #include <sys/stat.h>
+#include <sys/taskqueue.h>
 #include <sys/syscallsubr.h>
 #include <sys/sysproto.h>
 #include <sys/time.h>
@@ -650,6 +651,8 @@ struct kqring_ctx {
 	bool			closing;
 	bool			cancelling;
 	bool			cancelled;
+	bool			cancel_deferred; /* cancel_task queued */
+	struct task		cancel_task;	/* kqring_ctx_cancel_task() */
 	bool			in_ctx_list;
 	struct thread		*cancel_td;
 	struct proc		*owner_proc;	/* SINGLE_ISSUER process */
@@ -1211,6 +1214,7 @@ bool	kqring_fp_is_ring(const struct file *fp);
 int	kqring_fp_ctx(struct file *fp, struct kqring_ctx **ctxp);
 void	kqring_ctx_rele(struct kqring_ctx *ctx);
 void	kqring_ctx_cancel_all(struct kqring_ctx *ctx);
+int	kqring_teardown_sleep(void *chan, struct mtx *mtx, const char *wmesg);
 void	kqring_poll_fallback_locked(struct kqring_ctx *ctx);
 void	kqring_run_checks(struct kqring_ctx *ctx);
 int	kqring_reg_ring_fget(struct thread *td, uint32_t slot, bool is_enter,
@@ -1512,6 +1516,7 @@ bool	kqring_arm_nonsock_op(struct kqring_ctx *ctx, struct kqring_op *op);
 void	kqring_wq_rearm_ready(struct kqring_ctx *ctx, struct kqring_op *op);
 int	kqring_sqpoll_start(struct kqring_ctx *ctx, struct thread *td);
 bool	kqring_kthread_check_suspend(struct kqring_ctx *ctx);
+void	kqring_kthread_exit(void) __dead2;
 void	kqring_worker_hold(void);
 void	kqring_worker_rele(void);
 
@@ -1524,7 +1529,7 @@ int	kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 void	kqring_kpoll_disarm_locked(struct kqring_ctx *ctx,
 	    struct kqring_op *op);
 void	kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op);
-void	kqring_kpoll_stop(struct kqring_ctx *ctx);
+int	kqring_kpoll_stop(struct kqring_ctx *ctx, bool nowait);
 void	kqring_kpoll_close(struct kqring_ctx *ctx);
 
 /* Whether the ring has a kthread (SQPOLL, or completions only). */

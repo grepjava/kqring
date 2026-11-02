@@ -6,6 +6,10 @@
 
 #include "kqring_var.h"
 
+#include <sys/signalvar.h>
+#include <sys/sysent.h>
+#include <sys/umtxvar.h>
+
 void
 kqring_wq_abort_td(struct thread *wtd)
 {
@@ -173,7 +177,7 @@ kqring_wq_put(struct kqring_wq *wq)
  * Handle process-wide stop/single-threading requests (fork, execve,
  * exit1, SIGSTOP) on an in-process worker kthread.  Called with
  * wq->mtx held; returns true if the process is exiting or exec'ing
- * and the caller must kthread_exit().
+ * and the caller must kqring_kthread_exit().
  */
 static bool
 kqring_wq_check_suspend(struct kqring_wq *wq)
@@ -446,8 +450,7 @@ kqring_wq_thread(void *arg)
 	}
 	wq->total[type]--;
 	kqring_wq_rele_locked(wq);
-	kqring_worker_rele();
-	kthread_exit();
+	kqring_kthread_exit();
 }
 
 static bool
@@ -807,6 +810,39 @@ kqring_kthread_check_suspend(struct kqring_ctx *ctx)
 	return (ctx->closing);
 }
 
+/*
+ * kthread_exit() for a ring kthread (a worker, SQPOLL or completions
+ * thread, the poller), which also drops its kqring_worker_hold().
+ *
+ * These threads live in a user process.  A thread exiting while SIGSTOP or
+ * a debugger stops the process can be the last one the stop waits for,
+ * but kthread_exit() does not report the stop then, so it never completes:
+ * the parent or debugger never hears of it and never continues the
+ * process, which waits forever (under ptrace not even SIGKILL frees it).
+ * thr_exit(2) calls thread_stopped() for that, under the process locks up
+ * to thread_exit(), and so does this; otherwise it is kthread_exit().
+ */
+void
+kqring_kthread_exit(void)
+{
+	struct thread *td = curthread;
+	struct proc *p = td->td_proc;
+
+	/* As late as can be: the module may unload once the count is 0. */
+	kqring_worker_rele();
+	wakeup(td);
+	PROC_LOCK(p);
+	KASSERT(p->p_numthreads > 1, ("kqring: last thread is a ring kthread"));
+	if (p->p_sysent->sv_ontdexit != NULL)
+		p->p_sysent->sv_ontdexit(td);
+	tidhash_remove(td);
+	umtx_thread_exit(td);
+	tdsigcleanup(td);
+	PROC_SLOCK(p);
+	thread_stopped(p);
+	thread_exit();
+}
+
 static void
 kqring_sqpoll_thread(void *arg)
 {
@@ -835,7 +871,13 @@ kqring_sqpoll_thread(void *arg)
 		if (kqring_kthread_check_suspend(ctx))
 			break;
 
-		sx_xlock(&ctx->sq_sx);
+		/*
+		 * Interrupted only by a stop or exit (signals are masked): go
+		 * and suspend or exit above, rather than wait uninterruptibly
+		 * on an issuer that was stopped holding sq_sx.
+		 */
+		if (sx_xlock_sig(&ctx->sq_sx) != 0)
+			continue;
 		if (ctx->closing) {
 			sx_xunlock(&ctx->sq_sx);
 			break;
@@ -951,8 +993,7 @@ kqring_sqpoll_thread(void *arg)
 	if (finish_cancel)
 		kqring_ctx_cancel_all(ctx);
 	kqring_ctx_rele(ctx);
-	kqring_worker_rele();
-	kthread_exit();
+	kqring_kthread_exit();
 }
 
 int
@@ -1000,7 +1041,8 @@ kqring_sqpoll_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 			sbt = kqring_until(deadline);
 		if ((atomic_load_32(&shm->sq_flags) &
 		    IORING_SQ_CQ_OVERFLOW) != 0) {
-			sx_xlock(&ctx->sq_sx);
+			if (sx_xlock_sig(&ctx->sq_sx) != 0)
+				return (EINTR);
 			kqring_flush_overflow(ctx);
 			sx_xunlock(&ctx->sq_sx);
 		}

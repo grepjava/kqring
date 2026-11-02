@@ -1021,27 +1021,18 @@ kqring_bufs_clone(struct kqring_ctx *ctx, const struct kqring_register_arg *ra)
 	if (error != 0)
 		goto out;
 	/*
-	 * Lock sctx->sq_sx so another thread on a shared ring (or teardown)
-	 * cannot modify or free sctx->bufs while we clone it; order the two
-	 * sq_sx locks by address so opposing clones cannot deadlock.
+	 * Lock sctx->sq_sx too, so another thread on a shared ring (or
+	 * teardown) cannot modify or free sctx->bufs while we clone it.  We
+	 * hold our own, so never wait for it (opposing clones would deadlock):
+	 * try, and between tries sleep interruptibly, as kqring_enter_lock()
+	 * does, since its holder may be a stopped thread.
 	 */
-	if ((uintptr_t)ctx < (uintptr_t)sctx) {
-		sx_xlock(&sctx->sq_sx);
-	} else {
-		sx_xunlock(&ctx->sq_sx);
-		sx_xlock(&sctx->sq_sx);
-		sx_xlock(&ctx->sq_sx);
-		if (ctx->closing) {
-			error = EBADF;
-			goto out_unlock;
-		}
-		kqring_flush_overflow(ctx);
-		if (ctx->nocq >= KQRING_OCQ_BUSY || (ctx->bufs != NULL &&
-		    (cb.flags & IORING_REGISTER_DST_REPLACE) == 0)) {
-			error = EBUSY;
-			goto out_unlock;
-		}
+	while (!sx_try_xlock(&sctx->sq_sx)) {
+		error = pause_sig("kqclon", 1);
+		if (error != 0 && error != EWOULDBLOCK)
+			goto out;
 	}
+	error = 0;
 	if (!kqring_is_owner(sctx, td))
 		error = EEXIST;
 	else if (sctx->closing)

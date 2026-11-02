@@ -8780,6 +8780,94 @@ test_phase5_security_audit(void)
 	    "exit, execve(2) ring teardown, forged sq_tail bound, owner check\n");
 }
 
+/* Child of test_stop_during_close(): open and close rings, forever. */
+static void *
+stop_close_thread(void *arg)
+{
+	static const unsigned modes[] = {
+		0,	/* completions kthread (kqtask) */
+		IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG,
+		IORING_SETUP_SQPOLL,	/* submission kthread (kqsqp) */
+	};
+	unsigned i = (unsigned)(uintptr_t)arg;
+
+	for (;; i++) {
+		struct io_uring_params p;
+		long fd;
+
+		memset(&p, 0, sizeof(p));
+		p.flags = modes[i % nitems(modes)];
+		fd = kqring_setup(8, &p);
+		if (fd >= 0)
+			close((int)fd);
+	}
+	return (NULL);
+}
+
+/*
+ * SIGSTOP (and so a debugger) must be able to stop a process that is
+ * closing rings.  Teardown waits for the ring's kernel thread to exit, and
+ * that thread parks itself for the stop: if the closing thread's wait does
+ * not count as stopped, the stop never completes and the closer never
+ * wakes (under ptrace, not even SIGKILL frees it).
+ */
+static void
+test_stop_during_close(void)
+{
+	pid_t pid = fork();
+	bool ok = true;
+	int st;
+
+	assert(pid >= 0);
+	if (pid == 0) {
+		pthread_t td[4];
+
+		for (uintptr_t i = 0; i < nitems(td); i++)
+			assert(pthread_create(&td[i], NULL, stop_close_thread,
+			    (void *)i) == 0);
+		pause();
+		_exit(0);
+	}
+	usleep(100000);
+	for (int round = 0; round < 300; round++) {
+		bool stopped = false;
+
+		assert(kill(pid, SIGSTOP) == 0);
+		for (int ms = 0; ms < 3000 && !stopped; ms++) {
+			pid_t w = waitpid(pid, &st, WUNTRACED | WNOHANG);
+
+			assert(w >= 0);
+			if (w == pid) {
+				assert(WIFSTOPPED(st));
+				stopped = true;
+			} else {
+				usleep(1000);
+			}
+		}
+		if (!stopped) {
+			char cmd[64];
+
+			fprintf(stderr, "[FAIL] stop during ring close: not "
+			    "stopped 3 s after SIGSTOP (round %d)\n", round);
+			snprintf(cmd, sizeof(cmd), "procstat -kk %d >&2",
+			    (int)pid);
+			(void)system(cmd);
+			failures++;
+			ok = false;
+			break;
+		}
+		assert(kill(pid, SIGCONT) == 0);
+		usleep(500 + (useconds_t)(round % 7) * 300);
+	}
+	/* SIGCONT first: a process stuck half-stopped then exits on SIGKILL. */
+	(void)kill(pid, SIGCONT);
+	(void)kill(pid, SIGKILL);
+	assert(waitpid(pid, &st, 0) == pid);
+	if (ok)
+		printf("[PASS] SIGSTOP stops a process closing rings "
+		    "(300 stops)\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -8870,6 +8958,7 @@ main(int argc, char **argv)
 		test_sqe128_cqe32_attach_wq();
 		test_registered_rings();
 		test_sqpoll_and_iopoll();
+		test_stop_during_close();
 		test_phase5_security_audit();
 		printf("%s: %d failure(s)\n", failures ? "[FAIL]" : "[OK]",
 		    failures);

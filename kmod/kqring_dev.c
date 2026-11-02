@@ -561,12 +561,85 @@ kqring_ctx_rele(struct kqring_ctx *ctx)
 		kqring_ctx_free_final(ctx);
 }
 
-void
-kqring_ctx_cancel_all(struct kqring_ctx *ctx)
+/*
+ * Ring teardown and process stops.
+ *
+ * Teardown waits for other threads of the ring's process: its kthreads
+ * (SQPOLL or completions, the poller) to exit, and a thread that holds
+ * sq_sx.  Those park themselves for SIGSTOP and ptrace stops.  A process
+ * only counts as stopped once none of its threads is in an uninterruptible
+ * sleep, and a thread that enters an interruptible sleep while a stop is
+ * pending is not suspended there: the sleep fails, for the system call to
+ * unwind and stop at the user boundary.  close(2) cannot unwind, so a
+ * teardown that would wait while its process stops hands the rest of the
+ * work to kqring_teardown_tq, outside the process (as io_uring hands ring
+ * exit to a workqueue), and returns; the task finishes it once the
+ * kthreads have gone.  During exit the waits go on: the kthreads exit then.
+ */
+static struct taskqueue *kqring_teardown_tq;
+
+static void kqring_ctx_cancel_locked(struct kqring_ctx *ctx);
+
+static bool
+kqring_teardown_may_defer(void)
 {
-	struct kqring_op *op;
-	struct kqring_rcqe *rc;
-	struct kqring_wq *wq;
+	struct proc *p = curproc;
+
+	return ((p->p_flag & (P_SYSTEM | P_SINGLE_EXIT)) == 0 &&
+	    (p->p_flag2 & P2_WEXIT) == 0);
+}
+
+/*
+ * Sleep in teardown until woken or a second passes; callers loop on their
+ * condition.  EINTR: defer the teardown (see above).
+ */
+int
+kqring_teardown_sleep(void *chan, struct mtx *mtx, const char *wmesg)
+{
+	int error;
+
+	if ((curproc->p_flag & P_SYSTEM) != 0) {
+		(void)msleep(chan, mtx, 0, wmesg, hz);
+		return (0);
+	}
+	error = msleep(chan, mtx, PCATCH, wmesg, hz);
+	if (error != EINTR && error != ERESTART)
+		return (0);
+	if (kqring_teardown_may_defer())
+		return (EINTR);
+	(void)msleep(chan, mtx, 0, wmesg, 1);
+	return (0);
+}
+
+/* sq_sx for teardown, as kqring_teardown_sleep(). */
+static int
+kqring_teardown_sq_lock(struct kqring_ctx *ctx)
+{
+	for (;;) {
+		if ((curproc->p_flag & P_SYSTEM) != 0) {
+			sx_xlock(&ctx->sq_sx);
+			return (0);
+		}
+		if (sx_xlock_sig(&ctx->sq_sx) == 0)
+			return (0);
+		if (kqring_teardown_may_defer())
+			return (EINTR);
+		pause("kqsqsx", 1);
+	}
+}
+
+/*
+ * The first part of teardown: mark the ring closing, wait for its kthreads
+ * and take sq_sx.  With nowait (kqring_teardown_tq) it does not wait but
+ * returns EWOULDBLOCK.  Returns with sq_sx and ctx->mtx held and the ring
+ * marked cancelling by curthread (0), or EINTR (defer), or EALREADY:
+ * another thread is cancelling it (waited for, unless nowait or that is
+ * curthread).
+ */
+static int
+kqring_ctx_cancel_begin(struct kqring_ctx *ctx, bool nowait)
+{
+	int error;
 
 	/*
 	 * Signal closing and wait for the SQPOLL kthread to exit before
@@ -587,26 +660,103 @@ kqring_ctx_cancel_all(struct kqring_ctx *ctx)
 		wakeup(&ctx->sqpoll_wait_chan);
 	if (curthread == ctx->sqpoll_td) {
 		mtx_unlock(&ctx->mtx);
-		return;
+		return (EALREADY);
 	}
-	while (ctx->sqpoll_running)
-		msleep(&ctx->sqpoll_running, &ctx->mtx, 0, "kqsqdt", 0);
-	kqring_kpoll_stop(ctx);
-	if (ctx->cancelling) {
-		if (ctx->cancel_td != curthread) {
-			while (!ctx->cancelled)
-				msleep(&ctx->cancelled, &ctx->mtx, 0,
-				    "kqctxd", 0);
-		}
+	while (ctx->sqpoll_running) {
+		error = nowait ? EWOULDBLOCK :
+		    kqring_teardown_sleep(&ctx->sqpoll_running, &ctx->mtx,
+		    "kqsqdt");
+		if (error != 0)
+			goto fail;
+	}
+	if ((error = kqring_kpoll_stop(ctx, nowait)) != 0)
+		goto fail;
+	while (!ctx->cancelling) {
 		mtx_unlock(&ctx->mtx);
+		if (nowait)
+			error = sx_try_xlock(&ctx->sq_sx) ? 0 : EWOULDBLOCK;
+		else
+			error = kqring_teardown_sq_lock(ctx);
+		mtx_lock(&ctx->mtx);
+		if (error != 0)
+			goto fail;
+		if (!ctx->cancelling) {
+			ctx->cancelling = true;
+			ctx->cancel_td = curthread;
+			return (0);
+		}
+		sx_xunlock(&ctx->sq_sx);
+	}
+	if (ctx->cancel_td != curthread && !nowait) {
+		while (!ctx->cancelled)
+			if (kqring_teardown_sleep(&ctx->cancelled, &ctx->mtx,
+			    "kqctxd") != 0)
+				break;	/* The canceller finishes alone. */
+	}
+	error = EALREADY;
+fail:
+	mtx_unlock(&ctx->mtx);
+	return (error);
+}
+
+/* Teardown handed off by kqring_ctx_cancel_all(): finish it, unwaiting. */
+static void
+kqring_ctx_cancel_task(void *arg, int pending __unused)
+{
+	struct kqring_ctx *ctx = arg;
+	int error;
+
+	error = kqring_ctx_cancel_begin(ctx, true);
+	if (error == EWOULDBLOCK) {
+		/* A kthread is still parked for the stop: look again soon. */
+		pause("kqtdwt", hz / 50 + 1);
+		taskqueue_enqueue(kqring_teardown_tq, &ctx->cancel_task);
 		return;
 	}
-	ctx->cancelling = true;
-	ctx->cancel_td = curthread;
-	mtx_unlock(&ctx->mtx);
+	if (error == 0)
+		kqring_ctx_cancel_locked(ctx);
+	kqring_ctx_rele(ctx);
+	kqring_worker_rele();
+}
 
-	sx_xlock(&ctx->sq_sx);
-	mtx_lock(&ctx->mtx);
+void
+kqring_ctx_cancel_all(struct kqring_ctx *ctx)
+{
+	bool defer;
+
+	switch (kqring_ctx_cancel_begin(ctx, false)) {
+	case 0:
+		kqring_ctx_cancel_locked(ctx);
+		return;
+	case EINTR:
+		mtx_lock(&ctx->mtx);
+		defer = !ctx->cancel_deferred;
+		ctx->cancel_deferred = true;
+		mtx_unlock(&ctx->mtx);
+		if (defer) {
+			refcount_acquire(&ctx->refs);
+			kqring_worker_hold();
+			taskqueue_enqueue(kqring_teardown_tq, &ctx->cancel_task);
+		}
+		return;
+	default:
+		return;
+	}
+}
+
+/*
+ * The rest of teardown, entered from kqring_ctx_cancel_begin() with sq_sx
+ * and ctx->mtx held; releases both.
+ */
+static void
+kqring_ctx_cancel_locked(struct kqring_ctx *ctx)
+{
+	struct kqring_op *op;
+	struct kqring_rcqe *rc;
+	struct kqring_wq *wq;
+
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	sx_assert(&ctx->sq_sx, SA_XLOCKED);
 	/* Disk requests own their user pages until their bios finish. */
 	while (ctx->nbio > 0)
 		msleep(&ctx->nbio, &ctx->mtx, 0, "kqbio", 0);
@@ -730,6 +880,7 @@ kqring_fdopen(struct cdev *dev __unused, int fflags __unused,
 	mtx_init(&ctx->mtx, "kqring", NULL, MTX_DEF);
 	knlist_init_mtx(&ctx->rsel.si_note, &ctx->mtx);
 	callout_init_mtx(&ctx->wq_abort_callout, &ctx->mtx, 0);
+	TASK_INIT(&ctx->cancel_task, 0, kqring_ctx_cancel_task, ctx);
 	sx_init(&ctx->bg_sx, "kqring bg");
 	sx_init_flags(&ctx->sq_sx, "kqring sq", SX_DUPOK);
 	ctx->wq = kqring_wq_alloc(td);
@@ -949,7 +1100,8 @@ kqring_ioc_setup(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	int error;
 
 	/* Serialize against a concurrent setup or teardown on the descriptor. */
-	sx_xlock(&ctx->sq_sx);
+	if (sx_xlock_sig(&ctx->sq_sx) != 0)
+		return (EINTR);
 	mtx_lock(&ctx->mtx);
 	if (ctx->closing) {
 		mtx_unlock(&ctx->mtx);
@@ -1033,11 +1185,15 @@ kqring_enter_locks(const struct kqring_ctx *ctx, const struct thread *td)
 	    (ctx->wq != NULL && ctx->wq->proc != td->td_proc));
 }
 
-static inline void
+/*
+ * Interruptible (EINTR or ERESTART): a thread stopped while it holds sq_sx
+ * (in the worker hand-off wait, say) must not leave others in an
+ * uninterruptible wait for it, or the process never counts as stopped.
+ */
+static inline int
 kqring_enter_lock(struct kqring_ctx *ctx, bool lock)
 {
-	if (lock)
-		sx_xlock(&ctx->sq_sx);
+	return (lock ? sx_xlock_sig(&ctx->sq_sx) : 0);
 }
 
 static inline void
@@ -1200,7 +1356,8 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 		if ((ea->flags & IORING_ENTER_GETEVENTS) != 0 &&
 		    (atomic_load_32(&shm->sq_flags) &
 		    IORING_SQ_CQ_OVERFLOW) != 0) {
-			sx_xlock(&ctx->sq_sx);
+			if (kqring_enter_lock(ctx, true) != 0)
+				return (EINTR);
 			kqring_flush_overflow(ctx);
 			sx_xunlock(&ctx->sq_sx);
 		}
@@ -1211,9 +1368,11 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	}
 
 	/*
-	 * 2. Drain and submit queued SQEs.
+	 * 2. Drain and submit queued SQEs.  Nothing is done yet: a stop
+	 * restarts the call (ERESTART).
 	 */
-	kqring_enter_lock(ctx, lock);
+	if ((error = kqring_enter_lock(ctx, lock)) != 0)
+		return (error);
 	if (ctx->closing) {
 		kqring_enter_unlock(ctx, lock);
 		return (EBADF);
@@ -1394,7 +1553,8 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 			return (EINTR);
 		if (error == EWOULDBLOCK && has_timeout) {
 			if (kqring_until(deadline) == 0) {
-				kqring_enter_lock(ctx, lock);
+				if (kqring_enter_lock(ctx, lock) != 0)
+					return (EINTR);
 				if (!ctx->closing) {
 					kqring_run_taskwork(ctx);
 					kqring_run_checks(ctx);
@@ -1409,7 +1569,8 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 			}
 		}
 drain:
-		kqring_enter_lock(ctx, lock);
+		if (kqring_enter_lock(ctx, lock) != 0)
+			return (EINTR);
 		if (ctx->closing) {
 			kqring_enter_unlock(ctx, lock);
 			return (EBADF);
@@ -2087,6 +2248,10 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			LIST_INIT(&kqring_futex_hash[i]);
 		for (int i = 0; i < KQRING_PROC_HASH; i++)
 			LIST_INIT(&kqring_proc_hash[i]);
+		kqring_teardown_tq = taskqueue_create("kqring teardown",
+		    M_WAITOK, taskqueue_thread_enqueue, &kqring_teardown_tq);
+		taskqueue_start_threads(&kqring_teardown_tq, 1, PWAIT,
+		    "kqteardown");
 		kqring_exit_tag = EVENTHANDLER_REGISTER(process_exit,
 		    kqring_proc_exit, NULL, EVENTHANDLER_PRI_ANY);
 		kqring_exec_tag = EVENTHANDLER_REGISTER(process_exec,
@@ -2099,6 +2264,7 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			EVENTHANDLER_DEREGISTER(process_fork, kqring_fork_tag);
 			EVENTHANDLER_DEREGISTER(process_exec, kqring_exec_tag);
 			EVENTHANDLER_DEREGISTER(process_exit, kqring_exit_tag);
+			taskqueue_free(kqring_teardown_tq);
 			mtx_destroy(&kqring_zc_mtx);
 			rm_destroy(&kqring_rings_rm);
 			mtx_destroy(&kqring_proc_mtx);
@@ -2165,6 +2331,8 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			msleep(&kqring_live_workers, &kqring_proc_mtx, 0,
 			    "kqwqun", 0);
 		mtx_unlock(&kqring_proc_mtx);
+		/* Deferred teardowns held workers: none is left to run. */
+		taskqueue_free(kqring_teardown_tq);
 		for (int i = 0; i < KQRING_PROC_HASH; i++) {
 			struct kqring_proc_rings *pr;
 

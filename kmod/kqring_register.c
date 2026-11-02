@@ -943,8 +943,10 @@ kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
 	}
 	mtx_unlock(&ctx->mtx);
 
-	sx_xlock(&ctx->sq_sx);
-	if (ctx->closing) {
+	/* Interruptible, as kqring_enter_lock(): its holder may be stopped. */
+	if (sx_xlock_sig(&ctx->sq_sx) != 0) {
+		error = EINTR;
+	} else if (ctx->closing) {
 		sx_xunlock(&ctx->sq_sx);
 		error = EBADF;
 	} else {

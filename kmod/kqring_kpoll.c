@@ -378,8 +378,7 @@ kqring_kp_thread(void *arg)
 	wakeup(&ctx->kp_running);
 	mtx_unlock(&ctx->mtx);
 	kqring_ctx_rele(ctx);
-	kqring_worker_rele();
-	kthread_exit();
+	kqring_kthread_exit();
 }
 
 /*
@@ -701,13 +700,22 @@ kqring_kpoll_run(struct thread *td)
 	}
 }
 
-/* Ring teardown: wait for the poller to see ctx->closing and exit. */
-void
-kqring_kpoll_stop(struct kqring_ctx *ctx)
+/*
+ * Ring teardown: wait for the poller to see ctx->closing and exit.  As
+ * kqring_teardown_sleep(): EINTR to defer, or with nowait EWOULDBLOCK.
+ */
+int
+kqring_kpoll_stop(struct kqring_ctx *ctx, bool nowait)
 {
 	mtx_assert(&ctx->mtx, MA_OWNED);
-	while (ctx->kp_running && curthread != ctx->kp_td)
-		msleep(&ctx->kp_running, &ctx->mtx, 0, "kqkpdt", 0);
+	while (ctx->kp_running && curthread != ctx->kp_td) {
+		if (nowait)
+			return (EWOULDBLOCK);
+		if (kqring_teardown_sleep(&ctx->kp_running, &ctx->mtx,
+		    "kqkpdt") != 0)
+			return (EINTR);
+	}
+	return (0);
 }
 
 /* Close the ring's kqueue (its knotes go with it). */
