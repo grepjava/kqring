@@ -2640,6 +2640,48 @@ test_waitall(struct test_ring *r)
 	expect_cqe(r, 30402, 3);
 	close(sv[0]);
 
+	/*
+	 * TCP with part of the data already queued at submission: the
+	 * submitter must not block in soreceive_generic()'s MSG_WAITALL
+	 * loop (alarm(2) kills the test if it does), for RECV and RECVMSG.
+	 */
+	uint16_t port;
+	int lfd = tcp_listener(&port);
+	int c = tcp_connect(port);
+	wait_readable(lfd);
+	int a = accept(lfd, NULL, NULL);
+	assert(a >= 0);
+	for (int msg = 0; msg < 2; msg++) {
+		struct iovec iov = { .iov_base = buf, .iov_len = 10 };
+		struct msghdr mh = { .msg_iov = &iov, .msg_iovlen = 1 };
+		uint64_t ud = 30404 + (uint64_t)msg;
+
+		memset(buf, 0, sizeof(buf));
+		assert(write(c, "0123", 4) == 4);
+		wait_readable(a);
+		if (msg) {
+			sqe = ring_prep(r, IORING_OP_RECVMSG, a, ud);
+			sqe->addr = (uint64_t)(uintptr_t)&mh;
+		} else {
+			sqe = ring_prep(r, IORING_OP_RECV, a, ud);
+			sqe->addr = (uint64_t)(uintptr_t)buf;
+			sqe->len = 10;
+		}
+		sqe->msg_flags = MSG_WAITALL;
+		ring_push_sqe(r);
+		alarm(10);
+		ring_submit(r);
+		assert(ring_wait(r, 1, 30) == ETIMEDOUT);
+		alarm(0);
+		assert(write(c, "456789", 6) == 6);
+		assert(ring_wait(r, 1, 2000) == 0);
+		expect_cqe(r, ud, 10);
+		assert(memcmp(buf, "0123456789", 10) == 0);
+	}
+	close(a);
+	close(c);
+	close(lfd);
+
 	/* Multishot with MSG_WAITALL is rejected. */
 	sqe = ring_prep(r, IORING_OP_RECV, sv[0], 30403);
 	sqe->flags = IOSQE_BUFFER_SELECT;

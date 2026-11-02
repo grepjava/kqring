@@ -444,6 +444,11 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 		flags |= (int)sqe->msg_flags;
 	waitall = (flags & MSG_WAITALL) != 0 && !buf_select &&
 	    kqring_so_stream(so);
+	/*
+	 * kqring_waitall() does MSG_WAITALL: soreceive_generic() would
+	 * sbwait() for the rest despite MSG_DONTWAIT once it copied some.
+	 */
+	flags &= ~MSG_WAITALL;
 	error = soreceive(so, NULL, &auio, NULL, NULL, &flags);
 	/* MSG_TRUNC on a datagram: uio_resid underflows to the real size. */
 	n = (size_t)(want - auio.uio_resid);
@@ -1247,6 +1252,8 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 	msg.msg_flags = (int)sqe->msg_flags | MSG_DONTWAIT;
 	waitall = (msg.msg_flags & MSG_WAITALL) != 0 && !buf_select &&
 	    kqring_so_stream(so);
+	/* As in kqring_exec_recv(): never let soreceive() wait for it. */
+	msg.msg_flags &= ~MSG_WAITALL;
 	n = 0;
 	error = kqring_recvit(td, so, &msg, UIO_USERSPACE, NULL, &n);
 	if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
