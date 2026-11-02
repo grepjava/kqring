@@ -22,8 +22,8 @@
  *    DEFER_TASKRUN rings the issuer then only enters when the flag is set,
  *    as liburing does);
  *  - an issuer that stays inside one system call for 30 s;
- *  - sockets, user-wired pages or kqring malloc memory still held once
- *    everything is closed (a leak).
+ *  - sockets no descriptor refers to, user-wired pages or kqring malloc
+ *    memory still held once everything is closed (a leak).
  *
  * A kernel panic is a failure too: run it with debug.debugger_on_panic=0.
  * Raise RLIMIT_MEMLOCK (ulimit -l 8192) to cover registered buffers too.
@@ -33,12 +33,19 @@
 
 #include <sys/param.h>
 #include <sys/types.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/socketvar.h>
 #include <sys/sysctl.h>
 #include <sys/uio.h>
+#include <sys/un.h>
+#include <sys/unpcb.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
+#include <netinet/in_pcb.h>
+#include <netinet/tcp.h>
+#include <netinet/tcp_var.h>
 #include <arpa/inet.h>
 
 #include <errno.h>
@@ -222,8 +229,8 @@ tcp_pair(int sv[2])
 			err = ETIMEDOUT;
 		}
 		if (err != EACCES && err != EADDRNOTAVAIL &&
-		    err != ECONNREFUSED && err != EADDRINUSE &&
-		    err != ETIMEDOUT)
+		    err != ECONNREFUSED && err != ECONNRESET &&
+		    err != EADDRINUSE && err != ETIMEDOUT)
 			fail(false, "tcp connect to %s:%u: %s",
 			    inet_ntoa(tcp_addr.sin_addr),
 			    ntohs(tcp_addr.sin_port), strerror(err));
@@ -1182,43 +1189,114 @@ print_stats(uint64_t t0)
 }
 
 /*
- * Closed TCP connections keep their sockets until the handshake ends
- * (LAST_ACK, FIN_WAIT_1): wait for the count to stop falling, so that an
- * earlier run's leftovers do not hide a leak in the baseline.
+ * Sockets of ours that no descriptor refers to, less those TCP itself
+ * holds after close(2) to deliver what is still queued (INP_SOCKREF).  On
+ * a host whose packet filter drops some of that traffic they linger for
+ * hours with no process or kqring involved.  Counting only our uid and
+ * only unreferenced sockets keeps other processes' churn out of it; a
+ * reference kqring failed to drop shows up here.
  */
-static long
-settled_sockets(void)
+static void *
+sysctl_blob(const char *name, size_t *lenp)
 {
-	long prev = sysctl_num("kern.ipc.numopensockets"), cur;
+	void *buf = NULL;
+	size_t len;
 
-	for (int i = 0; i < 45; i++) {
-		sleep(2);
-		cur = sysctl_num("kern.ipc.numopensockets");
-		if (cur >= prev)
-			return (cur);
-		if (i == 0)
-			printf("waiting for %ld closing sockets to go...\n",
-			    cur);
-		prev = cur;
+	for (int i = 0; i < 10; i++) {
+		if (sysctlbyname(name, NULL, &len, NULL, 0) != 0)
+			break;
+		len += len / 4 + 4096;
+		free(buf);
+		if ((buf = malloc(len)) == NULL)
+			break;
+		if (sysctlbyname(name, buf, &len, NULL, 0) == 0) {
+			*lenp = len;
+			return (buf);
+		}
+		if (errno != ENOMEM)
+			break;
 	}
-	return (prev);
+	free(buf);
+	return (NULL);
 }
 
-/* Wait (up to 3 min, for TCP teardown) then compare with the baseline. */
+static int
+kvaddr_cmp(const void *a, const void *b)
+{
+	kvaddr_t x = *(const kvaddr_t *)a, y = *(const kvaddr_t *)b;
+
+	return (x < y ? -1 : x > y);
+}
+
+static long
+open_sockets(void)
+{
+	static const char *const lists[] = { "net.inet.tcp.pcblist",
+	    "net.local.stream.pcblist", "net.local.dgram.pcblist",
+	    "net.local.seqpacket.pcblist" };
+	struct xfile *xf;
+	kvaddr_t *held;
+	size_t len, nheld = 0;
+	uid_t uid = getuid();
+	long n = 0;
+
+	if ((xf = sysctl_blob("kern.file", &len)) == NULL)
+		fail(false, "kern.file: %s", strerror(errno));
+	if ((held = calloc(len / sizeof(*xf) + 1, sizeof(*held))) == NULL)
+		fail(false, "calloc");
+	for (size_t i = 0; i < len / sizeof(*xf); i++)
+		if (xf[i].xf_type == DTYPE_SOCKET)
+			held[nheld++] = xf[i].xf_data;
+	free(xf);
+	qsort(held, nheld, sizeof(*held), kvaddr_cmp);
+
+	for (size_t l = 0; l < nitems(lists); l++) {
+		char *buf, *p, *end;
+
+		if ((buf = sysctl_blob(lists[l], &len)) == NULL)
+			continue;
+		end = buf + len;
+		for (p = buf + ((struct xinpgen *)buf)->xig_len;
+		    p + sizeof(struct xinpgen) < end &&
+		    ((struct xinpgen *)p)->xig_len > sizeof(struct xinpgen);
+		    p += ((struct xinpgen *)p)->xig_len) {
+			const struct xsocket *xso;
+
+			if (l == 0) {
+				const struct xtcpcb *xt = (const void *)p;
+
+				if (xt->xt_inp.inp_flags & INP_SOCKREF)
+					continue;
+				xso = &xt->xt_inp.xi_socket;
+			} else
+				xso = &((const struct xunpcb *)p)->xu_socket;
+			if (xso->xso_so == 0 || xso->so_uid != uid ||
+			    bsearch(&xso->xso_so, held, nheld, sizeof(*held),
+			    kvaddr_cmp) != NULL)
+				continue;
+			n++;
+		}
+		free(buf);
+	}
+	free(held);
+	return (n);
+}
+
+/* Wait (up to 3 min) for things to drain, then compare with the baseline. */
 static int
 check_leaks(long socks0, long wired0, long mem0)
 {
 	long socks = 0, wired = 0, mem = 0;
 
 	for (int i = 0; i < 360; i++) {
-		socks = sysctl_num("kern.ipc.numopensockets");
+		socks = open_sockets();
 		wired = sysctl_num("vm.stats.vm.v_user_wire_count");
 		mem = kqring_malloc_inuse();
 		if (socks <= socks0 && wired <= wired0 && mem <= mem0)
 			break;
 		usleep(500000);
 	}
-	printf("leak check: sockets %ld -> %ld, user-wired pages %ld -> %ld, "
+	printf("leak check: unreferenced sockets %ld -> %ld, user-wired pages %ld -> %ld, "
 	    "kqring malloc in use %ld -> %ld\n", socks0, socks, wired0, wired,
 	    mem0, mem);
 	if (socks > socks0 || wired > wired0 || mem > mem0) {
@@ -1278,7 +1356,7 @@ main(int argc, char **argv)
 	    secs, nissuers, NCHAOS, seed);
 
 	warm_up();
-	socks0 = settled_sockets();
+	socks0 = open_sockets();
 	wired0 = sysctl_num("vm.stats.vm.v_user_wire_count");
 	mem0 = kqring_malloc_inuse();
 
