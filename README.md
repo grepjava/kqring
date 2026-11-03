@@ -286,6 +286,7 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
 - [`tests/kqring_bench.c`](tests/kqring_bench.c) — benchmarks against `kqueue(2)` and plain system calls; [`tests/bench_report.py`](tests/bench_report.py) turns runs into the tables and charts in [`BENCHMARK.MD`](BENCHMARK.MD).
 - [`tests/kqring_diskbench.c`](tests/kqring_diskbench.c) — storage workloads (queue depth, jobs, random or sequential, read/write mix) on a disk or file through kqring, `aio(4)` or `pread(2)` threads, with IOPS, latency percentiles and a `-V` mode that checks every read.
 - [`tests/kqring_stress.c`](tests/kqring_stress.c) — randomized multi-threaded stress test for races the functional suite can't time.
+- [`tests/kqring_fuzz.c`](tests/kqring_fuzz.c) — fuzzer: random SQEs, enters and register calls, closed descriptors and rings with requests in flight, run in a scratch directory with pointers that can't reach the fuzzer's own memory; fails on a hang, a CQ overrun or held resources (a panic shows in the crash dump). [`tests/kqring_leak.h`](tests/kqring_leak.h) has the leak checks it shares with the stress test.
 
 ## Further reading
 

@@ -3,7 +3,8 @@
 CC?=		cc
 CFLAGS=		-O2 -Wall -Wextra -Werror -std=c11 -I../include -pthread
 
-all: kqring_test kqring_bench kqring_mt_bench kqring_stress kqring_diskbench
+all: kqring_test kqring_bench kqring_mt_bench kqring_stress kqring_diskbench \
+    kqring_fuzz
 
 kqring_test: kqring_test.c ../include/sys/kqring.h
 	$(CC) $(CFLAGS) -o kqring_test kqring_test.c
@@ -14,12 +15,15 @@ kqring_bench: kqring_bench.c ../include/sys/kqring.h
 kqring_mt_bench: kqring_mt_bench.c ../include/sys/kqring.h
 	$(CC) $(CFLAGS) -o kqring_mt_bench kqring_mt_bench.c
 
-kqring_stress: kqring_stress.c ../include/sys/kqring.h
+kqring_stress: kqring_stress.c kqring_leak.h ../include/sys/kqring.h
 	$(CC) $(CFLAGS) -o kqring_stress kqring_stress.c
 
 kqring_diskbench: kqring_diskbench.c ../include/sys/kqring.h
 	$(CC) $(CFLAGS) -o kqring_diskbench kqring_diskbench.c
 
+kqring_fuzz: kqring_fuzz.c kqring_leak.h ../include/sys/kqring.h
+	$(CC) $(CFLAGS) -o kqring_fuzz kqring_fuzz.c
+
 clean:
 	rm -f kqring_test kqring_bench kqring_mt_bench kqring_stress \
-	    kqring_diskbench
+	    kqring_diskbench kqring_fuzz
