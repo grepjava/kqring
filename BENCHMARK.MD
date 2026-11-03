@@ -249,7 +249,7 @@ aio(4) is capped at 32 in flight per process by default (`vfs.aio.max_aio_per_pr
 | kqring `+P` | 106,642 | 536,900 | 108,485 | 593,678 |
 | kqring `+I` | 169,119 | 581,580 | 174,232 | 679,507 |
 
-Every md row is within 1% of the previous build. At 32 in flight, kqring reads match aio and writes are 14% ahead of it. One at a time, a thread calling `pread(2)` is 10% faster, as in the `disk` group above. `SQPOLL` is 37% slower one at a time: with a single I/O in flight, the polling thread and the waiting owner hand every request back and forth, which costs more than the system call `SQPOLL` saves. Registered files and buffers make no measurable difference on md. 128 KiB sequential reads, 8 in flight, run at about 36,000 per second (4.4 GiB/s) for both kqring and aio.
+Every md row is within 1% of the previous build. At 32 in flight, kqring reads match aio and writes are 14% ahead of it. One at a time, a thread calling `pread(2)` is 10% faster, as in the `disk` group above. `SQPOLL` was 37% slower one at a time in 0.2.0, because its thread slept between requests; see the `SQPOLL` table below. Registered files and buffers make no measurable difference on md. 128 KiB sequential reads, 8 in flight, run at about 36,000 per second (4.4 GiB/s) for both kqring and aio.
 
 **Waiting for several completions** (after 0.2.0). An enter with `min_complete` = N used to be woken for every worker or bio completion, and posted one CQE and slept again until N were there. Now a plain `READ`/`WRITE` completion wakes it only once N are queued, as io_uring's lazy task-work wake does (see ARCHITECTURE.MD). The md disk again, 4 KiB random I/O with 32 in flight, `kqring_diskbench -n` completions waited for per enter, median of 3 runs of 4 s alternating with the 0.2.0 module; context switches are the process's voluntary ones per run:
 
@@ -261,6 +261,16 @@ Every md row is within 1% of the previous build. At 32 in flight, kqring reads m
 | Writes, wait for 16 | 679,002 → **736,737** (+9%) | 842,941 → **213,961** (−75%) | 94 → 90 |
 
 Waiting for one completion can't batch, and those rows are unchanged within run-to-run noise (the context-switch counts vary by ±30% between runs). On a ZFS file whose data had to come from the disk, 16 reads in flight with 8 waited for ran at 4,860 IOPS either way, bound by the drive, with 31% fewer context switches (65,021 → 44,855).
+
+**`SQPOLL`** (after 0.2.0). In 0.2.0 the `SQPOLL` thread slept in 50 µs naps between requests even while active, so each request cost a wake-up to submit it and another to complete it. It now polls for the whole `sq_thread_idle`, as io_uring's does. The md disk, 4 KiB random reads, single runs of 3 s; `-C` polls the CQ in userspace instead of entering to wait, entering only to wake an idle `SQPOLL` thread:
+
+| In flight | plain kqring | `SQPOLL`, 0.2.0 | `SQPOLL` now | `SQPOLL` now, `-C` |
+|---:|---:|---:|---:|---:|
+| 1 | 168,633 | 107,298 | 123,629 | **199,844** (p50 4.2 µs) |
+| 4 | 553,795 | 400,019 | 375,146 | **580,194** |
+| 32 | 572,077 | | 595,881 | **605,323** |
+
+Polling the CQ, `SQPOLL` one at a time is 18% faster than plain kqring (p50 4.2 µs against 5.8 µs), with almost no context switches; that's how a latency-bound program would use it. An enter that waits for each completion still pays a sleep and a wake-up per request, as on Linux. The polling thread uses a CPU for as long as it stays active.
 
 `kqring_diskbench -V` checks every read against what was last written to that block and re-reads the whole area at the end. On this build, 3 s of mixed random reads and writes passed it on both the md disk and the ZFS file at 4 KiB for `pread`, aio (16 in flight), and kqring plain, `+F+B`, `+P`, `+I` and all four together (32 in flight), and for 4 kqring jobs of 64 in flight at 16 KiB.
 

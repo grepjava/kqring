@@ -5,7 +5,9 @@
 ### Performance
 
 - **Fewer wake-ups when waiting for several completions** on `DEFER_TASKRUN` rings. An enter with `min_complete` = N is now woken once N plain `READ`/`WRITE` completions from workers or disk drivers are queued, rather than for each one, as io_uring's lazy task-work wake does. Linked, drained, multishot and readiness requests still wake it at once. On an md(4) disk with 32 in flight and 16 waited for, context switches drop by 75–81% and IOPS rise 6–9%; see [BENCHMARK.MD](BENCHMARK.MD#storage-workloads-queue-depth-aio4-and-pread2-threads).
-- `kqring_diskbench -n N` waits for N completions per enter.
+- **The `SQPOLL` thread polls while active**, for the whole `sq_thread_idle`, as io_uring's does, instead of sleeping in 50 µs naps that cost two wake-ups per request. On an md(4) disk, one 4 KiB random read at a time: 200,000 per second when the program polls the CQ (18% more than without `SQPOLL`, p50 4.2 µs), up from 107,000.
+- **Poll wakeups from other processes wake a waiting enter directly.** A `write(2)` to a pipe polled with `POLL_ADD` used to reach the ring through its poller thread; now, when an enter is waiting, the knote wakes it and it collects the event itself. A cross-process poll round trip drops from 8.1 to 6.4 µs (`kevent(2)`: 5.7 µs). With no enter waiting, the poller still collects it.
+- `kqring_diskbench -n N` waits for N completions per enter, and `-C` (with `-P`) polls the CQ instead of entering to wait.
 
 ## 0.2.0 — 2026-11-03
 

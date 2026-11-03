@@ -124,10 +124,25 @@ kqring_kp_filt_event(struct knote *kn, long hint)
 		last = (uint32_t)MIN(MAX(kn->kn_data, 0), INT32_MAX);
 	prev = (uint32_t)ext[3];
 	if (mtx_owned(&kn->kn_kq->kq_lock)) {
+		struct kqring_ctx *ctx = (struct kqring_ctx *)(uintptr_t)ext[1];
+
 		ext[3] = (ext[3] & ~(uint64_t)UINT32_MAX) | last;
 		if (!ready || (prev != KQRING_KP_NOTREADY && last <= prev))
 			return (0);
 		ext[2]++;
+		/*
+		 * A wakeup from anywhere (another process's write(2), say):
+		 * wake an enter waiting on the ring, which then takes the
+		 * event itself, rather than wait for the poller to take it and
+		 * wake the enter in turn.  Only a flag and wakeup(): the file's
+		 * lock is held, which ctx->mtx must not nest inside.  A wakeup
+		 * missed as the enter goes to sleep leaves it to the poller.
+		 */
+		if (ctx != NULL) {
+			atomic_store_rel_int(&ctx->kp_kick, 1);
+			if (atomic_load_int(&ctx->cq_sleepers) != 0)
+				wakeup(&ctx->wakeup_chan);
+		}
 		return (1);
 	}
 	pending = (uint32_t)ext[2] != (uint32_t)(ext[3] >> 32);
@@ -218,6 +233,12 @@ kqring_kp_wrap(struct kqring_ctx *ctx, const struct kevent *kev, int n)
 				break;
 			}
 			if (kn->kn_influx == 0) {
+				/*
+				 * ext[1] names the ring for the wakeup; the
+				 * ring closes this kqueue (and so its knotes)
+				 * before it is freed.
+				 */
+				kn->kn_kevent.ext[1] = (uint64_t)(uintptr_t)ctx;
 				kn->kn_kevent.ext[2] = 0;
 				kn->kn_kevent.ext[3] = KQRING_KP_NOTREADY;
 				kn->kn_fop = fo;
@@ -647,6 +668,20 @@ kqring_kp_scan(struct kqring_ctx *ctx, struct thread *td)
 	fdrop(fp, td);
 	for (int i = 0; i < io.n; i++)
 		kqring_kp_event(ctx, &kev[i]);
+}
+
+/*
+ * An enter woken by kqring_kp_filt_event(): take the ring's events now, as
+ * the poller would, so that their requests are taskwork for this enter.
+ * Called with no ring lock held.
+ */
+void
+kqring_kpoll_kicked(struct kqring_ctx *ctx)
+{
+	if (atomic_load_acq_int(&ctx->kp_kick) == 0 ||
+	    atomic_swap_int(&ctx->kp_kick, 0) == 0)
+		return;
+	kqring_kp_scan(ctx, curthread);
 }
 
 /*

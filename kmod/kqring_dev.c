@@ -1507,7 +1507,8 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		if (!TAILQ_EMPTY(&ctx->retired_ops))
 			(void)kqring_wq_abort_retired_locked(ctx);
 		if (!TAILQ_EMPTY(&ctx->taskwork_ops) ||
-		    !STAILQ_EMPTY(&ctx->rcq)) {
+		    !STAILQ_EMPTY(&ctx->rcq) ||
+		    atomic_load_acq_int(&ctx->kp_kick) != 0) {
 			mtx_unlock(&ctx->mtx);
 			goto drain;
 		}
@@ -1579,6 +1580,8 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 			}
 		}
 drain:
+		/* Events a knote woke us for (kqring_kp_filt_event()). */
+		kqring_kpoll_kicked(ctx);
 		if (kqring_enter_lock(ctx, lock) != 0)
 			return (EINTR);
 		if (ctx->closing) {

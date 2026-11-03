@@ -711,6 +711,12 @@ struct kqring_ctx {
 	/* A CQE was dropped (KQRING_MAX_OVERFLOW); the issuer reports it. */
 	bool			cq_dropped;
 	bool			kp_running;
+	/*
+	 * A knote fired with an enter waiting: that enter takes the event
+	 * itself rather than wait for the poller (kqring_kpoll_kicked()).
+	 * Set from knote() with no ring lock; atomic.
+	 */
+	u_int			kp_kick;
 	uint64_t		kp_next_id;
 	TAILQ_HEAD(, kqring_op)	kp_ops[KQRING_KP_HASH];
 
@@ -1577,6 +1583,7 @@ void	kqring_worker_rele(void);
 #define	KQRING_KP_READ	0x01
 #define	KQRING_KP_WRITE	0x02
 void	kqring_kpoll_run(struct thread *td);
+void	kqring_kpoll_kicked(struct kqring_ctx *ctx);
 int	kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	    const struct file *fp);
 void	kqring_kpoll_disarm_locked(struct kqring_ctx *ctx,
