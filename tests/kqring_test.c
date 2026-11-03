@@ -15,6 +15,7 @@
 #include <sys/cpuset.h>
 #include <sys/event.h>
 #include <sys/eventfd.h>
+#include <sys/filio.h>
 #include <sys/linker.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
@@ -7485,6 +7486,204 @@ test_pipe_nowait(void)
 	    "poll wakeups counted when drained, none for own writes\n");
 }
 
+static _Atomic bool drain_stop, drain_stalled;
+static _Atomic uint64_t drain_seen;	/* when the issuer last got back */
+static const char stall_bytes[64];
+
+/*
+ * Reads all it can; if the issuer is stuck for 2 s, writes it data (so a
+ * test of the bug fails rather than hangs) and stops.
+ */
+static void *
+pipe_drainer(void *arg)
+{
+	const int *p = arg;
+	char c;
+
+	while (!atomic_load(&drain_stop)) {
+		if (read(p[0], &c, 1) == 1)
+			continue;
+		/* Loaded first: a later store can't pass now_ns(). */
+		uint64_t seen = atomic_load(&drain_seen);
+
+		if (now_ns() - seen > 2000000000ULL) {
+			atomic_store(&drain_stalled, true);
+			/* Enough for the workers' reads and the issuer's. */
+			assert(write(p[1], stall_bytes, sizeof(stall_bytes)) ==
+			    (ssize_t)sizeof(stall_bytes));
+			break;
+		}
+	}
+	return (NULL);
+}
+
+static unsigned
+reap_reads(struct test_ring *t)
+{
+	unsigned n = 0;
+
+	while (ring_cq_ready(t) > 0) {
+		struct io_uring_cqe c = ring_pop_cqe(t);
+
+		assert(c.user_data == 74000 && c.res == 1);
+		n++;
+	}
+	return (n);
+}
+
+/*
+ * READs of an O_NONBLOCK pipe that another thread drains: one the issuer
+ * saw ready may be empty when it reads, and must then go to a worker,
+ * which waits for data again if it loses it the same way.  The issuer used
+ * to wait itself, spinning in the enter until more data came (in the
+ * fuzzer, never, and the process couldn't even exit), and a worker failed
+ * the read with EAGAIN.
+ */
+static void
+test_pipe_nonblock_drained(void)
+{
+	struct test_ring t;
+	pthread_t th;
+	char sink;
+	int p[2];
+	unsigned sent = 0, got = 0;
+
+	ring_init(&t);
+	assert(pipe2(p, O_NONBLOCK) == 0);
+	atomic_store(&drain_stop, false);
+	atomic_store(&drain_stalled, false);
+	atomic_store(&drain_seen, now_ns());
+	assert(pthread_create(&th, NULL, pipe_drainer, p) == 0);
+	uint64_t end = now_ns() + 500000000ULL;
+	while (now_ns() < end && !atomic_load(&drain_stalled)) {
+		struct io_uring_sqe *sqe = ring_prep(&t, IORING_OP_READ, p[0],
+		    74000);
+
+		sqe->addr = (uint64_t)(uintptr_t)&sink;
+		sqe->len = 1;
+		sqe->off = (uint64_t)-1;
+		ring_push_sqe(&t);
+		assert(write(p[1], "m", 1) == 1);
+		ring_submit(&t);
+		atomic_store(&drain_seen, now_ns());
+		sent++;
+		got += reap_reads(&t);
+		/* Those on workers wait for a byte the drainer doesn't get. */
+		while (sent - got >= 16) {
+			assert(write(p[1], "w", 1) == 1);
+			(void)ring_wait(&t, 1, 10);
+			got += reap_reads(&t);
+			atomic_store(&drain_seen, now_ns());
+		}
+	}
+	atomic_store(&drain_stop, true);
+	assert(pthread_join(th, NULL) == 0);
+	assert(!atomic_load(&drain_stalled));
+	while (got < sent) {
+		assert(write(p[1], "x", 1) == 1);
+		assert(ring_wait(&t, 1, 2000) == 0);
+		got += reap_reads(&t);
+	}
+	close(t.fd);
+	close(p[0]);
+	close(p[1]);
+	printf("[PASS] %u READs of an O_NONBLOCK pipe drained by another "
+	    "thread\n", sent);
+}
+
+/* Reads what's there, without blocking a pipe the ring reads too. */
+static void *
+pipe_peek_drainer(void *arg)
+{
+	const int *p = arg;
+	uint32_t x = 2463534242U;
+	char c;
+	int n;
+
+	while (!atomic_load(&drain_stop)) {
+		if (ioctl(p[0], FIONREAD, &n) != 0 || n == 0)
+			continue;
+		/* A random 0-10 us late, so the ring wins some and races some. */
+		x ^= x << 13;
+		x ^= x >> 17;
+		x ^= x << 5;
+		uint64_t until = now_ns() + x % 10000;
+		while (now_ns() < until)
+			;
+		(void)read(p[0], &c, 1);
+	}
+	return (NULL);
+}
+
+/*
+ * READ_MULTISHOT on a blocking pipe that another thread drains: the pipe
+ * may be empty by the time the armed read runs, which must then re-arm.
+ * It used to block in pipe_read() instead, in whatever ran the taskwork
+ * (the enter here, the SQPOLL thread in the fuzzer), until the next
+ * write; here there is none, and SIGALRM fails the test.
+ */
+static void
+test_pipe_multishot_drained(void)
+{
+	struct test_ring t;
+	pthread_t th;
+	int p[2];
+	unsigned got = 0;
+	bool armed = false, eof = false;
+
+	ring_init(&t);
+	assert(pipe(p) == 0);
+	atomic_store(&drain_stop, false);
+	assert(pthread_create(&th, NULL, pipe_peek_drainer, p) == 0);
+	alarm(20);
+	uint64_t end = now_ns() + 500000000ULL;
+	while (now_ns() < end) {
+		if (!armed) {
+			struct io_uring_sqe *sqe = ring_prep(&t,
+			    IORING_OP_READ_MULTISHOT, p[0], 75000);
+
+			sqe->flags = IOSQE_BUFFER_SELECT;
+			ring_push_sqe(&t);
+			armed = true;
+		}
+		assert(write(p[1], "m", 1) == 1);
+		(void)ring_wait(&t, 1, 1);
+		while (ring_cq_ready(&t) > 0) {
+			struct io_uring_cqe c = ring_pop_cqe(&t);
+
+			assert(c.user_data == 75000);
+			assert(c.res == 1 || c.res == -ENOBUFS);
+			if ((c.flags & IORING_CQE_F_BUFFER) != 0)
+				ring_offer_buf(&t,
+				    c.flags >> IORING_CQE_BUFFER_SHIFT);
+			if ((c.flags & IORING_CQE_F_MORE) == 0)
+				armed = false;
+			got += c.res == 1;
+		}
+	}
+	atomic_store(&drain_stop, true);
+	/* The drainer may be waiting in read(): give it a byte. */
+	assert(write(p[1], "d", 1) == 1);
+	assert(pthread_join(th, NULL) == 0);
+	close(p[1]);
+	while (armed && !eof) {
+		assert(ring_wait(&t, 1, 2000) == 0);
+		while (ring_cq_ready(&t) > 0) {
+			struct io_uring_cqe c = ring_pop_cqe(&t);
+
+			if ((c.flags & IORING_CQE_F_BUFFER) != 0)
+				ring_offer_buf(&t,
+				    c.flags >> IORING_CQE_BUFFER_SHIFT);
+			eof = (c.flags & IORING_CQE_F_MORE) == 0;
+		}
+	}
+	alarm(0);
+	close(t.fd);
+	close(p[0]);
+	printf("[PASS] READ_MULTISHOT of a pipe drained by another thread "
+	    "(%u reads)\n", got);
+}
+
 static void *
 min_wait_writer(void *arg)
 {
@@ -9076,6 +9275,8 @@ main(int argc, char **argv)
 		test_nonsock_poll();
 		test_kpoll();
 		test_pipe_nowait();
+		test_pipe_nonblock_drained();
+		test_pipe_multishot_drained();
 		test_min_wait();
 		test_no_mmap();
 		test_resize_rings();

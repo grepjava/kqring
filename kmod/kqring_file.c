@@ -72,7 +72,8 @@ kqring_pipe_wait_read(struct kqring_ctx *ctx, struct file *fp,
 			error = ECANCELED;
 			break;
 		}
-		if (!op->wq_blocking) {
+		/* Off a worker there is no one to tell: sleep, never spin. */
+		if (!op->wq_blocking && op->wq_running) {
 			PIPE_UNLOCK(rpipe);
 			kqring_wq_mark_blocking(ctx, op);
 			PIPE_LOCK(rpipe);
@@ -569,8 +570,11 @@ kqring_file_rw(struct kqring_ctx *ctx, struct kqring_op *op, bool is_write,
 	error = kqring_rw_fget(op, is_write, &fp, &flags);
 	if (error != 0)
 		return (kqring_done(op, -error, 0));
-	nowait = nowait && fp->f_ops == &pipeops &&
-	    (fp->f_flag & FNONBLOCK) == 0;
+	/*
+	 * O_NONBLOCK too: another reader can drain the pipe after the issuer
+	 * saw it ready, and the issuer must then punt rather than wait.
+	 */
+	nowait = nowait && fp->f_ops == &pipeops;
 
 	if (buf_select) {
 		struct kqring_bgroup *bg;
@@ -638,6 +642,7 @@ again:
 		fdrop(fp, td);
 		return (kqring_done(op, 0, 0));
 	}
+retry:
 	if (!buf_select && !is_write && !kqring_pipe_readable(fp)) {
 		if (nowait)
 			goto punt;
@@ -654,6 +659,19 @@ again:
 			kqring_wq_mark_blocking(ctx, op);
 		error = is_write ? fo_write(fp, &auio, td->td_ucred, flags,
 		    td) : fo_read(fp, &auio, td->td_ucred, flags, td);
+		/*
+		 * Another reader drained an O_NONBLOCK pipe between the
+		 * wake-up and fo_read(): wait for it again.
+		 */
+		if (!is_write && error == EAGAIN && fp->f_type == DTYPE_PIPE &&
+		    auio.uio_resid == want) {
+			if (!buf_select)
+				goto retry;
+			sx_xlock(&ctx->bg_sx);
+			sel.bg->busy = false;
+			sx_xunlock(&ctx->bg_sx);
+			goto again;
+		}
 	}
 	bool vnode = fp->f_type == DTYPE_VNODE;
 	fdrop(fp, td);
@@ -773,7 +791,12 @@ kqring_exec_read_multishot(struct kqring_ctx *ctx, struct kqring_op *op,
 	sx_xunlock(&ctx->bg_sx);
 	kqring_uio_init(&auio, &aiov, 1, UIO_READ);
 	want = auio.uio_resid;
-	error = fo_read(fp, &auio, td->td_ucred, 0, td);
+	/*
+	 * Never blocking: another reader can drain the pipe since it was
+	 * seen readable, and this runs as taskwork (in an enter, or on the
+	 * SQPOLL thread), where a wait would hold up the whole ring.
+	 */
+	error = kqring_pipe_rw_nowait(fp, &auio, false, 0, td);
 	n = (size_t)(want - auio.uio_resid);
 	sx_xlock(&ctx->bg_sx);
 	sel.bg->busy = false;
