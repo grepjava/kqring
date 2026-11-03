@@ -16,6 +16,7 @@ How `kqring` compares with FreeBSD's `kqueue(2)` on the same workloads. Where kq
 - **Batching and worker hand-off.** 32 `NOP`s per enter cost 63 ns each, against 296 ns for an empty `kevent(2)` and 326 ns for a single `NOP` enter. Bounded adaptive spinning between the issuer and worker threads cut the `IOSQE_ASYNC` worker round trip from `4,371 ns` to `1,049 ns` (4.2× faster).
 - **Timers are faster, accept is even (or 8% faster with busy-polling).** A 1 µs `TIMEOUT` completes 30–52% faster than a 1 µs `EVFILT_TIMER` (`4,904 ns`). A multishot `ACCEPT` is on par with kqueue plus `accept(2)`, and 8% faster with 50 µs `IORING_REGISTER_NAPI` busy-polling; see [Accept](#accept-a-tcp-loopback-connection-set-up-and-torn-down).
 - **Disk devices go straight to the driver.** 4 KiB random reads on an md(4) disk cost 41% less than through a worker, and 32 in flight cost 975 ns each, 78% less than `pread(2)`.
+- **Queued storage I/O keeps up with aio(4).** At 32 in flight on an md(4) disk, kqring matches aio(4) on 4 KiB random reads and is 14% ahead on writes. `O_DIRECT` reads of a ZFS file now use several workers at once: 41–53% more IOPS at 4–64 in flight than the previous build, at ZFS's own ceiling with aio and `pread` threads. See [Storage workloads](#storage-workloads-queue-depth-aio4-and-pread2-threads).
 - **Pipes: 18–19% faster than kqueue.** A `READ` on a pipe that has data runs inline, blocking or not (`832–840 ns` vs `1,024 ns`). Only a read that has to wait goes to a worker thread.
 - **Rings scale with threads.** With one ring per thread, single-`NOP` enters reach 12.5 M/s on 8 threads (6.5 M/s before this build) and ping-pong stays 17–29% ahead of kqueue at every thread count; see [Multi-threaded scaling](#multi-threaded-scaling-one-ring-per-thread).
 
@@ -220,6 +221,38 @@ A positioned `READ` or `WRITE` on a disk device goes straight to the driver as a
 
 With one request per enter, kqring pays one sleep and wake-up more than `pread(2)`, since the owner waits in `kqring_enter()` for the bio callback's taskwork. With 32 in flight, the driver gets them all at once, which `pread(2)` can't do from one thread.
 
+### Storage workloads: queue depth, aio(4) and `pread(2)` threads
+
+[`tests/kqring_diskbench.c`](tests/kqring_diskbench.c) runs storage-benchmark-style workloads: a fixed number of I/Os in flight per job, random or sequential offsets, for a fixed time after a 1 s ramp. It runs the same workload through kqring, through FreeBSD's `aio(4)` (`aio_read`/`aio_write`, `aio_waitcomplete`), or through `pread(2)`/`pwrite(2)` threads, one per I/O in flight. The figures are IOPS (higher is better) and the 99th-percentile completion latency in µs, the median of 3 runs of 5 s. The "before" column is the module built from the previous commit, on the same machine and in the same session.
+
+Latency runs from just before an I/O is submitted to when its completion is seen, both clock readings taken once per batch. For kqring it therefore includes waiting behind the rest of a batch, which `aio_waitcomplete()` (one completion per call) doesn't, so compare kqring's p99 with its own earlier rows rather than with aio's.
+
+**A 256 MiB file on ZFS, `O_DIRECT`, 4 KiB random reads** (the worker path: FreeBSD filesystems have no asynchronous read entry point):
+
+| In flight | `pread` threads | aio | kqring before | kqring now | p99 before → now |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 67,860 | 51,716 | 70,778 | **71,069** | 27.6 → 27.6 |
+| 4 | 113,292 | 107,617 | 72,084 | **110,415** (+53%) | 73.7 → 63.5 |
+| 16 | 112,625 | 109,552 | 71,875 | **106,977** (+49%) | 258 → 270 |
+| 64 | 123,522 | 108,978 (32) | 72,269 | **101,781** (+41%) | 983 → 836 |
+
+aio(4) is capped at 32 in flight per process by default (`vfs.aio.max_aio_per_proc`). Before this build, kqring got no more from 64 reads in flight than from one: the issuer waited for each worker op before submitting the next, which saves a wake-up for a lone request but ran a batch one read at a time. Now a read doesn't wait while more SQEs follow in the same submission or another read is on the workers, and only one idle worker spins for the next op (16 spinning workers had made every hand-off a fight for the pool's mutex). Writes still wait their turn, keeping writes to one file in order as io-wq does. ZFS itself tops out at about 110,000 reads per second on this machine, whatever the API; random writes are bound by ZFS's copy-on-write at about 1,000–2,000 per second for every engine, so they aren't in the table.
+
+**A 1 GiB md(4) malloc disk, 4 KiB random I/O** (the bio path; md serves every bio from one thread, so this measures the I/O path, not media). `+F+B` is a fixed file and registered buffers, `+P` `SQPOLL` and `+I` `IOPOLL`:
+
+| Variant | Read, 1 | Read, 32 | Write, 1 | Write, 32 |
+|---|---:|---:|---:|---:|
+| `pread` / `pwrite` threads | 186,856 | 566,020 | 192,065 | 540,831 |
+| aio | 173,481 | 585,620 | 178,058 | 607,197 |
+| kqring | 169,262 | 578,572 | 174,659 | **694,807** |
+| kqring `+F+B` | 168,533 | 580,432 | 175,349 | 687,089 |
+| kqring `+P` | 106,642 | 536,900 | 108,485 | 593,678 |
+| kqring `+I` | 169,119 | 581,580 | 174,232 | 679,507 |
+
+Every md row is within 1% of the previous build. At 32 in flight, kqring reads match aio and writes are 14% ahead of it. One at a time, a thread calling `pread(2)` is 10% faster, as in the `disk` group above. `SQPOLL` is 37% slower one at a time: with a single I/O in flight, the polling thread and the waiting owner hand every request back and forth, which costs more than the system call `SQPOLL` saves. Registered files and buffers make no measurable difference on md. 128 KiB sequential reads, 8 in flight, run at about 36,000 per second (4.4 GiB/s) for both kqring and aio.
+
+`kqring_diskbench -V` checks every read against what was last written to that block and re-reads the whole area at the end. On this build, 3 s of mixed random reads and writes passed it on both the md disk and the ZFS file at 4 KiB for `pread`, aio (16 in flight), and kqring plain, `+F+B`, `+P`, `+I` and all four together (32 in flight), and for 4 kqring jobs of 64 in flight at 16 KiB.
+
 ### Timer: a 1 µs one-shot timer, armed and fired
 
 | Variant | ns/op | vs kqueue |
@@ -283,3 +316,16 @@ python3 tests/bench_report.py docs/bench bench.*.out
 ```
 
 The `file` group writes a 64 MiB temporary file in `/tmp`. The `disk` group runs only with `KQRING_BENCH_DISK` set to a device it may overwrite, for example `sudo mdconfig -a -t malloc -s 64m -u 9 && sudo chown $USER /dev/md9`; the test suite's disk test uses `KQRING_TEST_DISK` the same way.
+
+The storage tables come from `kqring_diskbench`; the comment at the top of [`tests/kqring_diskbench.c`](tests/kqring_diskbench.c) lists its options. For example, on a 1 GiB md disk and a file on ZFS:
+
+```sh
+sudo mdconfig -a -t malloc -s 1g -u 9 && sudo chown $USER /dev/md9
+./tests/kqring_diskbench -e kqring -q 32 -w randwrite /dev/md9
+./tests/kqring_diskbench -e aio -q 32 -w randwrite /dev/md9
+dd if=/dev/random of=$HOME/dbench.dat bs=1m count=256
+./tests/kqring_diskbench -e kqring -q 16 -w randread $HOME/dbench.dat
+./tests/kqring_diskbench -V -e kqring -F -B -w randrw /dev/md9   # verify
+```
+
+It refuses to write to a device unless it is an md(4) disk or `-f` is given. `-B` registers `-q` × `-b` bytes per job, so raise `ulimit -l` for it.

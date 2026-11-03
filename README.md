@@ -282,8 +282,10 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
   - [`kqring_rsrc.c`](kmod/kqring_rsrc.c) — fixed files, registered buffers, provided buffers and buffer rings, resource tags and personalities.
   - [`kqring_register.c`](kmod/kqring_register.c) — `io_uring_register` operations.
   - [`kqring_zc.c`](kmod/kqring_zc.c) — zero-copy send: page holding, `RLIMIT_MEMLOCK` accounting and mbuf construction.
-- [`tests/kqring_test.c`](tests/kqring_test.c) — functional test suite: 83 test groups covering every supported opcode, registration, setup flags and the lifetime rules above.
+- [`tests/kqring_test.c`](tests/kqring_test.c) — functional test suite: 87 test groups covering every supported opcode, registration, setup flags and the lifetime rules above.
 - [`tests/kqring_bench.c`](tests/kqring_bench.c) — benchmarks against `kqueue(2)` and plain system calls; [`tests/bench_report.py`](tests/bench_report.py) turns runs into the tables and charts in [`BENCHMARK.MD`](BENCHMARK.MD).
+- [`tests/kqring_diskbench.c`](tests/kqring_diskbench.c) — storage workloads (queue depth, jobs, random or sequential, read/write mix) on a disk or file through kqring, `aio(4)` or `pread(2)` threads, with IOPS, latency percentiles and a `-V` mode that checks every read.
+- [`tests/kqring_stress.c`](tests/kqring_stress.c) — randomized multi-threaded stress test for races the functional suite can't time.
 
 ## Further reading
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A process stopped while closing a ring could never stop.** Closing a ring under `SIGSTOP`, `truss(1)` or a debugger deadlocked the process. Ring teardown now finishes on a `kqteardown` kernel thread when a stop interrupts it, and ring kernel threads report a pending stop when they exit.
+- **`RECV` and `RECVMSG` with `MSG_WAITALL` could block the submitting thread** once some data had been copied; kqring now never passes `MSG_WAITALL` to `soreceive()` and waits for the rest itself.
+- **A batch of file reads that go to workers ran one at a time.** The submitting thread waited for each worker read before submitting the next, so `O_DIRECT` reads of a ZFS file got no more from 64 in flight than from one. Reads now run on several workers at once (41–53% more IOPS at 4–64 in flight), and only one idle worker spins for the next request. Writes keep their order, as io-wq's per-inode hashing does.
+- A `READ` or `WRITE` on a bad descriptor now fails at submission, as on Linux, rather than on a worker after later requests.
+
+### Testing
+
+- [`tests/kqring_diskbench.c`](tests/kqring_diskbench.c): storage workloads through kqring, `aio(4)` or `pread(2)` threads, with IOPS, latency percentiles and read verification.
+- [`tests/kqring_stress.c`](tests/kqring_stress.c): a randomized multi-threaded stress test.
+- Regression tests for stopping a process during ring close and for batches of `O_DIRECT` reads.
+
 ## 0.1.0 — 2026-10-25
 
 First release: an **experimental preview**. kqring is an out-of-tree kernel module that hasn't had an independent security audit, and a bug in it can crash the machine. Try it on test systems, not in production.
