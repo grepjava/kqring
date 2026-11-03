@@ -11,7 +11,7 @@
  * read against what was last written there.
  *
  *	kqring_diskbench [-e engine] [-w workload] [-b bs] [-q depth]
- *	    [-j jobs] [-t secs] [-r ramp] [-s size] [-m read%] [-FBPIV]
+ *	    [-j jobs] [-t secs] [-r ramp] [-s size] [-m read%] [-n wait] [-FBPIV]
  *	    [-f] [-L label] target
  *
  *	-e kqring | aio | psync		(default kqring; psync ignores -q)
@@ -20,6 +20,7 @@
  *					 of target, at most 1g)
  *	-q queue depth per job (32), -j jobs (1), -t seconds (10) after a
  *	   ramp of -r seconds (1) that is not counted, -m reads in randrw (50)
+ *	-n		kqring: wait for up to this many completions per enter (1)
  *	-F -B -P -I	kqring: fixed file, fixed buffers, SQPOLL, IOPOLL
  *	-V		verify: fill the area first, check every read, and
  *			re-read every block at the end
@@ -78,14 +79,14 @@ static struct {
 	bool		rand, verify, force;
 	bool		fixed_file, fixed_bufs, sqpoll, iopoll;
 	int		readpct;	/* reads in 100 I/Os */
-	unsigned	depth, jobs;
+	unsigned	depth, jobs, wait_nr;
 	uint64_t	bs, size;
 	int		secs, ramp;
 	const char	*target, *label;
 	char		workload[16];
 } cfg = {
 	.engine = E_KQRING, .rand = true, .readpct = 100, .depth = 32,
-	.jobs = 1, .bs = 4096, .secs = 10, .ramp = 1,
+	.jobs = 1, .wait_nr = 1, .bs = 4096, .secs = 10, .ramp = 1,
 	.workload = "randread",
 };
 
@@ -490,9 +491,9 @@ kq_prep(struct job *j, unsigned i, uint64_t t)
 	j->slots[i].t0 = t;
 }
 
-/* Submit what is prepared and wait for at least one completion. */
+/* Submit what is prepared and wait for -n completions (fewer in flight). */
 static void
-kq_enter(struct job *j)
+kq_enter(struct job *j, unsigned inflight)
 {
 	unsigned flags = IORING_ENTER_GETEVENTS, submit = 0;
 	long rc;
@@ -507,7 +508,8 @@ kq_enter(struct job *j)
 		submit = j->sq_tail -
 		    atomic_load_explicit(j->sq_khead, memory_order_acquire);
 	do
-		rc = kqring_enter(j->ring_fd, submit, 1, flags, NULL, 0);
+		rc = kqring_enter(j->ring_fd, submit, MIN(cfg.wait_nr, inflight),
+		    flags, NULL, 0);
 	while (rc < 0 && errno == EINTR);
 	if (rc < 0)
 		die("kqring_enter: %s", strerror(errno));
@@ -529,7 +531,7 @@ kq_run(struct job *j)
 	while (inflight > 0) {
 		unsigned h, tail;
 
-		kq_enter(j);
+		kq_enter(j, inflight);
 		h = atomic_load_explicit(j->cq_khead, memory_order_relaxed);
 		tail = atomic_load_explicit(j->cq_ktail, memory_order_acquire);
 		t = now_ns();
@@ -641,7 +643,7 @@ usage(void)
 	fprintf(stderr, "usage: kqring_diskbench [-e kqring|aio|psync] "
 	    "[-w read|write|randread|randwrite|randrw]\n"
 	    "\t[-b bs] [-q depth] [-j jobs] [-t secs] [-r ramp] [-s size] "
-	    "[-m read%%]\n\t[-FBPIV] [-f] [-L label] target\n");
+	    "[-m read%%] [-n wait]\n\t[-FBPIV] [-f] [-L label] target\n");
 	exit(2);
 }
 
@@ -672,7 +674,7 @@ main(int argc, char **argv)
 	bool writes, isfile;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "b:e:fj:m:q:r:s:t:w:BFIL:PV")) != -1) {
+	while ((ch = getopt(argc, argv, "b:e:fj:m:n:q:r:s:t:w:BFIL:PV")) != -1) {
 		switch (ch) {
 		case 'b':
 			cfg.bs = parse_size(optarg);
@@ -695,6 +697,9 @@ main(int argc, char **argv)
 			break;
 		case 'm':
 			cfg.readpct = atoi(optarg);
+			break;
+		case 'n':
+			cfg.wait_nr = (unsigned)strtoul(optarg, NULL, 10);
 			break;
 		case 'q':
 			cfg.depth = (unsigned)strtoul(optarg, NULL, 10);
@@ -750,7 +755,8 @@ main(int argc, char **argv)
 		usage();
 	cfg.rand = strncmp(cfg.workload, "rand", 4) == 0;
 	if (cfg.readpct < 0 || cfg.readpct > 100 || cfg.secs <= 0 ||
-	    cfg.ramp < 0 || cfg.jobs == 0 || cfg.jobs > MAX_JOBS)
+	    cfg.ramp < 0 || cfg.jobs == 0 || cfg.jobs > MAX_JOBS ||
+	    cfg.wait_nr == 0)
 		usage();
 	if (cfg.engine == E_PSYNC)
 		cfg.depth = 1;

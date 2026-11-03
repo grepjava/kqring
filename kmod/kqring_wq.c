@@ -345,6 +345,8 @@ kqring_wq_thread(void *arg)
 		}
 		op = TAILQ_FIRST(&wq->ops[type]);
 		if (op != NULL) {
+			bool deferred = false;
+
 			TAILQ_REMOVE(&wq->ops[type], op, wq_link);
 			op->wq_queued = false;
 			wq->pending[type]--;
@@ -415,9 +417,15 @@ kqring_wq_thread(void *arg)
 					    IORING_SQ_TASKRUN);
 				kqring_evfd_signal_locked(ctx);
 			} else if (!op->cancelled && !ctx->closing &&
-			    (op->wq_blocking || op->wq_wait_ready))
-				kqring_taskwork_add_locked(ctx, op);
-			if (ctx->sleeping)
+			    (op->wq_blocking || op->wq_wait_ready)) {
+				/* A finished read or write may batch its wake. */
+				if (op->wq_wait_ready)
+					kqring_taskwork_add_locked(ctx, op);
+				else
+					deferred =
+					    kqring_taskwork_add_lazy_locked(ctx, op);
+			}
+			if (ctx->sleeping && !deferred)
 				wakeup(&ctx->wakeup_chan);
 			mtx_unlock(&ctx->mtx);
 			kqring_ctx_rele(ctx);

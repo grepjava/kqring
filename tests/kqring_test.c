@@ -1347,6 +1347,82 @@ test_file_read_batch(struct test_ring *r)
 	printf("[PASS] batch of %d O_DIRECT file reads all complete\n", NREAD);
 }
 
+static void *
+fifos_writer(void *arg)
+{
+	const int *fd = arg;
+
+	usleep(100000);		/* until the enter below is asleep */
+	assert(write(fd[0], "a", 1) == 1);
+	assert(write(fd[1], "b", 1) == 1);
+	return (NULL);
+}
+
+/*
+ * An enter waiting for 3 CQEs: a READ on FIFO A linked to a NOP, and a
+ * READ on FIFO B, both on workers (which a FIFO read blocks) and written
+ * while the enter sleeps.  The NOP is only issued once A's completion
+ * runs, so that completion must wake the waiter though it wants 3: a
+ * plain read's completion may wait for others (lazy wake), a linked one's
+ * may not.
+ */
+static void
+test_lazy_wake_link(struct test_ring *r)
+{
+	char dir[] = "/tmp/kqring.XXXXXX", path[2][64];
+	char ca = 0, cb = 0;
+	int fd[2];
+	pthread_t t;
+
+	assert(mkdtemp(dir) != NULL);
+	for (int i = 0; i < 2; i++) {
+		snprintf(path[i], sizeof(path[i]), "%s/f%d", dir, i);
+		assert(mkfifo(path[i], 0600) == 0);
+		fd[i] = open(path[i], O_RDWR);	/* never waits for a peer */
+		assert(fd[i] >= 0);
+	}
+	for (int round = 0; round < 4; round++) {
+		struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_READ, fd[0],
+		    8201);
+		sqe->addr = (uint64_t)(uintptr_t)&ca;
+		sqe->len = 1;
+		sqe->off = (uint64_t)-1;
+		sqe->flags = IOSQE_IO_LINK;
+		ring_push_sqe(r);
+		ring_prep(r, IORING_OP_NOP, -1, 8202);
+		ring_push_sqe(r);
+		sqe = ring_prep(r, IORING_OP_READ, fd[1], 8203);
+		sqe->addr = (uint64_t)(uintptr_t)&cb;
+		sqe->len = 1;
+		sqe->off = (uint64_t)-1;
+		ring_push_sqe(r);
+		ca = cb = 0;
+		assert(pthread_create(&t, NULL, fifos_writer, fd) == 0);
+		/*
+		 * A wait that times out with CQEs succeeds, and its timeout
+		 * runs the taskwork, so a missed wake-up shows as time.
+		 */
+		uint64_t t0 = now_ns();
+		assert(ring_wait(r, 3, 5000) == 0);
+		assert(now_ns() - t0 < 2000000000ULL);
+		assert(pthread_join(t, NULL) == 0);
+		assert(ring_cq_ready(r) == 3);
+		for (int n = 0; n < 3; n++) {
+			struct io_uring_cqe c = ring_pop_cqe(r);
+
+			assert(c.user_data >= 8201 && c.user_data <= 8203);
+			assert(c.res == (c.user_data == 8202 ? 0 : 1));
+		}
+		assert(ca == 'a' && cb == 'b');
+	}
+	for (int i = 0; i < 2; i++) {
+		close(fd[i]);
+		unlink(path[i]);
+	}
+	rmdir(dir);
+	printf("[PASS] linked completion wakes an enter waiting for more\n");
+}
+
 static _Atomic uint32_t futex_word2;
 
 /* Pop one CQE and check it. */
@@ -8944,6 +9020,7 @@ main(int argc, char **argv)
 		test_send_armed(&r);
 		test_file_rw(&r);
 		test_file_read_batch(&r);
+		test_lazy_wake_link(&r);
 		test_close_with_pending();
 		test_links(&r);
 		test_cqe_skip(&r);

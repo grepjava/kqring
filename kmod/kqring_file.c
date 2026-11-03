@@ -197,7 +197,7 @@ kqring_bio_done(struct bio *bp)
 	op->cflags = 0;
 	op->bio_done = true;
 	ctx->bio_held -= op->bio_len;
-	kqring_taskwork_add_locked(ctx, op);
+	(void)kqring_taskwork_add_lazy_locked(ctx, op);
 	/* After this, op and ctx may be freed by a teardown waiting here. */
 	if (--ctx->nbio == 0 && ctx->closing)
 		wakeup(&ctx->nbio);

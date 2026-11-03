@@ -1515,9 +1515,9 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		 * A ring's kthread may have posted CQEs since the check above;
 		 * it wakes waiters only under mtx, so look again here.
 		 */
-		if (atomic_load_acq_32(&shm->cq_tail) -
-		    atomic_load_acq_32(&shm->cq_head) >= min_complete ||
-		    !STAILQ_EMPTY(&ctx->ocq) ||
+		cq_count = atomic_load_acq_32(&shm->cq_tail) -
+		    atomic_load_acq_32(&shm->cq_head);
+		if (cq_count >= min_complete || !STAILQ_EMPTY(&ctx->ocq) ||
 		    atomic_load_acq_32(&ctx->cq_timeouts) != timeouts) {
 			mtx_unlock(&ctx->mtx);
 			return (0);
@@ -1540,11 +1540,21 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		if (period != 0 && (!has_timeout || sleep_sbt > period))
 			sleep_sbt = period;
 
-		/* Timeout is sbintime_t, not ticks: use the _sbt variant. */
+		/*
+		 * Timeout is sbintime_t, not ticks: use the _sbt variant.  The
+		 * CQEs still wanted let plain completions batch their wake-ups
+		 * (kqring_taskwork_add_lazy_locked()); taskwork_ops is empty.
+		 */
 		ctx->sleeping++;
+		ctx->cq_sleepers++;
+		ctx->cq_wait_nr = min_complete - cq_count;
+		ctx->tw_lazy = 0;
 		/* As precise as the io_uring_enter(2) timeout (an hrtimer). */
 		error = msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, PCATCH,
 		    "kqwait", sleep_sbt, 0, C_PREL(10));
+		/* A waiter still asleep may have needed less: wake it each time. */
+		if (--ctx->cq_sleepers != 0)
+			ctx->cq_wait_nr = 1;
 		ctx->sleeping--;
 		may_poll = true;
 		mtx_unlock(&ctx->mtx);

@@ -108,6 +108,7 @@ flowchart LR
 `kqring` enforces a strict single-writer invariant for the Completion Queue (CQ), request lifecycle, and resource tables:
 
 1. **Asynchronous contexts never write CQEs or mutate resource tables.** Socket upcalls, `callout` timer callbacks, `MSG_RING` senders, and in-process worker threads only enqueue work onto `ctx->taskwork_ops` (or `ctx->rcq` for `MSG_RING`), set `IORING_SQ_TASKRUN`, and wake the ring sleeper (`&ctx->cq_wait` / `ctx->sqpoll_Wait` / `ctx->evfd`).
+   - **Lazy wake-up**, as io_uring's for `DEFER_TASKRUN`: an enter waiting in `kqring_wait_cqes()` records how many CQEs it still needs (`ctx->cq_wait_nr`). A worker or bio completion of a plain `READ`/`WRITE` (`kqring_taskwork_add_lazy_locked()`) wakes it only once that many are queued (`ctx->tw_lazy`), so `min_complete` = N costs one wake-up rather than N. Everything else wakes it at once: linked or drained requests (the next one can only be issued once this one's taskwork runs), multishot and readiness ops, and any wait with another sleeper on the ring.
 2. **All completions and table mutations run on the serialized issuer path:**
    - **`SINGLE_ISSUER | DEFER_TASKRUN`:** The owning thread (`ctx->owner_tid`) inside `kqring_enter(2)` (or `KQRING_IOC_ENTER`).
    - **Shared rings (no `SINGLE_ISSUER`):** any thread of the owner process (`ctx->shared`), one at a time under `sx_xlock(&ctx->sq_sx)`.

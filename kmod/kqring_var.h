@@ -818,6 +818,14 @@ struct kqring_ctx {
 	int			wakeup_chan;
 	u_int			sleeping;	/* threads in msleep; under mtx */
 	/*
+	 * Enter waiters among them (kqring_wait_cqes()), the CQEs a lone one
+	 * still needs, and the lazy taskwork queued since it slept; see
+	 * kqring_taskwork_add_lazy_locked().  Under mtx.
+	 */
+	u_int			cq_sleepers;
+	uint32_t		cq_wait_nr;
+	uint32_t		tw_lazy;
+	/*
 	 * Recycled ops (linked via active_link).  Only touched by the owner
 	 * thread (enter) and by kqring_close(), so no lock is needed.
 	 */
@@ -1024,12 +1032,14 @@ kqring_until(sbintime_t deadline)
 	return (deadline > now ? deadline - now : 0);
 }
 
-static inline void
-kqring_taskwork_add_locked(struct kqring_ctx *ctx, struct kqring_op *op)
+/* Returns true if it left the sleeper asleep (a deferred lazy wake-up). */
+static inline bool
+kqring_taskwork_add_common(struct kqring_ctx *ctx, struct kqring_op *op,
+    bool lazy)
 {
 	mtx_assert(&ctx->mtx, MA_OWNED);
 	if (op->cancelled || ctx->closing || op->in_taskwork)
-		return;
+		return (false);
 	op->in_taskwork = true;
 	/*
 	 * As io_uring does for DEFER_TASKRUN, tell an eventfd watcher that
@@ -1047,8 +1057,40 @@ kqring_taskwork_add_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 	 * re-checks taskwork_ops under ctx->mtx before sleeping, so
 	 * skipping wakeup() (sleepq lookup) here cannot lose a wakeup.
 	 */
-	if (ctx->sleeping)
-		wakeup(&ctx->wakeup_chan);
+	if (ctx->sleeping == 0)
+		return (false);
+	/*
+	 * As io_uring's lazy task-work wake for DEFER_TASKRUN: when the only
+	 * sleeper is an enter waiting for cq_wait_nr more CQEs, a plain read
+	 * or write completion (one CQE, nothing queued behind it) wakes it
+	 * only once that many are queued.  Anything else wakes it now: a
+	 * link or drained chain may need this one run before the rest can
+	 * complete, and a multishot op may post any number of CQEs.
+	 */
+	if (lazy && ctx->sleeping == ctx->cq_sleepers && ctx->cq_sleepers == 1 &&
+	    op->link == NULL && TAILQ_EMPTY(&ctx->defer_q) &&
+	    (kqring_op_is_read(op->sqe.opcode) ||
+	    kqring_op_is_write(op->sqe.opcode)) &&
+	    ++ctx->tw_lazy < ctx->cq_wait_nr)
+		return (true);
+	wakeup(&ctx->wakeup_chan);
+	return (false);
+}
+
+static inline void
+kqring_taskwork_add_locked(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	(void)kqring_taskwork_add_common(ctx, op, false);
+}
+
+/*
+ * A worker or bio completion: may defer the wake-up (see above), and then
+ * returns true; the caller must not wake the sleeper itself.
+ */
+static inline bool
+kqring_taskwork_add_lazy_locked(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	return (kqring_taskwork_add_common(ctx, op, true));
 }
 
 static inline struct sockbuf *
