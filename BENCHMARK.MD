@@ -251,6 +251,17 @@ aio(4) is capped at 32 in flight per process by default (`vfs.aio.max_aio_per_pr
 
 Every md row is within 1% of the previous build. At 32 in flight, kqring reads match aio and writes are 14% ahead of it. One at a time, a thread calling `pread(2)` is 10% faster, as in the `disk` group above. `SQPOLL` is 37% slower one at a time: with a single I/O in flight, the polling thread and the waiting owner hand every request back and forth, which costs more than the system call `SQPOLL` saves. Registered files and buffers make no measurable difference on md. 128 KiB sequential reads, 8 in flight, run at about 36,000 per second (4.4 GiB/s) for both kqring and aio.
 
+**Waiting for several completions** (after 0.2.0). An enter with `min_complete` = N used to be woken for every worker or bio completion, and posted one CQE and slept again until N were there. Now a plain `READ`/`WRITE` completion wakes it only once N are queued, as io_uring's lazy task-work wake does (see ARCHITECTURE.MD). The md disk again, 4 KiB random I/O with 32 in flight, `kqring_diskbench -n` completions waited for per enter, median of 3 runs of 4 s alternating with the 0.2.0 module; context switches are the process's voluntary ones per run:
+
+| Workload | IOPS 0.2.0 → now | Context switches 0.2.0 → now | p99 µs 0.2.0 → now |
+|---|---:|---:|---:|
+| Reads, wait for 1 | 571,714 → 567,003 | 92,978 → 118,218 | 129 → 129 |
+| Reads, wait for 16 | 544,886 → **576,624** (+6%) | 866,396 → **168,475** (−81%) | 113 → 109 |
+| Writes, wait for 1 | 729,499 → 726,606 | 47,509 → 62,736 | 104 → 104 |
+| Writes, wait for 16 | 679,002 → **736,737** (+9%) | 842,941 → **213,961** (−75%) | 94 → 90 |
+
+Waiting for one completion can't batch, and those rows are unchanged within run-to-run noise (the context-switch counts vary by ±30% between runs). On a ZFS file whose data had to come from the disk, 16 reads in flight with 8 waited for ran at 4,860 IOPS either way, bound by the drive, with 31% fewer context switches (65,021 → 44,855).
+
 `kqring_diskbench -V` checks every read against what was last written to that block and re-reads the whole area at the end. On this build, 3 s of mixed random reads and writes passed it on both the md disk and the ZFS file at 4 KiB for `pread`, aio (16 in flight), and kqring plain, `+F+B`, `+P`, `+I` and all four together (32 in flight), and for 4 kqring jobs of 64 in flight at 16 KiB.
 
 ### Timer: a 1 µs one-shot timer, armed and fired

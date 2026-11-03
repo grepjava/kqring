@@ -4,7 +4,7 @@
 
 ### Performance
 
-- **Fewer wake-ups when waiting for several completions** on `DEFER_TASKRUN` rings. An enter with `min_complete` = N is now woken once N plain `READ`/`WRITE` completions from workers or disk drivers are queued, rather than for each one, as io_uring's lazy task-work wake does. Linked, drained, multishot and readiness requests still wake it at once. On an md(4) disk with 32 in flight and 16 waited for, context switches drop by 58–71% and IOPS rise 6–7%.
+- **Fewer wake-ups when waiting for several completions** on `DEFER_TASKRUN` rings. An enter with `min_complete` = N is now woken once N plain `READ`/`WRITE` completions from workers or disk drivers are queued, rather than for each one, as io_uring's lazy task-work wake does. Linked, drained, multishot and readiness requests still wake it at once. On an md(4) disk with 32 in flight and 16 waited for, context switches drop by 75–81% and IOPS rise 6–9%; see [BENCHMARK.MD](BENCHMARK.MD#storage-workloads-queue-depth-aio4-and-pread2-threads).
 - `kqring_diskbench -n N` waits for N completions per enter.
 
 ## 0.2.0 — 2026-11-03
