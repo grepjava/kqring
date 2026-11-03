@@ -11,7 +11,7 @@
  * read against what was last written there.
  *
  *	kqring_diskbench [-e engine] [-w workload] [-b bs] [-q depth]
- *	    [-j jobs] [-t secs] [-r ramp] [-s size] [-m read%] [-n wait] [-FBPIV]
+ *	    [-j jobs] [-t secs] [-r ramp] [-s size] [-m read%] [-n wait] [-FBPCIV]
  *	    [-f] [-L label] target
  *
  *	-e kqring | aio | psync		(default kqring; psync ignores -q)
@@ -22,6 +22,8 @@
  *	   ramp of -r seconds (1) that is not counted, -m reads in randrw (50)
  *	-n		kqring: wait for up to this many completions per enter (1)
  *	-F -B -P -I	kqring: fixed file, fixed buffers, SQPOLL, IOPOLL
+ *	-C		with -P: poll the CQ in userspace rather than enter to
+ *			wait (entering only to wake an idle SQPOLL thread)
  *	-V		verify: fill the area first, check every read, and
  *			re-read every block at the end
  *	-f		allow writing to a device other than md(4)
@@ -77,7 +79,7 @@ enum { D_READ, D_WRITE };
 static struct {
 	enum engine	engine;
 	bool		rand, verify, force;
-	bool		fixed_file, fixed_bufs, sqpoll, iopoll;
+	bool		fixed_file, fixed_bufs, sqpoll, iopoll, cq_poll;
 	int		readpct;	/* reads in 100 I/Os */
 	unsigned	depth, jobs, wait_nr;
 	uint64_t	bs, size;
@@ -504,6 +506,21 @@ kq_enter(struct job *j, unsigned inflight)
 		if (atomic_load_explicit(j->sq_kflags, memory_order_relaxed) &
 		    IORING_SQ_NEED_WAKEUP)
 			flags |= IORING_ENTER_SQ_WAKEUP;
+		/*
+		 * -C: poll the CQ here rather than enter to wait for it, and
+		 * enter only to wake an idle SQPOLL thread.
+		 */
+		if (cfg.cq_poll) {
+			if ((flags & IORING_ENTER_SQ_WAKEUP) != 0 &&
+			    kqring_enter(j->ring_fd, 0, 0,
+			    IORING_ENTER_SQ_WAKEUP, NULL, 0) < 0)
+				die("kqring_enter: %s", strerror(errno));
+			while (atomic_load_explicit(j->cq_ktail,
+			    memory_order_acquire) == atomic_load_explicit(
+			    j->cq_khead, memory_order_relaxed))
+				;
+			return;
+		}
 	} else
 		submit = j->sq_tail -
 		    atomic_load_explicit(j->sq_khead, memory_order_acquire);
@@ -674,7 +691,7 @@ main(int argc, char **argv)
 	bool writes, isfile;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "b:e:fj:m:n:q:r:s:t:w:BFIL:PV")) != -1) {
+	while ((ch = getopt(argc, argv, "b:e:fj:m:n:q:r:s:t:w:BCFIL:PV")) != -1) {
 		switch (ch) {
 		case 'b':
 			cfg.bs = parse_size(optarg);
@@ -715,6 +732,9 @@ main(int argc, char **argv)
 			break;
 		case 'w':
 			strlcpy(cfg.workload, optarg, sizeof(cfg.workload));
+			break;
+		case 'C':
+			cfg.cq_poll = true;
 			break;
 		case 'B':
 			cfg.fixed_bufs = true;
@@ -767,6 +787,8 @@ main(int argc, char **argv)
 	if (cfg.engine != E_KQRING && (cfg.fixed_file || cfg.fixed_bufs ||
 	    cfg.sqpoll || cfg.iopoll))
 		die("-F, -B, -P and -I are kqring options");
+	if (cfg.cq_poll && !cfg.sqpoll)
+		die("-C needs -P");
 
 	writes = cfg.readpct < 100 || cfg.verify;
 	if (stat(cfg.target, &st) == 0)
@@ -835,11 +857,11 @@ main(int argc, char **argv)
 	if (cfg.label != NULL)
 		strlcpy(label, cfg.label, sizeof(label));
 	else
-		snprintf(label, sizeof(label), "%s%s%s%s%s",
+		snprintf(label, sizeof(label), "%s%s%s%s%s%s",
 		    cfg.engine == E_KQRING ? "kqring" : cfg.engine == E_AIO ?
 		    "aio" : "psync", cfg.fixed_file ? "+F" : "",
 		    cfg.fixed_bufs ? "+B" : "", cfg.sqpoll ? "+P" : "",
-		    cfg.iopoll ? "+I" : "");
+		    cfg.cq_poll ? "+C" : "", cfg.iopoll ? "+I" : "");
 	printf("%s: %s %s bs=%ju qd=%u jobs=%u area=%ju MiB%s\n", label,
 	    cfg.target, cfg.workload, (uintmax_t)cfg.bs, cfg.depth, cfg.jobs,
 	    (uintmax_t)(slice * cfg.bs * cfg.jobs >> 20),

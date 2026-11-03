@@ -967,6 +967,29 @@ kqring_sqpoll_thread(void *arg)
 
 		sbintime_t now = getsbinuptime();
 		sbintime_t elapsed = now - last_active;
+		if (elapsed < ctx->sqpoll_idle_sbt && !taskrun) {
+			/*
+			 * Within sq_thread_idle, poll for SQEs and completions
+			 * as io_uring's SQPOLL thread does, without sleeping:
+			 * a sleep here cost a wake-up for every request, to
+			 * submit it and again to complete it.  Slices of 50 us
+			 * keep the checks above running, and a stop, exit or
+			 * close ends the spin at once.
+			 */
+			mtx_unlock(&ctx->mtx);
+			for (sbintime_t start = now; now - start < 50 * SBT_1US;
+			    now = getsbinuptime()) {
+				if (atomic_load_acq_32(&shm->sq_tail) !=
+				    shm->sq_head ||
+				    !TAILQ_EMPTY(&ctx->taskwork_ops) ||
+				    !STAILQ_EMPTY(&ctx->rcq) || ctx->closing ||
+				    kqring_wq_suspend_pending())
+					break;
+				for (int s = 0; s < 64; s++)
+					cpu_spinwait();
+			}
+			continue;
+		}
 		if (elapsed < ctx->sqpoll_idle_sbt) {
 			ctx->sleeping++;
 			(void)msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, PCATCH,
