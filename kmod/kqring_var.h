@@ -739,11 +739,14 @@ struct kqring_ctx {
 	 * mtx from upcalls; the owner reads it without.  evfd_cqes counts
 	 * CQEs posted since the last signal (only asynchronous ones with
 	 * IORING_REGISTER_EVENTFD_ASYNC); submitting is set while SQEs are
-	 * being issued inline.
+	 * being issued inline, and submit_more while SQEs of the same
+	 * submission are still to come (a read then doesn't wait for its
+	 * worker, see kqring_wq_enqueue()).
 	 */
 	struct eventfd		*evfd;
 	bool			evfd_async;
 	bool			submitting;
+	bool			submit_more;
 	uint32_t		evfd_cqes;
 	/*
 	 * poll(2) / select(2) / kevent(2) on the ring descriptor: readable
@@ -927,6 +930,14 @@ static inline bool
 kqring_op_writev(uint8_t opcode)
 {
 	return (opcode == IORING_OP_WRITEV || opcode == IORING_OP_WRITEV_FIXED);
+}
+
+/* READ and its vectored and _FIXED forms. */
+static inline bool
+kqring_op_is_read(uint8_t opcode)
+{
+	return (opcode == IORING_OP_READ || opcode == IORING_OP_READV ||
+	    opcode == IORING_OP_READ_FIXED || opcode == IORING_OP_READV_FIXED);
 }
 
 /* READ / WRITE and their vectored and _FIXED forms: whether a write. */

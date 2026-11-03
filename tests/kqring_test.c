@@ -1299,6 +1299,54 @@ test_file_rw(struct test_ring *r)
 	printf("[PASS] OPENAT + positioned WRITE/READ + FSYNC + off=-1\n");
 }
 
+/*
+ * A batch of O_DIRECT file reads, which go to workers: the issuer doesn't
+ * wait for each in turn (so they can run at once), and their workers must
+ * then post every CQE themselves.
+ */
+static void
+test_file_read_batch(struct test_ring *r)
+{
+	enum { NREAD = 16, BLK = 4096 };
+	static char buf[NREAD][BLK] __attribute__((aligned(4096)));
+	char path[] = "/tmp/kqring_test.XXXXXX";
+	bool seen[NREAD] = { false };
+	int fd = mkstemp(path);
+
+	assert(fd >= 0);
+	for (int i = 0; i < NREAD; i++) {
+		memset(buf[i], 'a' + i, BLK);
+		assert(pwrite(fd, buf[i], BLK, (off_t)i * BLK) == BLK);
+	}
+	close(fd);
+	fd = open(path, O_RDONLY | O_DIRECT);
+	assert(fd >= 0);
+	memset(buf, 0, sizeof(buf));
+	for (int i = 0; i < NREAD; i++) {
+		struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_READ, fd,
+		    8100 + i);
+
+		sqe->addr = (uint64_t)(uintptr_t)buf[i];
+		sqe->len = BLK;
+		sqe->off = (uint64_t)i * BLK;
+		ring_push_sqe(r);
+	}
+	assert(ring_wait(r, NREAD, 10000) == 0);
+	assert(ring_cq_ready(r) == NREAD);
+	for (int n = 0; n < NREAD; n++) {
+		struct io_uring_cqe c = ring_pop_cqe(r);
+		int i = (int)(c.user_data - 8100);
+
+		assert(i >= 0 && i < NREAD && !seen[i] && c.res == BLK);
+		seen[i] = true;
+		for (int b = 0; b < BLK; b++)
+			assert(buf[i][b] == 'a' + i);
+	}
+	close(fd);
+	unlink(path);
+	printf("[PASS] batch of %d O_DIRECT file reads all complete\n", NREAD);
+}
+
 static _Atomic uint32_t futex_word2;
 
 /* Pop one CQE and check it. */
@@ -8895,6 +8943,7 @@ main(int argc, char **argv)
 		test_accept(&r);
 		test_send_armed(&r);
 		test_file_rw(&r);
+		test_file_read_batch(&r);
 		test_close_with_pending();
 		test_links(&r);
 		test_cqe_skip(&r);

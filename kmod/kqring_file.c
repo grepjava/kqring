@@ -398,8 +398,11 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	void *rl;
 	int error, flags, save;
 
-	if (kqring_rw_fget(op, is_write, &fp, &flags) != 0)
-		return (KQRING_RW_PUNT);	/* the worker reports the error */
+	/* A bad descriptor fails here, as the worker would fail it. */
+	if ((error = kqring_rw_fget(op, is_write, &fp, &flags)) != 0) {
+		kqring_done(op, -error, 0);
+		return (KQRING_RW_DONE);
+	}
 	if (fp->f_type == DTYPE_SOCKET) {
 		fdrop(fp, td);
 		return (KQRING_RW_SOCKET);

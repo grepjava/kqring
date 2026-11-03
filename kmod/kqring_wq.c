@@ -425,7 +425,11 @@ kqring_wq_thread(void *arg)
 			continue;
 		}
 
-		if (mp_ncpus > 1) {
+		/*
+		 * One idle worker spins for the next op; the rest sleep.  With
+		 * every idle worker spinning, each op sent them all at wq->mtx.
+		 */
+		if (mp_ncpus > 1 && wq->spinning[type] == 0) {
 			wq->spinning[type]++;
 			mtx_unlock(&wq->mtx);
 			for (int s = 0; s < 2048; s++) {
@@ -579,7 +583,7 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 {
 	struct thread *td = curthread;
 	struct kqring_wq *wq = ctx->wq;
-	bool need_spawn = false;
+	bool need_spawn = false, sync;
 
 	if (op->cred == NULL)
 		op->cred = crhold(td->td_ucred);
@@ -595,6 +599,21 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 	kqring_op_arm_locked(ctx, op);
 	TAILQ_INSERT_TAIL(&wq->ops[type], op, wq_link);
 	wq->pending[type]++;
+	/*
+	 * A read waits for its worker below only when nothing else could run
+	 * meanwhile: no more SQEs in this submission and no other op on its
+	 * type's workers.  Otherwise a batch of file reads would go to them
+	 * one at a time; the issuer collects completions in its enter wait.
+	 * Other ops always wait, so that writes to one file stay in order, as
+	 * io-wq's per-inode hashing keeps them.  An op not waited for is
+	 * posted by its worker, as a blocking one is (set before any worker
+	 * can take it).
+	 */
+	sync = !kqring_op_is_read(op->sqe.opcode) ||
+	    (!(ctx->submitting && ctx->submit_more) &&
+	    wq->pending[type] + wq->busy[type] == 1);
+	if (!sync)
+		op->wq_blocking = true;
 	if (!wq->closing && wq->total[type] < wq->pending[type] + wq->busy[type] &&
 	    wq->total[type] < wq->max[type]) {
 		wq->total[type]++;
@@ -617,7 +636,7 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 		}
 		mtx_lock(&ctx->mtx);
 	}
-	if (mp_ncpus > 1 && kqring_wq_can_wait_op_locked(ctx, op)) {
+	if (sync && mp_ncpus > 1 && kqring_wq_can_wait_op_locked(ctx, op)) {
 		mtx_unlock(&ctx->mtx);
 		for (int s = 0; s < 2048; s++) {
 			if (op->wq_done || op->wq_blocking || op->cancelled ||
@@ -628,7 +647,7 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 		}
 		mtx_lock(&ctx->mtx);
 	}
-	while (kqring_wq_can_wait_op_locked(ctx, op)) {
+	while (sync && kqring_wq_can_wait_op_locked(ctx, op)) {
 		int error;
 
 		ctx->sleeping++;
@@ -640,7 +659,9 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 			break;
 		}
 	}
-	if (op->wq_done && !op->cancelled && !ctx->closing) {
+	/* A worker posts an op marked blocking itself (taskwork). */
+	if (op->wq_done && !op->wq_blocking && !op->cancelled &&
+	    !ctx->closing) {
 		int32_t res;
 
 		kqring_op_unarm_locked(ctx, op);

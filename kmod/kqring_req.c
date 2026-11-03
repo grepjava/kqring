@@ -2575,6 +2575,7 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 			int err = op->prep_err;
 
 			atomic_store_rel_32(&shm->sq_head, head);
+			ctx->submit_more = consumed < max_submit;
 			kqring_chain_submit(ctx, chain_head, chain_failed);
 			chain_head = chain_tail = NULL;
 			/*
@@ -2592,6 +2593,7 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 	}
 	if (shm->sq_head != head)
 		atomic_store_rel_32(&shm->sq_head, head);
+	ctx->submit_more = false;
 	if (chain_head != NULL)
 		kqring_chain_submit(ctx, chain_head, chain_failed);
 	ctx->submitting = false;
