@@ -13,10 +13,20 @@
  * child that pokes at the ring, or closes the ring with requests in
  * flight.
  *
+ * Most random requests fail their checks early, so about 60% of rings
+ * are set up from known-good templates instead, with a fixed-file table,
+ * registered buffers, a buffer ring and a personality, and on them most
+ * requests are well formed for their opcode (reads and writes on real
+ * descriptors, provided and fixed buffers, multishot receives and polls,
+ * timeouts, cancellations and poll removals aimed at recent requests,
+ * MSG_RING, futexes, splice), chained with links and link timeouts, with
+ * data written to the other ends of the pipes and sockets they wait on.
+ *
  * It fails on:
  *  - a kernel panic (run it with debug.debugger_on_panic=0; the dump
  *    names the bug);
- *  - a system call that does not return for 30 s, signals included;
+ *  - a system call that does not return for 30 s, signals included, or a
+ *    teardown (closing everything, reaping children) that takes 120 s;
  *  - a CQ ring that holds more entries than it has room for;
  *  - kqring memory, user-wired pages or sockets nothing refers to still
  *    held once everything is closed.
@@ -45,6 +55,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -105,7 +116,24 @@ struct fz {
 	unsigned	sq_tail, sq_mask, cq_mask;
 	char		*user_mem[2];	/* NO_MMAP rings */
 	uint64_t	ud;
+	/*
+	 * Structured mode: a ring set up from a known-good template, and
+	 * what was registered on it, so requests can be well formed.
+	 */
+	bool		valid;
+	unsigned	nfiles;		/* fixed-file slots */
+	unsigned	nbufs;		/* registered buffers, 4 KiB each */
+	bool		pbuf;		/* buffer ring, group PBUF_BGID */
+	char		*pbuf_page;
+	uint16_t	personality;
+	uint64_t	recent[16];	/* user_data of recent requests */
+	unsigned	nrecent;
 };
+
+#define PBUF_BGID	7
+#define PBUF_N		8
+#define REGBUF_OFF	(ARENA_SIZE / 2)	/* registered buffers */
+#define PBUF_OFF	(ARENA_SIZE / 2 + 64 * 1024)	/* ring buffers */
 
 static struct fz	fzs[MAX_THREADS];
 static _Atomic int	ring_fds[MAX_THREADS];	/* MSG_RING targets */
@@ -125,11 +153,45 @@ now_ns(void)
 	return ((uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec);
 }
 
+/*
+ * Descriptors 0-2 are /dev/null while the fuzzer runs, since arena words
+ * are often small integers and end up as descriptors (PIPE results, file
+ * tables): the output goes to these instead, which are out of reach.
+ */
+#define OUT_FD		900
+#define ERR_FD		901
+
+static void
+stdio_hide(void)
+{
+	int null;
+
+	if (fcntl(STDOUT_FILENO, F_DUPFD, OUT_FD) != OUT_FD ||
+	    fcntl(STDERR_FILENO, F_DUPFD, ERR_FD) != ERR_FD ||
+	    (null = open("/dev/null", O_RDWR)) < 0) {
+		perror("kqring_fuzz: stdio");
+		exit(1);
+	}
+	fflush(stdout);
+	for (int fd = 0; fd <= STDERR_FILENO; fd++)
+		(void)dup2(null, fd);
+	if (null > STDERR_FILENO)
+		close(null);
+}
+
+static void
+stdio_restore(void)
+{
+	(void)dup2(OUT_FD, STDOUT_FILENO);
+	(void)dup2(ERR_FD, STDERR_FILENO);
+}
+
 static void __dead2 __printflike(1, 2)
 die(const char *fmt, ...)
 {
 	va_list ap;
 
+	stdio_restore();
 	va_start(ap, fmt);
 	fprintf(stderr, "kqring_fuzz: ");
 	vfprintf(stderr, fmt, ap);
@@ -326,6 +388,13 @@ pool_open(struct fz *f, int i)
 			f->pool[i + 6] = sv[1];
 		}
 		break;
+	}
+	/* The fuzzer writes to the other end itself, and must not block. */
+	if (i < 4 && f->pool[i + 6] >= 0)
+		(void)fcntl(f->pool[i + 6], F_SETFL, O_NONBLOCK);
+	switch (i) {
+	case 0: case 1: case 2: case 3:
+		break;
 	case 4:
 		snprintf(path, sizeof(path), "t%d", f->id);
 		fd = open(path, O_RDWR | O_CREAT, 0600);
@@ -368,7 +437,8 @@ pool_close(struct fz *f)
 static void
 dyn_add(struct fz *f, int fd)
 {
-	if (fd < 0)
+	/* stdio is the log; PIPE fds are read back from the arena. */
+	if (fd <= STDERR_FILENO)
 		return;
 	if (f->ndyn == NDYN) {
 		close(f->dyn[0]);
@@ -443,17 +513,39 @@ ring_open(struct fz *f)
 	char *base;
 	long r;
 
+	/* Setups io_uring programs use, plus a few optional flags. */
+	static const uint32_t templates[] = {
+		IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN,
+		0,
+		IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG,
+		IORING_SETUP_SQPOLL,
+		IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+		    IORING_SETUP_IOPOLL,
+		IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_R_DISABLED,
+	};
+	static const uint32_t extras = IORING_SETUP_CQSIZE |
+	    IORING_SETUP_SUBMIT_ALL | IORING_SETUP_SQE128 |
+	    IORING_SETUP_CQE32 | IORING_SETUP_NO_SQARRAY;
+
 	memset(p, 0, sizeof(*p));
-	p->flags = (uint32_t)rnd(f) & good;
-	if (chance(f, 5))
-		p->flags = (uint32_t)rnd(f) &
-		    ~(uint32_t)IORING_SETUP_REGISTERED_FD_ONLY;
-	if (chance(f, 50))
-		p->flags &= ~(uint32_t)(IORING_SETUP_SQPOLL |
-		    IORING_SETUP_IOPOLL);
-	entries = chance(f, 90) ? 1U << rn(f, 9) : (uint32_t)rnd(f);
-	p->cq_entries = chance(f, 80) ? entries * (1U << rn(f, 3)) :
-	    (uint32_t)rnd(f);
+	f->valid = chance(f, 60);
+	if (f->valid) {
+		p->flags = templates[rn(f, nitems(templates))] |
+		    ((uint32_t)rnd(f) & extras);
+		entries = 1U << (1 + rn(f, 8));
+		p->cq_entries = entries * (1U << rn(f, 3));
+	} else {
+		p->flags = (uint32_t)rnd(f) & good;
+		if (chance(f, 5))
+			p->flags = (uint32_t)rnd(f) &
+			    ~(uint32_t)IORING_SETUP_REGISTERED_FD_ONLY;
+		if (chance(f, 50))
+			p->flags &= ~(uint32_t)(IORING_SETUP_SQPOLL |
+			    IORING_SETUP_IOPOLL);
+		entries = chance(f, 90) ? 1U << rn(f, 9) : (uint32_t)rnd(f);
+		p->cq_entries = chance(f, 80) ? entries * (1U << rn(f, 3)) :
+		    (uint32_t)rnd(f);
+	}
 	p->sq_thread_idle = (uint32_t)rn(f, 50);
 	p->sq_thread_cpu = (uint32_t)rn(f, 16);
 	p->wq_fd = (uint32_t)gen_fd(f);
@@ -606,9 +698,386 @@ sanitize(struct fz *f, struct io_uring_sqe *s)
 		s->off = rn(f, 1 << 24);
 }
 
+/*
+ * Structured mode: register what well-formed requests use (a fixed-file
+ * table of the pool, buffers, a buffer ring, a personality), each of
+ * which may fail (RLIMIT_MEMLOCK, a disabled ring) and is then not used.
+ */
+static void
+ring_resources(struct fz *f)
+{
+	int fds[16];
+	struct iovec iov[4];
+	struct io_uring_buf_reg reg;
+	struct io_uring_buf *b = (void *)f->pbuf_page;
+
+	f->nfiles = f->nbufs = 0;
+	f->pbuf = false;
+	f->personality = 0;
+	f->nrecent = 0;
+	if ((f->p.flags & IORING_SETUP_R_DISABLED) != 0 && chance(f, 90))
+		(void)CALL(f, "enable", kqring_register(f->ring,
+		    IORING_REGISTER_ENABLE_RINGS, NULL, 0));
+	for (int i = 0; i < 16; i++)
+		fds[i] = i < NPOOL ? f->pool[i] : -1;
+	if (CALL(f, "files", kqring_register(f->ring, IORING_REGISTER_FILES,
+	    fds, 16)) == 0)
+		f->nfiles = 16;
+	for (int i = 0; i < 4; i++) {
+		iov[i].iov_base = f->arena + REGBUF_OFF + i * 8192;
+		iov[i].iov_len = 4096;
+	}
+	if (CALL(f, "buffers", kqring_register(f->ring,
+	    IORING_REGISTER_BUFFERS, iov, 4)) == 0)
+		f->nbufs = 4;
+	memset(f->pbuf_page, 0, PAGE_SIZE);
+	memset(&reg, 0, sizeof(reg));
+	reg.ring_addr = (uint64_t)(uintptr_t)f->pbuf_page;
+	reg.ring_entries = PBUF_N;
+	reg.bgid = PBUF_BGID;
+	if (CALL(f, "pbuf", kqring_register(f->ring, IORING_REGISTER_PBUF_RING,
+	    &reg, 1)) == 0) {
+		for (int i = 0; i < PBUF_N; i++) {
+			b[i].addr = (uint64_t)(uintptr_t)f->arena + PBUF_OFF +
+			    i * 4096;
+			b[i].len = 4096;
+			b[i].bid = (uint16_t)i;
+		}
+		atomic_store_explicit((_Atomic uint16_t *)(void *)
+		    &((struct io_uring_buf_ring *)(void *)f->pbuf_page)->tail,
+		    PBUF_N, memory_order_release);
+		f->pbuf = true;
+	}
+	long id = CALL(f, "personality", kqring_register(f->ring,
+	    IORING_REGISTER_PERSONALITY, NULL, 0));
+	if (id > 0)
+		f->personality = (uint16_t)id;
+}
+
+/* Give the buffer ring its buffers back (all of them, again). */
+static void
+pbuf_refill(struct fz *f)
+{
+	struct io_uring_buf_ring *br = (void *)f->pbuf_page;
+	uint16_t tail;
+
+	if (!f->pbuf)
+		return;
+	tail = atomic_load_explicit((_Atomic uint16_t *)(void *)&br->tail,
+	    memory_order_relaxed);
+	for (int i = 0; i < PBUF_N; i++) {
+		struct io_uring_buf *b = &br->bufs[(tail + i) & (PBUF_N - 1)];
+
+		b->addr = (uint64_t)(uintptr_t)f->arena + PBUF_OFF + i * 4096;
+		b->len = 4096;
+		b->bid = (uint16_t)i;
+	}
+	atomic_store_explicit((_Atomic uint16_t *)(void *)&br->tail,
+	    (uint16_t)(tail + PBUF_N), memory_order_release);
+}
+
+static uint64_t
+recent_ud(struct fz *f)
+{
+	return (f->nrecent == 0 ? rnd(f) :
+	    f->recent[rn(f, MIN(f->nrecent, nitems(f->recent)))]);
+}
+
+static struct __kernel_timespec *
+short_ts(struct fz *f)
+{
+	struct __kernel_timespec *ts = (void *)(f->arena +
+	    rn(f, REGBUF_OFF / 16) * 16);
+
+	ts->tv_sec = 0;
+	ts->tv_nsec = (long long)rn(f, 3000000);
+	return (ts);
+}
+
+/* An arena buffer of n bytes that stays inside the arena. */
+static uint64_t
+arena_buf(struct fz *f, uint32_t n)
+{
+	return ((uint64_t)(uintptr_t)f->arena +
+	    rn(f, (ARENA_SIZE - n) / 8) * 8);
+}
+
+/* A pool descriptor of a kind: 0 file, 1 pipe read, 2 socket, 3 any. */
+static int
+pool_fd(struct fz *f, int kind)
+{
+	static const int files[] = { 4 }, pipes[] = { 0, 1 },
+	    socks[] = { 2, 3, 8, 9 };
+
+	switch (kind) {
+	case 0:
+		return (f->pool[files[0]]);
+	case 1:
+		return (f->pool[pipes[rn(f, 2)]]);
+	case 2:
+		return (f->pool[socks[rn(f, 4)]]);
+	default:
+		return (f->pool[rn(f, NPOOL)]);
+	}
+}
+
+/* Use the fixed-file slot of pool slot i instead, if there is one. */
+static void
+maybe_fixed(struct fz *f, struct io_uring_sqe *s)
+{
+	for (int i = 0; i < NPOOL; i++)
+		if (f->nfiles != 0 && f->pool[i] == s->fd && chance(f, 30)) {
+			s->fd = i;
+			s->flags |= IOSQE_FIXED_FILE;
+			return;
+		}
+}
+
+/*
+ * A well-formed request of a random kind, on real descriptors, buffers
+ * and earlier requests.
+ */
+static void
+sqe_struct(struct fz *f, struct io_uring_sqe *s)
+{
+	uint32_t n = 1 + (uint32_t)rn(f, 4096);
+	struct iovec *iov;
+	struct msghdr *mh;
+
+	memset(s, 0, f->sqe_size);
+	switch (rn(f, 24)) {
+	case 0:
+		s->opcode = IORING_OP_NOP;
+		break;
+	case 1: case 2:
+		s->opcode = chance(f, 50) ? IORING_OP_READ : IORING_OP_WRITE;
+		s->fd = pool_fd(f, (int)rn(f, 4));
+		s->addr = arena_buf(f, n);
+		s->len = n;
+		s->off = chance(f, 30) ? (uint64_t)-1 : rn(f, 65536);
+		if (s->opcode == IORING_OP_READ && f->pbuf && chance(f, 30)) {
+			s->flags |= IOSQE_BUFFER_SELECT;
+			s->buf_group = PBUF_BGID;
+			s->addr = 0;
+		}
+		maybe_fixed(f, s);
+		break;
+	case 3:
+		if (f->nbufs == 0)
+			goto nop;
+		s->opcode = chance(f, 50) ? IORING_OP_READ_FIXED :
+		    IORING_OP_WRITE_FIXED;
+		s->buf_index = (uint16_t)rn(f, f->nbufs);
+		s->fd = pool_fd(f, (int)rn(f, 2));
+		s->addr = (uint64_t)(uintptr_t)f->arena + REGBUF_OFF +
+		    s->buf_index * 8192 + rn(f, 2048);
+		s->len = (uint32_t)rn(f, 2049);
+		s->off = rn(f, 65536);
+		maybe_fixed(f, s);
+		break;
+	case 4: {
+		int cnt = 1 + (int)rn(f, 4);
+
+		s->opcode = chance(f, 50) ? IORING_OP_READV : IORING_OP_WRITEV;
+		iov = (void *)(uintptr_t)arena_buf(f, 64);
+		for (int i = 0; i < cnt; i++) {
+			iov[i].iov_len = (size_t)rn(f, 2048);
+			iov[i].iov_base = (void *)(uintptr_t)arena_buf(f,
+			    (uint32_t)iov[i].iov_len);
+		}
+		s->fd = pool_fd(f, (int)rn(f, 4));
+		s->addr = (uint64_t)(uintptr_t)iov;
+		s->len = (uint32_t)cnt;
+		s->off = rn(f, 65536);
+		break;
+	}
+	case 5: case 6:
+		s->opcode = chance(f, 50) ? IORING_OP_RECV : IORING_OP_SEND;
+		s->fd = pool_fd(f, 2);
+		s->addr = arena_buf(f, n);
+		s->len = n;
+		s->msg_flags = chance(f, 70) ? 0 : (uint32_t)rn(f, 0x200);
+		if (s->opcode == IORING_OP_RECV && f->pbuf && chance(f, 40)) {
+			s->flags |= IOSQE_BUFFER_SELECT;
+			s->buf_group = PBUF_BGID;
+			s->addr = 0;
+			s->len = 0;
+			if (chance(f, 50))
+				s->ioprio = IORING_RECV_MULTISHOT;
+		}
+		if (chance(f, 20))
+			s->ioprio |= IORING_RECVSEND_POLL_FIRST;
+		maybe_fixed(f, s);
+		break;
+	case 7:
+		s->opcode = chance(f, 50) ? IORING_OP_RECVMSG :
+		    IORING_OP_SENDMSG;
+		mh = (void *)(uintptr_t)arena_buf(f, 128);
+		iov = (void *)(uintptr_t)arena_buf(f, 32);
+		memset(mh, 0, sizeof(*mh));
+		iov[0].iov_len = n;
+		iov[0].iov_base = (void *)(uintptr_t)arena_buf(f, n);
+		mh->msg_iov = iov;
+		mh->msg_iovlen = 1;
+		if (chance(f, 30)) {
+			mh->msg_control = (void *)(uintptr_t)arena_buf(f, 256);
+			mh->msg_controllen = (socklen_t)rn(f, 256);
+		}
+		s->fd = pool_fd(f, 2);
+		s->addr = (uint64_t)(uintptr_t)mh;
+		break;
+	case 8:
+		s->opcode = IORING_OP_POLL_ADD;
+		s->fd = pool_fd(f, 3);
+		s->poll32_events = chance(f, 60) ? POLLIN : chance(f, 50) ?
+		    POLLOUT : (uint32_t)rn(f, 0x200);
+		if (chance(f, 40))
+			s->len = IORING_POLL_ADD_MULTI;
+		maybe_fixed(f, s);
+		break;
+	case 9:
+		s->opcode = IORING_OP_POLL_REMOVE;
+		s->addr = recent_ud(f);
+		break;
+	case 10:
+		s->opcode = IORING_OP_TIMEOUT;
+		s->addr = (uint64_t)(uintptr_t)short_ts(f);
+		s->len = 1;
+		s->off = rn(f, 4);
+		s->timeout_flags = (uint32_t)rn(f, 0x40);
+		break;
+	case 11:
+		s->opcode = IORING_OP_TIMEOUT_REMOVE;
+		s->addr = recent_ud(f);
+		if (chance(f, 50)) {
+			s->timeout_flags = IORING_TIMEOUT_UPDATE;
+			s->addr2 = (uint64_t)(uintptr_t)short_ts(f);
+		}
+		break;
+	case 12:
+		s->opcode = IORING_OP_ASYNC_CANCEL;
+		s->addr = recent_ud(f);
+		s->cancel_flags = (uint32_t)rn(f, 8) & (IORING_ASYNC_CANCEL_ALL |
+		    IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_ANY);
+		s->fd = pool_fd(f, 3);
+		break;
+	case 13:
+		s->opcode = chance(f, 50) ? IORING_OP_FSYNC :
+		    IORING_OP_FTRUNCATE;
+		s->fd = pool_fd(f, 0);
+		s->off = rn(f, 1 << 20);
+		maybe_fixed(f, s);
+		break;
+	case 14:
+		s->opcode = IORING_OP_SPLICE;
+		s->splice_fd_in = pool_fd(f, 1);
+		s->fd = chance(f, 50) ? f->pool[6 + rn(f, 2)] : pool_fd(f, 0);
+		s->len = n;
+		s->splice_off_in = (uint64_t)-1;
+		s->off = chance(f, 50) ? (uint64_t)-1 : rn(f, 65536);
+		break;
+	case 15:
+		s->opcode = IORING_OP_MSG_RING;
+		s->fd = chance(f, 70) ? atomic_load(&ring_fds[rn(f, nthreads)]) :
+		    f->ring;
+		s->addr = chance(f, 80) ? IORING_MSG_DATA : IORING_MSG_SEND_FD;
+		s->len = (uint32_t)rnd(f);
+		s->off = rnd(f);
+		s->addr3 = rn(f, 16);
+		s->file_index = (uint32_t)rn(f, 17);
+		break;
+	case 16: {
+		uint32_t *w = (void *)(uintptr_t)arena_buf(f, 4);
+
+		w = (uint32_t *)((uintptr_t)w & ~(uintptr_t)3);
+		s->opcode = chance(f, 50) ? IORING_OP_FUTEX_WAIT :
+		    IORING_OP_FUTEX_WAKE;
+		s->addr = (uint64_t)(uintptr_t)w;
+		s->addr2 = s->opcode == IORING_OP_FUTEX_WAIT ? *w : rn(f, 4);
+		s->addr3 = ~0ULL;
+		s->fd = FUTEX2_SIZE_U32;
+		break;
+	}
+	case 17:
+		if (f->nfiles == 0)
+			goto nop;
+		s->opcode = IORING_OP_FILES_UPDATE;
+		{
+			int *fds = (void *)(uintptr_t)arena_buf(f, 16);
+
+			for (int i = 0; i < 4; i++)
+				fds[i] = chance(f, 70) ? pool_fd(f, 3) : -1;
+			s->addr = (uint64_t)(uintptr_t)fds;
+		}
+		s->len = 1 + (uint32_t)rn(f, 4);
+		s->off = rn(f, 16);
+		break;
+	case 18:
+		if (!f->pbuf)
+			goto nop;
+		s->opcode = IORING_OP_READ_MULTISHOT;
+		s->fd = pool_fd(f, 1);
+		s->flags = IOSQE_BUFFER_SELECT;
+		s->buf_group = PBUF_BGID;
+		break;
+	case 19:
+		s->opcode = IORING_OP_SEND_ZC;
+		s->fd = pool_fd(f, 2);
+		s->addr = arena_buf(f, n);
+		s->len = n;
+		if (f->nbufs != 0 && chance(f, 50)) {
+			s->ioprio = IORING_RECVSEND_FIXED_BUF;
+			s->buf_index = (uint16_t)rn(f, f->nbufs);
+			s->addr = (uint64_t)(uintptr_t)f->arena + REGBUF_OFF +
+			    s->buf_index * 8192;
+			s->len = (uint32_t)rn(f, 4097);
+		}
+		break;
+	case 20:
+		s->opcode = IORING_OP_SHUTDOWN;
+		s->fd = pool_fd(f, 2);
+		s->len = (uint32_t)rn(f, 3);
+		break;
+	case 21:
+		if (f->nfiles == 0)
+			goto nop;
+		s->opcode = IORING_OP_FIXED_FD_INSTALL;
+		s->fd = (int)rn(f, 16);
+		s->flags = IOSQE_FIXED_FILE;
+		break;
+	case 22:
+		s->opcode = chance(f, 50) ? IORING_OP_OPENAT : IORING_OP_STATX;
+		s->open_flags = O_RDWR | (chance(f, 50) ? O_CREAT : 0);
+		s->len = 0600;
+		s->addr2 = arena_buf(f, 512);	/* STATX buffer */
+		break;			/* paths: sanitize() */
+	default:
+	nop:
+		s->opcode = IORING_OP_NOP;
+	}
+	if (f->personality != 0 && chance(f, 10))
+		s->personality = f->personality;
+	if (chance(f, 10))
+		s->flags |= IOSQE_ASYNC;
+	if (chance(f, 5))
+		s->flags |= IOSQE_CQE_SKIP_SUCCESS;
+	if (chance(f, 3))
+		s->flags |= IOSQE_IO_DRAIN;
+	s->user_data = f->ud;
+	f->recent[f->nrecent++ % nitems(f->recent)] = f->ud;
+	sanitize(f, s);
+	f->ops[f->ud % NOPS].op = s->opcode;
+	f->ops[f->ud % NOPS].addr = s->addr;
+	f->ud++;
+}
+
 static void
 sqe_fill(struct fz *f, struct io_uring_sqe *s)
 {
+	if (f->valid && chance(f, 60)) {
+		sqe_struct(f, s);
+		return;
+	}
 	memset(s, 0, f->sqe_size);
 	if (chance(f, 85))
 		s->opcode = (uint8_t)rn(f, IORING_OP_LAST);
@@ -662,7 +1131,7 @@ reap(struct fz *f)
 	tail = atomic_load_explicit(f->cq_ktail, memory_order_acquire);
 	if (tail - head > f->p.cq_entries &&
 	    (f->p.flags & IORING_SETUP_NO_MMAP) == 0) {
-		fprintf(stderr, "kqring_fuzz: thread %d: CQ holds %u of %u "
+		dprintf(ERR_FD, "kqring_fuzz: thread %d: CQ holds %u of %u "
 		    "entries\n", f->id, tail - head, f->p.cq_entries);
 		atomic_store(&cq_bad, 1);
 		head = tail;
@@ -713,16 +1182,57 @@ do_submit(struct fz *f)
 		n = (unsigned)MIN(room, 1 + rn(f, MIN(f->p.sq_entries, 16)));
 		if (f->p.sq_entries == 0 || room > f->p.sq_entries)
 			n = 0;
+		struct io_uring_sqe *prev = NULL;
+
 		for (unsigned i = 0; i < n; i++) {
 			unsigned idx = f->sq_tail & f->sq_mask;
+			struct io_uring_sqe *s = (void *)(f->sqes +
+			    (size_t)idx * f->sqe_size);
 
 			if (f->sq_array != NULL)
 				f->sq_array[idx] = chance(f, 98) ? idx :
 				    (unsigned)rnd(f);
-			sqe_fill(f, (void *)(f->sqes + (size_t)idx *
-			    f->sqe_size));
+			sqe_fill(f, s);
+			/*
+			 * Chains: link to the next request, and sometimes
+			 * make that a LINK_TIMEOUT of this one.
+			 */
+			if (f->valid && prev != NULL &&
+			    (prev->flags & (IOSQE_IO_LINK |
+			    IOSQE_IO_HARDLINK)) != 0 && chance(f, 25)) {
+				uint64_t ud = s->user_data;
+
+				memset(s, 0, f->sqe_size);
+				s->opcode = IORING_OP_LINK_TIMEOUT;
+				s->addr = (uint64_t)(uintptr_t)short_ts(f);
+				s->len = 1;
+				s->user_data = ud;
+				f->ops[ud % NOPS].op = s->opcode;
+			}
+			if (f->valid && i + 1 < n && chance(f, 25))
+				s->flags |= chance(f, 80) ? IOSQE_IO_LINK :
+				    IOSQE_IO_HARDLINK;
+			prev = s;
 			f->sq_tail++;
 		}
+		/* Something for reads, receives and polls to find. */
+		if (f->valid && chance(f, 40)) {
+			struct pollfd pw = { .fd = f->pool[6 + rn(f, 4)],
+			    .events = POLLOUT };
+
+			/*
+			 * dup2() chaos can put a blocking file behind the
+			 * number: write only where there's room, and as a CALL
+			 * so the watchdog's kick ends it if the ring fills it.
+			 */
+			if (pw.fd >= 0 && poll(&pw, 1, 0) == 1 &&
+			    (pw.revents & POLLOUT) != 0)
+				(void)CALL(f, "write(pool)", write(pw.fd,
+				    f->arena + rn(f, 4096),
+				    1 + (size_t)rn(f, 512)));
+		}
+		if (chance(f, 10))
+			pbuf_refill(f);
 		atomic_store_explicit(f->sq_ktail, f->sq_tail,
 		    memory_order_release);
 		atomic_fetch_add(&st_sqes, n);
@@ -848,6 +1358,10 @@ fz_main(void *arg)
 		die("mprotect: %s", strerror(errno));
 	arena_fill(f);
 	pool_init(f);
+	f->pbuf_page = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	if (f->pbuf_page == MAP_FAILED)
+		die("mmap: %s", strerror(errno));
 
 	while (!atomic_load(&stop) && (max_iters == 0 || iters < max_iters)) {
 		int n;
@@ -856,6 +1370,8 @@ fz_main(void *arg)
 		iters++;
 		if (f->ring < 0)
 			continue;
+		if (f->valid)
+			ring_resources(f);
 		n = 1 + (int)rn(f, 200);
 		for (int i = 0; i < n && f->ring >= 0 && !atomic_load(&stop) &&
 		    (max_iters == 0 || iters < max_iters); i++, iters++) {
@@ -925,9 +1441,34 @@ unregister_rings(void)
 	close(fd);
 }
 
+static const char *_Atomic teardown_at;	/* the step, NULL when done */
+
+/* Teardown isn't watched by the loop in main(): fail it if it sticks. */
+static void *
+teardown_watch(void *arg __unused)
+{
+	uint64_t t0 = now_ns();
+	char cmd[160];
+
+	while (now_ns() - t0 < 4 * HANG_NS) {
+		if (atomic_load(&teardown_at) == NULL)
+			return (NULL);
+		usleep(100000);
+	}
+	stdio_restore();
+	fprintf(stderr, "kqring_fuzz: FAIL: teardown stuck in %s for %ju s "
+	    "(seed %ju)\n", atomic_load(&teardown_at),
+	    (uintmax_t)(4 * HANG_NS / 1000000000ULL), (uintmax_t)seed);
+	snprintf(cmd, sizeof(cmd), "procstat -kk %d; for c in $(pgrep -P %d); "
+	    "do procstat -kk $c; done", getpid(), getpid());
+	(void)system(cmd);
+	_exit(3);
+}
+
 int
 main(int argc, char **argv)
 {
+	pthread_t tw;
 	struct sigaction sa;
 	long socks0, wired0, mem0;
 	uint64_t t0, last = 0;
@@ -973,7 +1514,7 @@ main(int argc, char **argv)
 	names_init();
 	printf("kqring_fuzz: seed %ju, %d threads, %d s, in %s\n",
 	    (uintmax_t)seed, nthreads, run_secs, scratch);
-	fflush(stdout);
+	stdio_hide();
 
 	for (int i = 0; i < nthreads; i++) {
 		fzs[i].id = i;
@@ -997,6 +1538,7 @@ main(int argc, char **argv)
 			if (since == 0 || now < since)
 				continue;
 			if (now - since > HANG_NS) {
+				stdio_restore();
 				fprintf(stderr, "kqring_fuzz: FAIL: thread %d "
 				    "stuck in %s for %ju s (seed %ju)\n", i,
 				    atomic_load(&fzs[i].call),
@@ -1015,7 +1557,8 @@ main(int argc, char **argv)
 		if (atomic_load(&nfinished) == nthreads)
 			break;
 		if (now - last > 10000000000ULL) {
-			printf("[%4ju s] rings %ju (setup failed %ju) sqes %ju "
+			dprintf(OUT_FD, "[%4ju s] rings %ju (setup failed %ju) "
+			    "sqes %ju "
 			    "enters %ju registers %ju cqes %ju chaos %ju "
 			    "forks %ju kicks %ju\n",
 			    (uintmax_t)((now - t0) / 1000000000ULL),
@@ -1024,16 +1567,26 @@ main(int argc, char **argv)
 			    (uintmax_t)st_regs, (uintmax_t)st_cqes,
 			    (uintmax_t)st_chaos, (uintmax_t)st_forks,
 			    (uintmax_t)st_kicks);
-			fflush(stdout);
 			last = now;
 		}
 		usleep(100000);
 	}
+	atomic_store(&teardown_at, "pthread_join");
+	if (pthread_create(&tw, NULL, teardown_watch, NULL) != 0)
+		die("pthread_create");
 	for (int i = 0; i < nthreads; i++)
 		pthread_join(fzs[i].thr, NULL);
+	atomic_store(&teardown_at, "waitpid");
 	while (waitpid(-1, NULL, 0) > 0)
 		;
+	atomic_store(&teardown_at, "unregister");
 	unregister_rings();
+	atomic_store(&teardown_at, "close");
+	(void)close_range(3, OUT_FD - 1, 0);
+	closefrom(ERR_FD + 1);
+	stdio_restore();
+	atomic_store(&teardown_at, NULL);
+	pthread_join(tw, NULL);
 	closefrom(3);
 	if (chdir("/tmp") == 0) {
 		snprintf(cmd, sizeof(cmd), "rm -rf %s", scratch);
