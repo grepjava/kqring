@@ -8445,6 +8445,9 @@ test_registered_rings(void)
 	    &up[0], 1) == 1);
 	assert(kqring_enter(2, 0, 0, IORING_ENTER_REGISTERED_RING,
 	    NULL, 0) == -1 && errno == EBADF);
+	/* An empty slot counts as unregistered, as in io_uring. */
+	assert(kqring_register(t2.fd, IORING_UNREGISTER_RING_FDS, &up[0],
+	    1) == 1);
 	assert(kqring_register(0,
 	    IORING_UNREGISTER_RING_FDS | IORING_REGISTER_USE_REGISTERED_RING,
 	    &up[1], 1) == 1);

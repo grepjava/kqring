@@ -160,11 +160,9 @@ kqring_ring_fds_unregister(struct thread *td,
 			pr->nrings--;
 		}
 		mtx_unlock(&kqring_proc_mtx);
-		if (fp == NULL) {
-			error = EBADF;
-			break;
-		}
-		fdrop(fp, td);
+		/* An empty slot counts as done, as in io_uring. */
+		if (fp != NULL)
+			fdrop(fp, td);
 	}
 	if (i == 0)
 		return (error);
