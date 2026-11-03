@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-11-03
+
+Still an **experimental preview**, for test systems only: the same caveats as 0.1.0 apply. This release fixes a deadlock and a blocking receive that 0.1.0 users can hit, and makes queued file and socket I/O faster. The ABI is unchanged; rebuild the module and reload it.
 
 ### Fixed
 
@@ -8,12 +10,25 @@
 - **`RECV` and `RECVMSG` with `MSG_WAITALL` could block the submitting thread** once some data had been copied; kqring now never passes `MSG_WAITALL` to `soreceive()` and waits for the rest itself.
 - **A batch of file reads that go to workers ran one at a time.** The submitting thread waited for each worker read before submitting the next, so `O_DIRECT` reads of a ZFS file got no more from 64 in flight than from one. Reads now run on several workers at once (41–53% more IOPS at 4–64 in flight), and only one idle worker spins for the next request. Writes keep their order, as io-wq's per-inode hashing does.
 - A `READ` or `WRITE` on a bad descriptor now fails at submission, as on Linux, rather than on a worker after later requests.
+- `READV` run inline accepts more than 16 iovecs, and `IORING_REGISTER_CLONE_BUFFERS` no longer trips a lock-order warning on kernels with `WITNESS`.
+- Fifteen smaller fixes from a code review, in socket upcalls, buffer-ring pinning, taskwork and the worker pools.
+
+### Performance
+
+On the same Intel Core i5-8250U as 0.1.0 (details in [BENCHMARK.MD](BENCHMARK.MD)):
+
+- A request through a worker thread round-trips in about 1.0 µs, down from 4.4 µs: the issuer and the worker each spin briefly before sleeping.
+- An armed one-shot `RECV` costs 23% more than kqueue at 64 B, down from 37%: one-shot waiters are detached inside the socket upcall.
+- User-memory buffer rings are mapped into the kernel at registration, so selecting a provided buffer is a memory load rather than a `copyin(9)`.
+- 16 KiB AF_UNIX sends from registered buffers are 4% faster than `write(2)`.
+- Storage: at 32 in flight on an md(4) disk, kqring matches `aio(4)` on 4 KiB random reads and is 14% ahead on writes; `O_DIRECT` reads of a ZFS file reach ZFS's ceiling along with `aio(4)` and `pread(2)` threads.
 
 ### Testing
 
-- [`tests/kqring_diskbench.c`](tests/kqring_diskbench.c): storage workloads through kqring, `aio(4)` or `pread(2)` threads, with IOPS, latency percentiles and read verification.
-- [`tests/kqring_stress.c`](tests/kqring_stress.c): a randomized multi-threaded stress test.
-- Regression tests for stopping a process during ring close and for batches of `O_DIRECT` reads.
+- kqring's own suite has 88 tests, all passing in 10 consecutive passes with the module reloaded before each, a scratch disk and `RLIMIT_NOFILE` of 440,000, with no kqring memory, wired pages or open files left behind.
+- New: [`tests/kqring_stress.c`](tests/kqring_stress.c), a randomized multi-threaded stress test, which passes 10-minute runs with no leaks; [`tests/kqring_diskbench.c`](tests/kqring_diskbench.c), storage workloads through kqring, `aio(4)` or `pread(2)` threads with IOPS, latency percentiles and read verification; regression tests for stopping a process during ring close and for batches of `O_DIRECT` reads.
+- liburing 2.9: of 168 tests that build, 142 pass, 7 skip and 19 fail (144 pass with `RLIMIT_MEMLOCK` raised). The one failure beyond 0.1.0's is `fallocate`, because ZFS doesn't support preallocation; see [`liburing/README.md`](liburing/README.md).
+- Unloading is refused (`EBUSY`) while any ring is open, and succeeds as soon as the last one closes: 20 cycles of repeated unload attempts against 8 stress-test threads, each followed by a reload, all clean.
 
 ## 0.1.0 — 2026-10-25
 

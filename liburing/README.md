@@ -28,14 +28,14 @@ As with the raw interface, flag values passed through SQEs (`O_*`, `MSG_*`, `SOC
 
 ## Test results
 
-liburing's test suite, run on FreeBSD 15.1 with `kqring.ko` from this tree (October 2026):
+liburing's test suite, run on FreeBSD 15.1 with `kqring.ko` from this tree (November 2026, with the test directory on ZFS):
 
 | | Tests |
 |---|---|
 | Built | 168 (32 more need Linux-only headers or system calls) |
-| Passed | **143** (145 with `RLIMIT_MEMLOCK` raised) |
+| Passed | **142** (144 with `RLIMIT_MEMLOCK` raised) |
 | Skipped | 7 (the test found a feature missing and said so) |
-| Failed | 18, explained below |
+| Failed | 19, explained below |
 
 liburing's two AddressSanitizer tests (`xfail_*`) aren't built. liburing itself only builds them with ASan, and without it they wait forever by design.
 
@@ -50,6 +50,7 @@ liburing's two AddressSanitizer tests (`xfail_*`) aren't built. liburing itself 
 | `bind-listen` | Uses an uninitialised `struct __kernel_timespec`. |
 | `self` | Reads `/proc/self`. |
 | `truncate` | Passes Linux-only flags to `mkostemp(3)`. |
+| `fallocate` | Fails only when the test directory is on ZFS, which doesn't support preallocation: the `FALLOCATE` completes with `EOPNOTSUPP`. |
 | `pipe-reuse`, `splice` | FreeBSD writes large blocks to a pipe directly from the writer's pages, and such a `write(2)` blocks until a reader has taken all of it, which these tests don't expect. |
 
 ### Differences in kqring
