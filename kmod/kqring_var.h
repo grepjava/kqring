@@ -993,13 +993,22 @@ kqring_evfd_signal_locked(struct kqring_ctx *ctx)
 		ctx->woke_pollers = true;
 }
 
+/*
+ * STAILQ_EMPTY() for a list that may be read without its lock, as a hint
+ * rechecked under the lock.  With INVARIANTS, STAILQ_EMPTY() also asserts
+ * that stqh_last points at the head, which a racing insert or concat
+ * leaves untrue for a moment: a panic in a check that is otherwise fine.
+ */
+#define	KQRING_STQ_EMPTY_HINT(head)					\
+	(atomic_load_ptr(&(head)->stqh_first) == NULL)
+
 /* No room for another CQE in the CQ ring (it would overflow). */
 static inline bool
 kqring_cq_full(const struct kqring_ctx *ctx)
 {
 	const struct kqring_shm_header *shm = ctx->shm;
 
-	return (!STAILQ_EMPTY(&ctx->ocq) || atomic_load_acq_32(&shm->cq_tail) -
+	return (!KQRING_STQ_EMPTY_HINT(&ctx->ocq) || atomic_load_acq_32(&shm->cq_tail) -
 	    atomic_load_acq_32(&shm->cq_head) >= ctx->cq_entries);
 }
 
@@ -1016,8 +1025,8 @@ kqring_ring_readable(const struct kqring_ctx *ctx)
 	if (shm == NULL)
 		return (false);
 	return (atomic_load_acq_32(&shm->cq_tail) !=
-	    atomic_load_acq_32(&shm->cq_head) || !STAILQ_EMPTY(&ctx->ocq) ||
-	    !TAILQ_EMPTY(&ctx->taskwork_ops) || !STAILQ_EMPTY(&ctx->rcq));
+	    atomic_load_acq_32(&shm->cq_head) || !KQRING_STQ_EMPTY_HINT(&ctx->ocq) ||
+	    !TAILQ_EMPTY(&ctx->taskwork_ops) || !KQRING_STQ_EMPTY_HINT(&ctx->rcq));
 }
 
 

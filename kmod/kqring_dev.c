@@ -1450,7 +1450,7 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		 * A full CQ with overflow pending must be reaped first.  A
 		 * TIMEOUT completing also ends the wait, as in io_uring.
 		 */
-		if (cq_count >= min_complete || !STAILQ_EMPTY(&ctx->ocq) ||
+		if (cq_count >= min_complete || !KQRING_STQ_EMPTY_HINT(&ctx->ocq) ||
 		    atomic_load_acq_32(&ctx->cq_timeouts) != timeouts)
 			return (0);
 
@@ -1484,14 +1484,14 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 				    atomic_load_acq_32(&shm->cq_head) >=
 				    min_complete ||
 				    !TAILQ_EMPTY(&ctx->taskwork_ops) ||
-				    !STAILQ_EMPTY(&ctx->rcq))
+				    !KQRING_STQ_EMPTY_HINT(&ctx->rcq))
 					break;
 				cpu_spinwait();
 				now = getsbinuptime();
 			}
 			spin = 0;
 			if (!TAILQ_EMPTY(&ctx->taskwork_ops) ||
-			    !STAILQ_EMPTY(&ctx->rcq))
+			    !KQRING_STQ_EMPTY_HINT(&ctx->rcq))
 				goto drain;
 			continue;
 		}
@@ -1507,7 +1507,7 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		if (!TAILQ_EMPTY(&ctx->retired_ops))
 			(void)kqring_wq_abort_retired_locked(ctx);
 		if (!TAILQ_EMPTY(&ctx->taskwork_ops) ||
-		    !STAILQ_EMPTY(&ctx->rcq) ||
+		    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) ||
 		    atomic_load_acq_int(&ctx->kp_kick) != 0) {
 			mtx_unlock(&ctx->mtx);
 			goto drain;
@@ -1518,7 +1518,7 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		 */
 		cq_count = atomic_load_acq_32(&shm->cq_tail) -
 		    atomic_load_acq_32(&shm->cq_head);
-		if (cq_count >= min_complete || !STAILQ_EMPTY(&ctx->ocq) ||
+		if (cq_count >= min_complete || !KQRING_STQ_EMPTY_HINT(&ctx->ocq) ||
 		    atomic_load_acq_32(&ctx->cq_timeouts) != timeouts) {
 			mtx_unlock(&ctx->mtx);
 			return (0);
@@ -1574,7 +1574,7 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 				kqring_enter_unlock(ctx, lock);
 				cq_count = atomic_load_acq_32(&shm->cq_tail) -
 				    atomic_load_acq_32(&shm->cq_head);
-				if (cq_count > 0 || !STAILQ_EMPTY(&ctx->ocq))
+				if (cq_count > 0 || !KQRING_STQ_EMPTY_HINT(&ctx->ocq))
 					return (0);
 				return (ETIMEDOUT);
 			}

@@ -960,7 +960,7 @@ kqring_sqpoll_thread(void *arg)
 			(void)kqring_wq_abort_retired_locked(ctx);
 		if ((!taskrun && atomic_load_acq_32(&shm->sq_tail) !=
 		    shm->sq_head) || !TAILQ_EMPTY(&ctx->taskwork_ops) ||
-		    !STAILQ_EMPTY(&ctx->rcq)) {
+		    !KQRING_STQ_EMPTY_HINT(&ctx->rcq)) {
 			mtx_unlock(&ctx->mtx);
 			continue;
 		}
@@ -982,7 +982,7 @@ kqring_sqpoll_thread(void *arg)
 				if (atomic_load_acq_32(&shm->sq_tail) !=
 				    shm->sq_head ||
 				    !TAILQ_EMPTY(&ctx->taskwork_ops) ||
-				    !STAILQ_EMPTY(&ctx->rcq) || ctx->closing ||
+				    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) || ctx->closing ||
 				    kqring_wq_suspend_pending())
 					break;
 				for (int s = 0; s < 64; s++)
@@ -1004,7 +1004,7 @@ kqring_sqpoll_thread(void *arg)
 			atomic_set_32(&shm->sq_flags, IORING_SQ_NEED_WAKEUP);
 			if (atomic_load_acq_32(&shm->sq_tail) != shm->sq_head ||
 			    !TAILQ_EMPTY(&ctx->taskwork_ops) ||
-			    !STAILQ_EMPTY(&ctx->rcq) || ctx->closing) {
+			    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) || ctx->closing) {
 				atomic_clear_32(&shm->sq_flags,
 				    IORING_SQ_NEED_WAKEUP);
 				mtx_unlock(&ctx->mtx);
@@ -1100,7 +1100,7 @@ kqring_sqpoll_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		}
 		uint32_t cq_count = atomic_load_acq_32(&shm->cq_tail) -
 		    atomic_load_acq_32(&shm->cq_head);
-		if (cq_count >= min_complete || !STAILQ_EMPTY(&ctx->ocq))
+		if (cq_count >= min_complete || !KQRING_STQ_EMPTY_HINT(&ctx->ocq))
 			return (0);
 		if (has_timeout && sbt == 0)
 			return (ETIMEDOUT);
@@ -1108,14 +1108,14 @@ kqring_sqpoll_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		mtx_lock(&ctx->mtx);
 		cq_count = atomic_load_acq_32(&shm->cq_tail) -
 		    atomic_load_acq_32(&shm->cq_head);
-		if (cq_count >= min_complete || !STAILQ_EMPTY(&ctx->ocq)) {
+		if (cq_count >= min_complete || !KQRING_STQ_EMPTY_HINT(&ctx->ocq)) {
 			mtx_unlock(&ctx->mtx);
 			return (0);
 		}
 		if (!TAILQ_EMPTY(&ctx->retired_ops))
 			(void)kqring_wq_abort_retired_locked(ctx);
 		if ((!TAILQ_EMPTY(&ctx->taskwork_ops) ||
-		    !STAILQ_EMPTY(&ctx->rcq) ||
+		    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) ||
 		    atomic_load_acq_32(&shm->sq_tail) !=
 		    atomic_load_acq_32(&shm->sq_head)) && ctx->sleeping)
 			wakeup(&ctx->wakeup_chan);

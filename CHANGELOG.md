@@ -7,10 +7,12 @@
 - `IORING_UNREGISTER_RING_FDS` stopped with `EBADF` at the first empty slot, so unregistering a range left the slots after it registered (and their rings alive until exit). An empty slot now counts as done, as in io_uring. Found by the new fuzzer.
 - **A `READ` of an `O_NONBLOCK` pipe could hang its process for good.** If another reader drained the pipe after kqring saw it ready, the submitting thread spun in `kqring_enter()` until more data came, and the process couldn't exit until then. It now goes to a worker. A worker that lost the data the same way failed the read with `EAGAIN`; it now waits again. Found by the fuzzer.
 - **A `READ_MULTISHOT` of a pipe could stall its ring.** If another reader drained the pipe between kqring seeing data and reading it, the read blocked in whatever ran it: an enter, or the `SQPOLL` thread, which then served no other request, and a process sharing the ring couldn't exit. It now re-arms instead. Found by the fuzzer.
+- **Kernels with `INVARIANTS` panicked** when a ring was set up (`vm_page_valid()` on a page that wasn't busied) and on `FALLOCATE` (`RLIMIT_FSIZE` read without the process lock, which could also see a worker's stale limit), and under `SQPOLL` or `MSG_RING` load (an unlocked emptiness check of the `MSG_RING` queue, which `INVARIANTS` asserts on). The module also builds against such kernels now. kqring's suite, stress test and fuzzer pass on a `GENERIC-DEBUG` kernel (`INVARIANTS`, `WITNESS`) with no lock-order warnings.
 
 ### Testing
 
 - [`tests/kqring_fuzz.c`](tests/kqring_fuzz.c), a fuzzer for the whole interface: random setup parameters, SQEs, enter flags and arguments, and register calls, with descriptors, memory and rings closed under requests in flight. Most rings are also set up properly (registered files and buffers, a buffer ring, a personality) and get mostly well-formed requests and link chains, so the fuzzer gets past argument checks into the code behind them. A regression test for each bug it found is in `kqring_test`.
+- `test_send_armed` no longer fails now and then on slow kernels when its `POLLIN | POLLOUT` poll rightly completes for writability alone.
 
 ### Performance
 

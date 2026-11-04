@@ -142,8 +142,9 @@ kqring_alloc_shm(size_t bytes, vm_object_t *obj_out, vm_offset_t *kva_out,
 
 	VM_OBJECT_WLOCK(obj);
 	for (i = 0; i < npages; i++) {
-		m = vm_page_grab(obj, i, VM_ALLOC_NOBUSY | VM_ALLOC_ZERO |
-		    VM_ALLOC_WIRED | VM_ALLOC_NORMAL);
+		/* Busied: vm_page_valid() asserts it (INVARIANTS kernels). */
+		m = vm_page_grab(obj, i, VM_ALLOC_ZERO | VM_ALLOC_WIRED |
+		    VM_ALLOC_NORMAL);
 		if (m == NULL) {
 			/* Unwire and release pages grabbed so far */
 			for (size_t j = 0; j < i; j++) {
@@ -158,6 +159,7 @@ kqring_alloc_shm(size_t bytes, vm_object_t *obj_out, vm_offset_t *kva_out,
 			return (ENOMEM);
 		}
 		vm_page_valid(m);
+		vm_page_xunbusy(m);
 		pmap_qenter(kva + ptoa(i), &m, 1);
 	}
 	VM_OBJECT_WUNLOCK(obj);
@@ -2429,7 +2431,7 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 		 * IORING_SQ_TASKRUN set for the next enter.
 		 */
 		if (TAILQ_EMPTY(&ctx->taskwork_ops) &&
-		    (STAILQ_EMPTY(&ctx->rcq) ||
+		    (KQRING_STQ_EMPTY_HINT(&ctx->rcq) ||
 		    ctx->nocq >= KQRING_OCQ_BUSY) &&
 		    (ctx->shm == NULL ||
 		    (atomic_load_32(&ctx->shm->sq_flags) &
@@ -2483,7 +2485,7 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 		mtx_unlock(&ctx->mtx);
 		kqring_flush_ready(ctx);
 		if (TAILQ_EMPTY(&ctx->taskwork_ops) &&
-		    (STAILQ_EMPTY(&ctx->rcq) || ctx->nocq >= KQRING_OCQ_BUSY))
+		    (KQRING_STQ_EMPTY_HINT(&ctx->rcq) || ctx->nocq >= KQRING_OCQ_BUSY))
 			break;
 	}
 }

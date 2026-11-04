@@ -1186,19 +1186,38 @@ test_send_armed(struct test_ring *r)
 
 	/*
 	 * POLLIN | POLLOUT on a full socket must wake for either direction
-	 * (both upcalls armed), here for readability.
+	 * (both upcalls armed), here for readability.  The "z" segment also
+	 * ACKs cfd's data, and TCP frees send space (write upcall) before it
+	 * queues the byte, so a one-shot poll can rightly complete with
+	 * POLLOUT alone (often on a slow, INVARIANTS kernel): then go again.
 	 */
-	fill_socket(cfd);
-	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_POLL_ADD, cfd, 6002);
-	sqe->poll32_events = POLLIN | POLLOUT;
-	ring_push_sqe(r);
-	ring_submit(r);
-	assert(ring_cq_ready(r) == 0);
-	assert(ring_wait(r, 1, 20) == ETIMEDOUT);
-	assert(write(sfd, "z", 1) == 1);
-	assert(ring_wait(r, 1, 2000) == 0);
-	struct io_uring_cqe c = ring_pop_cqe(r);
-	assert(c.user_data == 6002 && (c.res & POLLIN) != 0);
+	struct io_uring_cqe c;
+	int tries = 0;
+	for (;;) {
+		assert(++tries <= 20);
+		fill_socket(cfd);
+		drain_socket(cfd);
+		struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_POLL_ADD,
+		    cfd, 6002);
+		sqe->poll32_events = POLLIN | POLLOUT;
+		ring_push_sqe(r);
+		ring_submit(r);
+		if (ring_wait(r, 1, 20) != ETIMEDOUT) {
+			/* Late ACK of the fill: writable already. */
+			c = ring_pop_cqe(r);
+			assert(c.user_data == 6002 && c.res == POLLOUT);
+			continue;
+		}
+		assert(write(sfd, "z", 1) == 1);
+		assert(ring_wait(r, 1, 2000) == 0);
+		c = ring_pop_cqe(r);
+		assert(c.user_data == 6002 && c.res > 0 &&
+		    (c.res & ~(POLLIN | POLLOUT)) == 0);
+		if (c.res & POLLIN)
+			break;
+		fprintf(stderr, "  poll woke with res 0x%x, retrying\n",
+		    (unsigned)c.res);
+	}
 	printf("[PASS] POLL_ADD(POLLIN|POLLOUT) on full TCP socket wakes on "
 	    "POLLIN\n");
 

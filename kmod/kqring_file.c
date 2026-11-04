@@ -1441,9 +1441,16 @@ kqring_exec_fallocate(const struct kqring_op *op)
 	 * RLIMIT_FSIZE, as io_uring's fallocate checks it (from a worker, so
 	 * without the SIGXFSZ write(2) would raise).
 	 */
-	if (!punch && (uint64_t)(off + len) >
-	    (uint64_t)lim_cur_proc(td->td_proc, RLIMIT_FSIZE))
-		return (-EFBIG);
+	if (!punch) {
+		rlim_t fsize;
+
+		/* The process's limit now: a worker's td_limit can be stale. */
+		PROC_LOCK(td->td_proc);
+		fsize = lim_cur_proc(td->td_proc, RLIMIT_FSIZE);
+		PROC_UNLOCK(td->td_proc);
+		if ((uint64_t)(off + len) > (uint64_t)fsize)
+			return (-EFBIG);
+	}
 	error = kqring_op_fget(op, cap_rights_init_one(&rights, CAP_PWRITE),
 	    FWRITE, &fp);
 	if (error != 0)
