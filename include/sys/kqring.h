@@ -995,13 +995,22 @@ struct kqring_trigger {
 	__u8	nsteps;		/* template SQEs linked after the trigger */
 	__u8	source;		/* KQRING_TRIG_SRC_* */
 	__u8	step_flags[8];	/* KQRING_STEP_*, one per template */
-	__u64	resv[2];	/* must be 0 */
+	__u64	kev;		/* SRC_KEVENT: struct kevent *; else 0 */
+	__u64	resv;		/* must be 0 */
 };
 
 #define KQRING_TRIG_MAX_STEPS		8
 #define KQRING_TRIG_MAX_INFLIGHT	64
 
 #define KQRING_TRIG_SRC_POLL		0	/* readiness of sqe->fd */
+/*
+ * A kqueue event, as KQRING_EXT_KEVENT waits for one (the ring must have
+ * KQRING_EXT_F_KEVENT): kev points to the struct kevent; sqe->fd is -1
+ * and poll32_events 0.  Each event runs the templates; the trigger ends
+ * with res 0 after the source's last event (a process's exit, a file
+ * revoked).  CQE_EACH firings carry the kevent request's res.
+ */
+#define KQRING_TRIG_SRC_KEVENT		1
 
 #define KQRING_TRIG_SERIAL		0
 #define KQRING_TRIG_CONCURRENT		(1U << 0)

@@ -10239,6 +10239,188 @@ test_kevent_bad(struct test_ring *plain)
 	    "same ident and filter -EBUSY\n");
 }
 
+/* A SRC_KEVENT trigger SQE watching *k. */
+static struct io_uring_sqe *
+kev_trig_prep(struct test_ring *r, const struct kevent *k, uint64_t ud,
+    struct kqring_trigger *t)
+{
+	struct io_uring_sqe *sqe = trig_prep(r, -1, 0, ud, t);
+
+	t->source = KQRING_TRIG_SRC_KEVENT;
+	t->kev = (uint64_t)(uintptr_t)k;
+	return (sqe);
+}
+
+/* "When this file is written, read it": SERIAL, a READ per change. */
+static void
+test_kevent_trigger_vnode(void)
+{
+	char path[] = "/tmp/kqring_test.XXXXXX";
+	struct kqring_trigger t = { .nsteps = 1 };
+	struct test_ring r;
+	struct kevent k;
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	char buf[64];
+	int fd = mkstemp(path);
+
+	assert(fd >= 0);
+	unlink(path);
+	trig_ring(&r);
+	EV_SET(&k, fd, EVFILT_VNODE, 0, NOTE_WRITE | NOTE_EXTEND, 0, NULL);
+	kev_trig_prep(&r, &k, 1, &t);
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_READ, fd, 2);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->off = 0;
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(ring_wait(&r, 1, 30) == ETIMEDOUT);
+	for (int i = 1; i <= 20; i++) {
+		assert(write(fd, "a", 1) == 1);
+		assert(trig_collect(&r, 1, 2000) >= 1);
+		c = ring_pop_cqe(&r);
+		/* Each change runs one READ of the whole file. */
+		assert(c.user_data == 2 && c.res == i);
+		assert(ring_wait(&r, 1, 5) == ETIMEDOUT);
+	}
+	assert(ring_cq_ready(&r) == 0);
+	trig_cancel(&r, 1);
+	c = trig_final(&r, 1, 2000);
+	assert(c.res == -ECANCELED);
+	close(fd);
+	close(r.fd);
+	printf("[PASS] kevent trigger EVFILT_VNODE: 20 writes, a READ of the "
+	    "file each, then cancelled\n");
+}
+
+/* A process's exit runs the templates once and ends the trigger with 0. */
+static void
+test_kevent_trigger_proc(void)
+{
+	struct kqring_trigger t = { .nsteps = 1 };
+	struct test_ring r;
+	struct kevent k;
+	struct io_uring_cqe c;
+	int go[2], st;
+	pid_t pid;
+
+	trig_ring(&r);
+	assert(pipe(go) == 0);
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		char b;
+
+		close(go[1]);
+		(void)read(go[0], &b, 1);
+		_exit(3);
+	}
+	close(go[0]);
+	EV_SET(&k, pid, EVFILT_PROC, 0, NOTE_EXIT, 0, NULL);
+	kev_trig_prep(&r, &k, 1, &t);
+	ring_push_sqe(&r);
+	ring_prep(&r, IORING_OP_NOP, -1, 2);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(ring_wait(&r, 1, 30) == ETIMEDOUT);
+	close(go[1]);
+	assert(trig_collect(&r, 2, 2000) >= 2);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 2 && c.res == 0);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 1 && c.res == 0 &&
+	    (c.flags & IORING_CQE_F_MORE) == 0);
+	assert(waitpid(pid, &st, 0) == pid && WEXITSTATUS(st) == 3);
+	close(r.fd);
+	printf("[PASS] kevent trigger EVFILT_PROC: the child's exit runs it "
+	    "once, then it ends with 0\n");
+}
+
+/* CONCURRENT on a signal, with a CQE per firing carrying the count. */
+static void
+test_kevent_trigger_signal(void)
+{
+	struct kqring_trigger t = { .nsteps = 1,
+	    .flags = KQRING_TRIG_CONCURRENT | KQRING_TRIG_CQE_EACH,
+	    .max_inflight = 4 };
+	void (*old)(int) = signal(SIGUSR2, SIG_IGN);
+	struct test_ring r;
+	struct kevent k;
+	struct io_uring_cqe c;
+	int32_t delivered = 0;
+	int nops = 0, fires = 0;
+
+	trig_ring(&r);
+	EV_SET(&k, SIGUSR2, EVFILT_SIGNAL, 0, 0, 0, NULL);
+	kev_trig_prep(&r, &k, 1, &t);
+	ring_push_sqe(&r);
+	ring_prep(&r, IORING_OP_NOP, -1, 2);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	for (int i = 0; i < 5; i++) {
+		assert(kill(getpid(), SIGUSR2) == 0);
+		(void)trig_collect(&r, 2, 2000);
+		while (ring_cq_ready(&r) > 0) {
+			c = ring_pop_cqe(&r);
+			if (c.user_data == 1) {
+				assert((c.flags & IORING_CQE_F_MORE) != 0);
+				delivered += c.res;
+				fires++;
+			} else {
+				assert(c.user_data == 2 && c.res == 0);
+				nops++;
+			}
+		}
+	}
+	assert(delivered == 5 && nops == fires && fires >= 1);
+	trig_cancel(&r, 1);
+	c = trig_final(&r, 1, 2000);
+	assert(c.res == -ECANCELED);
+	close(r.fd);
+	signal(SIGUSR2, old);
+	printf("[PASS] kevent trigger EVFILT_SIGNAL, CONCURRENT + CQE_EACH: 5 "
+	    "deliveries in %d firings, a run each\n", fires);
+}
+
+/* What a SRC_KEVENT trigger refuses. */
+static void
+test_kevent_trigger_bad(void)
+{
+	struct test_ring r;
+	struct kevent k;
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+
+	trig_ring(&r);
+	EV_SET(&k, SIGUSR2, EVFILT_SIGNAL, 0, 0, 0, NULL);
+	for (int i = 0; i < 5; i++) {
+		struct kqring_trigger t = { .nsteps = 1 };
+
+		sqe = kev_trig_prep(&r, &k, 10 + i, &t);
+		switch (i) {
+		case 0: sqe->fd = 0; break;			/* fd given */
+		case 1: t.kev = 0; break;			/* no kevent */
+		case 2: sqe->poll32_events = POLLIN; break;
+		case 3: t.source = KQRING_TRIG_SRC_POLL;	/* kev on poll */
+			sqe->fd = 0; break;
+		case 4: t.source = 7; break;			/* unknown */
+		}
+		ring_push_sqe(&r);
+		ring_prep(&r, IORING_OP_NOP, -1, 20);
+		ring_push_sqe(&r);
+		(void)kqring_enter(r.fd, 2, 0, 0, NULL, 0);
+		assert(ring_cq_ready(&r) == 2);
+		c = ring_pop_cqe(&r);
+		assert(c.user_data == 10 + (uint64_t)i && c.res == -EINVAL);
+		c = ring_pop_cqe(&r);
+		assert(c.user_data == 20 && c.res == -ECANCELED);
+	}
+	close(r.fd);
+	printf("[PASS] kevent trigger: bad arguments fail it\n");
+}
+
 static void
 test_kevents(struct test_ring *plain)
 {
@@ -10246,6 +10428,10 @@ test_kevents(struct test_ring *plain)
 	test_kevent_signal();
 	test_kevent_proc_exit();
 	test_kevent_bad(plain);
+	test_kevent_trigger_vnode();
+	test_kevent_trigger_proc();
+	test_kevent_trigger_signal();
+	test_kevent_trigger_bad();
 }
 
 static void

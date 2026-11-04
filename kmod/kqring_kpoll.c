@@ -730,7 +730,9 @@ kqring_kev_prep(struct kqring_op *op)
 	struct kevent *k;
 	int error;
 
-	if (sqe->len != sizeof(*k) || sqe->addr == 0 || sqe->fd != -1 ||
+	/* A trigger's waiter (op->trig_kev) has its kevent in the kernel. */
+	if (sqe->len != sizeof(*k) ||
+	    (sqe->addr == 0) != (op->trig_kev != NULL) || sqe->fd != -1 ||
 	    sqe->off != 0 || sqe->buf_index != 0 || sqe->file_index != 0 ||
 	    (sqe->rw_flags & ~KQRING_KEV_MULTISHOT) != 0 ||
 	    (sqe->flags & (IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT)) != 0)
@@ -738,9 +740,20 @@ kqring_kev_prep(struct kqring_op *op)
 	k = kqring_args_alloc(op, sizeof(*k), &error);
 	if (k == NULL)
 		return (error);
+	if (op->trig_kev != NULL) {
+		*k = *op->trig_kev;
+		return (0);
+	}
 	error = copyin((const void *)(uintptr_t)sqe->addr, k, sizeof(*k));
 	if (error != 0)
 		return (error);
+	return (kqring_kev_check(k));
+}
+
+/* The kevents a KQRING_EXT_KEVENT request (or trigger) may wait for. */
+int
+kqring_kev_check(const struct kevent *k)
+{
 	if (k->flags != 0 || k->data != 0 || k->udata != NULL ||
 	    k->ext[0] != 0 || k->ext[1] != 0 || k->ext[2] != 0 ||
 	    k->ext[3] != 0)
@@ -854,6 +867,11 @@ kqring_kev_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 		res = (int32_t)(fflags & INT32_MAX);
 	extra[0] = (uint64_t)data;
 	extra[1] = fflags;
+	/* A CONCURRENT trigger's waiter: the event fires the trigger. */
+	if (multi && !eof && op->trig_wait != NULL) {
+		kqring_trig_waiter_event(ctx, op, res, true);
+		return;
+	}
 	if (multi && !eof && !kqring_cq_full(ctx)) {
 		ctx->cq_seq++;
 		kqring_post_cqe_extra(ctx, op->sqe.user_data, res,

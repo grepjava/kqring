@@ -321,6 +321,8 @@ struct kqring_op {
 	/* Set for a final CQE that carries big_cqe words (CQE32). */
 	bool			cqe_has_extra;
 	uint64_t		cqe_extra[2];
+	/* A trigger's kevent waiter: its kevent, instead of sqe->addr. */
+	const struct kevent	*trig_kev;
 	bool			listening;	/* armed via solisten_upcall_set */
 	bool			oneshot_sb;	/* one-shot single-dir sockbuf op */
 	bool			so_soref;	/* soref(so) held by op->so */
@@ -1411,6 +1413,7 @@ struct kqring_trig {
 	struct kqring_trigger	args;
 	struct io_uring_sqe	tmpl[KQRING_TRIG_MAX_STEPS];
 	uint8_t			tmpl_extra[KQRING_TRIG_MAX_STEPS][64];
+	struct kevent		kev;		/* SRC_KEVENT: what it waits for */
 	struct kqring_op	*waiter;	/* armed or queued poll */
 	uint16_t		inflight;	/* runs not yet done */
 	bool			pending;	/* CONCURRENT: event not run yet */
@@ -1720,6 +1723,7 @@ void	kqring_kpoll_disarm_locked(struct kqring_ctx *ctx,
 	    struct kqring_op *op);
 void	kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op);
 int	kqring_kev_prep(struct kqring_op *op);
+int	kqring_kev_check(const struct kevent *k);
 void	kqring_kev_issue(struct kqring_ctx *ctx, struct kqring_op *op);
 int	kqring_kpoll_stop(struct kqring_ctx *ctx, bool nowait);
 void	kqring_kpoll_close(struct kqring_ctx *ctx);

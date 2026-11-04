@@ -91,21 +91,36 @@ kqring_trig_prep(struct kqring_op *op)
 	    (sqe->flags & (IOSQE_IO_DRAIN | IOSQE_ASYNC |
 	    IOSQE_CQE_SKIP_SUCCESS)) != 0)
 		return (EINVAL);
-	ta = kqring_args_alloc(op, sizeof(*ta), &error);
+	/* The kevent of a SRC_KEVENT trigger follows it in op->args. */
+	ta = kqring_args_alloc(op, sizeof(*ta) + sizeof(struct kevent),
+	    &error);
 	if (ta == NULL)
 		return (error);
 	error = copyin((const void *)(uintptr_t)sqe->addr, ta, sizeof(*ta));
 	if (error != 0)
 		return (error);
+	if (ta->source == KQRING_TRIG_SRC_KEVENT) {
+		struct kevent *k = (struct kevent *)(ta + 1);
+
+		if (ta->kev == 0 || sqe->fd != -1 || sqe->poll32_events != 0 ||
+		    (sqe->flags & IOSQE_FIXED_FILE) != 0)
+			return (EINVAL);
+		error = copyin((const void *)(uintptr_t)ta->kev, k, sizeof(*k));
+		if (error != 0)
+			return (error);
+		error = kqring_kev_check(k);
+		if (error != 0)
+			return (error);
+	} else if (ta->source != KQRING_TRIG_SRC_POLL || ta->kev != 0)
+		return (EINVAL);
 	concurrent = (ta->flags & KQRING_TRIG_CONCURRENT) != 0;
 	if ((ta->flags & ~(KQRING_TRIG_CONCURRENT | KQRING_TRIG_CQE_EACH |
 	    KQRING_TRIG_STOP_ON_ERROR)) != 0 ||
-	    ta->source != KQRING_TRIG_SRC_POLL ||
 	    ta->nsteps == 0 || ta->nsteps > KQRING_TRIG_MAX_STEPS ||
 	    (concurrent ? ta->max_inflight == 0 ||
 	    ta->max_inflight > KQRING_TRIG_MAX_INFLIGHT :
 	    ta->max_inflight != 0) ||
-	    ta->resv[0] != 0 || ta->resv[1] != 0)
+	    ta->resv != 0)
 		return (EINVAL);
 	/* Only steps with a step before them take step flags. */
 	for (int i = 0; i < KQRING_TRIG_MAX_STEPS; i++) {
@@ -154,6 +169,8 @@ kqring_trig_arm(struct kqring_trig *trig)
 	}
 	w = kqring_op_alloc(ctx);
 	w->sqe = trig->wsqe;
+	if (trig->args.source == KQRING_TRIG_SRC_KEVENT)
+		w->trig_kev = &trig->kev;
 	if ((trig->args.flags & KQRING_TRIG_CONCURRENT) == 0 &&
 	    trig->runs != 0 && trig->runs % KQRING_TRIG_BURST == 0)
 		w->sqe.flags |= IOSQE_ASYNC;
@@ -215,15 +232,20 @@ kqring_trig_run(struct kqring_trig *trig)
 	kqring_chain_queue(ctx, head);
 }
 
-/* The waiter saw the event (revents in res). */
+/*
+ * The waiter saw the event: revents in res, or for a SRC_KEVENT trigger
+ * the kevent request's res, and last if the source has gone (its last
+ * event).
+ */
 static void
-kqring_trig_fire(struct kqring_trig *trig, int32_t res)
+kqring_trig_fire(struct kqring_trig *trig, int32_t res, bool last)
 {
 	struct kqring_ctx *ctx = trig->ctx;
+	bool kev = trig->args.source == KQRING_TRIG_SRC_KEVENT;
 
 	if (trig->ending)
 		return;
-	if ((res & POLLNVAL) != 0) {
+	if (!kev && (res & POLLNVAL) != 0) {
 		kqring_trig_end(trig, -EBADF);
 		return;
 	}
@@ -240,7 +262,7 @@ kqring_trig_fire(struct kqring_trig *trig, int32_t res)
 	else
 		kqring_trig_run(trig);
 	/* A hangup, end of input or error is the last event: run it, end. */
-	if ((res & (POLLHUP | POLLRDHUP | POLLERR)) != 0)
+	if (kev ? last : (res & (POLLHUP | POLLRDHUP | POLLERR)) != 0)
 		kqring_trig_end(trig, 0);
 	else if ((trig->args.flags & KQRING_TRIG_CONCURRENT) == 0)
 		trig->want_arm = true;
@@ -259,9 +281,12 @@ kqring_trig_waiter_event(struct kqring_ctx *ctx, struct kqring_op *op,
 
 	KASSERT(trig != NULL && trig->waiter == op,
 	    ("kqring: event of a stale trigger poll"));
+	/* A kevent waiter's source went away with this event. */
+	bool last = op->kp_kev && op->kp_keof;
+
 	if (more) {
 		if (!ctx->closing)
-			kqring_trig_fire(trig, res);
+			kqring_trig_fire(trig, res, false);
 		return;
 	}
 	op->trig_wait = NULL;
@@ -269,11 +294,12 @@ kqring_trig_waiter_event(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (!ctx->closing) {
 		if (res < 0)
 			kqring_trig_end(trig, res);
-		else if ((trig->args.flags & KQRING_TRIG_CONCURRENT) != 0)
+		else if ((trig->args.flags & KQRING_TRIG_CONCURRENT) != 0 &&
+		    !last)
 			/* The multishot poll ended: the CQ was full. */
 			kqring_trig_end(trig, -EOVERFLOW);
 		else
-			kqring_trig_fire(trig, res);
+			kqring_trig_fire(trig, res, last);
 		kqring_trig_queue_work(trig);
 	}
 	kqring_trig_rele(trig);
@@ -481,20 +507,32 @@ kqring_trig_issue(struct kqring_ctx *ctx, struct kqring_op *op)
 	trig->ctx = ctx;
 	trig->user_data = op->sqe.user_data;
 	trig->args = *ta;
-	trig->wsqe.opcode = IORING_OP_POLL_ADD;
-	trig->wsqe.flags = op->sqe.flags & IOSQE_FIXED_FILE;
-	trig->wsqe.fd = op->sqe.fd;
 	trig->wsqe.personality = op->sqe.personality;
 	trig->wsqe.user_data = op->sqe.user_data;
-	trig->wsqe.poll32_events = op->sqe.poll32_events;
-	/*
-	 * Input that has ended (the peer shut down writing) stays readable
-	 * for ever: watch for it, so that it ends the trigger.
-	 */
-	if ((op->sqe.poll32_events & (POLLIN | POLLRDNORM)) != 0)
-		trig->wsqe.poll32_events |= POLLRDHUP;
-	if ((ta->flags & KQRING_TRIG_CONCURRENT) != 0)
-		trig->wsqe.len = IORING_POLL_ADD_MULTI;
+	if (ta->source == KQRING_TRIG_SRC_KEVENT) {
+		/* Waits as a KQRING_EXT_KEVENT request (w->trig_kev). */
+		trig->kev = *(const struct kevent *)(ta + 1);
+		trig->wsqe.opcode = ctx->ext_opcode;
+		trig->wsqe.ioprio = KQRING_EXT_KEVENT;
+		trig->wsqe.fd = -1;
+		trig->wsqe.len = sizeof(struct kevent);
+		if ((ta->flags & KQRING_TRIG_CONCURRENT) != 0)
+			trig->wsqe.rw_flags = KQRING_KEV_MULTISHOT;
+	} else {
+		trig->wsqe.opcode = IORING_OP_POLL_ADD;
+		trig->wsqe.flags = op->sqe.flags & IOSQE_FIXED_FILE;
+		trig->wsqe.fd = op->sqe.fd;
+		trig->wsqe.poll32_events = op->sqe.poll32_events;
+		/*
+		 * Input that has ended (the peer shut down writing) stays
+		 * readable for ever: watch for it, so that it ends the
+		 * trigger.
+		 */
+		if ((op->sqe.poll32_events & (POLLIN | POLLRDNORM)) != 0)
+			trig->wsqe.poll32_events |= POLLRDHUP;
+		if ((ta->flags & KQRING_TRIG_CONCURRENT) != 0)
+			trig->wsqe.len = IORING_POLL_ADD_MULTI;
+	}
 	n = 0;
 	for (t = tmpl; t != NULL; t = t->link, n++) {
 		trig->tmpl[n] = t->sqe;
@@ -535,6 +573,9 @@ kqring_trig_cancel(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe,
 			if ((cflags & IORING_ASYNC_CANCEL_OP) != 0)
 				continue;
 			if ((cflags & IORING_ASYNC_CANCEL_FD) != 0) {
+				/* A SRC_KEVENT trigger has no descriptor. */
+				if (trig->wsqe.fd < 0)
+					continue;
 				if (cfp != NULL ? !fixed ||
 				    (uint32_t)trig->wsqe.fd >= ctx->nfiles ||
 				    ctx->files[trig->wsqe.fd] == NULL ||

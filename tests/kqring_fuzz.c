@@ -661,6 +661,8 @@ static void	sanitize(struct fz *f, struct io_uring_sqe *s);
  * A trigger SQE (KQRING_EXT_TRIGGER) in s, whose `k` templates are the
  * next SQEs; its struct in the arena, mostly well formed.
  */
+static void gen_kevent(struct fz *f, struct kevent *k);
+
 static void
 sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
 {
@@ -690,6 +692,15 @@ sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
 		t->step_flags[rn(f, 8)] = (uint8_t)rnd(f);
 	if (chance(f, 2))
 		t->source = (uint8_t)rnd(f);
+	/* Sometimes a kqueue event instead of readiness. */
+	if (chance(f, 25)) {
+		struct kevent *kv = (void *)(f->arena +
+		    rn(f, REGBUF_OFF / 64) * 64);
+
+		gen_kevent(f, kv);
+		t->source = KQRING_TRIG_SRC_KEVENT;
+		t->kev = (uint64_t)(uintptr_t)kv;
+	}
 
 	memset(s, 0, f->sqe_size);
 	s->opcode = f->ext_op;
@@ -700,6 +711,11 @@ sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
 	s->addr = chance(f, 97) ? (uint64_t)(uintptr_t)t : gen_ptr(f);
 	s->len = chance(f, 97) ? sizeof(*t) : gen_len(f);
 	s->flags |= chance(f, 90) ? IOSQE_IO_LINK : IOSQE_IO_HARDLINK;
+	if (t->source == KQRING_TRIG_SRC_KEVENT && chance(f, 95)) {
+		s->fd = -1;
+		s->poll32_events = 0;
+		s->flags &= ~IOSQE_FIXED_FILE;
+	}
 	s->user_data = f->ud;
 	sanitize(f, s);
 	atomic_fetch_add(&st_trig, 1);
@@ -715,9 +731,8 @@ sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
  * pid (the fuzzer forks, so NOTE_FORK on itself fires).  Mostly valid.
  */
 static void
-sqe_kevent(struct fz *f, struct io_uring_sqe *s)
+gen_kevent(struct fz *f, struct kevent *k)
 {
-	struct kevent *k = (void *)(f->arena + rn(f, REGBUF_OFF / 64) * 64);
 	static const int sigs[] = { SIGURG, SIGWINCH, SIGINFO, SIGCHLD };
 
 	memset(k, 0, sizeof(*k));
@@ -743,7 +758,14 @@ sqe_kevent(struct fz *f, struct io_uring_sqe *s)
 		k->flags = (unsigned short)rnd(f);
 	if (chance(f, 3))
 		k->fflags = (unsigned)rnd(f);
+}
 
+static void
+sqe_kevent(struct fz *f, struct io_uring_sqe *s)
+{
+	struct kevent *k = (void *)(f->arena + rn(f, REGBUF_OFF / 64) * 64);
+
+	gen_kevent(f, k);
 	memset(s, 0, f->sqe_size);
 	s->opcode = f->ext_op;
 	s->ioprio = KQRING_EXT_KEVENT;

@@ -1,6 +1,6 @@
 # Spec: event-driven chains
 
-**Status:** phase 1 implemented (`kmod/kqring_trig.c`, tests in `kqring_test trig`). Of phase 2, `LEN_FROM_PREV` and `STOP_ON_ZERO` are implemented, with the echo benchmark; `BUF_FROM_PREV` is not yet. Phase 3 not yet.
+**Status:** phase 1 implemented (`kmod/kqring_trig.c`, tests in `kqring_test trig`). Of phase 2, `LEN_FROM_PREV` and `STOP_ON_ZERO` are implemented, with the echo benchmark; `BUF_FROM_PREV` is not yet. Phase 3, kevent sources (`KQRING_TRIG_SRC_KEVENT`), is implemented.
 
 In io_uring, linked requests run once: the next request in a chain starts when the one before it completes. An *event-driven chain* runs its linked requests each time an event fires. "Whenever this socket is readable, receive into a provided buffer and write what arrived to this file" becomes one submission. After that, the kernel runs the chain on every event with no round trip to user space, until the program cancels it.
 
@@ -30,7 +30,7 @@ sqe->user_data = 3;                         /* buffer and length from template 1
 io_uring_submit(ring);
 ```
 
-- The trigger arms an event source. Phase 1 supports readiness of a descriptor, as `POLL_ADD` does: sockets through upcalls, and other files through the ring's knotes. Phase 2 adds every kqueue filter, once a kevent extension exists (process exit, file changes, signals, user events, timers).
+- The trigger arms an event source: readiness of a descriptor, as `POLL_ADD` does (`KQRING_TRIG_SRC_POLL`: sockets through upcalls, other files through the ring's knotes), or a kqueue event, as a `KQRING_EXT_KEVENT` request waits for one (`KQRING_TRIG_SRC_KEVENT`: a file or directory changing, a signal, a process's exit, fork or exec).
 - The template SQEs are **not issued at submission**. kqring validates them as it would any SQE and keeps a copy. A bad template, or a trigger that refuses its templates (a nested trigger, a multishot or `IOSQE_IO_DRAIN` template, a `LINK_TIMEOUT` first, `nsteps` not matching), fails the trigger with its own error, and the templates complete with `-ECANCELED`.
 - Each run validates the templates again, as a new submission would, so a fixed file or buffer unregistered in the meantime fails that run's requests.
 - Each time the event fires, kqring builds a fresh chain from the templates and issues it as if the program had just submitted it. Every request posts its CQE as usual, with the template's `user_data`, so existing CQE handling works. `IOSQE_CQE_SKIP_SUCCESS` on a template hides successes and leaves only errors visible.
@@ -65,6 +65,7 @@ Together these make an in-kernel copy loop. An echo server is a `SERIAL` trigger
 - **The last event.** A hang-up (`POLLHUP`), an error (`POLLERR`) or, for a trigger watching `POLLIN`, end of input (`POLLRDHUP`: the peer shut down writing) runs one last time, then ends the trigger with `res = 0`. Without this, input that has ended would stay readable and fire for ever. A descriptor closed under the trigger (`POLLNVAL`) ends it with `-EBADF`, without a run.
 - A chain run that fails ends the trigger when `KQRING_TRIG_STOP_ON_ERROR` is set. The final CQE then carries the error. The failed request has already posted its own CQE under its own `user_data`, which tells the program which template it was. By default, failures only show in that request's own CQE and the trigger keeps going.
 - `STOP_ON_ZERO` ends it with `res = 0` after the run that read end of file.
+- **A kevent source's last event** (a process's exit, a file revoked) runs one last time, then ends the trigger with `res = 0`.
 - Closing the ring ends it with no CQE.
 - The CQ being full when the event fires ends it with `-EOVERFLOW`, as a multishot request ends. An event that a run doesn't consume (the templates don't read what made the descriptor ready) fires again at once, so it fills the CQ quickly.
 - Running out of request slots (`KQRING_MAX_REQS`) ends it with `-EBUSY`.
@@ -112,7 +113,8 @@ struct kqring_trigger {
 	__u8	nsteps;		/* number of template SQEs that follow, 1..8 */
 	__u8	source;		/* KQRING_TRIG_SRC_POLL (phase 1), _KEVENT (phase 2) */
 	__u8	step_flags[8];	/* KQRING_STEP_* per template */
-	__u64	resv[2];	/* must be 0 */
+	__u64	kev;		/* SRC_KEVENT: struct kevent *; else 0 */
+	__u64	resv;		/* must be 0 */
 };
 
 #define KQRING_TRIG_SERIAL		0
@@ -156,7 +158,7 @@ A liburing-style helper, `kqring_queue_init_ext()`, hides the opt-in.
 
 1. **Opt-in and escape opcode; readiness triggers, `SERIAL` and `CONCURRENT` modes, `CQE_EACH`, `STOP_ON_ERROR`, cancellation.** Tests in `kqring_test`: the escape opcode rejected without opt-in, echo server loop, EOF, cancel while running, fd closed, CQ overflow, bad templates, unregister of a fixed file used by a template. Fuzzer: opted-in rings with random trigger setups and templates.
 2. **Step flags.** Done: `LEN_FROM_PREV` and `STOP_ON_ZERO` (tests: a `RECV` → `SEND` echo with no CQE per message, an event-driven file copy that stops at end of file, and bad step flags). Not yet: `BUF_FROM_PREV`.
-3. **Kevent triggers**, once the kevent extension lands: process exit, file change and signal as trigger sources.
+3. **Kevent triggers.** Done: `source = KQRING_TRIG_SRC_KEVENT` with `kev` pointing to a `struct kevent`, as a `KQRING_EXT_KEVENT` request takes it (`sqe->fd` -1, `poll32_events` 0). A `SERIAL` trigger waits with a one-shot kevent request, a `CONCURRENT` one with a multishot one. `CQE_EACH` firings carry the kevent request's `res` (the `NOTE_*` that fired, or a signal's count). Tests: "when this file is written, read it" (20 writes, a `READ` each), a child's exit running a request once and ending the trigger, a signal-driven `CONCURRENT` trigger with `CQE_EACH`, and bad arguments.
 
 **Benchmark** (`kqring_bench echo`): a server thread echoes each message to a client that sends one and waits for it. Three servers are compared: kqueue (`kevent(2)`, `read(2)`, `write(2)`), io_uring style (each `RECV` CQE makes user space submit the `SEND` and the next `RECV`), and a trigger (`RECV` → `SEND` with `LEN_FROM_PREV`, no CQE or system call per message). It reports the round trip and the server thread's CPU time per message.
 
@@ -182,7 +184,7 @@ Event-driven chains are the first of three extensions, all behind the same opt-i
    - Rules: `sqe->fd` is -1 and the ident is in the kevent; `VNODE` needs a descriptor, not a fixed file; a ring can have one request per ident and filter (`-EBUSY` for a second, as a kqueue holds one knote per pair); only a thread of the ring's owner process can issue one (`-EOPNOTSUPP`), because the kqueue and descriptors are that process's.
    - **Not yet:** `EVFILT_READ` / `EVFILT_WRITE` for the byte count. A socket's read knote on the ring's kqueue is already taken by kqring's end-of-input watch (FreeBSD PR 300494), and a non-socket file's by `POLL_ADD`, so these need the two to share a knote first.
    - Left out because kqring already covers them: `EVFILT_TIMER` (multishot `TIMEOUT`), `EVFILT_USER` (`MSG_RING`), `EVFILT_AIO` (the ring does the I/O).
-   Still to do here: phase 3 of event-driven chains, kevent sources as triggers ("when this file changes, read it").
+   Kevent sources also drive triggers (phase 3 above): "when this file changes, read it".
 3. **kqueue bridge** (`KQRING_EXT_KQUEUE`): attach an existing kqueue to a ring, and its events, registered by any code such as libevent or libuv, arrive as CQEs with their `udata`. This is a migration aid, so programs can move to kqring one part at a time. A `POLL_ADD` on a kqueue fd only says that the kqueue has events.
 
 ## Open questions
