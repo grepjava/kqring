@@ -283,6 +283,18 @@ Polling the CQ, `SQPOLL` one at a time is 18% faster than plain kqring (p50 4.2 
 
 Both are dominated by timer-interrupt scheduling, not by the API.
 
+### Echo server: a kqring extension against kqueue and io_uring style
+
+`kqring_bench echo`. A server thread echoes each message to a client in another thread that sends one and waits for it. Each cell is round trip / server CPU per message, in ns, the median of 3 runs.
+
+| Server | AF_UNIX 64 B | AF_UNIX 4 KiB | TCP 64 B |
+|---|---:|---:|---:|
+| kqueue: `kevent` + `read` + `write` | 5,697 / 3,091 | 6,890 / 3,632 | 11,957 / 4,346 |
+| kqring io_uring style: each `RECV` CQE → submit `SEND` + next `RECV` | 6,060 / 3,019 | 7,169 / 3,553 | 12,361 / 4,373 |
+| kqring trigger: `RECV` → `SEND`, `LEN_FROM_PREV`, no CQE per message | **5,462 / 2,621** | **6,621 / 3,168** | **11,902 / 4,006** |
+
+Against kqueue, the trigger (an [event-driven chain](docs/event-chains-spec.md), opted into per ring) takes 15%, 13% and 8% less server CPU per message, and its round trip is 4%, 4% and 0.5% shorter. The server never returns to user space between messages. One message at a time, most of each round trip is the cross-thread wakeup, which none of the servers can avoid.
+
 ### Multi-threaded scaling: one ring per thread
 
 [`tests/kqring_mt_bench.c`](tests/kqring_mt_bench.c) runs each workload on 1, 2, 4 and 8 threads, each pinned to its own CPU (CPUs 2n and 2n+1 are the two hyperthreads of one core) with its own ring, kqueue, socket pair or file offset. That's the thread-per-core model `SINGLE_ISSUER` rings are made for. Figures are millions of operations per second for all threads together, the median of 5 runs of 2 s each, with the module reloaded before each run.

@@ -981,6 +981,18 @@ struct kqring_trigger {
 #define KQRING_TRIG_CQE_EACH		(1U << 1)
 #define KQRING_TRIG_STOP_ON_ERROR	(1U << 2)
 
+/*
+ * Step flags (step_flags[i], for template i >= 1): how a step uses the
+ * result of the one before it.  LEN_FROM_PREV sets the step's len to the
+ * previous res (bytes moved), never above the template's len (0 if the
+ * previous request failed); for READ, WRITE, READ_FIXED, WRITE_FIXED,
+ * SEND, SEND_ZC, RECV, SPLICE and TEE.  STOP_ON_ZERO: if the previous
+ * res was 0 (end of file), the rest of the run is skipped without CQEs
+ * and the trigger ends with res 0.  Bit 1 is reserved for BUF_FROM_PREV.
+ */
+#define KQRING_STEP_LEN_FROM_PREV	(1U << 0)
+#define KQRING_STEP_STOP_ON_ZERO	(1U << 2)
+
 #ifndef _KERNEL
 #include <errno.h>
 #include <fcntl.h>

@@ -393,6 +393,7 @@ struct kqring_op {
 	 */
 	struct kqring_trig	*trig_wait;
 	struct kqring_trun	*trun;
+	uint8_t			tstep;		/* trun: KQRING_STEP_* */
 	bool			multishot;	/* prep: a multishot request */
 	/*
 	 * Not cleared when the op is reused (kqring_op_alloc()): the
@@ -1404,6 +1405,7 @@ struct kqring_trun {
 	struct kqring_trig	*trig;
 	u_int			refs;		/* its requests not yet freed */
 	bool			failed;
+	bool			stopped;	/* STOP_ON_ZERO */
 	int32_t			err;
 };
 
@@ -1413,6 +1415,8 @@ void	kqring_trig_waiter_event(struct kqring_ctx *ctx, struct kqring_op *op,
 	    int32_t res, bool more);
 void	kqring_trun_put(struct kqring_trun *tr);
 void	kqring_trun_failed(struct kqring_trun *tr, int32_t res);
+bool	kqring_trun_step(struct kqring_op *op, struct kqring_op *next,
+	    int32_t res);
 void	kqring_trig_work(struct kqring_ctx *ctx);
 int32_t	kqring_trig_cancel(struct kqring_ctx *ctx,
 	    const struct io_uring_sqe *sqe, const struct file *cfp, bool all);

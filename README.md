@@ -185,7 +185,10 @@ Except for multi-threaded scaling (12.5 M single-`NOP` enters/s on 8 threads vs 
 
 kqring adds operations io_uring doesn't have. A ring is plain io_uring until the program opts in with the `KQRING_IOC_EXT_SETUP` ioctl on the ring descriptor. The ring then has one *escape opcode* (default `0xFF`, which the program can change), and `sqe->ioprio` picks the extension. None of this uses an io_uring opcode, flag or field, so programs written for Linux behave exactly as on Linux, and kqring can follow every future io_uring opcode at its Linux number.
 
-- **Event-driven chains** (`KQRING_EXT_TRIGGER`): a trigger request watches a descriptor's readiness and runs the up to 8 requests linked after it as a fresh chain each time the descriptor becomes ready, with no system call per event. "Whenever this socket is readable, receive and then send a reply" is one submission. `SERIAL` triggers run one chain at a time and re-arm when it's done; `CONCURRENT` ones start a chain per event, up to a limit. A trigger ends when cancelled, when its descriptor hangs up, or on a failed run if asked. See [docs/event-chains-spec.md](docs/event-chains-spec.md) for the interface and the plan: passing one request's result to the next, then kevent sources (file changes, signals, process events) and attaching an existing kqueue.
+- **Event-driven chains** (`KQRING_EXT_TRIGGER`): a trigger request watches a descriptor's readiness and runs the up to 8 requests linked after it as a fresh chain each time the descriptor becomes ready, with no system call per event. "Whenever this socket is readable, receive and then send a reply" is one submission. `SERIAL` triggers run one chain at a time and re-arm when it's done; `CONCURRENT` ones start a chain per event, up to a limit. A trigger ends when cancelled, when its descriptor hangs up, or on a failed run if asked.
+- **Step flags** pass one request's result to the next within a run: `KQRING_STEP_LEN_FROM_PREV` sets a step's length to the bytes the step before it moved, and `KQRING_STEP_STOP_ON_ZERO` ends the trigger when the step before it reads end of file. A `RECV` → `SEND` pair with both makes an echo server that posts no CQE and needs no system call per message; a `READ` → `WRITE` pair copies a file.
+
+See [docs/event-chains-spec.md](docs/event-chains-spec.md) for the interface, the echo benchmark and the plan: passing a provided buffer to the next step, then kevent sources (file changes, signals, process events) and attaching an existing kqueue.
 
 ---
 
@@ -237,6 +240,7 @@ kqring adds operations io_uring doesn't have. A ring is plain io_uring until the
 - **Eventfd** is signalled once per enter that posted CQEs, and when work is queued for an idle ring. A multishot `POLL_ADD` on the ring's own registered eventfd ends after its first CQE; Linux ends it only when the wakeup came from the ring's own signal.
 
 **Polling**
+- **An AF_UNIX stream peer's `shutdown(SHUT_WR)` isn't seen.** FreeBSD 15 wakes `poll(2)` and kqueue when the peer of an AF_UNIX stream socket shuts down writing, but runs no socket upcall, which is what kqring waits on. A `RECV`, `POLL_ADD` or trigger armed on that socket then doesn't complete until something else happens on it. A peer that closes is seen at once, as is anything on TCP. A workaround in kqring is planned.
 - **Poll wakeups with no enter waiting are seen by a kernel thread.** A `POLL_ADD` on another of the process's rings (or its eventfd) gets its CQE before the waking enter returns, as on Linux; on a `DEFER_TASKRUN` ring, at the owner's next enter. Any other wakeup of a non-socket file, such as a `write(2)` to a polled pipe from another process, wakes an enter waiting on the ring directly, which collects it; with no enter waiting, the ring's poller thread reports it a moment later, where Linux posts it before the waker's system call returns. Each wakeup gets its CQE, even if the file is drained again before it is collected.
 
 **Module**

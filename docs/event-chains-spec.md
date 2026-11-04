@@ -1,6 +1,6 @@
 # Spec: event-driven chains
 
-**Status:** phase 1 implemented (`kmod/kqring_trig.c`, tests in `kqring_test trig`); phases 2 and 3 not yet.
+**Status:** phase 1 implemented (`kmod/kqring_trig.c`, tests in `kqring_test trig`). Of phase 2, `LEN_FROM_PREV` and `STOP_ON_ZERO` are implemented, with the echo benchmark; `BUF_FROM_PREV` is not yet. Phase 3 not yet.
 
 In io_uring, linked requests run once: the next request in a chain starts when the one before it completes. An *event-driven chain* runs its linked requests each time an event fires. "Whenever this socket is readable, receive into a provided buffer and write what arrived to this file" becomes one submission. After that, the kernel runs the chain on every event with no round trip to user space, until the program cancels it.
 
@@ -49,17 +49,22 @@ The trigger's argument struct gives each template step flags that take an input 
 
 | Step flag | Effect on this template's copy |
 |---|---|
-| `KQRING_STEP_LEN_FROM_PREV` | `len` = the previous request's `res` (bytes moved). |
-| `KQRING_STEP_BUF_FROM_PREV` | Use the provided buffer the previous request selected (its `IORING_CQE_F_BUFFER` id), and give it back to the buffer ring when this request completes. The previous request's CQE then doesn't hand the buffer to user space. |
-| `KQRING_STEP_STOP_ON_ZERO` | If the previous `res` was 0 (EOF), skip the rest of this run, end the trigger and report `res = 0` in its final CQE. |
+| `KQRING_STEP_LEN_FROM_PREV` | `len` = the previous request's `res` (bytes moved), never more than the template's own `len`, and 0 if the previous request failed (reached through `IOSQE_IO_HARDLINK`). For `READ`, `WRITE`, `READ_FIXED`, `WRITE_FIXED`, `SEND`, `SEND_ZC`, `RECV`, `SPLICE` and `TEE`; on any other opcode it fails the trigger with `-EINVAL`. Because `len` only shrinks, every check made of it when the template was prepared still holds. |
+| `KQRING_STEP_STOP_ON_ZERO` | If the previous `res` was 0 (end of file), the rest of this run is skipped without CQEs, and the trigger ends with `res = 0` in its final CQE once the run is done. |
+| `KQRING_STEP_BUF_FROM_PREV` (bit 1, reserved, not implemented yet) | Use the provided buffer the previous request selected, and give it back when this request completes, so the previous CQE doesn't hand it to user space. |
 
-Together these make an in-kernel copy loop (receive → send, receive → write to a file) that holds no buffer between runs. Nothing in io_uring can express this, because its links cannot pass a value from one request to the next.
+Step flags go on the step that takes the result, so `step_flags[0]` must be 0, as must the flags of steps past `nsteps`. A `LINK_TIMEOUT` template takes none.
+
+Together these make an in-kernel copy loop. An echo server is a `SERIAL` trigger on `POLLIN` with two templates: `RECV` into a buffer, then `SEND` of that buffer with `LEN_FROM_PREV | STOP_ON_ZERO`, both with `IOSQE_CQE_SKIP_SUCCESS`. Use `MSG_WAITALL` on the `SEND`, so a slow peer doesn't cut a message short. The ring then posts nothing per message, and user space does nothing at all until the trigger ends. A `READ` → `WRITE` pair with `off = -1` copies a file in the same way. Nothing in io_uring can express this, because its links cannot pass a value from one request to the next.
+
+**Why `BUF_FROM_PREV` waits.** Giving a buffer back to a buffer ring from the kernel would mean writing the ring's tail, which belongs to user space. It needs a small kernel-side store of returned buffers, which selection would take from before the ring, and the selected address carried from each receive path to the request that uses it. Until then, use a `SERIAL` trigger per connection with its own buffer, as above. The runs of a `CONCURRENT` trigger all use the templates' addresses, so they would share one buffer.
 
 ### Ending a trigger
 
 - `ASYNC_CANCEL` on the trigger's `user_data` (or with `IORING_ASYNC_CANCEL_FD` on its fd, or `CANCEL_ANY`) ends it. Chains already running finish first; the final CQE, `-ECANCELED`, comes after their CQEs. (`IORING_ASYNC_CANCEL_OP` never matches a trigger, and `POLL_REMOVE` doesn't touch its poll.) Cancelling the runs themselves too (`KQRING_TRIG_CANCEL_RUNNING`) is left for later.
 - **The last event.** A hang-up (`POLLHUP`), an error (`POLLERR`) or, for a trigger watching `POLLIN`, end of input (`POLLRDHUP`: the peer shut down writing) runs one last time, then ends the trigger with `res = 0`. Without this, input that has ended would stay readable and fire for ever. A descriptor closed under the trigger (`POLLNVAL`) ends it with `-EBADF`, without a run.
 - A chain run that fails ends the trigger when `KQRING_TRIG_STOP_ON_ERROR` is set. The final CQE then carries the error. The failed request has already posted its own CQE under its own `user_data`, which tells the program which template it was. By default, failures only show in that request's own CQE and the trigger keeps going.
+- `STOP_ON_ZERO` ends it with `res = 0` after the run that read end of file.
 - Closing the ring ends it with no CQE.
 - The CQ being full when the event fires ends it with `-EOVERFLOW`, as a multishot request ends. An event that a run doesn't consume (the templates don't read what made the descriptor ready) fires again at once, so it fills the CQ quickly.
 - Running out of request slots (`KQRING_MAX_REQS`) ends it with `-EBUSY`.
@@ -69,6 +74,7 @@ Together these make an in-kernel copy loop (receive → send, receive → write 
 - At most 1,024 triggers per ring (`-EBUSY` past that).
 - A `SERIAL` trigger whose event is still pending re-arms at once, but after 16 firings in a row its re-arm goes through taskwork. So the work one enter does is bounded even if the event never stops.
 - Rings with restrictions (`IORING_REGISTER_RESTRICTIONS`) refuse the escape opcode with `-EACCES`, and `IORING_SETUP_IOPOLL` rings with `-EINVAL`.
+- **AF_UNIX stream sockets on FreeBSD 15:** when the peer calls `shutdown(SHUT_WR)`, the kernel wakes `poll(2)` and kqueue but runs no socket upcall. So a trigger, like any armed kqring `RECV` or `POLL_ADD` on that socket, doesn't see end of input until more happens on the socket. A peer that closes is seen at once, and TCP isn't affected.
 - Don't combine triggers with `IOSQE_IO_DRAIN`. A trigger's poll stays in flight, as an armed multishot request does, so a drained chain submitted later waits for it, and runs queued behind that chain wait too.
 
 ## ABI
@@ -149,10 +155,20 @@ A liburing-style helper, `kqring_queue_init_ext()`, hides the opt-in.
 ## Phases
 
 1. **Opt-in and escape opcode; readiness triggers, `SERIAL` and `CONCURRENT` modes, `CQE_EACH`, `STOP_ON_ERROR`, cancellation.** Tests in `kqring_test`: the escape opcode rejected without opt-in, echo server loop, EOF, cancel while running, fd closed, CQ overflow, bad templates, unregister of a fixed file used by a template. Fuzzer: opted-in rings with random trigger setups and templates.
-2. **Step flags** (`LEN_FROM_PREV`, `BUF_FROM_PREV`, `STOP_ON_ZERO`): recv → send echo and recv → file copy with no user-space work per message.
+2. **Step flags.** Done: `LEN_FROM_PREV` and `STOP_ON_ZERO` (tests: a `RECV` → `SEND` echo with no CQE per message, an event-driven file copy that stops at end of file, and bad step flags). Not yet: `BUF_FROM_PREV`.
 3. **Kevent triggers**, once the kevent extension lands: process exit, file change and signal as trigger sources.
 
-**Benchmark** (in `tests/kqring_bench.c`): a TCP echo server three ways, with 64 B and 4 KiB messages. The comparison is a trigger-driven chain (zero system calls per message on the server) against multishot `RECV` plus a `SEND` from user space, and against kqueue. Server CPU per message and p50/p99 round-trip latency are measured.
+**Benchmark** (`kqring_bench echo`): a server thread echoes each message to a client that sends one and waits for it. Three servers are compared: kqueue (`kevent(2)`, `read(2)`, `write(2)`), io_uring style (each `RECV` CQE makes user space submit the `SEND` and the next `RECV`), and a trigger (`RECV` → `SEND` with `LEN_FROM_PREV`, no CQE or system call per message). It reports the round trip and the server thread's CPU time per message.
+
+Medians of 3 runs on an Intel Core i5-8250U, FreeBSD 15.1 `GENERIC` (round trip / server CPU, in µs):
+
+| Messages | kqueue | io_uring style | Trigger |
+|---|---|---|---|
+| AF_UNIX, 64 B | 5.70 / 3.09 | 6.06 / 3.02 | 5.46 / 2.62 |
+| AF_UNIX, 4 KiB | 6.89 / 3.63 | 7.17 / 3.55 | 6.62 / 3.17 |
+| TCP, 64 B | 11.96 / 4.35 | 12.36 / 4.37 | 11.90 / 4.01 |
+
+The trigger uses 8–15% less server CPU per message than kqueue and is the fastest round trip in each case. One message at a time, most of each round trip is waking the other thread, which no server can avoid, so the gains are modest. The trigger's advantage grows with the work it saves per message: many connections, or chains of more than two steps.
 
 ## Roadmap for kqring's extensions
 

@@ -21,6 +21,7 @@
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/event.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -32,6 +33,8 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -1229,6 +1232,199 @@ bench_disk(void)
 	close(fd);
 }
 
+/* ------------------------------------------------------------------------
+ * echo: a server thread echoes each message back to a client that sends
+ * one and waits for it (one op = one round trip, as the client sees it).
+ *
+ *   kqueue            kevent(2), then read(2) and write(2)
+ *   kqring_recv_send  io_uring style: each RECV's CQE makes user space
+ *                     submit the SEND and the next RECV (one enter)
+ *   kqring_trigger    an event-driven chain (KQRING_EXT_TRIGGER): RECV ->
+ *                     SEND with LEN_FROM_PREV, both CQE_SKIP_SUCCESS; the
+ *                     server sits in one enter for the whole run, and no
+ *                     CQE or system call is needed per message
+ *
+ * Each variant also reports <variant>_server_cpu: the server thread's CPU
+ * time per message, which the client's wakeup latency doesn't hide.
+ * ------------------------------------------------------------------------
+ */
+
+#define ECHO_ITERS	100000
+
+enum { ECHO_KQUEUE, ECHO_RECV_SEND, ECHO_TRIGGER };
+
+struct echo_srv {
+	int		fd;
+	int		variant;
+	_Atomic int	ready;
+	uint64_t	cpu_ns;		/* the server thread's CPU time */
+};
+
+static uint64_t
+thread_cpu_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+	return ((uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec);
+}
+
+static void *
+echo_server(void *arg)
+{
+	struct echo_srv *e = arg;
+	static char buf[BUF_SIZE];
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	struct ring r;
+	uint64_t cpu0 = thread_cpu_ns();
+
+	switch (e->variant) {
+	case ECHO_KQUEUE: {
+		struct kevent kev, out;
+		int kq = kqueue();
+
+		assert(kq >= 0);
+		EV_SET(&kev, e->fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+		assert(kevent(kq, &kev, 1, NULL, 0, NULL) == 0);
+		atomic_store(&e->ready, 1);
+		for (;;) {
+			ssize_t n;
+
+			assert(kevent(kq, NULL, 0, &out, 1, NULL) == 1);
+			n = read(e->fd, buf, sizeof(buf));
+			if (n < 0 && errno == EAGAIN)
+				continue;
+			if (n <= 0)
+				break;
+			assert(write(e->fd, buf, (size_t)n) == n);
+		}
+		close(kq);
+		break;
+	}
+	case ECHO_RECV_SEND:
+		ring_init(&r);
+		atomic_store(&e->ready, 1);
+		sqe = ring_prep(&r, IORING_OP_RECV, e->fd, 1);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		for (;;) {
+			ring_enter(&r, 1);
+			c = ring_pop(&r);
+			if (c.res <= 0)
+				break;
+			sqe = ring_prep(&r, IORING_OP_SEND, e->fd, 2);
+			sqe->addr = (uint64_t)(uintptr_t)buf;
+			sqe->len = (uint32_t)c.res;
+			sqe->msg_flags = MSG_WAITALL;
+			sqe->flags = IOSQE_IO_LINK | IOSQE_CQE_SKIP_SUCCESS;
+			sqe = ring_prep(&r, IORING_OP_RECV, e->fd, 1);
+			sqe->addr = (uint64_t)(uintptr_t)buf;
+			sqe->len = sizeof(buf);
+		}
+		ring_fini(&r);
+		break;
+	case ECHO_TRIGGER: {
+		struct kqring_ext_setup es = { .version = KQRING_EXT_VERSION };
+		struct kqring_trigger t = { .nsteps = 2,
+		    .step_flags = { 0, KQRING_STEP_LEN_FROM_PREV |
+		    KQRING_STEP_STOP_ON_ZERO } };
+		bool done = false;
+
+		ring_init(&r);
+		assert(ioctl(r.fd, KQRING_IOC_EXT_SETUP, &es) == 0);
+		sqe = ring_prep(&r, es.ext_opcode, e->fd, 1);
+		sqe->ioprio = KQRING_EXT_TRIGGER;
+		sqe->poll32_events = POLLIN;
+		sqe->addr = (uint64_t)(uintptr_t)&t;
+		sqe->len = sizeof(t);
+		sqe->flags = IOSQE_IO_LINK;
+		sqe = ring_prep(&r, IORING_OP_RECV, e->fd, 2);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		sqe->flags = IOSQE_IO_LINK | IOSQE_CQE_SKIP_SUCCESS;
+		sqe = ring_prep(&r, IORING_OP_SEND, e->fd, 3);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		sqe->msg_flags = MSG_WAITALL;
+		sqe->flags = IOSQE_CQE_SKIP_SUCCESS;
+		atomic_store(&e->ready, 1);
+		/* Only the trigger's final CQE, when the client hangs up. */
+		while (!done) {
+			ring_enter(&r, 1);
+			while (ring_ready(&r) > 0) {
+				c = ring_pop(&r);
+				assert(c.user_data == 1);
+				done = (c.flags & IORING_CQE_F_MORE) == 0;
+			}
+		}
+		assert(c.res == 0);
+		ring_fini(&r);
+		break;
+	}
+	}
+	e->cpu_ns = thread_cpu_ns() - cpu0;
+	return (NULL);
+}
+
+static void
+echo_run(const char *group, bool tcp, size_t len)
+{
+	static const char *const names[] = { "kqueue", "kqring_recv_send",
+	    "kqring_trigger" };
+	static const char *const cpu_names[] = { "kqueue_server_cpu",
+	    "kqring_recv_send_server_cpu", "kqring_trigger_server_cpu" };
+	static char back[BUF_SIZE];
+
+	for (int v = ECHO_KQUEUE; v <= ECHO_TRIGGER; v++) {
+		struct echo_srv e = { .variant = v };
+		pthread_t th;
+		uint64_t t0;
+		int cl;
+
+		if (tcp)
+			tcp_pair(&e.fd, &cl);
+		else {
+			int sv[2];
+
+			assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+			assert(fcntl(sv[1], F_SETFL, O_NONBLOCK) == 0);
+			cl = sv[0];
+			e.fd = sv[1];
+		}
+		assert(pthread_create(&th, NULL, echo_server, &e) == 0);
+		while (atomic_load(&e.ready) == 0)
+			usleep(100);
+		for (int i = -1000; i < ECHO_ITERS; i++) {	/* warm-up */
+			size_t got = 0;
+
+			if (i == 0)
+				t0 = now_ns();
+			xwrite(cl, len);
+			while (got < len) {
+				ssize_t n = read(cl, back + got, len - got);
+
+				assert(n > 0);
+				got += (size_t)n;
+			}
+		}
+		row(group, names[v], now_ns() - t0, ECHO_ITERS);
+		close(cl);
+		assert(pthread_join(th, NULL) == 0);
+		/* Server CPU per message (setup and warm-up included). */
+		row(group, cpu_names[v], e.cpu_ns, ECHO_ITERS + 1000);
+		close(e.fd);
+	}
+}
+
+static void
+bench_echo(void)
+{
+	echo_run("echo_unix_64", false, 64);
+	echo_run("echo_unix_4096", false, 4096);
+	echo_run("echo_tcp_64", true, 64);
+}
+
 static const struct {
 	const char	*name;
 	void		(*fn)(void);
@@ -1243,6 +1439,7 @@ static const struct {
 	{ "send-unix",	bench_send_unix },
 	{ "timer",	bench_timer },
 	{ "disk",	bench_disk },
+	{ "echo",	bench_echo },
 };
 
 int

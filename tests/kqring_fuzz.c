@@ -667,6 +667,9 @@ sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
 	    rn(f, REGBUF_OFF / 64) * 64);
 	static const uint32_t evs[] = { POLLIN, POLLOUT, POLLIN | POLLOUT,
 	    POLLIN | POLLRDHUP, POLLPRI };
+	static const uint8_t steps[] = { KQRING_STEP_LEN_FROM_PREV,
+	    KQRING_STEP_STOP_ON_ZERO,
+	    KQRING_STEP_LEN_FROM_PREV | KQRING_STEP_STOP_ON_ZERO };
 
 	memset(t, 0, sizeof(*t));
 	t->nsteps = chance(f, 95) ? (uint8_t)k : (uint8_t)rn(f, 10);
@@ -677,6 +680,11 @@ sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
 		t->max_inflight = (uint16_t)rnd(f);
 	if (chance(f, 3))
 		t->flags = (uint32_t)rnd(f);
+	/* Valid step flags often (refused on steps that have no len). */
+	for (unsigned i = 1; i < k && i < KQRING_TRIG_MAX_STEPS; i++) {
+		if (chance(f, 40))
+			t->step_flags[i] = steps[rn(f, nitems(steps))];
+	}
 	if (chance(f, 2))
 		t->step_flags[rn(f, 8)] = (uint8_t)rnd(f);
 	if (chance(f, 2))

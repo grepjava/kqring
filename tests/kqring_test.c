@@ -9591,7 +9591,7 @@ test_trigger_bad_templates(void)
 	c = ring_pop_cqe(&r);
 	assert(c.user_data == 3 && c.res == -EINVAL);
 
-	/* Step flags (phase 2) and no templates at all: bad trigger SQE. */
+	/* A step flag on the first step, and no templates: bad trigger SQE. */
 	trig_prep(&r, p[0], POLLIN, 5, &bad);
 	ring_push_sqe(&r);
 	ring_prep(&r, IORING_OP_NOP, -1, 6);
@@ -9613,6 +9613,269 @@ test_trigger_bad_templates(void)
 	close(r.fd);
 	printf("[PASS] trigger: bad templates and arguments fail it, "
 	    "templates -ECANCELED\n");
+}
+
+/*
+ * The echo server of the spec: on each POLLIN, RECV into a buffer then
+ * SEND what it got (LEN_FROM_PREV), both CQE_SKIP_SUCCESS, so the ring
+ * posts nothing per message.  Messages of every size up to 300 bytes and
+ * a 256 KiB stream come back exactly; shutting the peer's write side
+ * ends the trigger with 0.
+ */
+static void
+test_trigger_echo(void)
+{
+	enum { BUF = 4096, STREAM = 256 * 1024 };
+	static char rbuf[BUF], out[STREAM], in[STREAM];
+	struct test_ring r;
+	struct kqring_trigger t = { .nsteps = 2,
+	    .step_flags = { 0, KQRING_STEP_LEN_FROM_PREV |
+	    KQRING_STEP_STOP_ON_ZERO } };
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	size_t sent = 0, got = 0;
+	int sv[2];
+
+	trig_ring(&r);
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	trig_prep(&r, sv[1], POLLIN, 1, &t);
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_RECV, sv[1], 2);
+	sqe->addr = (uint64_t)(uintptr_t)rbuf;
+	sqe->len = BUF;
+	sqe->flags = IOSQE_IO_LINK | IOSQE_CQE_SKIP_SUCCESS;
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_SEND, sv[1], 3);
+	sqe->addr = (uint64_t)(uintptr_t)rbuf;
+	sqe->len = BUF;
+	sqe->msg_flags = MSG_WAITALL;	/* all of it, even if the peer is slow */
+	sqe->flags = IOSQE_CQE_SKIP_SUCCESS;
+	ring_push_sqe(&r);
+	ring_submit(&r);
+
+	/* One message at a time, of every size up to 300 bytes. */
+	for (int i = 1; i <= 300; i++) {
+		char msg[300], back[300];
+		size_t n = 0;
+
+		memset(msg, 'a' + i % 26, (size_t)i);
+		msg[0] = (char)i;
+		assert(write(sv[0], msg, (size_t)i) == i);
+		while (n < (size_t)i) {
+			struct pollfd pfd = { .fd = sv[0], .events = POLLIN };
+			ssize_t k;
+
+			/* The enter runs the trigger's requests. */
+			(void)ring_wait(&r, 1, 1);
+			if (poll(&pfd, 1, 0) == 0)
+				continue;
+			k = read(sv[0], back + n, sizeof(back) - n);
+			assert(k > 0);
+			n += (size_t)k;
+		}
+		assert(n == (size_t)i && memcmp(msg, back, n) == 0);
+	}
+	/* A stream bigger than the buffer and the socket buffers. */
+	for (size_t i = 0; i < STREAM; i++)
+		out[i] = (char)(i * 7 + i / 4096);
+	while (got < STREAM) {
+		ssize_t k;
+
+		if (sent < STREAM) {
+			size_t want = STREAM - sent;
+
+			k = write(sv[0], out + sent, want < 8192 ? want : 8192);
+			if (k > 0)
+				sent += (size_t)k;
+			else
+				assert(errno == EAGAIN);
+		}
+		(void)ring_wait(&r, 1, 1);
+		k = read(sv[0], in + got, STREAM - got);
+		if (k > 0)
+			got += (size_t)k;
+		else
+			assert(k < 0 && errno == EAGAIN);
+	}
+	assert(memcmp(out, in, STREAM) == 0);
+	/* Not one CQE so far. */
+	assert(ring_cq_ready(&r) == 0);
+	/*
+	 * The peer closes.  (Not shutdown(SHUT_WR): FreeBSD 15 runs no socket
+	 * upcall when an AF_UNIX peer shuts down writing; see the README.)
+	 */
+	close(sv[0]);
+	c = trig_final(&r, 1, 2000);
+	assert(c.res == 0);
+	assert(ring_cq_ready(&r) == 0);
+	close(sv[1]);
+	close(r.fd);
+	printf("[PASS] trigger echo (RECV -> SEND, LEN_FROM_PREV): 300 "
+	    "messages and a 256 KiB stream, no CQE per message; ends 0 on "
+	    "hangup\n");
+}
+
+/*
+ * STOP_ON_ZERO without a hangup: a pipe that stays readable drives a
+ * READ -> WRITE file copy (file positions, off -1) until the READ hits
+ * end of file; the WRITE of that run posts nothing and the trigger ends
+ * with 0.
+ */
+static void
+test_trigger_file_copy(void)
+{
+	enum { SIZE = 100000, CHUNK = 4096 };
+	static char data[SIZE], back[SIZE], buf[CHUNK];
+	char spath[] = "/tmp/kqring_test.XXXXXX";
+	char dpath[] = "/tmp/kqring_test.XXXXXX";
+	struct test_ring r;
+	struct kqring_trigger t = { .nsteps = 2,
+	    .step_flags = { 0, KQRING_STEP_LEN_FROM_PREV |
+	    KQRING_STEP_STOP_ON_ZERO } };
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	int sfd = mkstemp(spath), dfd = mkstemp(dpath), p[2];
+
+	assert(sfd >= 0 && dfd >= 0);
+	unlink(spath);
+	unlink(dpath);
+	for (int i = 0; i < SIZE; i++)
+		data[i] = (char)(i * 13 + i / 1000);
+	assert(write(sfd, data, SIZE) == SIZE);
+	assert(lseek(sfd, 0, SEEK_SET) == 0);
+	trig_ring(&r);
+	assert(pipe2(p, O_NONBLOCK) == 0);
+	assert(write(p[1], "go", 2) == 2);	/* never read: always ready */
+	trig_prep(&r, p[0], POLLIN, 1, &t);
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_READ, sfd, 2);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = CHUNK;
+	sqe->off = (uint64_t)-1;
+	sqe->flags = IOSQE_IO_LINK | IOSQE_CQE_SKIP_SUCCESS;
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_WRITE, dfd, 3);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = CHUNK;
+	sqe->off = (uint64_t)-1;
+	sqe->flags = IOSQE_CQE_SKIP_SUCCESS;
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	c = trig_final(&r, 1, 5000);
+	assert(c.res == 0);
+	assert(ring_cq_ready(&r) == 0);
+	assert(pread(dfd, back, SIZE, 0) == SIZE);
+	assert(lseek(dfd, 0, SEEK_END) == SIZE);
+	assert(memcmp(data, back, SIZE) == 0);
+	close(p[0]);
+	close(p[1]);
+	close(sfd);
+	close(dfd);
+	close(r.fd);
+	printf("[PASS] trigger file copy (READ -> WRITE, STOP_ON_ZERO): "
+	    "100,000 bytes, ends 0 at end of file with no other CQE\n");
+}
+
+/* Bad step flags fail the trigger; LEN_FROM_PREV after a failure is 0. */
+static void
+test_trigger_step_flags_bad(void)
+{
+	static const uint8_t bad[][2] = {
+		{ KQRING_STEP_LEN_FROM_PREV, 0 },	/* on the first step */
+		{ 0, 1U << 1 },				/* reserved bit */
+		{ 0, 1U << 7 },				/* unknown bit */
+		{ 0, KQRING_STEP_LEN_FROM_PREV },	/* NOP has no len */
+	};
+	struct kqring_trigger t;
+	struct test_ring r;
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	char buf[16];
+	int p[2], q[2];
+
+	trig_ring(&r);
+	assert(pipe2(p, O_NONBLOCK) == 0);
+	for (size_t i = 0; i < nitems(bad); i++) {
+		memset(&t, 0, sizeof(t));
+		t.nsteps = 2;
+		t.step_flags[0] = bad[i][0];
+		t.step_flags[1] = bad[i][1];
+		trig_prep(&r, p[0], POLLIN, 10 + i, &t);
+		ring_push_sqe(&r);
+		ring_prep(&r, IORING_OP_NOP, -1, 20)->flags = IOSQE_IO_LINK;
+		ring_push_sqe(&r);
+		ring_prep(&r, IORING_OP_NOP, -1, 21);
+		ring_push_sqe(&r);
+		(void)kqring_enter(r.fd, ring_pending(&r), 0, 0, NULL, 0);
+		assert(ring_cq_ready(&r) == 3);
+		for (int k = 0; k < 3; k++) {
+			c = ring_pop_cqe(&r);
+			if (c.user_data == 10 + i)
+				assert(c.res == -EINVAL);
+			else
+				assert(c.user_data >= 20 &&
+				    c.res == -ECANCELED);
+		}
+	}
+	/* A flag past nsteps. */
+	memset(&t, 0, sizeof(t));
+	t.nsteps = 1;
+	t.step_flags[1] = KQRING_STEP_STOP_ON_ZERO;
+	trig_prep(&r, p[0], POLLIN, 30, &t);
+	ring_push_sqe(&r);
+	ring_prep(&r, IORING_OP_NOP, -1, 31);
+	ring_push_sqe(&r);
+	(void)kqring_enter(r.fd, ring_pending(&r), 0, 0, NULL, 0);
+	assert(ring_cq_ready(&r) == 2);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 30 && c.res == -EINVAL);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 31 && c.res == -ECANCELED);
+
+	/* HARDLINK past a failed step: LEN_FROM_PREV gives len 0. */
+	memset(&t, 0, sizeof(t));
+	t.nsteps = 3;
+	t.flags = KQRING_TRIG_CQE_EACH;
+	t.step_flags[2] = KQRING_STEP_LEN_FROM_PREV;
+	assert(pipe2(q, O_NONBLOCK) == 0);
+	assert(write(p[1], "x", 1) == 1);
+	trig_prep(&r, p[0], POLLIN, 40, &t);
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_READ, p[0], 43);	/* takes the event */
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->flags = IOSQE_IO_LINK;
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_NOP, -1, 41);
+	sqe->nop_flags = IORING_NOP_INJECT_RESULT;
+	sqe->len = (uint32_t)-EIO;
+	sqe->flags = IOSQE_IO_HARDLINK;
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_WRITE, q[1], 42);
+	sqe->addr = (uint64_t)(uintptr_t)"0123456789abcdef";
+	sqe->len = 16;
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(trig_collect(&r, 4, 2000) >= 4);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 40 && (c.flags & IORING_CQE_F_MORE) != 0);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 43 && c.res == 1);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 41 && c.res == -EIO);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 42 && c.res == 0);
+	assert(read(q[0], buf, sizeof(buf)) == -1 && errno == EAGAIN);
+	trig_cancel(&r, 40);
+	c = trig_final(&r, 40, 2000);
+	assert(c.res == -ECANCELED);
+	close(q[0]);
+	close(q[1]);
+	close(p[0]);
+	close(p[1]);
+	close(r.fd);
+	printf("[PASS] trigger step flags: bad ones fail the trigger; "
+	    "LEN_FROM_PREV after a failed step is 0\n");
 }
 
 /* Close the ring with triggers armed and a run waiting on a socket. */
@@ -9669,6 +9932,9 @@ test_triggers(struct test_ring *plain)
 	test_trigger_concurrent();
 	test_trigger_hangup();
 	test_trigger_bad_templates();
+	test_trigger_echo();
+	test_trigger_file_copy();
+	test_trigger_step_flags_bad();
 	test_trigger_close();
 }
 

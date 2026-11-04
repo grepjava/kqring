@@ -2030,6 +2030,10 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 		if (failed && (op->sqe.flags & IOSQE_IO_HARDLINK) == 0)
 			kqring_chain_fail(ctx, next,
 			    (op->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) != 0);
+		else if (__predict_false(op->trun != NULL) &&
+		    !kqring_trun_step(op, next, res))
+			/* STOP_ON_ZERO: the rest of the run posts nothing. */
+			kqring_chain_fail(ctx, next, true);
 		else
 			TAILQ_INSERT_TAIL(&ctx->ready_q, next, q_link);
 	}

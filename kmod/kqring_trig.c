@@ -26,6 +26,8 @@
  * completion or kqring_op_free().
  */
 
+#define	KQRING_STEP_ALL	(KQRING_STEP_LEN_FROM_PREV | KQRING_STEP_STOP_ON_ZERO)
+
 /* Most triggers alive on one ring. */
 #define	KQRING_TRIG_MAX		1024U
 
@@ -105,9 +107,10 @@ kqring_trig_prep(struct kqring_op *op)
 	    ta->max_inflight != 0) ||
 	    ta->resv[0] != 0 || ta->resv[1] != 0)
 		return (EINVAL);
-	/* Step flags come with phase 2 of the spec. */
+	/* Only steps with a step before them take step flags. */
 	for (int i = 0; i < KQRING_TRIG_MAX_STEPS; i++) {
-		if (ta->step_flags[i] != 0)
+		if ((ta->step_flags[i] & ~KQRING_STEP_ALL) != 0 ||
+		    ((i == 0 || i >= ta->nsteps) && ta->step_flags[i] != 0))
 			return (EINVAL);
 	}
 	return (0);
@@ -190,6 +193,7 @@ kqring_trig_run(struct kqring_trig *trig)
 		o->sqe = trig->tmpl[i];
 		memcpy(o->sqe_extra, trig->tmpl_extra[i], sizeof(o->sqe_extra));
 		o->trun = tr;
+		o->tstep = trig->args.step_flags[i];
 		tr->refs++;
 		/* Checked again each run: fixed files and buffers can change. */
 		o->prep_err = kqring_req_prep(o, prev);
@@ -285,6 +289,48 @@ kqring_trun_failed(struct kqring_trun *tr, int32_t res)
 	}
 }
 
+/* Whether LEN_FROM_PREV can set this opcode's len. */
+static bool
+kqring_step_len_ok(uint8_t opcode)
+{
+	switch (opcode) {
+	case IORING_OP_READ:
+	case IORING_OP_WRITE:
+	case IORING_OP_READ_FIXED:
+	case IORING_OP_WRITE_FIXED:
+	case IORING_OP_SEND:
+	case IORING_OP_SEND_ZC:
+	case IORING_OP_RECV:
+	case IORING_OP_SPLICE:
+	case IORING_OP_TEE:
+		return (true);
+	default:
+		return (false);
+	}
+}
+
+/*
+ * From kqring_req_complete(): op of a run completed with res and next is
+ * the step after it (not yet issued).  Apply next's step flags.  Returns
+ * false if the rest of the run is to be skipped (STOP_ON_ZERO).
+ */
+bool
+kqring_trun_step(struct kqring_op *op, struct kqring_op *next, int32_t res)
+{
+	struct kqring_trun *tr = op->trun;
+
+	if (next->trun != tr || next->tstep == 0)
+		return (true);
+	if ((next->tstep & KQRING_STEP_STOP_ON_ZERO) != 0 && res == 0) {
+		tr->stopped = true;
+		return (false);
+	}
+	/* Only shrinks len, so what prep checked of it still holds. */
+	if ((next->tstep & KQRING_STEP_LEN_FROM_PREV) != 0)
+		next->sqe.len = res < 0 ? 0 : MIN((uint32_t)res, next->sqe.len);
+	return (true);
+}
+
 /* A request of the run was freed; the last one ends the run. */
 void
 kqring_trun_put(struct kqring_trun *tr)
@@ -301,6 +347,8 @@ kqring_trun_put(struct kqring_trun *tr)
 		if (tr->failed &&
 		    (trig->args.flags & KQRING_TRIG_STOP_ON_ERROR) != 0)
 			kqring_trig_end(trig, tr->err);
+		else if (tr->stopped)
+			kqring_trig_end(trig, 0);
 		kqring_trig_queue_work(trig);
 	}
 	free(tr, M_KQRING);
@@ -408,6 +456,12 @@ kqring_trig_issue(struct kqring_ctx *ctx, struct kqring_op *op)
 		if (t->sqe.opcode == KQRING_IOP_TRIGGER || t->multishot ||
 		    (t->sqe.flags & IOSQE_IO_DRAIN) != 0 ||
 		    (n == 0 && t->sqe.opcode == IORING_OP_LINK_TIMEOUT))
+			err = -EINVAL;
+		/* A step flag names a step that a result is passed to. */
+		if (n < KQRING_TRIG_MAX_STEPS && ta->step_flags[n] != 0 &&
+		    (t->sqe.opcode == IORING_OP_LINK_TIMEOUT ||
+		    ((ta->step_flags[n] & KQRING_STEP_LEN_FROM_PREV) != 0 &&
+		    !kqring_step_len_ok(t->sqe.opcode))))
 			err = -EINVAL;
 		n++;
 	}
