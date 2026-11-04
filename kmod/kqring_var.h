@@ -310,6 +310,17 @@ struct kqring_op {
 	int			kp_revents;
 	u_int			kp_nev;
 	uint32_t		kp_seen[2];	/* read, write: kqring_kp_filt_event() */
+	/*
+	 * KQRING_EXT_KEVENT (kp_kev): the kevent in op->args, and what fired
+	 * since the last delivery (under ctx->mtx).
+	 */
+	bool			kp_kev;
+	bool			kp_keof;	/* EV_EOF: the source is gone */
+	uint32_t		kp_kfflags;
+	int64_t			kp_kdata;
+	/* Set for a final CQE that carries big_cqe words (CQE32). */
+	bool			cqe_has_extra;
+	uint64_t		cqe_extra[2];
 	bool			listening;	/* armed via solisten_upcall_set */
 	bool			oneshot_sb;	/* one-shot single-dir sockbuf op */
 	bool			so_soref;	/* soref(so) held by op->so */
@@ -1385,6 +1396,7 @@ void	kqring_chain_queue(struct kqring_ctx *ctx, struct kqring_op *head);
  * from the escape opcode.
  */
 #define	KQRING_IOP_TRIGGER	IORING_OP_LAST
+#define	KQRING_IOP_KEVENT	(IORING_OP_LAST + 1)
 
 /* A trigger: alive from its issue until its final CQE and last run. */
 struct kqring_trig {
@@ -1707,6 +1719,8 @@ int	kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 void	kqring_kpoll_disarm_locked(struct kqring_ctx *ctx,
 	    struct kqring_op *op);
 void	kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op);
+int	kqring_kev_prep(struct kqring_op *op);
+void	kqring_kev_issue(struct kqring_ctx *ctx, struct kqring_op *op);
 int	kqring_kpoll_stop(struct kqring_ctx *ctx, bool nowait);
 void	kqring_kpoll_close(struct kqring_ctx *ctx);
 

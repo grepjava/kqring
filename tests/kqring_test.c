@@ -14,6 +14,7 @@
 #include <sys/capsicum.h>
 #include <sys/cpuset.h>
 #include <sys/event.h>
+#include <sys/ioctl.h>
 #include <sys/eventfd.h>
 #include <sys/filio.h>
 #include <sys/linker.h>
@@ -9983,6 +9984,270 @@ test_unix_peer_shutdown(void)
 	    "POLL_ADD and trigger (as on TCP)\n");
 }
 
+/* ---- Kevent requests (KQRING_EXT_KEVENT) ---- */
+
+static struct io_uring_sqe *
+kev_prep(struct test_ring *r, const struct kevent *k, uint64_t ud, bool multi)
+{
+	struct io_uring_sqe *sqe = ring_prep(r, KQRING_EXT_OPCODE_DEFAULT, -1,
+	    ud);
+
+	sqe->ioprio = KQRING_EXT_KEVENT;
+	sqe->addr = (uint64_t)(uintptr_t)k;
+	sqe->len = sizeof(*k);
+	sqe->rw_flags = multi ? KQRING_KEV_MULTISHOT : 0;
+	return (sqe);
+}
+
+/* EVFILT_VNODE: one-shot NOTE_WRITE, then multishot until cancelled. */
+static void
+test_kevent_vnode(void)
+{
+	char path[] = "/tmp/kqring_test.XXXXXX";
+	struct test_ring r;
+	struct kevent k;
+	struct io_uring_cqe c;
+	int fd = mkstemp(path);
+
+	assert(fd >= 0);
+	trig_ring(&r);
+	EV_SET(&k, fd, EVFILT_VNODE, 0, NOTE_WRITE | NOTE_EXTEND, 0, NULL);
+	kev_prep(&r, &k, 1, false);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(ring_wait(&r, 1, 30) == ETIMEDOUT);
+	assert(write(fd, "x", 1) == 1);
+	c = trig_final(&r, 1, 2000);
+	assert((c.res & NOTE_WRITE) != 0 && (c.res & ~(NOTE_WRITE |
+	    NOTE_EXTEND)) == 0);
+
+	/* Multishot: a CQE per write (with F_MORE), then a cancel ends it. */
+	kev_prep(&r, &k, 2, true);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	for (int i = 0; i < 5; i++) {
+		assert(write(fd, "y", 1) == 1);
+		assert(trig_collect(&r, 1, 2000) >= 1);
+		c = ring_pop_cqe(&r);
+		assert(c.user_data == 2 && (c.flags & IORING_CQE_F_MORE) != 0);
+		assert((c.res & NOTE_WRITE) != 0);
+		assert(ring_cq_ready(&r) == 0);
+	}
+	trig_cancel(&r, 2);
+	c = trig_final(&r, 2, 2000);
+	assert(c.res == -ECANCELED);
+	/* Gone: another write posts nothing for it. */
+	assert(write(fd, "z", 1) == 1);
+	(void)trig_collect(&r, 10, 100);
+	while (ring_cq_ready(&r) > 0)
+		assert(ring_pop_cqe(&r).user_data == 9999);
+	close(fd);
+	unlink(path);
+	close(r.fd);
+	printf("[PASS] KEVENT EVFILT_VNODE: one-shot NOTE_WRITE, multishot "
+	    "CQE per write, cancel ends it\n");
+}
+
+/* EVFILT_SIGNAL: deliveries counted, even of an ignored signal. */
+static void
+test_kevent_signal(void)
+{
+	struct test_ring r;
+	struct kevent k;
+	struct io_uring_cqe c;
+	void (*old)(int) = signal(SIGUSR2, SIG_IGN);
+	int32_t total = 0;
+
+	trig_ring(&r);
+	EV_SET(&k, SIGUSR2, EVFILT_SIGNAL, 0, 0, 0, NULL);
+	kev_prep(&r, &k, 1, true);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(ring_wait(&r, 1, 30) == ETIMEDOUT);
+	for (int i = 0; i < 3; i++)
+		assert(kill(getpid(), SIGUSR2) == 0);
+	while (total < 3) {
+		assert(trig_collect(&r, 1, 2000) >= 1);
+		c = ring_pop_cqe(&r);
+		assert(c.user_data == 1 && (c.flags & IORING_CQE_F_MORE) != 0);
+		assert(c.res >= 1);
+		total += c.res;
+	}
+	assert(total == 3);
+	trig_cancel(&r, 1);
+	c = trig_final(&r, 1, 2000);
+	assert(c.res == -ECANCELED);
+	close(r.fd);
+	signal(SIGUSR2, old);
+	printf("[PASS] KEVENT EVFILT_SIGNAL: 3 deliveries of an ignored "
+	    "signal counted\n");
+}
+
+/*
+ * EVFILT_PROC NOTE_EXIT on a child, on a CQE32 ring: res is NOTE_EXIT,
+ * big_cqe[0] the exit status.  A multishot request ends with the exit.
+ */
+static void
+test_kevent_proc_exit(void)
+{
+	struct io_uring_params p;
+	struct kqring_ext_setup es = { .version = KQRING_EXT_VERSION };
+	struct __kernel_timespec ts = { .tv_sec = 2 };
+	struct io_uring_getevents_arg ga = { .ts = (uint64_t)(uintptr_t)&ts };
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe *c;
+	struct kevent k;
+	int fd, go[2], st;
+	pid_t pid;
+
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+	    IORING_SETUP_CQE32;
+	fd = (int)kqring_setup(4, &p);
+	assert(fd >= 0);
+	assert(ioctl(fd, KQRING_IOC_EXT_SETUP, &es) == 0);
+	assert((es.features & KQRING_EXT_F_KEVENT) != 0);
+	size_t ring_len = p.cq_off.cqes +
+	    (size_t)p.cq_entries * sizeof(struct io_uring_cqe) * 2;
+	char *base = mmap(NULL, ring_len, PROT_READ | PROT_WRITE, MAP_SHARED,
+	    fd, IORING_OFF_SQ_RING);
+	struct io_uring_sqe *sqes = mmap(NULL,
+	    p.sq_entries * sizeof(struct io_uring_sqe), PROT_READ | PROT_WRITE,
+	    MAP_SHARED, fd, IORING_OFF_SQES);
+	assert(base != MAP_FAILED && sqes != MAP_FAILED);
+	unsigned *sq_array = (unsigned *)(base + p.sq_off.array);
+	_Atomic unsigned *sq_ktail = (_Atomic unsigned *)(base +
+	    p.sq_off.tail);
+	_Atomic unsigned *cq_khead = (_Atomic unsigned *)(base +
+	    p.cq_off.head);
+	_Atomic unsigned *cq_ktail = (_Atomic unsigned *)(base +
+	    p.cq_off.tail);
+	struct io_uring_cqe *cqes = (struct io_uring_cqe *)(base +
+	    p.cq_off.cqes);
+
+	assert(pipe(go) == 0);
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		char b;
+
+		close(go[1]);
+		(void)read(go[0], &b, 1);
+		_exit(7);
+	}
+	close(go[0]);
+	EV_SET(&k, pid, EVFILT_PROC, 0, NOTE_EXIT, 0, NULL);
+	sqe = &sqes[0];
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->opcode = KQRING_EXT_OPCODE_DEFAULT;
+	sqe->ioprio = KQRING_EXT_KEVENT;
+	sqe->fd = -1;
+	sqe->addr = (uint64_t)(uintptr_t)&k;
+	sqe->len = sizeof(k);
+	sqe->rw_flags = KQRING_KEV_MULTISHOT;
+	sqe->user_data = 77;
+	sq_array[0] = 0;
+	atomic_store_explicit(sq_ktail, 1, memory_order_release);
+	assert(kqring_enter(fd, 1, 0, 0, NULL, 0) == 1);
+	assert(atomic_load(cq_ktail) == atomic_load(cq_khead));
+	close(go[1]);		/* the child exits */
+	(void)kqring_enter(fd, 0, 1, IORING_ENTER_GETEVENTS |
+	    IORING_ENTER_EXT_ARG, &ga, sizeof(ga));
+	assert(atomic_load(cq_ktail) - atomic_load(cq_khead) == 1);
+	c = &cqes[(atomic_load(cq_khead) & *(unsigned *)(base +
+	    p.cq_off.ring_mask)) * 2];
+	assert(c->user_data == 77 && c->res == KQRING_KEV_PROC_NOTE(NOTE_EXIT));
+	assert((c->flags & IORING_CQE_F_MORE) == 0);	/* exit ends it */
+	assert(WIFEXITED((int)c->big_cqe[0]) &&
+	    WEXITSTATUS((int)c->big_cqe[0]) == 7);
+	assert(c->big_cqe[1] == NOTE_EXIT);
+	atomic_store(cq_khead, atomic_load(cq_khead) + 1);
+	assert(waitpid(pid, &st, 0) == pid && WEXITSTATUS(st) == 7);
+	close(fd);
+	printf("[PASS] KEVENT EVFILT_PROC: child exit ends a multishot "
+	    "request, status in big_cqe[0] (CQE32)\n");
+}
+
+/* Arguments the kevent request refuses, and one knote per ident. */
+static void
+test_kevent_bad(struct test_ring *plain)
+{
+	struct test_ring r;
+	struct kevent k;
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	int p[2];
+
+	assert(pipe(p) == 0);
+	trig_ring(&r);
+	for (int i = 0; i < 8; i++) {
+		EV_SET(&k, p[0], EVFILT_VNODE, 0, NOTE_WRITE, 0, NULL);
+		sqe = kev_prep(&r, &k, 100 + i, false);
+		switch (i) {
+		case 0: k.filter = EVFILT_READ; break;	/* POLL_ADD's job */
+		case 1: k.flags = EV_ONESHOT; break;
+		case 2: k.udata = &k; break;
+		case 3: k.fflags = 0; break;
+		case 4: sqe->fd = p[0]; break;
+		case 5: sqe->rw_flags = 1U << 5; break;
+		case 6: sqe->len = sizeof(k) - 8; break;
+		case 7: k.filter = EVFILT_SIGNAL; k.ident = 0; k.fflags = 0;
+			break;
+		}
+		ring_push_sqe(&r);
+		(void)kqring_enter(r.fd, 1, 0, 0, NULL, 0);
+		assert(ring_cq_ready(&r) == 1);
+		c = ring_pop_cqe(&r);
+		assert(c.user_data == 100 + (uint64_t)i && c.res == -EINVAL);
+	}
+	/* A pid that doesn't exist. */
+	EV_SET(&k, 99998, EVFILT_PROC, 0, NOTE_EXIT, 0, NULL);
+	kev_prep(&r, &k, 110, false);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	c = trig_final(&r, 110, 1000);
+	assert(c.res == -ESRCH);
+	/* The same ident and filter twice (a file: pipes have no vnode). */
+	char path[] = "/tmp/kqring_test.XXXXXX";
+	int ffd = mkstemp(path);
+
+	assert(ffd >= 0);
+	unlink(path);
+	EV_SET(&k, ffd, EVFILT_VNODE, 0, NOTE_WRITE, 0, NULL);
+	kev_prep(&r, &k, 111, false);
+	ring_push_sqe(&r);
+	kev_prep(&r, &k, 112, false);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	c = trig_final(&r, 112, 1000);
+	assert(c.res == -EBUSY);
+	trig_cancel(&r, 111);
+	c = trig_final(&r, 111, 1000);
+	assert(c.res == -ECANCELED);
+	close(ffd);
+	close(r.fd);
+
+	/* Without the opt-in, an unknown opcode. */
+	kev_prep(plain, &k, 120, false);
+	ring_push_sqe(plain);
+	(void)kqring_enter(plain->fd, 1, 0, 0, NULL, 0);
+	c = ring_pop_cqe(plain);
+	assert(c.user_data == 120 && c.res == -EINVAL);
+	close(p[0]);
+	close(p[1]);
+	printf("[PASS] KEVENT: bad arguments -EINVAL, missing pid -ESRCH, "
+	    "same ident and filter -EBUSY\n");
+}
+
+static void
+test_kevents(struct test_ring *plain)
+{
+	test_kevent_vnode();
+	test_kevent_signal();
+	test_kevent_proc_exit();
+	test_kevent_bad(plain);
+}
+
 static void
 test_triggers(struct test_ring *plain)
 {
@@ -10010,6 +10275,7 @@ main(int argc, char **argv)
 	/* "trig": only the event-driven chain tests. */
 	if (argc >= 2 && strcmp(argv[1], "trig") == 0) {
 		test_triggers(&r);
+		test_kevents(&r);
 		printf("[OK]: %d failure(s)\n", failures);
 		return (failures != 0);
 	}
@@ -10089,6 +10355,7 @@ main(int argc, char **argv)
 		test_pipe_nonblock_drained();
 		test_pipe_multishot_drained();
 		test_triggers(&r);
+		test_kevents(&r);
 		test_min_wait();
 		test_no_mmap();
 		test_resize_rings();

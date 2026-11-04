@@ -70,7 +70,7 @@ kqring_ext_setup(struct kqring_ctx *ctx, struct kqring_ext_setup *es)
 	if (error != 0)
 		return (error);
 	es->ext_opcode = opcode;
-	es->features = KQRING_EXT_F_TRIGGER;
+	es->features = KQRING_EXT_F_TRIGGER | KQRING_EXT_F_KEVENT;
 	return (0);
 }
 

@@ -96,6 +96,7 @@ static _Atomic uint64_t	st_rings, st_setup_fail, st_sqes, st_enters,
 			st_regs, st_cqes, st_chaos, st_forks, st_kicks;
 /* Triggers submitted; their per-event and final CQEs; finals not -EINVAL. */
 static _Atomic uint64_t	st_trig, st_trig_fire, st_trig_end, st_trig_live;
+static _Atomic uint64_t	st_kev;
 static _Atomic int	cq_bad, nfinished;
 
 struct fz {
@@ -709,6 +710,58 @@ sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
 }
 
 /*
+ * A kevent request (KQRING_EXT_KEVENT): a file's vnode events, a signal
+ * that is ignored by default, or this process, its parent or a random
+ * pid (the fuzzer forks, so NOTE_FORK on itself fires).  Mostly valid.
+ */
+static void
+sqe_kevent(struct fz *f, struct io_uring_sqe *s)
+{
+	struct kevent *k = (void *)(f->arena + rn(f, REGBUF_OFF / 64) * 64);
+	static const int sigs[] = { SIGURG, SIGWINCH, SIGINFO, SIGCHLD };
+
+	memset(k, 0, sizeof(*k));
+	switch (rn(f, 3)) {
+	case 0:
+		EV_SET(k, pool_fd(f, chance(f, 70) ? 0 : 3), EVFILT_VNODE, 0,
+		    1U + (uint32_t)rn(f, 0x7ff), 0, NULL);
+		break;
+	case 1:
+		EV_SET(k, sigs[rn(f, nitems(sigs))], EVFILT_SIGNAL, 0, 0, 0,
+		    NULL);
+		break;
+	default:
+		EV_SET(k, chance(f, 40) ? getpid() : chance(f, 50) ?
+		    getppid() : (pid_t)rn(f, 100000), EVFILT_PROC, 0,
+		    (chance(f, 50) ? NOTE_EXIT : 0) | (chance(f, 50) ?
+		    NOTE_FORK : 0) | NOTE_EXEC, 0, NULL);
+		break;
+	}
+	if (chance(f, 5))
+		k->filter = (short)rnd(f);
+	if (chance(f, 3))
+		k->flags = (unsigned short)rnd(f);
+	if (chance(f, 3))
+		k->fflags = (unsigned)rnd(f);
+
+	memset(s, 0, f->sqe_size);
+	s->opcode = f->ext_op;
+	s->ioprio = KQRING_EXT_KEVENT;
+	s->fd = chance(f, 97) ? -1 : pool_fd(f, 3);
+	s->addr = chance(f, 97) ? (uint64_t)(uintptr_t)k : gen_ptr(f);
+	s->len = chance(f, 97) ? sizeof(*k) : gen_len(f);
+	s->rw_flags = chance(f, 50) ? KQRING_KEV_MULTISHOT :
+	    chance(f, 95) ? 0 : (uint32_t)rnd(f);
+	s->user_data = f->ud;
+	atomic_fetch_add(&st_kev, 1);
+	f->recent[f->nrecent++ % nitems(f->recent)] = f->ud;
+	/* Its CQEs aren't a trigger's. */
+	f->ops[f->ud % NOPS].op = IORING_OP_NOP;
+	f->ops[f->ud % NOPS].addr = s->addr;
+	f->ud++;
+}
+
+/*
  * Keep a request's pointers away from anything but the arena and names,
  * its paths relative, and its sockets local; and CLOSE to descriptors of
  * this thread's requests, never the fuzzer's own.
@@ -1297,6 +1350,13 @@ do_submit(struct fz *f)
 				f->sq_tail++;
 				continue;
 			}
+			if (f->ext_op != 0 && f->tmpl_left == 0 &&
+			    chance(f, f->valid ? 4 : 1)) {
+				sqe_kevent(f, s);
+				prev = s;
+				f->sq_tail++;
+				continue;
+			}
 			sqe_fill(f, s);
 			/*
 			 * Chains: link to the next request, and sometimes
@@ -1718,6 +1778,7 @@ main(int argc, char **argv)
 	    "firings reported %ju\n", (uintmax_t)st_trig,
 	    (uintmax_t)st_trig_end, (uintmax_t)st_trig_live,
 	    (uintmax_t)st_trig_fire);
+	printf("kqring_fuzz: kevent requests %ju\n", (uintmax_t)st_kev);
 	if (atomic_load(&cq_bad)) {
 		fprintf(stderr, "kqring_fuzz: FAIL: a CQ ring overran\n");
 		rc = 1;

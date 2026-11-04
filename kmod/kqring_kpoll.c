@@ -366,7 +366,18 @@ kqring_kp_event(struct kqring_ctx *ctx, const struct kevent *kev)
 		if (op->kp_id == id)
 			break;
 	}
-	if (op != NULL && op->kp_on && !op->cancelled) {
+	if (op != NULL && op->kp_on && !op->cancelled && op->kp_kev) {
+		/* Events merge until delivered; signals add up. */
+		op->kp_kfflags |= kev->fflags;
+		if (kev->filter == EVFILT_SIGNAL)
+			op->kp_kdata += kev->data;
+		else
+			op->kp_kdata = kev->data;
+		if ((kev->flags & EV_EOF) != 0)
+			op->kp_keof = true;
+		op->kp_nev++;
+		kqring_taskwork_add_locked(ctx, op);
+	} else if (op != NULL && op->kp_on && !op->cancelled) {
 		/*
 		 * The wakeups kqring_kp_filt_event() counted since the last
 		 * event, or one.  The poller and kqring_kpoll_run() both take
@@ -585,6 +596,13 @@ kqring_kp_kevents(const struct kqring_op *op, struct kevent *kev,
 	void *udata = (void *)(uintptr_t)op->kp_id;
 	int n = 0;
 
+	if (op->kp_kev) {
+		const struct kevent *k = op->args;
+
+		EV_SET(&kev[n++], k->ident, k->filter, flags, k->fflags, 0,
+		    udata);
+		return (n);
+	}
 	if ((op->kp_filters & KQRING_KP_READ) != 0)
 		EV_SET(&kev[n++], sqe->fd, EVFILT_READ, flags, 0, 0, udata);
 	if ((op->kp_filters & KQRING_KP_WRITE) != 0)
@@ -692,6 +710,165 @@ kqring_kpoll_disarm_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 	mtx_lock(&ctx->mtx);
 }
 
+/* ------------------------------------------------------------------------
+ * KQRING_EXT_KEVENT: a kqueue event as a request (include/sys/kqring.h).
+ * The kevent is registered on the ring's kqueue with the request's kp_id
+ * as udata, like a non-socket POLL_ADD's knotes, and the poller records
+ * what fires (kqring_kp_event()); taskwork posts it.
+ * ------------------------------------------------------------------------
+ */
+
+#define	KQRING_KEV_VNODE_ALL	(NOTE_DELETE | NOTE_WRITE | NOTE_EXTEND | \
+	NOTE_ATTRIB | NOTE_LINK | NOTE_RENAME | NOTE_REVOKE | NOTE_OPEN | \
+	NOTE_CLOSE | NOTE_CLOSE_WRITE | NOTE_READ)
+#define	KQRING_KEV_PROC_ALL	(NOTE_EXIT | NOTE_FORK | NOTE_EXEC)
+
+int
+kqring_kev_prep(struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct kevent *k;
+	int error;
+
+	if (sqe->len != sizeof(*k) || sqe->addr == 0 || sqe->fd != -1 ||
+	    sqe->off != 0 || sqe->buf_index != 0 || sqe->file_index != 0 ||
+	    (sqe->rw_flags & ~KQRING_KEV_MULTISHOT) != 0 ||
+	    (sqe->flags & (IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT)) != 0)
+		return (EINVAL);
+	k = kqring_args_alloc(op, sizeof(*k), &error);
+	if (k == NULL)
+		return (error);
+	error = copyin((const void *)(uintptr_t)sqe->addr, k, sizeof(*k));
+	if (error != 0)
+		return (error);
+	if (k->flags != 0 || k->data != 0 || k->udata != NULL ||
+	    k->ext[0] != 0 || k->ext[1] != 0 || k->ext[2] != 0 ||
+	    k->ext[3] != 0)
+		return (EINVAL);
+	switch (k->filter) {
+	case EVFILT_VNODE:
+		if (k->ident > INT_MAX || k->fflags == 0 ||
+		    (k->fflags & ~KQRING_KEV_VNODE_ALL) != 0)
+			return (EINVAL);
+		break;
+	case EVFILT_PROC:
+		if (k->ident == 0 || k->ident > PID_MAX || k->fflags == 0 ||
+		    (k->fflags & ~KQRING_KEV_PROC_ALL) != 0)
+			return (EINVAL);
+		break;
+	case EVFILT_SIGNAL:
+		if (k->ident == 0 || k->ident > _SIG_MAXSIG || k->fflags != 0)
+			return (EINVAL);
+		break;
+	default:
+		return (EINVAL);
+	}
+	return (0);
+}
+
+/* Issue: register the kevent, or complete with the error. */
+void
+kqring_kev_issue(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	const struct kevent *k = op->args;
+	bool multi = (op->sqe.rw_flags & KQRING_KEV_MULTISHOT) != 0;
+	struct kevent kev;
+	struct kqring_op *o;
+	int error;
+
+	/* The kqueue and its descriptors are the owner process's. */
+	if (ctx->owner_proc != curproc) {
+		kqring_req_complete(ctx, op, -EOPNOTSUPP, 0);
+		return;
+	}
+	error = kqring_kp_start(ctx);
+	if (error != 0) {
+		kqring_req_complete(ctx, op, -error, 0);
+		return;
+	}
+	mtx_lock(&ctx->mtx);
+	/* A kqueue holds one knote per ident and filter. */
+	TAILQ_FOREACH(o, KQRING_KP_BUCKET(ctx, (int)k->ident), kp_link) {
+		if (o->kp_kev && o->kp_fd == (int)k->ident &&
+		    ((const struct kevent *)o->args)->filter == k->filter)
+			break;
+	}
+	if (o != NULL) {
+		mtx_unlock(&ctx->mtx);
+		kqring_req_complete(ctx, op, -EBUSY, 0);
+		return;
+	}
+	op->kp_id = ++ctx->kp_next_id;
+	op->kp_fd = (int)k->ident;
+	op->kp_kev = true;
+	op->kp_keof = false;
+	op->kp_kfflags = 0;
+	op->kp_kdata = 0;
+	op->kp_nev = 0;
+	op->kp_on = true;
+	op->cancelled = false;
+	TAILQ_INSERT_TAIL(KQRING_KP_BUCKET(ctx, op->kp_fd), op, kp_link);
+	kqring_op_arm_locked(ctx, op);
+	mtx_unlock(&ctx->mtx);
+
+	(void)kqring_kp_kevents(op, &kev, EV_ADD | (multi ? EV_CLEAR :
+	    EV_ONESHOT));
+	error = kqring_kp_change(ctx, &kev, 1);
+	if (error == 0)
+		return;
+	mtx_lock(&ctx->mtx);
+	kqring_op_unarm_locked(ctx, op);
+	mtx_unlock(&ctx->mtx);
+	kqring_req_complete(ctx, op, -error, 0);
+}
+
+/* Post what fired for a kevent request (taskwork). */
+static void
+kqring_kev_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	const struct kevent *k = op->args;
+	bool multi = (op->sqe.rw_flags & KQRING_KEV_MULTISHOT) != 0;
+	uint64_t extra[2];
+	uint32_t fflags;
+	int64_t data;
+	int32_t res;
+	bool eof;
+	u_int nev;
+
+	mtx_lock(&ctx->mtx);
+	nev = op->kp_nev;
+	fflags = op->kp_kfflags;
+	data = op->kp_kdata;
+	eof = op->kp_keof;
+	op->kp_nev = 0;
+	op->kp_kfflags = 0;
+	op->kp_kdata = 0;
+	mtx_unlock(&ctx->mtx);
+	if (nev == 0)
+		return;
+	if (k->filter == EVFILT_SIGNAL)
+		res = (int32_t)MIN(data, INT32_MAX);
+	else if (k->filter == EVFILT_PROC)
+		res = KQRING_KEV_PROC_NOTE(fflags);
+	else
+		res = (int32_t)(fflags & INT32_MAX);
+	extra[0] = (uint64_t)data;
+	extra[1] = fflags;
+	if (multi && !eof && !kqring_cq_full(ctx)) {
+		ctx->cq_seq++;
+		kqring_post_cqe_extra(ctx, op->sqe.user_data, res,
+		    IORING_CQE_F_MORE, extra);
+		return;
+	}
+	op->cqe_has_extra = true;
+	op->cqe_extra[0] = extra[0];
+	op->cqe_extra[1] = extra[1];
+	mtx_lock(&ctx->mtx);
+	kqring_op_unarm_locked(ctx, op);
+	mtx_unlock(&ctx->mtx);
+	kqring_req_complete(ctx, op, res, 0);
+}
+
 /*
  * Post what the poller saw for op (run as taskwork): its CQE, or for a
  * multishot request one per event, with F_MORE.  A multishot request
@@ -707,6 +884,10 @@ kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 	int rev;
 	u_int nev;
 
+	if (op->kp_kev) {
+		kqring_kev_deliver(ctx, op);
+		return;
+	}
 	mtx_lock(&ctx->mtx);
 	/*
 	 * A multishot poll on the ring's own eventfd would be woken by the

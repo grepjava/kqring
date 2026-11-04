@@ -951,9 +951,36 @@ struct kqring_ext_setup {
 #define KQRING_IOC_EXT_SETUP	_IOWR(KQRING_IOC_MAGIC, 4, struct kqring_ext_setup)
 
 #define KQRING_EXT_F_TRIGGER	(1ULL << 0)
+#define KQRING_EXT_F_KEVENT	(1ULL << 1)
 
 /* Sub-opcodes (sqe->ioprio of the escape opcode). */
 #define KQRING_EXT_TRIGGER	1
+#define KQRING_EXT_KEVENT	2
+
+/*
+ * KQRING_EXT_KEVENT: wait for a kqueue event io_uring has no request for.
+ * sqe->addr points to a struct kevent giving ident, filter and fflags as
+ * for EV_ADD (flags, data, udata and ext must be 0); sqe->len is its size;
+ * sqe->fd must be -1.  sqe->rw_flags: KQRING_KEV_MULTISHOT for a CQE per
+ * event (IORING_CQE_F_MORE) until cancelled or the source goes away.
+ *
+ *   EVFILT_VNODE   ident: a descriptor (not a fixed file); fflags: NOTE_*
+ *                  vnode events.  res: the NOTE_* that fired.
+ *   EVFILT_PROC    ident: a pid; fflags: NOTE_EXIT, NOTE_FORK, NOTE_EXEC.
+ *                  res: the NOTE_* that fired, shifted right by 16 (they
+ *                  are the top bits, and res must stay positive): test it
+ *                  with KQRING_KEV_PROC_NOTE().  A process's exit is its
+ *                  last event and ends a multishot request.
+ *   EVFILT_SIGNAL  ident: a signal number; fflags 0.  res: how many times
+ *                  it was delivered since the last CQE (block or ignore
+ *                  it, or its action runs too).
+ *
+ * With IORING_SETUP_CQE32, big_cqe[0] holds the kevent's data (for
+ * NOTE_EXIT, the exit status as wait(2) reports it) and big_cqe[1] the
+ * fflags that fired.
+ */
+#define KQRING_KEV_MULTISHOT	(1U << 0)
+#define KQRING_KEV_PROC_NOTE(note)	((int32_t)((uint32_t)(note) >> 16))
 
 /*
  * KQRING_EXT_TRIGGER: an event-driven chain.  The trigger SQE (fd,

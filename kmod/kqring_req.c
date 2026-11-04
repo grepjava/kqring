@@ -1388,6 +1388,9 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		case KQRING_EXT_TRIGGER:
 			op->sqe.opcode = KQRING_IOP_TRIGGER;
 			break;
+		case KQRING_EXT_KEVENT:
+			op->sqe.opcode = KQRING_IOP_KEVENT;
+			break;
 		default:
 			return (EINVAL);
 		}
@@ -1594,6 +1597,12 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		error = kqring_trig_prep(op);
 		if (error != 0)
 			return (error);
+		break;
+	case KQRING_IOP_KEVENT:
+		error = kqring_kev_prep(op);
+		if (error != 0)
+			return (error);
+		multishot = (sqe->rw_flags & KQRING_KEV_MULTISHOT) != 0;
 		break;
 	case IORING_OP_POLL_REMOVE:
 		if (sqe->buf_index != 0 || sqe->splice_fd_in != 0)
@@ -1982,7 +1991,11 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 		if (op->sqe.opcode == IORING_OP_TIMEOUT)
 			kqring_post_cqe_uncounted(ctx, op->sqe.user_data, res,
 			    cflags);
-		else
+		else if (__predict_false(op->cqe_has_extra)) {
+			ctx->cq_seq++;
+			kqring_post_cqe_extra(ctx, op->sqe.user_data, res,
+			    cflags, op->cqe_extra);
+		} else
 			kqring_post_cqe(ctx, op->sqe.user_data, res, cflags);
 	}
 	if (op->zc_notif != NULL) {
@@ -2262,6 +2275,9 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 		return;
 	case KQRING_IOP_TRIGGER:
 		kqring_trig_issue(ctx, op);
+		return;
+	case KQRING_IOP_KEVENT:
+		kqring_kev_issue(ctx, op);
 		return;
 	default:
 		if (kqring_op_use_wq(sqe)) {

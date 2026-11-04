@@ -175,13 +175,14 @@ The trigger uses 8–15% less server CPU per message than kqueue and is the fast
 Event-driven chains are the first of three extensions, all behind the same opt-in and escape opcode. Each is a sub-opcode, and none duplicates an operation kqring already has.
 
 1. **Event-driven chains** (`KQRING_EXT_TRIGGER`, this spec): phases 1 and 2 above.
-2. **Kevent operation** (`KQRING_EXT_KEVENT`), one-shot or multishot, with a CQE per event. Its `res` carries the kevent's `data`, and with a 32-byte CQE (`CQE32`) the whole kevent is returned. Filters:
-   - `EVFILT_VNODE`: a file or directory was written, extended, renamed, deleted, or had its attributes or links changed. io_uring has no operation for this; Linux needs inotify plus a read.
-   - `EVFILT_SIGNAL`: a signal arrived, with its count. io_uring has no operation for this; Linux needs signalfd plus a read.
-   - `EVFILT_PROC`: any process (not only a child, unlike `WAITID`) exited, with its status, or forked or ran exec.
-   - `EVFILT_READ` / `EVFILT_WRITE`, only for the byte count: bytes readable, space to write, pending connections. `POLL_ADD` itself stays as on Linux.
+2. **Kevent operation** (`KQRING_EXT_KEVENT`, **implemented** for `VNODE`, `SIGNAL` and `PROC`; `include/sys/kqring.h` has the interface). One-shot or multishot (`KQRING_KEV_MULTISHOT` in `sqe->rw_flags`), with a CQE per event. `sqe->addr` points to a `struct kevent` with the ident, filter and fflags. With a 32-byte CQE (`CQE32`), `big_cqe[0]` holds the kevent's `data` and `big_cqe[1]` the fflags that fired. Events that fire before a CQE is posted merge into it.
+   - `EVFILT_VNODE`: a file or directory was written, extended, renamed, deleted, or had its attributes or links changed. `res` is the `NOTE_*` that fired. io_uring has no operation for this; Linux needs inotify plus a read.
+   - `EVFILT_SIGNAL`: a signal arrived. `res` is how many times since the last CQE, even for a signal that's ignored. io_uring has no operation for this; Linux needs signalfd plus a read.
+   - `EVFILT_PROC`: any process (not only a child, unlike `WAITID`) exited, forked or ran exec. `res` is the `NOTE_*` shifted right by 16 (`KQRING_KEV_PROC_NOTE()`), because they are the top bits and `res` must stay positive. The exit status is `big_cqe[0]`, so it needs `CQE32`. An exit is the process's last event and ends a multishot request.
+   - Rules: `sqe->fd` is -1 and the ident is in the kevent; `VNODE` needs a descriptor, not a fixed file; a ring can have one request per ident and filter (`-EBUSY` for a second, as a kqueue holds one knote per pair); only a thread of the ring's owner process can issue one (`-EOPNOTSUPP`), because the kqueue and descriptors are that process's.
+   - **Not yet:** `EVFILT_READ` / `EVFILT_WRITE` for the byte count. A socket's read knote on the ring's kqueue is already taken by kqring's end-of-input watch (FreeBSD PR 300494), and a non-socket file's by `POLL_ADD`, so these need the two to share a knote first.
    - Left out because kqring already covers them: `EVFILT_TIMER` (multishot `TIMEOUT`), `EVFILT_USER` (`MSG_RING`), `EVFILT_AIO` (the ring does the I/O).
-   This also provides phase 3 of event-driven chains: kevent sources as triggers ("when this file changes, read it").
+   Still to do here: phase 3 of event-driven chains, kevent sources as triggers ("when this file changes, read it").
 3. **kqueue bridge** (`KQRING_EXT_KQUEUE`): attach an existing kqueue to a ring, and its events, registered by any code such as libevent or libuv, arrive as CQEs with their `udata`. This is a migration aid, so programs can move to kqring one part at a time. A `POLL_ADD` on a kqueue fd only says that the kqueue has events.
 
 ## Open questions
