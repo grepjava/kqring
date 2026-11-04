@@ -115,7 +115,7 @@ kqring_trig_prep(struct kqring_op *op)
 		return (EINVAL);
 	concurrent = (ta->flags & KQRING_TRIG_CONCURRENT) != 0;
 	if ((ta->flags & ~(KQRING_TRIG_CONCURRENT | KQRING_TRIG_CQE_EACH |
-	    KQRING_TRIG_STOP_ON_ERROR)) != 0 ||
+	    KQRING_TRIG_STOP_ON_ERROR | KQRING_TRIG_CANCEL_RUNNING)) != 0 ||
 	    ta->nsteps == 0 || ta->nsteps > KQRING_TRIG_MAX_STEPS ||
 	    (concurrent ? ta->max_inflight == 0 ||
 	    ta->max_inflight > KQRING_TRIG_MAX_INFLIGHT :
@@ -401,6 +401,55 @@ kqring_trig_stop_waiter(struct kqring_trig *trig)
 		kqring_req_complete(ctx, w, -ECANCELED, 0);
 }
 
+/* Whether op belongs to a run of trig. */
+static inline bool
+kqring_trig_owns(const struct kqring_trig *trig, const struct kqring_op *op)
+{
+	return (op->trun != NULL && op->trun->trig == trig);
+}
+
+/*
+ * CANCEL_RUNNING: cancel the requests of trig's runs.  Armed ones (and
+ * ones on a worker) complete -ECANCELED as ASYNC_CANCEL completes them,
+ * which fails the rest of their chains; chains queued but not issued yet
+ * fail whole.  Disk I/O in flight can't be cancelled and finishes.  From
+ * kqring_trig_step(), so never inside a completion.
+ */
+static void
+kqring_trig_cancel_runs(struct kqring_trig *trig)
+{
+	struct kqring_ctx *ctx = trig->ctx;
+	struct kqring_op *op, *tmp;
+
+	for (;;) {
+		mtx_lock(&ctx->mtx);
+		TAILQ_FOREACH(op, &ctx->active_ops, active_link) {
+			if (kqring_trig_owns(trig, op) && !op->cancelled &&
+			    !op->bio)
+				break;
+		}
+		if (op != NULL)
+			kqring_op_unarm_locked(ctx, op);
+		mtx_unlock(&ctx->mtx);
+		if (op == NULL)
+			break;
+		kqring_req_complete(ctx, op, -ECANCELED, 0);
+	}
+	TAILQ_FOREACH_SAFE(op, &ctx->ready_q, q_link, tmp) {
+		if (!kqring_trig_owns(trig, op))
+			continue;
+		TAILQ_REMOVE(&ctx->ready_q, op, q_link);
+		kqring_chain_fail(ctx, op, false);
+	}
+	TAILQ_FOREACH_SAFE(op, &ctx->defer_q, q_link, tmp) {
+		if (!kqring_trig_owns(trig, op))
+			continue;
+		TAILQ_REMOVE(&ctx->defer_q, op, q_link);
+		ctx->ndeferred -= op->nchain;
+		kqring_chain_fail(ctx, op, false);
+	}
+}
+
 /* Act on one trigger taken off ctx->trig_work. */
 static void
 kqring_trig_step(struct kqring_trig *trig)
@@ -409,6 +458,11 @@ kqring_trig_step(struct kqring_trig *trig)
 
 	if (trig->ending) {
 		kqring_trig_stop_waiter(trig);
+		if ((trig->args.flags & KQRING_TRIG_CANCEL_RUNNING) != 0 &&
+		    trig->end_res < 0 && !trig->runs_cancelled) {
+			trig->runs_cancelled = true;
+			kqring_trig_cancel_runs(trig);
+		}
 		if (trig->waiter != NULL || trig->inflight != 0 ||
 		    trig->posted)
 			return;

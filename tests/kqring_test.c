@@ -9876,6 +9876,92 @@ test_trigger_step_flags_bad(void)
 	    "LEN_FROM_PREV after a failed step is 0\n");
 }
 
+/*
+ * CANCEL_RUNNING: a CONCURRENT trigger with three runs waiting (a RECV on
+ * an empty socket each, then a linked NOP), cancelled.  Each RECV gets
+ * -ECANCELED and its NOP -ECANCELED, all before the trigger's final CQE.
+ * Without the flag the runs stay until they finish.
+ */
+static void
+test_trigger_cancel_running(void)
+{
+	for (int with = 0; with < 2; with++) {
+		struct kqring_trigger t = { .nsteps = 2,
+		    .flags = KQRING_TRIG_CONCURRENT |
+		    (with ? KQRING_TRIG_CANCEL_RUNNING : 0),
+		    .max_inflight = 4 };
+		struct test_ring r;
+		struct io_uring_sqe *sqe;
+		struct io_uring_cqe c;
+		char buf[8];
+		int p[2], sv[2], recvs = 0, nops = 0;
+		bool final = false;
+
+		trig_ring(&r);
+		assert(pipe2(p, O_NONBLOCK) == 0);
+		assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0,
+		    sv) == 0);
+		trig_prep(&r, p[0], POLLIN, 1, &t);
+		ring_push_sqe(&r);
+		sqe = ring_prep(&r, IORING_OP_RECV, sv[1], 2);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		sqe->flags = IOSQE_IO_LINK;
+		ring_push_sqe(&r);
+		ring_prep(&r, IORING_OP_NOP, -1, 3);
+		ring_push_sqe(&r);
+		ring_submit(&r);
+		/* Three events, three runs, each left waiting on its RECV. */
+		for (int i = 0; i < 3; i++) {
+			char x;
+
+			assert(write(p[1], "e", 1) == 1);
+			(void)ring_wait(&r, 1, 20);
+			assert(read(p[0], &x, 1) == 1);
+		}
+		assert(ring_cq_ready(&r) == 0);
+		trig_cancel(&r, 1);
+		uint64_t end = now_ns() + 2000000000ULL;
+		while (!final && now_ns() < end) {
+			(void)ring_wait(&r, 1, 50);
+			while (ring_cq_ready(&r) > 0) {
+				c = ring_pop_cqe(&r);
+				if (c.user_data == 2) {
+					assert(!final && c.res == -ECANCELED);
+					recvs++;
+				} else if (c.user_data == 3) {
+					assert(!final && c.res == -ECANCELED);
+					nops++;
+				} else if (c.user_data == 1) {
+					assert(c.res == -ECANCELED);
+					final = true;
+				} else
+					assert(c.user_data == 9999);
+			}
+		}
+		if (with) {
+			assert(final && recvs == 3 && nops == 3);
+		} else {
+			/* The runs keep the trigger alive: no final CQE yet. */
+			assert(!final && recvs == 0 && nops == 0);
+			/* Data for one of them finishes one run. */
+			assert(write(sv[0], "d", 1) == 1);
+			(void)trig_collect(&r, 2, 1000);
+			c = ring_pop_cqe(&r);
+			assert(c.user_data == 2 && c.res == 1);
+			c = ring_pop_cqe(&r);
+			assert(c.user_data == 3 && c.res == 0);
+		}
+		close(r.fd);
+		close(p[0]);
+		close(p[1]);
+		close(sv[0]);
+		close(sv[1]);
+	}
+	printf("[PASS] trigger CANCEL_RUNNING: a cancel ends 3 waiting runs "
+	    "(-ECANCELED each) before the final CQE; without it they stay\n");
+}
+
 /* Close the ring with triggers armed and a run waiting on a socket. */
 static void
 test_trigger_close(void)
@@ -10446,6 +10532,7 @@ test_triggers(struct test_ring *plain)
 	test_trigger_echo();
 	test_trigger_file_copy();
 	test_trigger_step_flags_bad();
+	test_trigger_cancel_running();
 	test_trigger_close();
 	test_unix_peer_shutdown();
 }

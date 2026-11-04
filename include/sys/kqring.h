@@ -1016,6 +1016,13 @@ struct kqring_trigger {
 #define KQRING_TRIG_CONCURRENT		(1U << 0)
 #define KQRING_TRIG_CQE_EACH		(1U << 1)
 #define KQRING_TRIG_STOP_ON_ERROR	(1U << 2)
+/*
+ * When the trigger ends with an error (cancelled, STOP_ON_ERROR, the CQ
+ * full), cancel its runs still in flight, as ASYNC_CANCEL would, rather
+ * than let them finish.  A normal end (res 0: the source's last event, or
+ * STOP_ON_ZERO) still lets the last run finish.
+ */
+#define KQRING_TRIG_CANCEL_RUNNING	(1U << 3)
 
 /*
  * Step flags (step_flags[i], for template i >= 1): how a step uses the

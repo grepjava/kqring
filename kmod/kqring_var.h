@@ -1420,6 +1420,7 @@ struct kqring_trig {
 	bool			ending;		/* no more runs; final CQE due */
 	bool			want_arm;	/* SERIAL: re-arm at next work */
 	bool			posted;		/* final CQE posted */
+	bool			runs_cancelled;	/* CANCEL_RUNNING done */
 	int32_t			end_res;
 	uint64_t		runs;
 };

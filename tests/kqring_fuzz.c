@@ -676,7 +676,7 @@ sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
 
 	memset(t, 0, sizeof(*t));
 	t->nsteps = chance(f, 95) ? (uint8_t)k : (uint8_t)rn(f, 10);
-	t->flags = (uint32_t)rn(f, 8);	/* CONCURRENT | CQE_EACH | STOP */
+	t->flags = (uint32_t)rn(f, 16);	/* CONCURRENT .. CANCEL_RUNNING */
 	if ((t->flags & KQRING_TRIG_CONCURRENT) != 0)
 		t->max_inflight = (uint16_t)(1 + rn(f, 8));
 	if (chance(f, 3))
