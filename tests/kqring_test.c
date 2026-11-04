@@ -9700,10 +9700,7 @@ test_trigger_echo(void)
 	assert(memcmp(out, in, STREAM) == 0);
 	/* Not one CQE so far. */
 	assert(ring_cq_ready(&r) == 0);
-	/*
-	 * The peer closes.  (Not shutdown(SHUT_WR): FreeBSD 15 runs no socket
-	 * upcall when an AF_UNIX peer shuts down writing; see the README.)
-	 */
+	/* The peer closes (test_unix_peer_shutdown() covers SHUT_WR). */
 	close(sv[0]);
 	c = trig_final(&r, 1, 2000);
 	assert(c.res == 0);
@@ -9923,6 +9920,69 @@ test_trigger_close(void)
 	    "in flight (50 rounds)\n");
 }
 
+/*
+ * The peer of an AF_UNIX stream socket shuts down writing while a RECV,
+ * a POLL_ADD and a trigger wait on it: FreeBSD runs no socket upcall for
+ * that, so kqring watches for it with a knote (kqring_kpoll_soeof_watch()).
+ * Each must complete within a second; TCP is the control.
+ */
+static void
+test_unix_peer_shutdown(void)
+{
+	for (int kind = 0; kind < 6; kind++) {
+		bool tcp = kind >= 3;
+		int what = kind % 3;	/* RECV, POLL_ADD, trigger */
+		struct kqring_trigger t = { .nsteps = 1 };
+		struct test_ring r;
+		struct io_uring_sqe *sqe;
+		struct io_uring_cqe c;
+		char buf[16];
+		int sv[2];
+
+		trig_ring(&r);
+		if (tcp) {
+			uint16_t port;
+			int l = tcp_listener(&port);
+
+			sv[0] = tcp_connect(port);
+			wait_readable(l);
+			sv[1] = accept(l, NULL, NULL);
+			assert(sv[1] >= 0);
+			close(l);
+		} else
+			assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+		if (what == 2) {
+			trig_prep(&r, sv[1], POLLIN, 1, &t);
+			ring_push_sqe(&r);
+			sqe = ring_prep(&r, IORING_OP_RECV, sv[1], 2);
+			sqe->addr = (uint64_t)(uintptr_t)buf;
+			sqe->len = sizeof(buf);
+			sqe->flags = IOSQE_CQE_SKIP_SUCCESS;
+		} else {
+			sqe = ring_prep(&r, what == 0 ? IORING_OP_RECV :
+			    IORING_OP_POLL_ADD, sv[1], 1);
+			if (what == 1)
+				sqe->poll32_events = POLLIN;
+			else {
+				sqe->addr = (uint64_t)(uintptr_t)buf;
+				sqe->len = sizeof(buf);
+			}
+		}
+		ring_push_sqe(&r);
+		ring_submit(&r);
+		assert(ring_wait(&r, 1, 50) == ETIMEDOUT);
+		assert(shutdown(sv[0], SHUT_WR) == 0);
+		c = trig_final(&r, 1, 1000);
+		assert(c.res == (what == 1 ? (int32_t)(POLLIN) : 0) ||
+		    (what == 1 && (c.res & POLLIN) != 0));
+		close(sv[0]);
+		close(sv[1]);
+		close(r.fd);
+	}
+	printf("[PASS] AF_UNIX peer shutdown(SHUT_WR) completes an armed RECV, "
+	    "POLL_ADD and trigger (as on TCP)\n");
+}
+
 static void
 test_triggers(struct test_ring *plain)
 {
@@ -9936,6 +9996,7 @@ test_triggers(struct test_ring *plain)
 	test_trigger_file_copy();
 	test_trigger_step_flags_bad();
 	test_trigger_close();
+	test_unix_peer_shutdown();
 }
 
 int

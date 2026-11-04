@@ -98,6 +98,8 @@ struct kqring_kp_fops {
 
 /* One per filterops seen (pipe read and write, eventfd, tty, ...). */
 static struct kqring_kp_fops kqring_kp_fops[16];
+/* The end-of-input watches' (kqring_kpoll_soeof_watch()): sockets only. */
+static struct kqring_kp_fops kqring_kp_eof_fops[4];
 static struct mtx kqring_kp_fops_mtx;
 MTX_SYSINIT(kqring_kp_fops, &kqring_kp_fops_mtx, "kqring kpoll fops",
     MTX_DEF);
@@ -150,21 +152,50 @@ kqring_kp_filt_event(struct knote *kn, long hint)
 	return (ready || pending);
 }
 
-static const struct filterops *
-kqring_kp_fops_get(const struct filterops *orig)
+/*
+ * An end-of-input watch: report only end of input or an error, never
+ * data, which the socket's upcall reports.  From knote() (kq lock held),
+ * wake an enter waiting on the ring, as kqring_kp_filt_event() does.
+ */
+static int
+kqring_kp_eof_event(struct knote *kn, long hint)
 {
+	const struct kqring_kp_fops *w = __containerof(kn->kn_fop,
+	    struct kqring_kp_fops, fo);
+	struct kqring_ctx *ctx;
+
+	if (!w->orig->f_event(kn, hint) ||
+	    ((kn->kn_flags & EV_EOF) == 0 && kn->kn_data > 0))
+		return (0);
+	if (mtx_owned(&kn->kn_kq->kq_lock)) {
+		ctx = (struct kqring_ctx *)(uintptr_t)kn->kn_kevent.ext[1];
+		if (ctx != NULL) {
+			atomic_store_rel_int(&ctx->kp_kick, 1);
+			if (atomic_load_int(&ctx->cq_sleepers) != 0)
+				wakeup(&ctx->wakeup_chan);
+		}
+	}
+	return (1);
+}
+
+static const struct filterops *
+kqring_kp_fops_get(const struct filterops *orig, bool eof)
+{
+	struct kqring_kp_fops *tab = eof ? kqring_kp_eof_fops : kqring_kp_fops;
+	u_int ntab = eof ? nitems(kqring_kp_eof_fops) : nitems(kqring_kp_fops);
 	struct kqring_kp_fops *w = NULL;
 
 	mtx_lock(&kqring_kp_fops_mtx);
-	for (u_int i = 0; i < nitems(kqring_kp_fops); i++) {
-		if (kqring_kp_fops[i].orig == orig) {
-			w = &kqring_kp_fops[i];
+	for (u_int i = 0; i < ntab; i++) {
+		if (tab[i].orig == orig) {
+			w = &tab[i];
 			break;
 		}
-		if (kqring_kp_fops[i].orig == NULL) {
-			w = &kqring_kp_fops[i];
+		if (tab[i].orig == NULL) {
+			w = &tab[i];
 			w->fo = *orig;
-			w->fo.f_event = kqring_kp_filt_event;
+			w->fo.f_event = eof ? kqring_kp_eof_event :
+			    kqring_kp_filt_event;
 			w->orig = orig;
 			break;
 		}
@@ -174,10 +205,18 @@ kqring_kp_fops_get(const struct filterops *orig)
 }
 
 static bool
+kqring_kp_fops_eof(const struct filterops *fo)
+{
+	return (fo >= &kqring_kp_eof_fops[0].fo &&
+	    fo <= &kqring_kp_eof_fops[nitems(kqring_kp_eof_fops) - 1].fo);
+}
+
+static bool
 kqring_kp_fops_ours(const struct filterops *fo)
 {
-	return (fo >= &kqring_kp_fops[0].fo &&
-	    fo <= &kqring_kp_fops[nitems(kqring_kp_fops) - 1].fo);
+	return ((fo >= &kqring_kp_fops[0].fo &&
+	    fo <= &kqring_kp_fops[nitems(kqring_kp_fops) - 1].fo) ||
+	    kqring_kp_fops_eof(fo));
 }
 
 /* The knote kev registered on kq, under the kq lock. */
@@ -205,7 +244,8 @@ kqring_kp_knote(struct kqueue *kq, const struct kevent *kev)
  * filterops and only misses wakeups drained before the poller looks.
  */
 static void
-kqring_kp_wrap(struct kqring_ctx *ctx, const struct kevent *kev, int n)
+kqring_kp_wrap(struct kqring_ctx *ctx, const struct kevent *kev, int n,
+    bool eof)
 {
 	const struct filterops *orig, *fo;
 	struct kqueue *kq;
@@ -223,7 +263,7 @@ kqring_kp_wrap(struct kqring_ctx *ctx, const struct kevent *kev, int n)
 		if (orig == NULL || kqring_kp_fops_ours(orig) ||
 		    orig->f_event == NULL)
 			continue;
-		if ((fo = kqring_kp_fops_get(orig)) == NULL)
+		if ((fo = kqring_kp_fops_get(orig, eof)) == NULL)
 			continue;
 		for (int tries = 0; tries < 100; tries++) {
 			mtx_lock(&kq->kq_lock);
@@ -317,6 +357,10 @@ kqring_kp_event(struct kqring_ctx *ctx, const struct kevent *kev)
 	uint64_t id = (uint64_t)(uintptr_t)kev->udata;
 	struct kqring_op *op;
 
+	if (kev->udata == KQRING_KP_SOEOF) {
+		kqring_so_eof_kick(curthread, (int)kev->ident);
+		return;
+	}
 	mtx_lock(&ctx->mtx);
 	TAILQ_FOREACH(op, KQRING_KP_BUCKET(ctx, kev->ident), kp_link) {
 		if (op->kp_id == id)
@@ -480,6 +524,59 @@ kqring_kp_start(struct kqring_ctx *ctx)
 	return (error);
 }
 
+/*
+ * End of input on AF_UNIX stream sockets.  When the peer shuts down
+ * writing, FreeBSD 15 (uipc_cantrcvmore()) wakes select, poll and kqueue
+ * but runs no socket upcall, so a request waiting on kqring's upcall
+ * would never hear of it.  A socket a request waits to read from through
+ * a descriptor therefore gets a knote on the ring's kqueue, once per
+ * descriptor until it is closed, with filterops that report only end of
+ * input (kqring_kp_eof_event()).  The poller, or an enter's scan, then
+ * runs the upcall (kqring_so_eof_kick()).  Requests on fixed files have
+ * no descriptor to watch.  so (watched through fd, generation gen) is
+ * only compared, never used: the request may be gone.  No locks held.
+ *
+ * ctx->soeof[] saves the kqueue lookup on each arm.  It can't tell when
+ * fd was closed (dropping the knote) and the same socket put back on the
+ * same number (dup2(2)); that socket then goes unwatched until the entry
+ * is replaced.
+ */
+void
+kqring_kpoll_soeof_watch(struct kqring_ctx *ctx, int fd,
+    const struct socket *so, so_gen_t gen)
+{
+	struct kqring_soeof *c;
+	struct kevent kev;
+	struct file *fp;
+	struct knote *kn;
+	bool have;
+
+	/* The caller found fd missing from ctx->soeof[]. */
+	if (fd < 0 || ctx->owner_proc != curproc ||
+	    kqring_kp_start(ctx) != 0)
+		return;
+	c = &ctx->soeof[(u_int)fd % nitems(ctx->soeof)];
+	EV_SET(&kev, fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, KQRING_KP_SOEOF);
+	if ((fp = kqring_kp_getfp(ctx)) == NULL)
+		return;
+	mtx_lock(&((struct kqueue *)fp->f_data)->kq_lock);
+	kn = kqring_kp_knote(fp->f_data, &kev);
+	have = kn != NULL && kn->kn_fp != NULL && kn->kn_fp->f_data == so &&
+	    kqring_kp_fops_eof(kn->kn_fop);
+	mtx_unlock(&((struct kqueue *)fp->f_data)->kq_lock);
+	fdrop(fp, curthread);
+	if (!have) {
+		if (kqring_kp_change(ctx, &kev, 1) != 0)
+			return;
+		kqring_kp_wrap(ctx, &kev, 1, true);
+	}
+	mtx_lock(&ctx->mtx);
+	c->fd = fd;
+	c->so = so;
+	c->gen = gen;
+	mtx_unlock(&ctx->mtx);
+}
+
 static int
 kqring_kp_kevents(const struct kqring_op *op, struct kevent *kev,
     u_short flags)
@@ -553,7 +650,7 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	    (!level ? EV_CLEAR : 0));
 	error = kqring_kp_change(ctx, kev, n);
 	if (error == 0) {
-		kqring_kp_wrap(ctx, kev, n);
+		kqring_kp_wrap(ctx, kev, n, false);
 		return (0);
 	}
 	mtx_lock(&ctx->mtx);

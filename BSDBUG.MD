@@ -4,7 +4,7 @@ FreeBSD kernel bugs that kqring's development turned up: what each one is, how k
 
 | # | Summary | Found | Upstream | kqring |
 |---|---|---|---|---|
-| 1 | [AF_UNIX stream `shutdown(SHUT_WR)` runs no `SO_RCV` upcall on the peer](#1-af_unix-stream-shutdownshut_wr-runs-no-so_rcv-upcall-on-the-peer) | 2026-11-04 | [PR 300494](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=300494), open | Workaround in progress |
+| 1 | [AF_UNIX stream `shutdown(SHUT_WR)` runs no `SO_RCV` upcall on the peer](#1-af_unix-stream-shutdownshut_wr-runs-no-so_rcv-upcall-on-the-peer) | 2026-11-04 | [PR 300494](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=300494), open | Worked around (descriptors; not fixed files) |
 
 How to add one: give it the next number, a row in the table, and a section below with the same headings. Put any reproducer in `tests/bsdbugs/<name>/`. Once it's filed, record the PR number and its URL, and keep the status up to date.
 
@@ -15,7 +15,7 @@ How to add one: give it the next number, a row in the table, and a section below
 - **Found:** 2026-11-04, by kqring's event-driven chain tests (an armed `RECV` never completed after the peer half-closed).
 - **Affects:** FreeBSD 15.1-RELEASE (reproduced on 15.1-RELEASE-p6, amd64: kqring on `GENERIC` and `GENERIC-DEBUG`, the reproducer module on `GENERIC-DEBUG`). The same code is in `main` as of 2026-11-04.
 - **Upstream:** [PR 300494](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=300494), filed 2026-11-04 (Base System / kern, 15.1-RELEASE, Affects Some People). Status: open. Follows up commit 52c0aa086d6b (June 2025), which fixed the same event for select, poll and kqueue but not for upcalls; the regression came with the unix/stream rewrite, d15792780760.
-- **kqring workaround:** a knote on the ring's private kqueue that reports only end of input, for each AF_UNIX stream socket that a request waits to read from through a descriptor (`kqring_kpoll_soeof_watch()`). Requests that use only fixed files are still affected. README, *Differences from Linux*, *Polling*.
+- **kqring workaround** (since 2026-11-04): each AF_UNIX stream socket a request waits to read from through a descriptor gets a knote on the ring's private kqueue that reports only end of input (`kqring_kpoll_soeof_watch()` in `kmod/kqring_kpoll.c`). The ring's poller, or an enter's scan, then runs kqring's upcall (`kqring_so_eof_kick()`). It's registered once per descriptor and removed by kqueue when the descriptor closes. Requests that name the socket only by a fixed-file index are still affected. Regression test: `test_unix_peer_shutdown` in `kqring_test`. README, *Differences from Linux*, *Polling*. Remove the workaround once a fixed release is the oldest one kqring supports.
 - **Reproducer:** [`tests/bsdbugs/unix_shutdown_upcall/`](tests/bsdbugs/unix_shutdown_upcall/), a small kernel module that prints the result when loaded.
 
 ### Report as filed

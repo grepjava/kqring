@@ -728,6 +728,15 @@ struct kqring_ctx {
 	u_int			kp_kick;
 	uint64_t		kp_next_id;
 	TAILQ_HEAD(, kqring_op)	kp_ops[KQRING_KP_HASH];
+	/*
+	 * AF_UNIX stream sockets with an end-of-input knote, by descriptor
+	 * (kqring_kpoll_soeof_watch()); a cache, under mtx.
+	 */
+	struct kqring_soeof {
+		int		fd;
+		const struct socket *so;
+		so_gen_t	gen;
+	}			soeof[16];
 
 	/*
 	 * Registered files and buffers (owner thread only).  A NULL slot is
@@ -1677,6 +1686,22 @@ void	kqring_worker_rele(void);
 #define	KQRING_KP_WRITE	0x02
 void	kqring_kpoll_run(struct thread *td);
 void	kqring_kpoll_kicked(struct kqring_ctx *ctx);
+void	kqring_kpoll_soeof_watch(struct kqring_ctx *ctx, int fd,
+	    const struct socket *so, so_gen_t gen);
+void	kqring_so_eof_kick(struct thread *td, int fd);
+/* Whether fd already has an end-of-input knote for so; under ctx->mtx. */
+static inline bool
+kqring_soeof_cached_locked(struct kqring_ctx *ctx, int fd,
+    const struct socket *so, so_gen_t gen)
+{
+	const struct kqring_soeof *c = &ctx->soeof[(u_int)fd %
+	    nitems(ctx->soeof)];
+
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	return (c->fd == fd && c->so == so && c->gen == gen);
+}
+/* The udata of end-of-input knotes; a kp_id never reaches it. */
+#define	KQRING_KP_SOEOF		((void *)(uintptr_t)UINT64_MAX)
 int	kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	    const struct file *fp);
 void	kqring_kpoll_disarm_locked(struct kqring_ctx *ctx,

@@ -74,7 +74,7 @@ Together these make an in-kernel copy loop. An echo server is a `SERIAL` trigger
 - At most 1,024 triggers per ring (`-EBUSY` past that).
 - A `SERIAL` trigger whose event is still pending re-arms at once, but after 16 firings in a row its re-arm goes through taskwork. So the work one enter does is bounded even if the event never stops.
 - Rings with restrictions (`IORING_REGISTER_RESTRICTIONS`) refuse the escape opcode with `-EACCES`, and `IORING_SETUP_IOPOLL` rings with `-EINVAL`.
-- **AF_UNIX stream sockets on FreeBSD 15:** when the peer calls `shutdown(SHUT_WR)`, the kernel wakes `poll(2)` and kqueue but runs no socket upcall. So a trigger, like any armed kqring `RECV` or `POLL_ADD` on that socket, doesn't see end of input until more happens on the socket. A peer that closes is seen at once, and TCP isn't affected.
+- **AF_UNIX stream sockets on FreeBSD 15:** when the peer calls `shutdown(SHUT_WR)`, the kernel runs no socket upcall ([PR 300494](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=300494)). kqring watches the socket with a knote instead, so a trigger on a descriptor sees end of input at once. A trigger on a fixed file doesn't, until more happens on the socket.
 - Don't combine triggers with `IOSQE_IO_DRAIN`. A trigger's poll stays in flight, as an armed multishot request does, so a drained chain submitted later waits for it, and runs queued behind that chain wait too.
 
 ## ABI

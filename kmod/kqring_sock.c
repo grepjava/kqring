@@ -2376,6 +2376,12 @@ armed:
 	bool want_polled = (op->dirs & KQ_DIR_SND) != 0 &&
 	    so->so_proto->pr_domain->dom_family == AF_LOCAL &&
 	    so->so_type != SOCK_DGRAM;
+	/* See kqring_kpoll_soeof_watch(); read before op may complete. */
+	bool want_eof = (op->dirs & KQ_DIR_RCV) != 0 && !op->listening &&
+	    op->ffile == NULL && so->so_proto->pr_domain->dom_family ==
+	    AF_LOCAL && so->so_type != SOCK_DGRAM;
+	so_gen_t gen = so->so_gencnt;
+	int fd = op->sqe.fd;
 
 	mtx_lock(&ctx->mtx);
 	if (!op->armed) {
@@ -2389,6 +2395,33 @@ armed:
 	}
 	if (ready_now)
 		kqring_taskwork_add_locked(ctx, op);
+	if (want_eof)
+		want_eof = !kqring_soeof_cached_locked(ctx, fd, so, gen);
 	mtx_unlock(&ctx->mtx);
+	if (want_eof)
+		kqring_kpoll_soeof_watch(ctx, fd, so, gen);
 	return (true);
+}
+
+/*
+ * An end-of-input knote fired for descriptor fd (kqring_kp_eof_event()):
+ * run kqring's upcall on its socket, as sowakeup() would have.
+ */
+void
+kqring_so_eof_kick(struct thread *td, int fd)
+{
+	struct socket *so;
+	struct file *fp;
+
+	if (fget(td, fd, &cap_no_rights, &fp) != 0)
+		return;
+	if (fp->f_type == DTYPE_SOCKET) {
+		so = fp->f_data;
+		SOCK_RECVBUF_LOCK(so);
+		if (!SOLISTENING(so) && so->so_rcv.sb_upcall == kqring_soupcall)
+			(void)kqring_soupcall(so, so->so_rcv.sb_upcallarg,
+			    M_NOWAIT);
+		SOCK_RECVBUF_UNLOCK(so);
+	}
+	fdrop(fp, td);
 }
