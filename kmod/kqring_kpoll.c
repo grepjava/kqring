@@ -625,6 +625,11 @@ kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 	mtx_unlock(&ctx->mtx);
 	if (rev == 0)
 		return;
+	if (multi && op->trig_wait != NULL) {
+		/* Events taken together fire a trigger once. */
+		kqring_trig_waiter_event(ctx, op, rev, true);
+		return;
+	}
 	if (multi) {
 		for (u_int i = 0; i < nev; i++) {
 			if (kqring_cq_full(ctx))

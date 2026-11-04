@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- **kqring extensions**, opted into per ring with the new `KQRING_IOC_EXT_SETUP` ioctl, through one escape opcode (default `0xFF`) that never collides with an io_uring opcode. Rings that don't opt in are unchanged. See the README's *kqring extensions*.
+- **Event-driven chains** (`KQRING_EXT_TRIGGER`): a trigger watches a descriptor and runs the requests linked after it each time the descriptor is ready, with no system call per event, until it's cancelled or the descriptor hangs up. Serial and concurrent modes, a CQE per firing if asked, and an end on the first failed run if asked. [docs/event-chains-spec.md](docs/event-chains-spec.md) has the interface and the next phases.
+- `POLL_ADD` on a socket reports `POLLRDHUP` when the peer has shut down writing, as `poll(2)` and Linux do.
+
 ### Fixed
 
 - `IORING_UNREGISTER_RING_FDS` stopped with `EBADF` at the first empty slot, so unregistering a range left the slots after it registered (and their rings alive until exit). An empty slot now counts as done, as in io_uring. Found by the new fuzzer.
@@ -12,6 +18,7 @@
 ### Testing
 
 - [`tests/kqring_fuzz.c`](tests/kqring_fuzz.c), a fuzzer for the whole interface: random setup parameters, SQEs, enter flags and arguments, and register calls, with descriptors, memory and rings closed under requests in flight. Most rings are also set up properly (registered files and buffers, a buffer ring, a personality) and get mostly well-formed requests and link chains, so the fuzzer gets past argument checks into the code behind them. A regression test for each bug it found is in `kqring_test`.
+- Event-driven chains have their own tests (`kqring_test trig` runs only those): serial and concurrent runs, per-firing CQEs, an event never consumed, hang-up, bad templates, `STOP_ON_ERROR`, and closing the ring mid-run. The fuzzer opts half its well-formed rings in and submits triggers with random modes and templates: a 30-minute run on a `GENERIC-DEBUG` kernel submitted 119,000 triggers with no failures or lock-order warnings.
 - `test_send_armed` no longer fails now and then on slow kernels when its `POLLIN | POLLOUT` poll rightly completes for writability alone.
 
 ### Performance

@@ -9213,6 +9213,465 @@ test_stop_during_close(void)
 		    "(300 stops)\n");
 }
 
+/* ---- Event-driven chains (KQRING_EXT_TRIGGER) ---- */
+
+/* A ring opted in to kqring's extensions. */
+static void
+trig_ring(struct test_ring *r)
+{
+	struct kqring_ext_setup es = { .version = KQRING_EXT_VERSION };
+
+	ring_init(r);
+	assert(ioctl(r->fd, KQRING_IOC_EXT_SETUP, &es) == 0);
+	assert(es.ext_opcode == KQRING_EXT_OPCODE_DEFAULT);
+	assert((es.features & KQRING_EXT_F_TRIGGER) != 0);
+}
+
+static struct io_uring_sqe *
+trig_prep(struct test_ring *r, int fd, uint32_t events, uint64_t ud,
+    struct kqring_trigger *t)
+{
+	struct io_uring_sqe *sqe = ring_prep(r, KQRING_EXT_OPCODE_DEFAULT, fd,
+	    ud);
+
+	sqe->ioprio = KQRING_EXT_TRIGGER;
+	sqe->poll32_events = events;
+	sqe->addr = (uint64_t)(uintptr_t)t;
+	sqe->len = sizeof(*t);
+	sqe->flags = IOSQE_IO_LINK;
+	return (sqe);
+}
+
+/* Enter until n CQEs are ready or timeout_ms passes; returns how many. */
+static unsigned
+trig_collect(struct test_ring *r, unsigned n, int timeout_ms)
+{
+	uint64_t end = now_ns() + (uint64_t)timeout_ms * 1000000ULL;
+
+	while (ring_cq_ready(r) < n && now_ns() < end)
+		(void)ring_wait(r, n - ring_cq_ready(r), 50);
+	return (ring_cq_ready(r));
+}
+
+/* Pop CQEs until the one with user_data ud and no F_MORE; fail on timeout. */
+static struct io_uring_cqe
+trig_final(struct test_ring *r, uint64_t ud, int timeout_ms)
+{
+	uint64_t end = now_ns() + (uint64_t)timeout_ms * 1000000ULL;
+
+	for (;;) {
+		while (ring_cq_ready(r) > 0) {
+			struct io_uring_cqe c = ring_pop_cqe(r);
+
+			if (c.user_data == ud &&
+			    (c.flags & IORING_CQE_F_MORE) == 0)
+				return (c);
+		}
+		if (now_ns() >= end) {
+			fprintf(stderr, "[FAIL] trigger %ju: no final CQE\n",
+			    (uintmax_t)ud);
+			abort();
+		}
+		(void)ring_wait(r, 1, 50);
+	}
+}
+
+static void
+trig_cancel(struct test_ring *r, uint64_t ud)
+{
+	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_ASYNC_CANCEL, -1,
+	    9999);
+
+	sqe->addr = ud;
+	ring_push_sqe(r);
+	ring_submit(r);
+}
+
+static void
+test_trigger_optin(struct test_ring *plain)
+{
+	struct kqring_ext_setup es = { .version = KQRING_EXT_VERSION };
+	struct kqring_trigger t = { .nsteps = 1 };
+	struct test_ring r;
+	struct io_uring_cqe c;
+
+	/* Without the opt-in, the escape opcode is just an unknown one. */
+	trig_prep(plain, 0, POLLIN, 7001, &t)->flags = 0;
+	ring_push_sqe(plain);
+	ring_submit(plain);
+	assert(ring_cq_ready(plain) == 1);
+	c = ring_pop_cqe(plain);
+	assert(c.user_data == 7001 && c.res == -EINVAL);
+
+	ring_setup(&r);
+	es.version = 2;
+	assert(ioctl(r.fd, KQRING_IOC_EXT_SETUP, &es) == -1 && errno == EINVAL);
+	es.version = KQRING_EXT_VERSION;
+	es.ext_opcode = IORING_OP_READ;	/* an io_uring opcode: refused */
+	assert(ioctl(r.fd, KQRING_IOC_EXT_SETUP, &es) == -1 && errno == EINVAL);
+	es.ext_opcode = 0xF7;
+	assert(ioctl(r.fd, KQRING_IOC_EXT_SETUP, &es) == 0);
+	assert(es.ext_opcode == 0xF7);
+	es.ext_opcode = 0;
+	assert(ioctl(r.fd, KQRING_IOC_EXT_SETUP, &es) == -1 && errno == EBUSY);
+	close(r.fd);
+	printf("[PASS] EXT_SETUP: opt-in once, never an io_uring opcode; "
+	    "escape opcode unknown without it\n");
+}
+
+/* SERIAL: each message runs RECV then SEND, in order; cancel ends it. */
+static void
+test_trigger_serial(void)
+{
+	struct test_ring r;
+	struct kqring_trigger t = { .nsteps = 2 };
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	char rbuf[64], ack[4];
+	int sv[2];
+
+	trig_ring(&r);
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	trig_prep(&r, sv[1], POLLIN, 1, &t);
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_RECV, sv[1], 2);
+	sqe->addr = (uint64_t)(uintptr_t)rbuf;
+	sqe->len = sizeof(rbuf);
+	sqe->flags = IOSQE_IO_LINK;
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_SEND, sv[1], 3);
+	sqe->addr = (uint64_t)(uintptr_t)"ack!";
+	sqe->len = 4;
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	/* Armed, nothing ran: no CQE. */
+	assert(ring_wait(&r, 1, 20) == ETIMEDOUT);
+
+	for (int i = 0; i < 200; i++) {
+		char m = (char)('a' + i % 26);
+		struct pollfd pfd = { .fd = sv[0], .events = POLLIN };
+
+		assert(write(sv[0], &m, 1) == 1);
+		assert(trig_collect(&r, 2, 2000) >= 2);
+		c = ring_pop_cqe(&r);
+		assert(c.user_data == 2 && c.res == 1 && rbuf[0] == m);
+		c = ring_pop_cqe(&r);
+		assert(c.user_data == 3 && c.res == 4);
+		assert(poll(&pfd, 1, 2000) == 1);
+		assert(read(sv[0], ack, sizeof(ack)) == 4);
+		assert(memcmp(ack, "ack!", 4) == 0);
+	}
+	assert(ring_cq_ready(&r) == 0);
+	trig_cancel(&r, 1);
+	c = trig_final(&r, 1, 2000);
+	assert(c.res == -ECANCELED);
+	/* And it is gone: nothing runs on more data. */
+	assert(write(sv[0], "x", 1) == 1);
+	(void)trig_collect(&r, 10, 100);
+	while (ring_cq_ready(&r) > 0) {
+		c = ring_pop_cqe(&r);
+		assert(c.user_data == 9999);	/* the cancel's own CQE */
+	}
+	close(sv[0]);
+	close(sv[1]);
+	close(r.fd);
+	printf("[PASS] trigger SERIAL: 200 events, each RECV then SEND, "
+	    "then ASYNC_CANCEL ends it\n");
+}
+
+/*
+ * An event that stays pending (a pipe never read, the template a NOP)
+ * fires again and again, as a level-triggered poll would.  Each enter
+ * still returns, CQE_EACH reports every firing before its run, and the
+ * trigger ends: cancelled, or with -EOVERFLOW once the CQ fills, as a
+ * multishot request ends.
+ */
+static void
+test_trigger_pending_event(void)
+{
+	struct test_ring r;
+	struct kqring_trigger t = { .nsteps = 1,
+	    .flags = KQRING_TRIG_CQE_EACH };
+	unsigned fires = 0, nops = 0, enters = 0;
+	bool ended = false;
+	struct io_uring_cqe c;
+	int32_t end_res = 0;
+	int p[2];
+
+	trig_ring(&r);
+	assert(pipe2(p, O_NONBLOCK) == 0);
+	assert(write(p[1], "x", 1) == 1);
+	trig_prep(&r, p[0], POLLIN, 1, &t);
+	ring_push_sqe(&r);
+	ring_prep(&r, IORING_OP_NOP, -1, 2);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	for (; enters < 20 && !ended; enters++) {
+		uint64_t t0 = now_ns();
+
+		(void)ring_wait(&r, 8, 200);
+		/* Bounded: the enter came back well inside a second. */
+		assert(now_ns() - t0 < 1000000000ULL);
+		while (ring_cq_ready(&r) > 0) {
+			c = ring_pop_cqe(&r);
+			if (c.user_data == 1 &&
+			    (c.flags & IORING_CQE_F_MORE) == 0) {
+				ended = true;
+				end_res = c.res;
+			} else if (c.user_data == 1) {
+				assert((c.res & POLLIN) != 0);
+				fires++;
+			} else {
+				assert(c.user_data == 2 && c.res == 0);
+				nops++;
+			}
+		}
+	}
+	assert(fires >= 16 && nops <= fires && nops + 1 >= fires);
+	if (!ended) {
+		trig_cancel(&r, 1);
+		c = trig_final(&r, 1, 2000);
+		end_res = c.res;
+	}
+	assert(end_res == -ECANCELED || end_res == -EOVERFLOW);
+	close(p[0]);
+	close(p[1]);
+	close(r.fd);
+	printf("[PASS] trigger on an event never consumed: %u firings in %u "
+	    "enters, each bounded, ended %s\n", fires, enters,
+	    end_res == -EOVERFLOW ? "by CQ overflow" : "by cancel");
+}
+
+/* CONCURRENT on a pipe: each write runs a READ; then STOP_ON_ERROR. */
+static void
+test_trigger_concurrent(void)
+{
+	struct test_ring r;
+	struct kqring_trigger t = { .nsteps = 1,
+	    .flags = KQRING_TRIG_CONCURRENT, .max_inflight = 4 };
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	char buf[8];
+	int p[2];
+
+	trig_ring(&r);
+	assert(pipe2(p, O_NONBLOCK) == 0);
+	trig_prep(&r, p[0], POLLIN, 1, &t);
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_READ, p[0], 2);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 1;
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(ring_wait(&r, 1, 20) == ETIMEDOUT);
+	for (int i = 0; i < 50; i++) {
+		char m = (char)('0' + i % 10);
+
+		assert(write(p[1], &m, 1) == 1);
+		assert(trig_collect(&r, 1, 2000) >= 1);
+		c = ring_pop_cqe(&r);
+		assert(c.user_data == 2 && c.res == 1 && buf[0] == m);
+	}
+	trig_cancel(&r, 1);
+	c = trig_final(&r, 1, 2000);
+	assert(c.res == -ECANCELED);
+	close(r.fd);
+
+	/* STOP_ON_ERROR: a run that fails ends the trigger with its error. */
+	struct kqring_trigger ts = { .nsteps = 1,
+	    .flags = KQRING_TRIG_STOP_ON_ERROR };
+
+	trig_ring(&r);
+	trig_prep(&r, p[0], POLLIN, 1, &ts);
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_NOP, -1, 2);
+	sqe->nop_flags = IORING_NOP_INJECT_RESULT;
+	sqe->len = (uint32_t)-EIO;
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(write(p[1], "e", 1) == 1);
+	assert(trig_collect(&r, 1, 2000) >= 1);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 2 && c.res == -EIO);
+	c = trig_final(&r, 1, 2000);
+	assert(c.res == -EIO);
+	close(r.fd);
+	close(p[0]);
+	close(p[1]);
+	printf("[PASS] trigger CONCURRENT: 50 writes, 50 READs; "
+	    "STOP_ON_ERROR ends with the run's error\n");
+}
+
+/* The peer closing (POLLHUP): the last event runs, then the trigger ends. */
+static void
+test_trigger_hangup(void)
+{
+	struct test_ring r;
+	struct kqring_trigger t = { .nsteps = 1 };
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	char rbuf[16];
+	int sv[2];
+	bool saw_recv = false;
+
+	trig_ring(&r);
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+	trig_prep(&r, sv[1], POLLIN, 1, &t);
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_RECV, sv[1], 2);
+	sqe->addr = (uint64_t)(uintptr_t)rbuf;
+	sqe->len = sizeof(rbuf);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	close(sv[0]);
+	uint64_t end = now_ns() + 3000000000ULL;
+	for (;;) {
+		assert(now_ns() < end);
+		(void)ring_wait(&r, 1, 50);
+		if (ring_cq_ready(&r) == 0)
+			continue;
+		c = ring_pop_cqe(&r);
+		if (c.user_data == 2) {
+			assert(c.res == 0);	/* EOF */
+			saw_recv = true;
+			continue;
+		}
+		assert(c.user_data == 1 && (c.flags & IORING_CQE_F_MORE) == 0);
+		if (c.res != 0)
+			fprintf(stderr, "  hangup: trigger ended with %d\n",
+			    c.res);
+		assert(c.res == 0);
+		break;
+	}
+	assert(saw_recv);
+	close(sv[1]);
+	close(r.fd);
+	printf("[PASS] trigger: peer hangup runs the last event, then ends "
+	    "it (res 0)\n");
+}
+
+/* Templates the trigger refuses: its CQE -EINVAL, theirs -ECANCELED. */
+static void
+test_trigger_bad_templates(void)
+{
+	struct test_ring r;
+	struct kqring_trigger t2 = { .nsteps = 2 };
+	struct kqring_trigger t1 = { .nsteps = 1 };
+	struct kqring_trigger bad = { .nsteps = 1, .step_flags = { 1 } };
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	int p[2];
+
+	trig_ring(&r);
+	assert(pipe2(p, O_NONBLOCK) == 0);
+
+	/* nsteps says 2, one template follows. */
+	trig_prep(&r, p[0], POLLIN, 1, &t2);
+	ring_push_sqe(&r);
+	ring_prep(&r, IORING_OP_NOP, -1, 2);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(ring_cq_ready(&r) == 2);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 2 && c.res == -ECANCELED);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 1 && c.res == -EINVAL);
+
+	/* A multishot template (last, so it may carry no link). */
+	trig_prep(&r, p[0], POLLIN, 3, &t1);
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_POLL_ADD, p[0], 4);
+	sqe->poll32_events = POLLIN;
+	sqe->len = IORING_POLL_ADD_MULTI;
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(ring_cq_ready(&r) == 2);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 4 && c.res == -ECANCELED);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 3 && c.res == -EINVAL);
+
+	/* Step flags (phase 2) and no templates at all: bad trigger SQE. */
+	trig_prep(&r, p[0], POLLIN, 5, &bad);
+	ring_push_sqe(&r);
+	ring_prep(&r, IORING_OP_NOP, -1, 6);
+	ring_push_sqe(&r);
+	(void)kqring_enter(r.fd, ring_pending(&r), 0, 0, NULL, 0);
+	assert(ring_cq_ready(&r) == 2);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 5 && c.res == -EINVAL);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 6 && c.res == -ECANCELED);
+	trig_prep(&r, p[0], POLLIN, 7, &t1)->flags = 0;
+	ring_push_sqe(&r);
+	(void)kqring_enter(r.fd, ring_pending(&r), 0, 0, NULL, 0);
+	assert(ring_cq_ready(&r) == 1);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 7 && c.res == -EINVAL);
+	close(p[0]);
+	close(p[1]);
+	close(r.fd);
+	printf("[PASS] trigger: bad templates and arguments fail it, "
+	    "templates -ECANCELED\n");
+}
+
+/* Close the ring with triggers armed and a run waiting on a socket. */
+static void
+test_trigger_close(void)
+{
+	for (int round = 0; round < 50; round++) {
+		struct test_ring r;
+		struct kqring_trigger ts = { .nsteps = 1 };
+		struct kqring_trigger tc = { .nsteps = 1,
+		    .flags = KQRING_TRIG_CONCURRENT, .max_inflight = 8 };
+		struct io_uring_sqe *sqe;
+		char buf[8];
+		int p[2], sv[2];
+
+		trig_ring(&r);
+		assert(pipe2(p, O_NONBLOCK) == 0);
+		assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0,
+		    sv) == 0);
+		/* Pipe event -> RECV on an empty socket: the run stays armed. */
+		trig_prep(&r, p[0], POLLIN, 1, &ts);
+		ring_push_sqe(&r);
+		sqe = ring_prep(&r, IORING_OP_RECV, sv[1], 2);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		ring_push_sqe(&r);
+		trig_prep(&r, p[0], POLLIN, 3, &tc);
+		ring_push_sqe(&r);
+		sqe = ring_prep(&r, IORING_OP_RECV, sv[1], 4);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		ring_push_sqe(&r);
+		ring_submit(&r);
+		if (round % 2 == 0) {
+			assert(write(p[1], "x", 1) == 1);
+			(void)ring_wait(&r, 1, 5);
+		}
+		close(r.fd);
+		close(p[0]);
+		close(p[1]);
+		close(sv[0]);
+		close(sv[1]);
+	}
+	printf("[PASS] trigger: ring closed with triggers armed and runs "
+	    "in flight (50 rounds)\n");
+}
+
+static void
+test_triggers(struct test_ring *plain)
+{
+	test_trigger_optin(plain);
+	test_trigger_serial();
+	test_trigger_pending_event();
+	test_trigger_concurrent();
+	test_trigger_hangup();
+	test_trigger_bad_templates();
+	test_trigger_close();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -9221,6 +9680,12 @@ main(int argc, char **argv)
 	struct test_ring r;
 
 	ring_init(&r);
+	/* "trig": only the event-driven chain tests. */
+	if (argc >= 2 && strcmp(argv[1], "trig") == 0) {
+		test_triggers(&r);
+		printf("[OK]: %d failure(s)\n", failures);
+		return (failures != 0);
+	}
 	if (run_tests) {
 		test_probe(&r);
 		test_multishot_and_eof(&r);
@@ -9296,6 +9761,7 @@ main(int argc, char **argv)
 		test_pipe_nowait();
 		test_pipe_nonblock_drained();
 		test_pipe_multishot_drained();
+		test_triggers(&r);
 		test_min_wait();
 		test_no_mmap();
 		test_resize_rings();

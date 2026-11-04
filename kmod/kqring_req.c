@@ -555,7 +555,7 @@ kqring_req_resources(struct kqring_ctx *ctx, struct kqring_op *op)
 }
 
 
-static struct kqring_op *
+struct kqring_op *
 kqring_op_alloc(struct kqring_ctx *ctx)
 {
 	struct kqring_op *op;
@@ -574,14 +574,22 @@ kqring_op_alloc(struct kqring_ctx *ctx)
 }
 
 /* Never called with ctx->mtx held (callout_drain() may sleep). */
-static void
+void
 kqring_op_free(struct kqring_op *op)
 {
 	struct kqring_ctx *ctx = op->ctx;
+	struct kqring_trun *tr = op->trun;
 
 	KASSERT(!op->armed && !op->in_taskwork && !op->timer_pending &&
 	    !op->wq_queued && !op->wq_running && !op->wq_retired,
 	    ("kqring: freeing a live op"));
+	/*
+	 * A trigger's poll freed without completing (ring teardown, a
+	 * chain that failed): the trigger stops waiting on it.
+	 */
+	if (op->trig_wait != NULL)
+		kqring_trig_waiter_event(ctx, op, -ECANCELED, false);
+	op->trun = NULL;
 	ctx->nreqs--;
 	/*
 	 * The callout was stopped under ctx->mtx, so its function will not
@@ -639,6 +647,9 @@ kqring_op_free(struct kqring_op *op)
 		crfree(op->cred);
 		op->cred = NULL;
 	}
+	/* The last request of a trigger's run: the run is done. */
+	if (tr != NULL)
+		kqring_trun_put(tr);
 	if (!ctx->closing && ctx->nfree < KQRING_OP_CACHE_MAX) {
 		TAILQ_INSERT_HEAD(&ctx->free_ops, op, active_link);
 		ctx->nfree++;
@@ -853,7 +864,11 @@ kqring_op_attempt(struct kqring_ctx *ctx, struct kqring_op *op,
 			op->cflags &= ~IORING_CQE_F_MORE;
 			return (0);
 		}
-		kqring_post_cqe(ctx, op->sqe.user_data, op->res, op->cflags);
+		if (op->trig_wait != NULL)
+			kqring_trig_waiter_event(ctx, op, op->res, true);
+		else
+			kqring_post_cqe(ctx, op->sqe.user_data, op->res,
+			    op->cflags);
 		if (!more)
 			return (EAGAIN);
 	}
@@ -866,7 +881,7 @@ kqring_op_attempt(struct kqring_ctx *ctx, struct kqring_op *op,
  */
 
 /* Allocate op->args (zeroed), charged to the ring's argument budget. */
-static void *
+void *
 kqring_args_alloc(struct kqring_op *op, size_t len, int *errorp)
 {
 	struct kqring_ctx *ctx = op->ctx;
@@ -1282,6 +1297,7 @@ kqring_op_takes_file(uint8_t opcode)
 	case IORING_OP_WRITEV_FIXED:
 	case IORING_OP_SPLICE:
 	case IORING_OP_TEE:
+	case KQRING_IOP_TRIGGER:
 		return (true);
 	default:
 		return (false);
@@ -1348,7 +1364,7 @@ kqring_iopoll_op_ok(uint8_t opcode)
  * implement instead of silently ignoring them.  IOSQE_ASYNC is only a
  * hint.  `prev` is the request this one is linked behind, if any.
  */
-static int
+int
 kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 {
 	struct kqring_ctx *ctx = op->ctx;
@@ -1359,10 +1375,26 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 	uint32_t ioprio_ok;
 	bool direct = sqe->file_index != 0;
 	bool multishot = false, buf_select_ok = false, bundle_ok = false;
+	bool ext = false;
 	int error;
 
+	/*
+	 * The ring's escape opcode, once it opted in to kqring's extensions:
+	 * the sub-opcode in ioprio picks an internal opcode.  An unknown
+	 * sub-opcode fails as an unknown opcode does.
+	 */
+	if (ctx->ext_on && sqe->opcode == ctx->ext_opcode) {
+		switch (sqe->ioprio) {
+		case KQRING_EXT_TRIGGER:
+			op->sqe.opcode = KQRING_IOP_TRIGGER;
+			break;
+		default:
+			return (EINVAL);
+		}
+		ext = true;
+	}
 	/* An opcode past the ABI fails here (and ends a submission). */
-	if (sqe->opcode >= IORING_OP_LAST)
+	if (sqe->opcode >= IORING_OP_LAST && !ext)
 		return (EINVAL);
 	if ((sqe->flags & ~KQRING_SQE_FLAGS) != 0)
 		return (EINVAL);
@@ -1557,6 +1589,11 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		    IORING_POLL_ADD_LEVEL)) != 0)
 			return (EINVAL);
 		multishot = (sqe->len & IORING_POLL_ADD_MULTI) != 0;
+		break;
+	case KQRING_IOP_TRIGGER:
+		error = kqring_trig_prep(op);
+		if (error != 0)
+			return (error);
 		break;
 	case IORING_OP_POLL_REMOVE:
 		if (sqe->buf_index != 0 || sqe->splice_fd_in != 0)
@@ -1816,6 +1853,7 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 	if (multishot && (sqe->flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK |
 	    IOSQE_CQE_SKIP_SUCCESS)) != 0)
 		return (EINVAL);
+	op->multishot = multishot;
 	return (0);
 }
 
@@ -1830,7 +1868,7 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
  * request that failed had IOSQE_CQE_SKIP_SUCCESS) their CQEs are not
  * posted, as io_uring's REQ_F_SKIP_LINK_CQES.
  */
-static void
+void
 kqring_chain_fail(struct kqring_ctx *ctx, struct kqring_op *op,
     bool skip_cqes)
 {
@@ -1912,10 +1950,18 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 		mtx_unlock(&ctx->mtx);
 	}
 	KASSERT(!op->armed, ("kqring: completing an armed op"));
+	/* A trigger's poll reports to its trigger, not to the CQ. */
+	if (__predict_false(op->trig_wait != NULL)) {
+		kqring_trig_waiter_event(ctx, op, res, false);
+		kqring_op_free(op);
+		return;
+	}
 	failed = res < 0 && !(res == -ETIME &&
 	    (op->sqe.opcode == IORING_OP_TIMEOUT ||
 	    op->sqe.opcode == IORING_OP_LINK_TIMEOUT) &&
 	    (op->sqe.timeout_flags & IORING_TIMEOUT_ETIME_SUCCESS) != 0);
+	if (__predict_false(op->trun != NULL) && failed)
+		kqring_trun_failed(op->trun, res);
 
 	/*
 	 * SEND_ZC / SENDMSG_ZC: IORING_CQE_F_MORE announces the notification
@@ -2210,6 +2256,9 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 	case IORING_OP_POLL_REMOVE:
 		kqring_req_complete(ctx, op, kqring_poll_remove(ctx, sqe), 0);
 		return;
+	case KQRING_IOP_TRIGGER:
+		kqring_trig_issue(ctx, op);
+		return;
 	default:
 		if (kqring_op_use_wq(sqe)) {
 			armed = kqring_wq_enqueue(ctx, op,
@@ -2234,12 +2283,18 @@ kqring_flush_ready(struct kqring_ctx *ctx)
 {
 	struct kqring_op *op;
 
-	if (TAILQ_EMPTY(&ctx->ready_q) && TAILQ_EMPTY(&ctx->defer_q))
+	if (TAILQ_EMPTY(&ctx->ready_q) && TAILQ_EMPTY(&ctx->defer_q) &&
+	    TAILQ_EMPTY(&ctx->trig_work))
 		return;
 	for (;;) {
 		if ((op = TAILQ_FIRST(&ctx->ready_q)) != NULL) {
 			TAILQ_REMOVE(&ctx->ready_q, op, q_link);
 			kqring_req_issue(ctx, op);
+			continue;
+		}
+		/* Triggers to re-arm or run: they queue on ready_q. */
+		if (!TAILQ_EMPTY(&ctx->trig_work)) {
+			kqring_trig_work(ctx);
 			continue;
 		}
 		if ((op = TAILQ_FIRST(&ctx->defer_q)) == NULL)
@@ -2281,8 +2336,25 @@ kqring_chain_submit(struct kqring_ctx *ctx, struct kqring_op *head,
 	if (head->drain)
 		ctx->drain_barrier = true;
 	kqring_req_issue(ctx, head);
-	if (!TAILQ_EMPTY(&ctx->ready_q) || !TAILQ_EMPTY(&ctx->defer_q))
+	if (!TAILQ_EMPTY(&ctx->ready_q) || !TAILQ_EMPTY(&ctx->defer_q) ||
+	    !TAILQ_EMPTY(&ctx->trig_work))
 		kqring_flush_ready(ctx);
+}
+
+/*
+ * Queue a chain built in the kernel (a trigger's run) as a submission
+ * would, to be issued by the next kqring_flush_ready(): behind chains
+ * an IOSQE_IO_DRAIN holds back, never inline here.
+ */
+void
+kqring_chain_queue(struct kqring_ctx *ctx, struct kqring_op *head)
+{
+	if (!TAILQ_EMPTY(&ctx->defer_q) || ctx->drain_barrier) {
+		ctx->ndeferred += head->nchain;
+		TAILQ_INSERT_TAIL(&ctx->defer_q, head, q_link);
+		return;
+	}
+	TAILQ_INSERT_TAIL(&ctx->ready_q, head, q_link);
 }
 
 /* Free a request that will never complete (ring teardown). */

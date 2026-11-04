@@ -21,6 +21,10 @@
  * timeouts, cancellations and poll removals aimed at recent requests,
  * MSG_RING, futexes, splice), chained with links and link timeouts, with
  * data written to the other ends of the pipes and sockets they wait on.
+ * Half of those rings (and a few others) opt in to kqring's extensions,
+ * sometimes with bad arguments, and get event-driven chains: triggers on
+ * those pipes and sockets with random modes and 1-3 templates from the
+ * same well-formed requests, cancelled like any other request.
  *
  * It fails on:
  *  - a kernel panic (run it with debug.debugger_on_panic=0; the dump
@@ -90,6 +94,8 @@ static char		scratch[64];
 
 static _Atomic uint64_t	st_rings, st_setup_fail, st_sqes, st_enters,
 			st_regs, st_cqes, st_chaos, st_forks, st_kicks;
+/* Triggers submitted; their per-event and final CQEs; finals not -EINVAL. */
+static _Atomic uint64_t	st_trig, st_trig_fire, st_trig_end, st_trig_live;
 static _Atomic int	cq_bad, nfinished;
 
 struct fz {
@@ -128,6 +134,8 @@ struct fz {
 	uint16_t	personality;
 	uint64_t	recent[16];	/* user_data of recent requests */
 	unsigned	nrecent;
+	uint8_t		ext_op;		/* escape opcode once opted in, or 0 */
+	unsigned	tmpl_left;	/* templates still due after a trigger */
 };
 
 #define PBUF_BGID	7
@@ -623,6 +631,73 @@ ring_open(struct fz *f)
 	f->cq_ktail = (void *)(base + p->cq_off.tail);
 	f->cq_mask = *(unsigned *)(void *)(base + p->cq_off.ring_mask);
 	f->sq_tail = atomic_load(f->sq_ktail);
+
+	/* kqring's extensions: opt in (sometimes badly, sometimes twice). */
+	f->ext_op = 0;
+	f->tmpl_left = 0;
+	if (chance(f, f->valid ? 50 : 10)) {
+		struct kqring_ext_setup es = { .version = KQRING_EXT_VERSION };
+
+		if (chance(f, 5))
+			es.version = (uint32_t)rnd(f);
+		if (chance(f, 15))
+			es.ext_opcode = (uint8_t)rnd(f);
+		if (chance(f, 3))
+			es.resv[0] = rnd(f);
+		if (CALL(f, "EXT_SETUP", ioctl(f->ring, KQRING_IOC_EXT_SETUP,
+		    &es)) == 0)
+			f->ext_op = es.ext_opcode;
+		if (chance(f, 5))
+			(void)ioctl(f->ring, KQRING_IOC_EXT_SETUP, &es);
+	}
+}
+
+static int	pool_fd(struct fz *f, int kind);
+static void	maybe_fixed(struct fz *f, struct io_uring_sqe *s);
+static void	sanitize(struct fz *f, struct io_uring_sqe *s);
+
+/*
+ * A trigger SQE (KQRING_EXT_TRIGGER) in s, whose `k` templates are the
+ * next SQEs; its struct in the arena, mostly well formed.
+ */
+static void
+sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
+{
+	struct kqring_trigger *t = (void *)(f->arena +
+	    rn(f, REGBUF_OFF / 64) * 64);
+	static const uint32_t evs[] = { POLLIN, POLLOUT, POLLIN | POLLOUT,
+	    POLLIN | POLLRDHUP, POLLPRI };
+
+	memset(t, 0, sizeof(*t));
+	t->nsteps = chance(f, 95) ? (uint8_t)k : (uint8_t)rn(f, 10);
+	t->flags = (uint32_t)rn(f, 8);	/* CONCURRENT | CQE_EACH | STOP */
+	if ((t->flags & KQRING_TRIG_CONCURRENT) != 0)
+		t->max_inflight = (uint16_t)(1 + rn(f, 8));
+	if (chance(f, 3))
+		t->max_inflight = (uint16_t)rnd(f);
+	if (chance(f, 3))
+		t->flags = (uint32_t)rnd(f);
+	if (chance(f, 2))
+		t->step_flags[rn(f, 8)] = (uint8_t)rnd(f);
+	if (chance(f, 2))
+		t->source = (uint8_t)rnd(f);
+
+	memset(s, 0, f->sqe_size);
+	s->opcode = f->ext_op;
+	s->ioprio = chance(f, 97) ? KQRING_EXT_TRIGGER : (uint16_t)rnd(f);
+	s->fd = pool_fd(f, chance(f, 50) ? 1 : chance(f, 80) ? 2 : 3);
+	maybe_fixed(f, s);
+	s->poll32_events = evs[rn(f, nitems(evs))];
+	s->addr = chance(f, 97) ? (uint64_t)(uintptr_t)t : gen_ptr(f);
+	s->len = chance(f, 97) ? sizeof(*t) : gen_len(f);
+	s->flags |= chance(f, 90) ? IOSQE_IO_LINK : IOSQE_IO_HARDLINK;
+	s->user_data = f->ud;
+	sanitize(f, s);
+	atomic_fetch_add(&st_trig, 1);
+	f->recent[f->nrecent++ % nitems(f->recent)] = f->ud;
+	f->ops[f->ud % NOPS].op = s->opcode;
+	f->ops[f->ud % NOPS].addr = s->addr;
+	f->ud++;
 }
 
 /*
@@ -1145,6 +1220,16 @@ reap(struct fz *f)
 		uint8_t op = f->ops[c->user_data % NOPS].op;
 
 		atomic_fetch_add(&st_cqes, 1);
+		if (f->ext_op != 0 && op == f->ext_op) {
+			if ((c->flags & IORING_CQE_F_MORE) != 0)
+				atomic_fetch_add(&st_trig_fire, 1);
+			else {
+				atomic_fetch_add(&st_trig_end, 1);
+				if (c->res != -EINVAL)
+					atomic_fetch_add(&st_trig_live, 1);
+			}
+			continue;
+		}
 		if (c->res < 0)
 			continue;
 		switch (op) {
@@ -1192,6 +1277,18 @@ do_submit(struct fz *f)
 			if (f->sq_array != NULL)
 				f->sq_array[idx] = chance(f, 98) ? idx :
 				    (unsigned)rnd(f);
+			/* An event-driven chain: a trigger, then templates. */
+			if (f->ext_op != 0 && f->tmpl_left == 0 &&
+			    i + 1 < n && chance(f, f->valid ? 8 : 2)) {
+				unsigned k = 1 + (unsigned)rn(f,
+				    MIN(3, n - i - 1));
+
+				sqe_trigger(f, s, k);
+				f->tmpl_left = k;
+				prev = s;
+				f->sq_tail++;
+				continue;
+			}
 			sqe_fill(f, s);
 			/*
 			 * Chains: link to the next request, and sometimes
@@ -1212,6 +1309,20 @@ do_submit(struct fz *f)
 			if (f->valid && i + 1 < n && chance(f, 25))
 				s->flags |= chance(f, 80) ? IOSQE_IO_LINK :
 				    IOSQE_IO_HARDLINK;
+			if (f->tmpl_left > 0) {
+				/*
+				 * A template runs again on every event: never
+				 * a CLOSE, whose descriptor number may be
+				 * reused.  Linked up to the last, mostly.
+				 */
+				if (s->opcode == IORING_OP_CLOSE)
+					s->opcode = IORING_OP_NOP;
+				if (--f->tmpl_left > 0)
+					s->flags |= IOSQE_IO_LINK;
+				else if (chance(f, 95))
+					s->flags &= ~(IOSQE_IO_LINK |
+					    IOSQE_IO_HARDLINK);
+			}
 			prev = s;
 			f->sq_tail++;
 		}
@@ -1595,6 +1706,10 @@ main(int argc, char **argv)
 	printf("kqring_fuzz: rings %ju, sqes %ju, enters %ju, registers %ju, "
 	    "cqes %ju\n", (uintmax_t)st_rings, (uintmax_t)st_sqes,
 	    (uintmax_t)st_enters, (uintmax_t)st_regs, (uintmax_t)st_cqes);
+	printf("kqring_fuzz: triggers %ju (ended %ju, %ju not -EINVAL), "
+	    "firings reported %ju\n", (uintmax_t)st_trig,
+	    (uintmax_t)st_trig_end, (uintmax_t)st_trig_live,
+	    (uintmax_t)st_trig_fire);
 	if (atomic_load(&cq_bad)) {
 		fprintf(stderr, "kqring_fuzz: FAIL: a CQ ring overran\n");
 		rc = 1;

@@ -926,6 +926,61 @@ struct kqring_register_arg {
 #define KQRING_IOC_ENTER	_IOWR(KQRING_IOC_MAGIC, 2, struct kqring_enter_arg)
 #define KQRING_IOC_REGISTER	_IOWR(KQRING_IOC_MAGIC, 3, struct kqring_register_arg)
 
+/*
+ * kqring's own extensions (docs/event-chains-spec.md).
+ *
+ * A ring is plain io_uring until the program opts in with
+ * KQRING_IOC_EXT_SETUP on the ring descriptor, before its first
+ * submission.  The ring then takes one escape opcode (ext_opcode, default
+ * KQRING_EXT_OPCODE_DEFAULT), whose sqe->ioprio is a KQRING_EXT_* sub-opcode;
+ * every other SQE field keeps its io_uring meaning.  Nothing here gives a
+ * kqring meaning to an io_uring number, so a later Linux opcode, flag or
+ * field never collides with a kqring one; if Linux ever assigns the escape
+ * opcode, pick another (any the probe reports unsupported).
+ */
+#define KQRING_EXT_VERSION		1
+#define KQRING_EXT_OPCODE_DEFAULT	0xFF
+
+struct kqring_ext_setup {
+	__u32	version;	/* KQRING_EXT_VERSION */
+	__u8	ext_opcode;	/* escape opcode; 0 = KQRING_EXT_OPCODE_DEFAULT */
+	__u8	resv0[3];
+	__u64	features;	/* out: KQRING_EXT_F_* */
+	__u64	resv[2];	/* must be 0 */
+};
+#define KQRING_IOC_EXT_SETUP	_IOWR(KQRING_IOC_MAGIC, 4, struct kqring_ext_setup)
+
+#define KQRING_EXT_F_TRIGGER	(1ULL << 0)
+
+/* Sub-opcodes (sqe->ioprio of the escape opcode). */
+#define KQRING_EXT_TRIGGER	1
+
+/*
+ * KQRING_EXT_TRIGGER: an event-driven chain.  The trigger SQE (fd,
+ * poll32_events, IOSQE_FIXED_FILE allowed) is linked to `nsteps` template
+ * SQEs that are run as a new chain each time the event fires, until the
+ * trigger is cancelled or ends; it then posts its final CQE (no F_MORE).
+ * sqe->addr points to a struct kqring_trigger, sqe->len is its size.
+ */
+struct kqring_trigger {
+	__u32	flags;		/* KQRING_TRIG_* */
+	__u16	max_inflight;	/* CONCURRENT: 1..KQRING_TRIG_MAX_INFLIGHT */
+	__u8	nsteps;		/* template SQEs linked after the trigger */
+	__u8	source;		/* KQRING_TRIG_SRC_* */
+	__u8	step_flags[8];	/* KQRING_STEP_*, one per template */
+	__u64	resv[2];	/* must be 0 */
+};
+
+#define KQRING_TRIG_MAX_STEPS		8
+#define KQRING_TRIG_MAX_INFLIGHT	64
+
+#define KQRING_TRIG_SRC_POLL		0	/* readiness of sqe->fd */
+
+#define KQRING_TRIG_SERIAL		0
+#define KQRING_TRIG_CONCURRENT		(1U << 0)
+#define KQRING_TRIG_CQE_EACH		(1U << 1)
+#define KQRING_TRIG_STOP_ON_ERROR	(1U << 2)
+
 #ifndef _KERNEL
 #include <errno.h>
 #include <fcntl.h>

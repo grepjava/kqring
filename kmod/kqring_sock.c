@@ -1649,6 +1649,9 @@ again:
 	if (sbavail(&so->so_rcv) >= MAX(so->so_rcv.sb_lowat, 1) || rd_eof ||
 	    so->so_error != 0)
 		revents |= events & (POLLIN | POLLRDNORM);
+	/* The peer shut down writing, as sopoll() and Linux report it. */
+	if (rd_eof)
+		revents |= events & POLLRDHUP;
 	SOCK_RECVBUF_UNLOCK(so);
 
 	SOCK_SENDBUF_LOCK(so);

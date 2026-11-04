@@ -506,6 +506,7 @@ kqring_ctx_free_final(struct kqring_ctx *ctx)
 		TAILQ_REMOVE(&ctx->defer_q, op, q_link);
 		kqring_req_destroy(ctx, op);
 	}
+	kqring_trig_teardown(ctx);
 
 	while ((op = TAILQ_FIRST(&ctx->free_ops)) != NULL) {
 		TAILQ_REMOVE(&ctx->free_ops, op, active_link);
@@ -802,6 +803,8 @@ kqring_ctx_cancel_locked(struct kqring_ctx *ctx)
 		TAILQ_REMOVE(&ctx->defer_q, op, q_link);
 		kqring_req_destroy(ctx, op);
 	}
+	/* Their polls and runs are gone: drop the triggers themselves. */
+	kqring_trig_teardown(ctx);
 	mtx_lock(&kqring_zc_mtx);
 	mtx_lock(&ctx->mtx);
 	while (!TAILQ_EMPTY(&ctx->zc_pending)) {
@@ -890,6 +893,8 @@ kqring_fdopen(struct cdev *dev __unused, int fflags __unused,
 	TAILQ_INIT(&ctx->free_ops);
 	TAILQ_INIT(&ctx->ready_q);
 	TAILQ_INIT(&ctx->defer_q);
+	LIST_INIT(&ctx->triggers);
+	TAILQ_INIT(&ctx->trig_work);
 	TAILQ_INIT(&ctx->zc_pending);
 	for (int i = 0; i < KQRING_KP_HASH; i++)
 		TAILQ_INIT(&ctx->kp_ops[i]);
@@ -1772,6 +1777,9 @@ kqring_ioctl(struct file *fp, u_long cmd, void *data,
 		error = kqring_ioc_register(ctx, ra, td, &res);
 		break;
 	}
+	case KQRING_IOC_EXT_SETUP:
+		error = kqring_ext_setup(ctx, (struct kqring_ext_setup *)data);
+		break;
 	default:
 		return (ENOTTY);
 	}

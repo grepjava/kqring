@@ -652,7 +652,7 @@ kqring_cancel_match_req(const struct kqring_op *op,
 			return (false);
 	}
 	if ((cflags & IORING_ASYNC_CANCEL_OP) != 0 &&
-	    op->sqe.opcode != sqe->len)
+	    (op->sqe.opcode != sqe->len || op->trig_wait != NULL))
 		return (false);
 	/* user_data is matched unless only FD and/or OP were asked for. */
 	if (((cflags & (IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_OP)) == 0 ||
@@ -715,6 +715,9 @@ kqring_cancel(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
 		if (!all)
 			break;
 	}
+	/* Triggers between events, with no poll armed to be found above. */
+	if (ctx->ntriggers > 0 && (n == 0 || all))
+		n += kqring_trig_cancel(ctx, sqe, cfp, all);
 	if (n == 0)
 		return (running ? -EALREADY : -ENOENT);
 	return (all ? n : 0);
@@ -790,7 +793,9 @@ kqring_poll_remove(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
 
 	mtx_lock(&ctx->mtx);
 	LIST_FOREACH(op, kqring_poll_bucket(ctx, sqe->addr), poll_hlink) {
-		if (!op->cancelled && op->sqe.user_data == sqe->addr)
+		/* A trigger's poll is the trigger's: ASYNC_CANCEL ends it. */
+		if (!op->cancelled && op->sqe.user_data == sqe->addr &&
+		    op->trig_wait == NULL)
 			break;
 	}
 	if (op != NULL) {

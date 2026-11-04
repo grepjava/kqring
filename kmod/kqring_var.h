@@ -387,6 +387,14 @@ struct kqring_op {
 	u_long			bio_bytes;
 	size_t			bio_len;	/* bytes held in user pages */
 	/*
+	 * Event-driven chains (kqring_trig.c): the poll a trigger waits on
+	 * (its completions go to the trigger, never to the CQ), or the run
+	 * of a trigger this request belongs to.  Owner thread only.
+	 */
+	struct kqring_trig	*trig_wait;
+	struct kqring_trun	*trun;
+	bool			multishot;	/* prep: a multishot request */
+	/*
 	 * Not cleared when the op is reused (kqring_op_alloc()): the
 	 * callout is initialized once timer_init is set, and the SQE copied
 	 * in at submission (sqe_extra only on IORING_SETUP_SQE128 rings).
@@ -798,6 +806,17 @@ struct kqring_ctx {
 	 */
 	struct kqring_op_list	ready_q;
 	struct kqring_op_list	defer_q;
+	/*
+	 * kqring extensions (KQRING_IOC_EXT_SETUP): ext_opcode is the
+	 * escape opcode once ext_on.  Triggers alive, and those with work
+	 * to do (re-arm, a pending run, the final CQE) at the next
+	 * kqring_flush_ready().  Owner thread only.
+	 */
+	bool			ext_on;
+	uint8_t			ext_opcode;
+	LIST_HEAD(, kqring_trig) triggers;
+	TAILQ_HEAD(, kqring_trig) trig_work;
+	uint32_t		ntriggers;
 	uint32_t		nreqs;
 	uint32_t		ndeferred;
 	bool			drain_barrier;	/* a drained chain is in flight */
@@ -1338,6 +1357,67 @@ void	kqring_req_destroy(struct kqring_ctx *ctx, struct kqring_op *op);
 void	kqring_run_taskwork(struct kqring_ctx *ctx);
 void	kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 	    uint32_t *submitted_out);
+struct kqring_op *kqring_op_alloc(struct kqring_ctx *ctx);
+void	kqring_op_free(struct kqring_op *op);
+int	kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev);
+void	*kqring_args_alloc(struct kqring_op *op, size_t len, int *errorp);
+void	kqring_chain_fail(struct kqring_ctx *ctx, struct kqring_op *op,
+	    bool skip_cqes);
+void	kqring_chain_queue(struct kqring_ctx *ctx, struct kqring_op *head);
+
+/*
+ * kqring_trig.c: event-driven chains (KQRING_EXT_TRIGGER).
+ *
+ * Internal opcodes for kqring's extensions, past every io_uring opcode:
+ * the ring's escape opcode is translated into one at prep, so nothing
+ * else depends on which escape opcode a ring chose.  An SQE can't carry
+ * one directly: prep rejects opcodes past IORING_OP_LAST unless they came
+ * from the escape opcode.
+ */
+#define	KQRING_IOP_TRIGGER	IORING_OP_LAST
+
+/* A trigger: alive from its issue until its final CQE and last run. */
+struct kqring_trig {
+	struct kqring_ctx	*ctx;
+	LIST_ENTRY(kqring_trig)	link;		/* ctx->triggers while alive */
+	TAILQ_ENTRY(kqring_trig) work_link;	/* ctx->trig_work */
+	bool			on_work;
+	bool			listed;
+	u_int			refs;		/* list + waiter + runs */
+	uint64_t		user_data;
+	struct io_uring_sqe	wsqe;		/* the waiter's POLL_ADD */
+	struct kqring_trigger	args;
+	struct io_uring_sqe	tmpl[KQRING_TRIG_MAX_STEPS];
+	uint8_t			tmpl_extra[KQRING_TRIG_MAX_STEPS][64];
+	struct kqring_op	*waiter;	/* armed or queued poll */
+	uint16_t		inflight;	/* runs not yet done */
+	bool			pending;	/* CONCURRENT: event not run yet */
+	bool			ending;		/* no more runs; final CQE due */
+	bool			want_arm;	/* SERIAL: re-arm at next work */
+	bool			posted;		/* final CQE posted */
+	int32_t			end_res;
+	uint64_t		runs;
+};
+
+/* One run of a trigger's templates. */
+struct kqring_trun {
+	struct kqring_trig	*trig;
+	u_int			refs;		/* its requests not yet freed */
+	bool			failed;
+	int32_t			err;
+};
+
+int	kqring_trig_prep(struct kqring_op *op);
+void	kqring_trig_issue(struct kqring_ctx *ctx, struct kqring_op *op);
+void	kqring_trig_waiter_event(struct kqring_ctx *ctx, struct kqring_op *op,
+	    int32_t res, bool more);
+void	kqring_trun_put(struct kqring_trun *tr);
+void	kqring_trun_failed(struct kqring_trun *tr, int32_t res);
+void	kqring_trig_work(struct kqring_ctx *ctx);
+int32_t	kqring_trig_cancel(struct kqring_ctx *ctx,
+	    const struct io_uring_sqe *sqe, const struct file *cfp, bool all);
+void	kqring_trig_teardown(struct kqring_ctx *ctx);
+int	kqring_ext_setup(struct kqring_ctx *ctx, struct kqring_ext_setup *es);
 
 /* kqring_rsrc.c */
 struct kqring_bgroup *kqring_bgroup_find(struct kqring_ctx *ctx, uint16_t bgid);

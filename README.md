@@ -181,6 +181,12 @@ Except for multi-threaded scaling (12.5 M single-`NOP` enters/s on 8 threads vs 
 
 `IORING_REGISTER_PROBE` reports exactly which opcodes are available. These Linux operations have no FreeBSD equivalent and are rejected with `-EOPNOTSUPP` or `-EINVAL`: `EPOLL_CTL`, `EPOLL_WAIT` and `RECV_ZC`. `IORING_REGISTER_NAPI` is accepted, but FreeBSD has no NAPI polling for a module to call, so it sets only a busy-wait: a wait spins up to `busy_poll_to` µs for completions before it sleeps. The static NAPI id operations fail with `EOPNOTSUPP`.
 
+## kqring extensions
+
+kqring adds operations io_uring doesn't have. A ring is plain io_uring until the program opts in with the `KQRING_IOC_EXT_SETUP` ioctl on the ring descriptor. The ring then has one *escape opcode* (default `0xFF`, which the program can change), and `sqe->ioprio` picks the extension. None of this uses an io_uring opcode, flag or field, so programs written for Linux behave exactly as on Linux, and kqring can follow every future io_uring opcode at its Linux number.
+
+- **Event-driven chains** (`KQRING_EXT_TRIGGER`): a trigger request watches a descriptor's readiness and runs the up to 8 requests linked after it as a fresh chain each time the descriptor becomes ready, with no system call per event. "Whenever this socket is readable, receive and then send a reply" is one submission. `SERIAL` triggers run one chain at a time and re-arm when it's done; `CONCURRENT` ones start a chain per event, up to a limit. A trigger ends when cancelled, when its descriptor hangs up, or on a failed run if asked. See [docs/event-chains-spec.md](docs/event-chains-spec.md) for the interface and the plan: passing one request's result to the next, then kevent sources (file changes, signals, process events) and attaching an existing kqueue.
+
 ---
 
 ## Differences from Linux
@@ -282,6 +288,7 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
   - [`kqring_rsrc.c`](kmod/kqring_rsrc.c) — fixed files, registered buffers, provided buffers and buffer rings, resource tags and personalities.
   - [`kqring_register.c`](kmod/kqring_register.c) — `io_uring_register` operations.
   - [`kqring_zc.c`](kmod/kqring_zc.c) — zero-copy send: page holding, `RLIMIT_MEMLOCK` accounting and mbuf construction.
+  - [`kqring_trig.c`](kmod/kqring_trig.c) — kqring's extensions: the opt-in, and event-driven chains (triggers, their polls and runs).
 - [`tests/kqring_test.c`](tests/kqring_test.c) — functional test suite: 87 test groups covering every supported opcode, registration, setup flags and the lifetime rules above.
 - [`tests/kqring_bench.c`](tests/kqring_bench.c) — benchmarks against `kqueue(2)` and plain system calls; [`tests/bench_report.py`](tests/bench_report.py) turns runs into the tables and charts in [`BENCHMARK.MD`](BENCHMARK.MD).
 - [`tests/kqring_diskbench.c`](tests/kqring_diskbench.c) — storage workloads (queue depth, jobs, random or sequential, read/write mix) on a disk or file through kqring, `aio(4)` or `pread(2)` threads, with IOPS, latency percentiles and a `-V` mode that checks every read.
