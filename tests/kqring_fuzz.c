@@ -677,6 +677,9 @@ sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
 	memset(t, 0, sizeof(*t));
 	t->nsteps = chance(f, 95) ? (uint8_t)k : (uint8_t)rn(f, 10);
 	t->flags = (uint32_t)rn(f, 16);	/* CONCURRENT .. CANCEL_RUNNING */
+	/* KQFUZZ_NO_CANCEL_RUNNING: leave it out (narrowing down a crash). */
+	if (getenv("KQFUZZ_NO_CANCEL_RUNNING") != NULL)
+		t->flags &= ~KQRING_TRIG_CANCEL_RUNNING;
 	if ((t->flags & KQRING_TRIG_CONCURRENT) != 0)
 		t->max_inflight = (uint16_t)(1 + rn(f, 8));
 	if (chance(f, 3))
@@ -736,7 +739,16 @@ gen_kevent(struct fz *f, struct kevent *k)
 	static const int sigs[] = { SIGURG, SIGWINCH, SIGINFO, SIGCHLD };
 
 	memset(k, 0, sizeof(*k));
-	switch (rn(f, 3)) {
+	switch (rn(f, 4)) {
+	case 3:
+		/* KQFUZZ_NO_KEVCOUNT: leave byte counts out. */
+		if (getenv("KQFUZZ_NO_KEVCOUNT") != NULL) {
+			EV_SET(k, SIGURG, EVFILT_SIGNAL, 0, 0, 0, NULL);
+			break;
+		}
+		EV_SET(k, pool_fd(f, 3), chance(f, 60) ? EVFILT_READ :
+		    EVFILT_WRITE, 0, 0, 0, NULL);
+		break;
 	case 0:
 		EV_SET(k, pool_fd(f, chance(f, 70) ? 0 : 3), EVFILT_VNODE, 0,
 		    1U + (uint32_t)rn(f, 0x7ff), 0, NULL);

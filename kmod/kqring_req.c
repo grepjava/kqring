@@ -1599,10 +1599,11 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 			return (error);
 		break;
 	case KQRING_IOP_KEVENT:
+		/* Before prep: a byte-count request becomes a POLL_ADD. */
+		multishot = (sqe->rw_flags & KQRING_KEV_MULTISHOT) != 0;
 		error = kqring_kev_prep(op);
 		if (error != 0)
 			return (error);
-		multishot = (sqe->rw_flags & KQRING_KEV_MULTISHOT) != 0;
 		break;
 	case IORING_OP_POLL_REMOVE:
 		if (sqe->buf_index != 0 || sqe->splice_fd_in != 0)

@@ -108,6 +108,7 @@ kqring_trig_prep(struct kqring_op *op)
 		error = copyin((const void *)(uintptr_t)ta->kev, k, sizeof(*k));
 		if (error != 0)
 			return (error);
+		/* Readiness is SRC_POLL's (kqring_kev_check() refuses it). */
 		error = kqring_kev_check(k);
 		if (error != 0)
 			return (error);

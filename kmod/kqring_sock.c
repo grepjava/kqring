@@ -1902,12 +1902,58 @@ kqring_exec_poll(struct kqring_op *op, struct socket *expect)
 	} else {
 		revents = kqring_fo_poll_nonblock(fp, events, td);
 	}
+	/* A byte-count kevent request reports how much instead. */
+	int32_t res = revents;
+
+	if (revents > 0 && op->kev_count != 0)
+		res = kqring_kev_count(op, fp);
 	fdrop(fp, td);
 
 	if (revents == 0)
 		return (EAGAIN);
-	return (kqring_done(op, revents,
+	return (kqring_done(op, res,
 	    (sqe->len & IORING_POLL_ADD_MULTI) != 0 ? IORING_CQE_F_MORE : 0));
+}
+
+/*
+ * The count of a ready EVFILT_READ / EVFILT_WRITE kevent request, as
+ * the kevent's data would be: bytes to read, connections waiting on a
+ * listening socket, or room to write.
+ */
+int32_t
+kqring_kev_count(const struct kqring_op *op, struct file *fp)
+{
+	struct thread *td = curthread;
+	long n = 0;
+
+	if (fp->f_type == DTYPE_SOCKET) {
+		struct socket *so = fp->f_data;
+
+		if (op->kev_count == EVFILT_READ) {
+			SOCK_RECVBUF_LOCK(so);
+			if (!SOLISTENING(so))
+				n = sbavail(&so->so_rcv) - so->so_rcv.sb_ctl;
+			SOCK_RECVBUF_UNLOCK(so);
+			if (SOLISTENING(so)) {
+				SOCK_LOCK(so);
+				if (SOLISTENING(so))
+					n = so->sol_qlen;
+				SOCK_UNLOCK(so);
+			}
+		} else {
+			SOCK_SENDBUF_LOCK(so);
+			if (!SOLISTENING(so))
+				n = sbspace(&so->so_snd);
+			SOCK_SENDBUF_UNLOCK(so);
+		}
+	} else {
+		int v = 0;
+
+		if (fo_ioctl(fp, op->kev_count == EVFILT_READ ? FIONREAD :
+		    FIONSPACE, &v, td->td_ucred, td) == 0)
+			n = v;
+	}
+	return ((int32_t)MIN(MAX(n, 0), INT32_MAX));
 }
 
 

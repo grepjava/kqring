@@ -10072,6 +10072,9 @@ test_unix_peer_shutdown(void)
 
 /* ---- Kevent requests (KQRING_EXT_KEVENT) ---- */
 
+static struct io_uring_sqe *kev_trig_prep(struct test_ring *r,
+    const struct kevent *k, uint64_t ud, struct kqring_trigger *t);
+
 static struct io_uring_sqe *
 kev_prep(struct test_ring *r, const struct kevent *k, uint64_t ud, bool multi)
 {
@@ -10254,6 +10257,103 @@ test_kevent_proc_exit(void)
 	    "request, status in big_cqe[0] (CQE32)\n");
 }
 
+/* EVFILT_READ / EVFILT_WRITE: readiness, with how much as res. */
+static void
+test_kevent_counts(void)
+{
+	struct kqring_trigger t = { .nsteps = 1 };
+	struct test_ring r;
+	struct kevent k;
+	struct io_uring_cqe c;
+	uint16_t port;
+	int sv[2], p[2], l, cl[2];
+	char buf[64];
+
+	trig_ring(&r);
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+	/* One-shot READ: waits, then reports the bytes waiting. */
+	EV_SET(&k, sv[1], EVFILT_READ, 0, 0, 0, NULL);
+	kev_prep(&r, &k, 1, false);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(ring_wait(&r, 1, 30) == ETIMEDOUT);
+	assert(write(sv[0], "hello", 5) == 5);
+	c = trig_final(&r, 1, 2000);
+	assert(c.res == 5);
+
+	/* Multishot READ: the count grows as data comes, none of it read. */
+	kev_prep(&r, &k, 2, true);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(trig_collect(&r, 1, 2000) >= 1);	/* already readable */
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 2 && c.res == 5 &&
+	    (c.flags & IORING_CQE_F_MORE) != 0);
+	assert(write(sv[0], "1234567", 7) == 7);
+	assert(trig_collect(&r, 1, 2000) >= 1);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 2 && c.res == 12);
+	trig_cancel(&r, 2);
+	c = trig_final(&r, 2, 2000);
+	assert(c.res == -ECANCELED);
+	assert(read(sv[1], buf, sizeof(buf)) == 12);
+
+	/* WRITE: room in the send buffer. */
+	EV_SET(&k, sv[0], EVFILT_WRITE, 0, 0, 0, NULL);
+	kev_prep(&r, &k, 3, false);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	c = trig_final(&r, 3, 2000);
+	assert(c.res > 0);
+
+	/* A listening socket: the connections waiting to be accepted. */
+	l = tcp_listener(&port);
+	EV_SET(&k, l, EVFILT_READ, 0, 0, 0, NULL);
+	kev_prep(&r, &k, 4, false);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(ring_wait(&r, 1, 30) == ETIMEDOUT);
+	cl[0] = tcp_connect(port);
+	cl[1] = tcp_connect(port);
+	(void)ring_wait(&r, 1, 100);
+	c = trig_final(&r, 4, 2000);
+	assert(c.res >= 1 && c.res <= 2);
+
+	/* A pipe: FIONREAD's count. */
+	assert(pipe2(p, O_NONBLOCK) == 0);
+	assert(write(p[1], "abc", 3) == 3);
+	EV_SET(&k, p[0], EVFILT_READ, 0, 0, 0, NULL);
+	kev_prep(&r, &k, 5, false);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	c = trig_final(&r, 5, 2000);
+	assert(c.res == 3);
+
+	/* Not a trigger source: SRC_POLL does readiness. */
+	EV_SET(&k, p[0], EVFILT_READ, 0, 0, 0, NULL);
+	kev_trig_prep(&r, &k, 6, &t);
+	ring_push_sqe(&r);
+	ring_prep(&r, IORING_OP_NOP, -1, 7);
+	ring_push_sqe(&r);
+	(void)kqring_enter(r.fd, 2, 0, 0, NULL, 0);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 6 && c.res == -EINVAL);
+	(void)ring_pop_cqe(&r);
+
+	close(cl[0]);
+	close(cl[1]);
+	close(l);
+	close(p[0]);
+	close(p[1]);
+	close(sv[0]);
+	close(sv[1]);
+	close(r.fd);
+	printf("[PASS] KEVENT EVFILT_READ / EVFILT_WRITE: bytes waiting "
+	    "(one-shot, multishot 5 then 12), room to write, connections "
+	    "waiting, a pipe's FIONREAD\n");
+}
+
 /* Arguments the kevent request refuses, and one knote per ident. */
 static void
 test_kevent_bad(struct test_ring *plain)
@@ -10270,7 +10370,7 @@ test_kevent_bad(struct test_ring *plain)
 		EV_SET(&k, p[0], EVFILT_VNODE, 0, NOTE_WRITE, 0, NULL);
 		sqe = kev_prep(&r, &k, 100 + i, false);
 		switch (i) {
-		case 0: k.filter = EVFILT_READ; break;	/* POLL_ADD's job */
+		case 0: k.filter = EVFILT_TIMER; break;	/* multishot TIMEOUT's */
 		case 1: k.flags = EV_ONESHOT; break;
 		case 2: k.udata = &k; break;
 		case 3: k.fflags = 0; break;
@@ -10513,6 +10613,7 @@ test_kevents(struct test_ring *plain)
 	test_kevent_vnode();
 	test_kevent_signal();
 	test_kevent_proc_exit();
+	test_kevent_counts();
 	test_kevent_bad(plain);
 	test_kevent_trigger_vnode();
 	test_kevent_trigger_proc();

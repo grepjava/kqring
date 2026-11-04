@@ -747,6 +747,27 @@ kqring_kev_prep(struct kqring_op *op)
 	error = copyin((const void *)(uintptr_t)sqe->addr, k, sizeof(*k));
 	if (error != 0)
 		return (error);
+	if (k->filter == EVFILT_READ || k->filter == EVFILT_WRITE) {
+		bool multi = (sqe->rw_flags & KQRING_KEV_MULTISHOT) != 0;
+
+		if (k->ident > INT_MAX || k->fflags != 0 || k->flags != 0 ||
+		    k->data != 0 || k->udata != NULL || k->ext[0] != 0 ||
+		    k->ext[1] != 0 || k->ext[2] != 0 || k->ext[3] != 0)
+			return (EINVAL);
+		/*
+		 * Readiness, as a POLL_ADD of ident; its result becomes the
+		 * count (kqring_kev_count()).  The kevent in args is kept.
+		 */
+		op->kev_count = k->filter;
+		op->sqe.opcode = IORING_OP_POLL_ADD;
+		op->sqe.ioprio = 0;
+		op->sqe.fd = (int)k->ident;
+		op->sqe.addr = 0;
+		op->sqe.len = multi ? IORING_POLL_ADD_MULTI : 0;
+		op->sqe.poll32_events = k->filter == EVFILT_READ ?
+		    POLLIN | POLLRDNORM : POLLOUT | POLLWRNORM;
+		return (0);
+	}
 	return (kqring_kev_check(k));
 }
 
@@ -921,6 +942,16 @@ kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 	mtx_unlock(&ctx->mtx);
 	if (rev == 0)
 		return;
+	/* A byte-count kevent request: how much, not which events. */
+	if (op->kev_count != 0) {
+		struct file *fp;
+
+		if (fget(curthread, op->kp_fd, &cap_no_rights, &fp) == 0) {
+			rev = kqring_kev_count(op, fp);
+			fdrop(fp, curthread);
+		} else
+			rev = 0;
+	}
 	if (multi && op->trig_wait != NULL) {
 		/* Events taken together fire a trigger once. */
 		kqring_trig_waiter_event(ctx, op, rev, true);

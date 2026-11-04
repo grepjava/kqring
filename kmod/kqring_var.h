@@ -321,6 +321,11 @@ struct kqring_op {
 	/* Set for a final CQE that carries big_cqe words (CQE32). */
 	bool			cqe_has_extra;
 	uint64_t		cqe_extra[2];
+	/*
+	 * An EVFILT_READ / EVFILT_WRITE kevent request, run as a POLL_ADD
+	 * whose res becomes the byte count (kqring_kev_count()).
+	 */
+	short			kev_count;
 	/* A trigger's kevent waiter: its kevent, instead of sqe->addr. */
 	const struct kevent	*trig_kev;
 	bool			listening;	/* armed via solisten_upcall_set */
@@ -1725,6 +1730,7 @@ void	kqring_kpoll_disarm_locked(struct kqring_ctx *ctx,
 void	kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op);
 int	kqring_kev_prep(struct kqring_op *op);
 int	kqring_kev_check(const struct kevent *k);
+int32_t	kqring_kev_count(const struct kqring_op *op, struct file *fp);
 void	kqring_kev_issue(struct kqring_ctx *ctx, struct kqring_op *op);
 int	kqring_kpoll_stop(struct kqring_ctx *ctx, bool nowait);
 void	kqring_kpoll_close(struct kqring_ctx *ctx);

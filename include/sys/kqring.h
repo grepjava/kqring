@@ -974,6 +974,14 @@ struct kqring_ext_setup {
  *   EVFILT_SIGNAL  ident: a signal number; fflags 0.  res: how many times
  *                  it was delivered since the last CQE (block or ignore
  *                  it, or its action runs too).
+ *   EVFILT_READ,   ident: a descriptor; fflags 0.  Completes when it is
+ *   EVFILT_WRITE   readable (writable), as POLL_ADD does, and res is how
+ *                  much: bytes to read (a listening socket: connections
+ *                  waiting), or room to write.  A socket's counts come
+ *                  from its buffers; another file's from FIONREAD and
+ *                  FIONSPACE (0 if it has no such ioctl).  res 0 when
+ *                  readable means end of input or an error.  Not a
+ *                  trigger source (use KQRING_TRIG_SRC_POLL).
  *
  * With IORING_SETUP_CQE32, big_cqe[0] holds the kevent's data (for
  * NOTE_EXIT, the exit status as wait(2) reports it) and big_cqe[1] the
