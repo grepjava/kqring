@@ -10846,6 +10846,146 @@ test_kqueue_bridge_ends(struct test_ring *plain)
 	    "the kqueue, -EBADF on close, -EBUSY, -EINVAL\n");
 }
 
+/* Hand the SQE ring_prep() made to the SQ thread, waking it if it sleeps. */
+static void
+kqb_sq_push(struct test_ring *r)
+{
+	ring_push_sqe(r);
+	atomic_thread_fence(memory_order_seq_cst);
+	if ((atomic_load_explicit(r->sq_kflags, memory_order_relaxed) &
+	    IORING_SQ_NEED_WAKEUP) != 0)
+		assert(kqring_enter(r->fd, 0, 0, IORING_ENTER_SQ_WAKEUP, NULL,
+		    0) == 0);
+}
+
+/* The next CQE, with no system call: only the SQ thread can post it. */
+static struct io_uring_cqe
+kqb_sq_cqe(struct test_ring *r)
+{
+	uint64_t deadline = now_ns() + 2000000000ULL;
+
+	while (ring_cq_ready(r) == 0) {
+		assert(now_ns() < deadline);
+		usleep(50);
+	}
+	return (ring_pop_cqe(r));
+}
+
+static void
+kqb_sq_event(struct test_ring *r, uint64_t udata, int32_t res)
+{
+	struct io_uring_cqe c = kqb_sq_cqe(r);
+
+	assert(c.user_data == udata && c.res == res &&
+	    (c.flags & IORING_CQE_F_MORE) != 0);
+}
+
+/*
+ * On an SQPOLL ring the SQ thread issues the request and delivers the
+ * events, with nobody in an enter: awake, or woken from its sleep by the
+ * event.  It refuses what isn't a kqueue, and a kqueue whose descriptor now
+ * names a file with no f_data ends the bridge.
+ */
+static void
+test_kqueue_bridge_sqpoll(void)
+{
+	struct io_uring_params p;
+	struct kqring_ext_setup es = { .version = KQRING_EXT_VERSION };
+	struct io_uring_cqe c;
+	struct io_uring_sqe *sqe;
+	struct test_ring r;
+	uint64_t deadline;
+	int dn, kq, pp[2], sv[2];
+
+	memset(&r, 0, sizeof(r));
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_SQPOLL;
+	p.sq_thread_idle = 30;
+	r.fd = (int)kqring_setup(SQ_ENTRIES, &p);
+	assert(r.fd >= 0);
+	ring_map(&r, &p);
+	assert(ioctl(r.fd, KQRING_IOC_EXT_SETUP, &es) == 0);
+
+	kq = kqueue();
+	dn = open("/dev/null", O_RDONLY);
+	assert(kq >= 0 && dn >= 0);
+	assert(pipe(pp) == 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	kqb_add(kq, 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0x1111);
+	kqb_add(kq, pp[0], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0x2222);
+	kqb_prep(&r, kq, 50);
+	kqb_sq_push(&r);
+
+	kqb_add(kq, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0x1111);
+	kqb_sq_event(&r, 0x1111, 0);
+	assert(write(pp[1], "hello", 5) == 5);
+	kqb_sq_event(&r, 0x2222, 5);
+
+	/* The thread asleep: the event alone must bring it back. */
+	deadline = now_ns() + 2000000000ULL;
+	while ((atomic_load_explicit(r.sq_kflags, memory_order_acquire) &
+	    IORING_SQ_NEED_WAKEUP) == 0) {
+		assert(now_ns() < deadline);
+		usleep(1000);
+	}
+	kqb_add(kq, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0x1111);
+	kqb_sq_event(&r, 0x1111, 0);
+	for (int i = 0; i < 50; i++) {
+		kqb_add(kq, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0x1111);
+		kqb_sq_event(&r, 0x1111, 0);
+	}
+
+	/* Refused on the SQ thread, as an enter would. */
+	const int notkq[] = { pp[0], sv[0], dn };
+
+	for (unsigned i = 0; i < nitems(notkq); i++) {
+		kqb_prep(&r, notkq[i], 60 + i);
+		kqb_sq_push(&r);
+		c = kqb_sq_cqe(&r);
+		assert(c.user_data == 60 + i && c.res == -EINVAL &&
+		    (c.flags & IORING_CQE_F_MORE) == 0);
+	}
+	kqb_prep(&r, 12345, 63);
+	kqb_sq_push(&r);
+	c = kqb_sq_cqe(&r);
+	assert(c.user_data == 63 && c.res == -EBADF);
+
+	/* The descriptor now names a device: seen at the next enter. */
+	assert(dup2(dn, kq) == kq);
+	assert(trig_final(&r, 50, 2000).res == -EBADF);
+	close(kq);
+
+	/* A cancel, then a ring closed with a bridge and an event pending. */
+	kq = kqueue();
+	assert(kq >= 0);
+	kqb_add(kq, 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0x3333);
+	kqb_prep(&r, kq, 51);
+	kqb_sq_push(&r);
+	sqe = ring_prep(&r, IORING_OP_ASYNC_CANCEL, -1, 9999);
+	sqe->addr = 51;
+	kqb_sq_push(&r);
+	assert(trig_final(&r, 51, 2000).res == -ECANCELED);
+	while (ring_cq_ready(&r) > 0)
+		(void)ring_pop_cqe(&r);
+	kqb_prep(&r, kq, 52);
+	kqb_sq_push(&r);
+	kqb_add(kq, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0x3333);
+	kqb_sq_event(&r, 0x3333, 0);
+	kqb_add(kq, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0x3333);
+
+	munmap(r.sqes, r.sqes_len);
+	munmap(r.ring_map, r.ring_map_len);
+	close(r.fd);
+	close(kq);
+	close(pp[0]);
+	close(pp[1]);
+	close(sv[0]);
+	close(sv[1]);
+	close(dn);
+	printf("[PASS] KQUEUE bridge on SQPOLL: events with no enter, awake "
+	    "and from sleep; refusals; a replaced descriptor; cancel; close\n");
+}
+
 /* A CQE32 ring gets the ident, filter, flags and fflags too. */
 static void
 test_kqueue_bridge_cqe32(void)
@@ -11181,6 +11321,7 @@ test_kevents(struct test_ring *plain)
 	test_kqueue_bridge_level();
 	test_kqueue_bridge_ends(plain);
 	test_kqueue_bridge_cqe32();
+	test_kqueue_bridge_sqpoll();
 	test_kevent_trigger_vnode();
 	test_kevent_trigger_proc();
 	test_kevent_trigger_signal();

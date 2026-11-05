@@ -24,7 +24,8 @@
  * Half of those rings (and a few others) opt in to kqring's extensions,
  * sometimes with bad arguments, and get event-driven chains: triggers on
  * those pipes and sockets with random modes and 1-3 templates from the
- * same well-formed requests, cancelled like any other request.
+ * same well-formed requests, or a RECV passing its provided buffer to a
+ * SEND, cancelled like any other request.
  *
  * It fails on:
  *  - a kernel panic (run it with debug.debugger_on_panic=0; the dump
@@ -82,6 +83,7 @@
 #define NPOOL		12
 #define NDYN		64		/* descriptors a ring made, to close */
 #define NOPS		256		/* opcode and addr per user_data slot */
+#define OP_ECHO		0xfd		/* in ops[]: a step sending a passed buffer */
 #define HANG_NS		(30ULL * 1000000000ULL)
 #define KICK_NS		(2ULL * 1000000000ULL)
 #define REG_RINGS	16
@@ -98,6 +100,8 @@ static _Atomic uint64_t	st_rings, st_setup_fail, st_sqes, st_enters,
 static _Atomic uint64_t	st_trig, st_trig_fire, st_trig_end, st_trig_live;
 static _Atomic uint64_t	st_kev;
 static _Atomic uint64_t	st_kqb;
+/* BUF_FROM_PREV pairs submitted; sends of a buffer that was passed. */
+static _Atomic uint64_t	st_echo, st_echo_sent;
 static _Atomic int	cq_bad, nfinished;
 
 struct fz {
@@ -139,6 +143,8 @@ struct fz {
 	unsigned	nrecent;
 	uint8_t		ext_op;		/* escape opcode once opted in, or 0 */
 	unsigned	tmpl_left;	/* templates still due after a trigger */
+	bool		tmpl_echo;	/* they are a buffer-passing pair */
+	int		echo_fd;	/* on this socket */
 };
 
 #define PBUF_BGID	7
@@ -643,6 +649,7 @@ ring_open(struct fz *f)
 	/* kqring's extensions: opt in (sometimes badly, sometimes twice). */
 	f->ext_op = 0;
 	f->tmpl_left = 0;
+	f->tmpl_echo = false;
 	if (chance(f, f->valid ? 50 : 10)) {
 		struct kqring_ext_setup es = { .version = KQRING_EXT_VERSION };
 
@@ -704,6 +711,13 @@ sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
 		t->step_flags[rn(f, 8)] = (uint8_t)rnd(f);
 	if (chance(f, 2))
 		t->source = (uint8_t)rnd(f);
+	if (f->tmpl_echo) {
+		t->nsteps = 2;
+		memset(t->step_flags, 0, sizeof(t->step_flags));
+		t->step_flags[1] = KQRING_STEP_BUF_FROM_PREV |
+		    (chance(f, 50) ? KQRING_STEP_STOP_ON_ZERO : 0);
+		atomic_fetch_add(&st_echo, 1);
+	}
 	/* Sometimes a kqueue event instead of readiness. */
 	if (chance(f, 25)) {
 		struct kevent *kv = (void *)(f->arena +
@@ -718,8 +732,10 @@ sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
 	s->opcode = f->ext_op;
 	s->ioprio = chance(f, 97) ? KQRING_EXT_TRIGGER : (uint16_t)rnd(f);
 	s->fd = pool_fd(f, chance(f, 50) ? 1 : chance(f, 80) ? 2 : 3);
+	if (f->tmpl_echo)
+		s->fd = f->echo_fd = pool_fd(f, 2);
 	maybe_fixed(f, s);
-	s->poll32_events = evs[rn(f, nitems(evs))];
+	s->poll32_events = f->tmpl_echo ? POLLIN : evs[rn(f, nitems(evs))];
 	s->addr = chance(f, 97) ? (uint64_t)(uintptr_t)t : gen_ptr(f);
 	s->len = chance(f, 97) ? sizeof(*t) : gen_len(f);
 	s->flags |= chance(f, 90) ? IOSQE_IO_LINK : IOSQE_IO_HARDLINK;
@@ -735,6 +751,35 @@ sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
 	f->ops[f->ud % NOPS].op = s->opcode;
 	f->ops[f->ud % NOPS].addr = s->addr;
 	f->ud++;
+}
+
+/*
+ * The templates of a trigger passing a provided buffer: a RECV or READ
+ * that selects one, then the SEND or WRITE that takes it, in place of the
+ * request sqe_fill() put in s.  Random templates hardly ever make this.
+ */
+static void
+sqe_echo(struct fz *f, struct io_uring_sqe *s, bool first)
+{
+	uint64_t ud = s->user_data;
+
+	memset(s, 0, f->sqe_size);
+	s->user_data = ud;
+	s->fd = f->echo_fd;
+	if (first) {
+		s->opcode = chance(f, 70) ? IORING_OP_RECV : IORING_OP_READ;
+		s->flags = IOSQE_BUFFER_SELECT;
+		s->buf_group = PBUF_BGID;
+		f->ops[ud % NOPS].op = s->opcode;
+	} else {
+		s->opcode = chance(f, 70) ? IORING_OP_SEND : IORING_OP_WRITE;
+		if (s->opcode == IORING_OP_WRITE)
+			s->off = (uint64_t)-1;
+		else if (chance(f, 50))
+			s->msg_flags = MSG_WAITALL;
+		f->ops[ud % NOPS].op = OP_ECHO;
+	}
+	f->ops[ud % NOPS].addr = 0;
 }
 
 /*
@@ -1366,6 +1411,8 @@ reap(struct fz *f)
 		uint8_t op = f->ops[c->user_data % NOPS].op;
 
 		atomic_fetch_add(&st_cqes, 1);
+		if (op == OP_ECHO && c->res > 0)
+			atomic_fetch_add(&st_echo_sent, 1);
 		if (f->ext_op != 0 && op == f->ext_op) {
 			if ((c->flags & IORING_CQE_F_MORE) != 0)
 				atomic_fetch_add(&st_trig_fire, 1);
@@ -1429,6 +1476,10 @@ do_submit(struct fz *f)
 				unsigned k = 1 + (unsigned)rn(f,
 				    MIN(3, n - i - 1));
 
+				f->tmpl_echo = f->pbuf && i + 2 < n &&
+				    chance(f, 30);
+				if (f->tmpl_echo)
+					k = 2;
 				sqe_trigger(f, s, k);
 				f->tmpl_left = k;
 				prev = s;
@@ -1477,11 +1528,16 @@ do_submit(struct fz *f)
 				 */
 				if (s->opcode == IORING_OP_CLOSE)
 					s->opcode = IORING_OP_NOP;
+				if (f->tmpl_echo)
+					sqe_echo(f, s, f->tmpl_left == 2);
 				if (--f->tmpl_left > 0)
 					s->flags |= IOSQE_IO_LINK;
-				else if (chance(f, 95))
-					s->flags &= ~(IOSQE_IO_LINK |
-					    IOSQE_IO_HARDLINK);
+				else {
+					f->tmpl_echo = false;
+					if (chance(f, 95))
+						s->flags &= ~(IOSQE_IO_LINK |
+						    IOSQE_IO_HARDLINK);
+				}
 			}
 			prev = s;
 			f->sq_tail++;
@@ -1872,6 +1928,8 @@ main(int argc, char **argv)
 	    (uintmax_t)st_trig_fire);
 	printf("kqring_fuzz: kevent requests %ju\n", (uintmax_t)st_kev);
 	printf("kqring_fuzz: kqueue bridges %ju\n", (uintmax_t)st_kqb);
+	printf("kqring_fuzz: buffer-passing pairs %ju, buffers sent %ju\n",
+	    (uintmax_t)st_echo, (uintmax_t)st_echo_sent);
 	if (atomic_load(&cq_bad)) {
 		fprintf(stderr, "kqring_fuzz: FAIL: a CQ ring overran\n");
 		rc = 1;
