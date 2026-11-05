@@ -1039,9 +1039,21 @@ struct kqring_trigger {
  * previous request failed); for READ, WRITE, READ_FIXED, WRITE_FIXED,
  * SEND, SEND_ZC, RECV, SPLICE and TEE.  STOP_ON_ZERO: if the previous
  * res was 0 (end of file), the rest of the run is skipped without CQEs
- * and the trigger ends with res 0.  Bit 1 is reserved for BUF_FROM_PREV.
+ * and the trigger ends with res 0.
+ *
+ * BUF_FROM_PREV (SEND and WRITE only, not with IOSQE_BUFFER_SELECT): the
+ * previous step selected one provided buffer (IOSQE_BUFFER_SELECT) and
+ * filled it with res bytes; this step uses that buffer and length instead
+ * of its own addr and len, and gives the buffer back to its group when it
+ * completes.  The previous step's CQE then has no IORING_CQE_F_BUFFER: the
+ * buffer never goes to user space.  A buffer ring gets it back in the
+ * kernel (selection takes such buffers first), as user space owns the
+ * ring's tail; a later CQE that selects it reports its id as usual.  If
+ * the previous step selected no single whole buffer (none, a bundle, or
+ * part of an IOU_PBUF_RING_INC buffer), this step fails with -ENOBUFS.
  */
 #define KQRING_STEP_LEN_FROM_PREV	(1U << 0)
+#define KQRING_STEP_BUF_FROM_PREV	(1U << 1)
 #define KQRING_STEP_STOP_ON_ZERO	(1U << 2)
 
 #ifndef _KERNEL

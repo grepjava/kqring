@@ -647,6 +647,11 @@ kqring_op_free(struct kqring_op *op)
 		crfree(op->cred);
 		op->cred = NULL;
 	}
+	/* A BUF_FROM_PREV step is done with the buffer it was given. */
+	if (__predict_false(op->tbuf.valid)) {
+		op->tbuf.valid = false;
+		kqring_buf_give_back(ctx, &op->tbuf);
+	}
 	/* The last request of a trigger's run: the run is done. */
 	if (tr != NULL)
 		kqring_trun_put(tr);
@@ -1972,6 +1977,11 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 	    (op->sqe.timeout_flags & IORING_TIMEOUT_ETIME_SUCCESS) != 0);
 	if (__predict_false(op->trun != NULL) && failed)
 		kqring_trun_failed(op->trun, res);
+	/* A buffer passed to the next step never goes to user space. */
+	if (__predict_false(op->trun != NULL) && !failed &&
+	    kqring_trun_passes_buf(op, res))
+		cflags &= ~(IORING_CQE_F_BUFFER | IORING_CQE_F_BUF_MORE |
+		    (0xffffU << IORING_CQE_BUFFER_SHIFT));
 
 	/*
 	 * SEND_ZC / SENDMSG_ZC: IORING_CQE_F_MORE announces the notification
@@ -2044,11 +2054,21 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 		if (failed && (op->sqe.flags & IOSQE_IO_HARDLINK) == 0)
 			kqring_chain_fail(ctx, next,
 			    (op->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) != 0);
-		else if (__predict_false(op->trun != NULL) &&
-		    !kqring_trun_step(op, next, res))
-			/* STOP_ON_ZERO: the rest of the run posts nothing. */
-			kqring_chain_fail(ctx, next, true);
-		else
+		else if (__predict_false(op->trun != NULL)) {
+			switch (kqring_trun_step(op, next, res)) {
+			case KQRING_TSTEP_RUN:
+				TAILQ_INSERT_TAIL(&ctx->ready_q, next, q_link);
+				break;
+			case KQRING_TSTEP_STOP:
+				/* STOP_ON_ZERO: the rest posts nothing. */
+				kqring_chain_fail(ctx, next, true);
+				break;
+			case KQRING_TSTEP_FAIL:
+				/* next->prep_err says why; the rest -ECANCELED. */
+				kqring_chain_fail(ctx, next, false);
+				break;
+			}
+		} else
 			TAILQ_INSERT_TAIL(&ctx->ready_q, next, q_link);
 	}
 	kqring_op_free(op);

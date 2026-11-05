@@ -9780,7 +9780,7 @@ test_trigger_step_flags_bad(void)
 {
 	static const uint8_t bad[][2] = {
 		{ KQRING_STEP_LEN_FROM_PREV, 0 },	/* on the first step */
-		{ 0, 1U << 1 },				/* reserved bit */
+		{ 0, KQRING_STEP_BUF_FROM_PREV },	/* on a NOP */
 		{ 0, 1U << 7 },				/* unknown bit */
 		{ 0, KQRING_STEP_LEN_FROM_PREV },	/* NOP has no len */
 	};
@@ -9960,6 +9960,233 @@ test_trigger_cancel_running(void)
 	}
 	printf("[PASS] trigger CANCEL_RUNNING: a cancel ends 3 waiting runs "
 	    "(-ECANCELED each) before the final CQE; without it they stay\n");
+}
+
+/*
+ * A buffer ring of n buffers of sz bytes in group bgid on ring r, all
+ * offered once; user space never adds to it again.
+ */
+static char *
+buf_ring_small(struct test_ring *r, uint16_t bgid, unsigned n, unsigned sz)
+{
+	long page = sysconf(_SC_PAGESIZE);
+	struct io_uring_buf_ring *br = mmap(NULL, (size_t)page,
+	    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	char *mem = malloc((size_t)n * sz);
+	struct io_uring_buf_reg reg = {
+		.ring_addr = (uint64_t)(uintptr_t)br,
+		.ring_entries = n,
+		.bgid = bgid,
+	};
+	struct io_uring_buf *b = (struct io_uring_buf *)br;
+
+	assert(br != MAP_FAILED && mem != NULL);
+	assert(kqring_register(r->fd, IORING_REGISTER_PBUF_RING, &reg, 1) == 0);
+	for (unsigned i = 0; i < n; i++) {
+		b[i].addr = (uint64_t)(uintptr_t)(mem + (size_t)i * sz);
+		b[i].len = sz;
+		b[i].bid = (uint16_t)i;
+	}
+	atomic_store_explicit((_Atomic uint16_t *)&br->tail, (uint16_t)n,
+	    memory_order_release);
+	return (mem);
+}
+
+/* One SERIAL echo trigger on fd: RECV from group bgid -> SEND that buffer. */
+static void
+buf_echo_trigger(struct test_ring *r, int fd, uint64_t ud, uint16_t bgid,
+    struct kqring_trigger *t)
+{
+	struct io_uring_sqe *sqe;
+
+	memset(t, 0, sizeof(*t));
+	t->nsteps = 2;
+	t->step_flags[1] = KQRING_STEP_BUF_FROM_PREV | KQRING_STEP_STOP_ON_ZERO;
+	trig_prep(r, fd, POLLIN, ud, t);
+	ring_push_sqe(r);
+	sqe = ring_prep(r, IORING_OP_RECV, fd, ud + 1);
+	sqe->flags = IOSQE_IO_LINK | IOSQE_BUFFER_SELECT |
+	    IOSQE_CQE_SKIP_SUCCESS;
+	sqe->buf_group = bgid;
+	ring_push_sqe(r);
+	sqe = ring_prep(r, IORING_OP_SEND, fd, ud + 2);
+	sqe->msg_flags = MSG_WAITALL;
+	sqe->flags = IOSQE_CQE_SKIP_SUCCESS;
+	ring_push_sqe(r);
+}
+
+/*
+ * BUF_FROM_PREV: eight connections share one group of four buffers.  Each
+ * echo RECVs into a provided buffer and SENDs that buffer, which then goes
+ * back to the group: 400 messages over the eight, no CQE, and user space
+ * never gives a buffer back.  Run with a buffer ring and with a
+ * PROVIDE_BUFFERS list.
+ */
+static void
+test_trigger_buf_from_prev(void)
+{
+	enum { NCONN = 8, NBUF = 4, BSZ = 64 };
+
+	for (int ring_group = 1; ring_group >= 0; ring_group--) {
+		struct kqring_trigger t[NCONN];
+		struct test_ring r;
+		struct io_uring_cqe c;
+		char *mem = NULL;
+		int sv[NCONN][2];
+
+		trig_ring(&r);
+		if (ring_group)
+			mem = buf_ring_small(&r, 9, NBUF, BSZ);
+		else {
+			struct io_uring_sqe *sqe;
+
+			mem = malloc(NBUF * BSZ);
+			sqe = ring_prep(&r, IORING_OP_PROVIDE_BUFFERS, NBUF,
+			    500);
+			sqe->addr = (uint64_t)(uintptr_t)mem;
+			sqe->len = BSZ;
+			sqe->buf_group = 9;
+			sqe->off = 0;
+			ring_push_sqe(&r);
+			ring_submit(&r);
+			assert(trig_collect(&r, 1, 1000) == 1);
+			assert(ring_pop_cqe(&r).res == 0);
+		}
+		for (int i = 0; i < NCONN; i++) {
+			assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK,
+			    0, sv[i]) == 0);
+			buf_echo_trigger(&r, sv[i][1], 100 + 10 * i, 9, &t[i]);
+		}
+		ring_submit(&r);
+		for (int m = 0; m < 400; m++) {
+			int i = m % NCONN;
+			char msg[BSZ], back[BSZ];
+			size_t len = 1 + (size_t)(m * 7) % BSZ, n = 0;
+
+			memset(msg, 'A' + m % 26, len);
+			msg[0] = (char)m;
+			assert(write(sv[i][0], msg, len) == (ssize_t)len);
+			while (n < len) {
+				struct pollfd pfd = { .fd = sv[i][0],
+				    .events = POLLIN };
+
+				(void)ring_wait(&r, 1, 1);
+				assert(ring_cq_ready(&r) == 0);
+				if (poll(&pfd, 1, 0) == 0)
+					continue;
+				ssize_t k = read(sv[i][0], back + n,
+				    sizeof(back) - n);
+				assert(k > 0);
+				n += (size_t)k;
+			}
+			assert(n == len && memcmp(msg, back, len) == 0);
+		}
+		/* Each connection's peer closes: each trigger ends with 0. */
+		for (int i = 0; i < NCONN; i++) {
+			close(sv[i][0]);
+			c = trig_final(&r, 100 + 10 * i, 2000);
+			assert(c.res == 0);
+			close(sv[i][1]);
+		}
+		assert(ring_cq_ready(&r) == 0);
+		close(r.fd);
+		free(mem);
+	}
+	printf("[PASS] trigger BUF_FROM_PREV: 8 connections share 4 provided "
+	    "buffers (ring and list) for 400 echoes, no CQE, none given back "
+	    "by user space\n");
+}
+
+/*
+ * BUF_FROM_PREV's other cases: the CQE of the step whose buffer is passed
+ * has no F_BUFFER; a step that selected no buffer makes the next -ENOBUFS;
+ * templates that can't take a buffer fail the trigger.
+ */
+static void
+test_trigger_buf_from_prev_edges(void)
+{
+	struct kqring_trigger t = { .nsteps = 2,
+	    .step_flags = { 0, KQRING_STEP_BUF_FROM_PREV } };
+	struct test_ring r;
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	char buf[16], back[16];
+	int sv[2];
+
+	trig_ring(&r);
+	(void)buf_ring_small(&r, 3, 2, 16);
+	assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+	/* RECV's CQE shown: res 3, no F_BUFFER (the SEND has the buffer). */
+	trig_prep(&r, sv[1], POLLIN, 1, &t);
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_RECV, sv[1], 2);
+	sqe->flags = IOSQE_IO_LINK | IOSQE_BUFFER_SELECT;
+	sqe->buf_group = 3;
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_SEND, sv[1], 3);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	for (int i = 0; i < 5; i++) {	/* more than the 2 buffers */
+		assert(write(sv[0], "abc", 3) == 3);
+		assert(trig_collect(&r, 2, 2000) >= 2);
+		c = ring_pop_cqe(&r);
+		assert(c.user_data == 2 && c.res == 3 &&
+		    (c.flags & IORING_CQE_F_BUFFER) == 0);
+		c = ring_pop_cqe(&r);
+		assert(c.user_data == 3 && c.res == 3);
+		assert(read(sv[0], back, sizeof(back)) == 3);
+		assert(memcmp(back, "abc", 3) == 0);
+	}
+	trig_cancel(&r, 1);
+	assert(trig_final(&r, 1, 2000).res == -ECANCELED);
+
+	/* The RECV selects nothing (a plain buffer): the SEND -ENOBUFS. */
+	trig_prep(&r, sv[1], POLLIN, 11, &t);
+	ring_push_sqe(&r);
+	sqe = ring_prep(&r, IORING_OP_RECV, sv[1], 12);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->flags = IOSQE_IO_LINK;
+	ring_push_sqe(&r);
+	ring_prep(&r, IORING_OP_SEND, sv[1], 13);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(write(sv[0], "x", 1) == 1);
+	assert(trig_collect(&r, 2, 2000) >= 2);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 12 && c.res == 1);
+	c = ring_pop_cqe(&r);
+	assert(c.user_data == 13 && c.res == -ENOBUFS);
+	trig_cancel(&r, 11);
+	assert(trig_final(&r, 11, 2000).res == -ECANCELED);
+
+	/* Templates that can't take a buffer. */
+	for (int i = 0; i < 3; i++) {
+		trig_prep(&r, sv[1], POLLIN, 20 + i, &t);
+		ring_push_sqe(&r);
+		sqe = ring_prep(&r, IORING_OP_RECV, sv[1], 30);
+		sqe->flags = IOSQE_IO_LINK | IOSQE_BUFFER_SELECT;
+		sqe->buf_group = 3;
+		ring_push_sqe(&r);
+		sqe = ring_prep(&r, i == 0 ? IORING_OP_RECV : i == 1 ?
+		    IORING_OP_FSYNC : IORING_OP_SEND, sv[1], 31);
+		if (i == 2) {
+			sqe->flags = IOSQE_BUFFER_SELECT;
+			sqe->buf_group = 3;
+		}
+		ring_push_sqe(&r);
+		ring_submit(&r);
+		c = trig_final(&r, 20 + (uint64_t)i, 1000);
+		assert(c.res == -EINVAL);
+		while (ring_cq_ready(&r) > 0)
+			assert(ring_pop_cqe(&r).res == -ECANCELED);
+	}
+	close(sv[0]);
+	close(sv[1]);
+	close(r.fd);
+	printf("[PASS] trigger BUF_FROM_PREV edges: passed buffer not in the "
+	    "CQE, -ENOBUFS without one, bad templates refused\n");
 }
 
 /* Close the ring with triggers armed and a run waiting on a socket. */
@@ -10634,6 +10861,8 @@ test_triggers(struct test_ring *plain)
 	test_trigger_file_copy();
 	test_trigger_step_flags_bad();
 	test_trigger_cancel_running();
+	test_trigger_buf_from_prev();
+	test_trigger_buf_from_prev_edges();
 	test_trigger_close();
 	test_unix_peer_shutdown();
 }

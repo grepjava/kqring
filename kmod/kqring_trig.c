@@ -26,7 +26,8 @@
  * completion or kqring_op_free().
  */
 
-#define	KQRING_STEP_ALL	(KQRING_STEP_LEN_FROM_PREV | KQRING_STEP_STOP_ON_ZERO)
+#define	KQRING_STEP_ALL	(KQRING_STEP_LEN_FROM_PREV | KQRING_STEP_BUF_FROM_PREV | \
+	KQRING_STEP_STOP_ON_ZERO)
 
 /* Most triggers alive on one ring. */
 #define	KQRING_TRIG_MAX		1024U
@@ -336,26 +337,66 @@ kqring_step_len_ok(uint8_t opcode)
 	}
 }
 
+/* The step after op in its run (past a moot LINK_TIMEOUT), or NULL. */
+static struct kqring_op *
+kqring_trun_next(const struct kqring_op *op)
+{
+	struct kqring_op *next = op->link;
+
+	if (next != NULL && next->sqe.opcode == IORING_OP_LINK_TIMEOUT)
+		next = next->link;
+	return (next != NULL && next->trun == op->trun ? next : NULL);
+}
+
 /*
- * From kqring_req_complete(): op of a run completed with res and next is
- * the step after it (not yet issued).  Apply next's step flags.  Returns
- * false if the rest of the run is to be skipped (STOP_ON_ZERO).
+ * Whether op's CQE (res) gives its buffer to the next step rather than
+ * user space: op selected one whole buffer (tsel) and the next step takes
+ * it (BUF_FROM_PREV).  STOP_ON_ZERO and failures take nothing: they have
+ * no data in a buffer.
  */
 bool
+kqring_trun_passes_buf(const struct kqring_op *op, int32_t res)
+{
+	struct kqring_op *next = kqring_trun_next(op);
+
+	return (op->tsel.valid && res > 0 && next != NULL &&
+	    (next->tstep & KQRING_STEP_BUF_FROM_PREV) != 0);
+}
+
+/*
+ * From kqring_req_complete(): op of a run completed with res and next is
+ * the step after it (not yet issued).  Apply next's step flags: run next,
+ * skip the rest of the run quietly (STOP_ON_ZERO), or fail next (with
+ * next->prep_err) and the rest.
+ */
+enum kqring_tstep
 kqring_trun_step(struct kqring_op *op, struct kqring_op *next, int32_t res)
 {
 	struct kqring_trun *tr = op->trun;
 
 	if (next->trun != tr || next->tstep == 0)
-		return (true);
+		return (KQRING_TSTEP_RUN);
 	if ((next->tstep & KQRING_STEP_STOP_ON_ZERO) != 0 && res == 0) {
 		tr->stopped = true;
-		return (false);
+		return (KQRING_TSTEP_STOP);
+	}
+	if ((next->tstep & KQRING_STEP_BUF_FROM_PREV) != 0) {
+		/* kqring_req_complete() kept the buffer out of op's CQE. */
+		if (!op->tsel.valid || res <= 0) {
+			next->prep_err = ENOBUFS;
+			kqring_trun_failed(tr, -ENOBUFS);
+			return (KQRING_TSTEP_FAIL);
+		}
+		next->tbuf = op->tsel;
+		op->tsel.valid = false;
+		next->sqe.addr = next->tbuf.addr;
+		next->sqe.len = MIN((uint32_t)res, next->tbuf.len);
+		return (KQRING_TSTEP_RUN);
 	}
 	/* Only shrinks len, so what prep checked of it still holds. */
 	if ((next->tstep & KQRING_STEP_LEN_FROM_PREV) != 0)
 		next->sqe.len = res < 0 ? 0 : MIN((uint32_t)res, next->sqe.len);
-	return (true);
+	return (KQRING_TSTEP_RUN);
 }
 
 /* A request of the run was freed; the last one ends the run. */
@@ -543,6 +584,15 @@ kqring_trig_issue(struct kqring_ctx *ctx, struct kqring_op *op)
 		    (t->sqe.opcode == IORING_OP_LINK_TIMEOUT ||
 		    ((ta->step_flags[n] & KQRING_STEP_LEN_FROM_PREV) != 0 &&
 		    !kqring_step_len_ok(t->sqe.opcode))))
+			err = -EINVAL;
+		/* A buffer goes to a plain SEND or WRITE (not fixed, not chosen). */
+		if (n < KQRING_TRIG_MAX_STEPS &&
+		    (ta->step_flags[n] & KQRING_STEP_BUF_FROM_PREV) != 0 &&
+		    ((t->sqe.opcode != IORING_OP_SEND &&
+		    t->sqe.opcode != IORING_OP_WRITE) ||
+		    (t->sqe.flags & IOSQE_BUFFER_SELECT) != 0 ||
+		    (t->sqe.opcode == IORING_OP_SEND &&
+		    (t->sqe.ioprio & IORING_RECVSEND_BUNDLE) != 0)))
 			err = -EINVAL;
 		n++;
 	}

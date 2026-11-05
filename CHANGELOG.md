@@ -11,6 +11,7 @@
 - **Kevent triggers** (`KQRING_TRIG_SRC_KEVENT`): an event-driven chain can run on a kqueue event rather than readiness, such as a file changing, a signal or a process's exit, and a process's exit is its last event. Tested by "when this file is written, read it", a child's exit, and a signal-driven `CONCURRENT` trigger; the fuzzer makes a quarter of its triggers kevent triggers.
 - **Kevent byte counts:** an `EVFILT_READ` or `EVFILT_WRITE` kevent request completes when its descriptor is readable or writable, with `res` the bytes waiting (connections waiting, on a listening socket) or the room to write.
 - **`KQRING_TRIG_CANCEL_RUNNING`:** a trigger that ends with an error (a cancel, `STOP_ON_ERROR`, the CQ full) also cancels its runs still in flight, rather than let them finish.
+- **`KQRING_STEP_BUF_FROM_PREV`:** a `SEND` or `WRITE` step uses the provided buffer the step before it selected and filled, and gives it back to its group when done, so connections share a pool of provided buffers and user space never recycles one. Works with buffer rings and `PROVIDE_BUFFERS` groups.
 - **Step flags for event-driven chains:** `KQRING_STEP_LEN_FROM_PREV` gives a step the byte count of the step before it, and `KQRING_STEP_STOP_ON_ZERO` ends the trigger at end of file. A `RECV` → `SEND` echo server then runs entirely in the kernel, with no CQE or system call per message. In `kqring_bench echo` it uses 8–15% less server CPU per message than a kqueue server, and has the shortest round trip.
 
 ### Fixed

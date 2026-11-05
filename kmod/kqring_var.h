@@ -412,6 +412,19 @@ struct kqring_op {
 	struct kqring_trig	*trig_wait;
 	struct kqring_trun	*trun;
 	uint8_t			tstep;		/* trun: KQRING_STEP_* */
+	/*
+	 * BUF_FROM_PREV (trun): the one provided buffer this request
+	 * selected (tsel), which the next step may take; and the buffer it
+	 * took from the step before (tbuf), given back when it is freed.
+	 */
+	struct kqring_tbuf {
+		bool		valid;
+		uint16_t	bgid;
+		uint16_t	bid;
+		uint32_t	gen;		/* its group's kqring_bgroup.gen */
+		uint32_t	len;
+		uint64_t	addr;
+	}			tsel, tbuf;
 	bool			multishot;	/* prep: a multishot request */
 	/*
 	 * Not cleared when the op is reused (kqring_op_alloc()): the
@@ -589,8 +602,13 @@ struct kqring_bgroup {
 	uint32_t		ring_entries;
 	uint32_t		ring_mask;
 	uint16_t		head;		/* kernel consumer index */
-	STAILQ_HEAD(, kqring_kbuf) bufs;	/* PROVIDE_BUFFERS */
+	/*
+	 * PROVIDE_BUFFERS; for a ring, the buffers BUF_FROM_PREV gave back,
+	 * which selection takes before the ring's.
+	 */
+	STAILQ_HEAD(, kqring_kbuf) bufs;
 	uint32_t		nbufs;
+	uint32_t		gen;		/* unique to this group */
 };
 
 LIST_HEAD(kqring_bgroup_list, kqring_bgroup);
@@ -616,6 +634,7 @@ struct kqring_sel {
 	uint64_t		addr0;		/* its address */
 	uint32_t		len0;		/* and full length */
 	uint32_t		lens[KQRING_MAX_BUNDLE]; /* lengths used */
+	bool			from_list;	/* a ring group's bufs list */
 };
 
 #define	KQ_DIR_RCV	0x1
@@ -1445,8 +1464,11 @@ void	kqring_trig_waiter_event(struct kqring_ctx *ctx, struct kqring_op *op,
 	    int32_t res, bool more);
 void	kqring_trun_put(struct kqring_trun *tr);
 void	kqring_trun_failed(struct kqring_trun *tr, int32_t res);
-bool	kqring_trun_step(struct kqring_op *op, struct kqring_op *next,
+/* What kqring_trun_step() decided for the next step of a run. */
+enum kqring_tstep { KQRING_TSTEP_RUN, KQRING_TSTEP_STOP, KQRING_TSTEP_FAIL };
+enum kqring_tstep kqring_trun_step(struct kqring_op *op, struct kqring_op *next,
 	    int32_t res);
+bool	kqring_trun_passes_buf(const struct kqring_op *op, int32_t res);
 void	kqring_trig_work(struct kqring_ctx *ctx);
 int32_t	kqring_trig_cancel(struct kqring_ctx *ctx,
 	    const struct io_uring_sqe *sqe, const struct file *cfp, bool all);
@@ -1461,6 +1483,10 @@ bool	kqring_buf_none(struct kqring_ctx *ctx, uint16_t bgid);
 bool	kqring_buf_drained(const struct kqring_sel *sel);
 uint32_t kqring_buf_commit(struct kqring_ctx *ctx,
 	    const struct kqring_sel *sel, size_t done);
+uint32_t kqring_buf_commit_op(struct kqring_ctx *ctx, struct kqring_op *op,
+	    const struct kqring_sel *sel, size_t done);
+void	kqring_buf_give_back(struct kqring_ctx *ctx,
+	    const struct kqring_tbuf *tb);
 void	kqring_rsrc_put(struct kqring_ctx *ctx, struct kqring_rsrc *r);
 void	kqring_caps_all(struct filecaps *caps);
 int32_t	kqring_fixed_install(struct kqring_ctx *ctx, struct file *fp,

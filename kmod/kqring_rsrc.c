@@ -113,10 +113,19 @@ kqring_buf_select(struct kqring_ctx *ctx, uint16_t bgid, size_t max,
 	if (bg == NULL || bg->busy)
 		return (ENOBUFS);
 	sel->bg = bg;
+	sel->from_list = !bg->is_ring || !STAILQ_EMPTY(&bg->bufs);
 	nmax = MIN(nmax, KQRING_MAX_BUNDLE);
 	if (max == 0 || max > (size_t)INT32_MAX)
 		max = INT32_MAX;
-	if (bg->is_ring) {
+	if (bg->is_ring && sel->from_list) {
+		/* Buffers BUF_FROM_PREV gave back: one, before the ring's. */
+		error = kqring_bring_tail(ctx, bg, &tail);
+		if (error != 0)
+			return (error);
+		sel->tail = tail;
+		nmax = 1;
+	}
+	if (!sel->from_list) {
 		error = kqring_bring_tail(ctx, bg, &tail);
 		if (error != 0)
 			return (error);
@@ -187,8 +196,10 @@ kqring_buf_none(struct kqring_ctx *ctx, uint16_t bgid)
 		return (true);
 	if (bg->busy)
 		return (false);
+	if (!STAILQ_EMPTY(&bg->bufs))
+		return (false);
 	if (!bg->is_ring)
-		return (STAILQ_EMPTY(&bg->bufs));
+		return (true);
 	/* A fault is reported by the selection that follows. */
 	return (kqring_bring_tail(ctx, bg, &tail) == 0 && tail == bg->head);
 }
@@ -207,7 +218,7 @@ kqring_buf_drained(const struct kqring_sel *sel)
 		return (false);
 	if (!bg->is_ring)
 		return (STAILQ_EMPTY(&bg->bufs));
-	return (bg->head == sel->tail);
+	return (STAILQ_EMPTY(&bg->bufs) && bg->head == sel->tail);
 }
 
 /*
@@ -231,7 +242,7 @@ kqring_buf_commit(struct kqring_ctx *ctx, const struct kqring_sel *sel,
 	    ((uint32_t)sel->bid << IORING_CQE_BUFFER_SHIFT);
 	for (used = 0; used < sel->nbufs && left > 0; used++)
 		left -= MIN(left, sel->lens[used]);
-	if (!bg->is_ring) {
+	if (sel->from_list) {
 		while (used-- > 0) {
 			kb = STAILQ_FIRST(&bg->bufs);
 			STAILQ_REMOVE_HEAD(&bg->bufs, link);
@@ -255,6 +266,71 @@ kqring_buf_commit(struct kqring_ctx *ctx, const struct kqring_sel *sel,
 	return (cflags);
 }
 
+
+/*
+ * kqring_buf_commit() for op, also noting, for a request of a trigger's
+ * run, the one whole buffer it took (op->tsel), which the next step may
+ * use (KQRING_STEP_BUF_FROM_PREV).
+ */
+uint32_t
+kqring_buf_commit_op(struct kqring_ctx *ctx, struct kqring_op *op,
+    const struct kqring_sel *sel, size_t n)
+{
+	uint32_t cflags = kqring_buf_commit(ctx, sel, n);
+
+	if (__predict_false(op->trun != NULL)) {
+		/* Not an incremental ring's: its entry may be part used. */
+		op->tsel.valid = sel->nbufs == 1 &&
+		    (cflags & IORING_CQE_F_BUF_MORE) == 0 &&
+		    (sel->from_list ||
+		    (sel->bg->ring_flags & IOU_PBUF_RING_INC) == 0);
+		op->tsel.bgid = sel->bg->bgid;
+		op->tsel.gen = sel->bg->gen;
+		op->tsel.bid = sel->bid;
+		op->tsel.addr = sel->addr0;
+		op->tsel.len = sel->len0;
+	}
+	return (cflags);
+}
+
+/*
+ * Give a buffer a BUF_FROM_PREV step used back to its group, unless the
+ * group has gone (or was replaced) meanwhile.  A list group gets it back
+ * at the front (still warm in cache), a ring group on its list of
+ * given-back buffers, which selection takes first.
+ */
+void
+kqring_buf_give_back(struct kqring_ctx *ctx, const struct kqring_tbuf *tb)
+{
+	struct kqring_bgroup *bg;
+	struct kqring_kbuf *kb;
+	bool locked = sx_xlocked(&ctx->bg_sx);
+
+	if (ctx->closing)
+		return;
+	if (!locked)
+		sx_xlock(&ctx->bg_sx);
+	bg = kqring_bgroup_find(ctx, tb->bgid);
+	if (bg != NULL && bg->gen == tb->gen) {
+		kb = malloc(sizeof(*kb), M_KQRING, M_WAITOK);
+		kb->addr = tb->addr;
+		kb->len = tb->len;
+		kb->bid = tb->bid;
+		/*
+		 * A reserved group (a worker selected from the front and will
+		 * commit it) gets it at the back, so that commit takes the
+		 * buffer that was selected.
+		 */
+		if (bg->busy)
+			STAILQ_INSERT_TAIL(&bg->bufs, kb, link);
+		else
+			STAILQ_INSERT_HEAD(&bg->bufs, kb, link);
+		bg->nbufs++;
+		ctx->nprovided++;
+	}
+	if (!locked)
+		sx_xunlock(&ctx->bg_sx);
+}
 
 /*
  * Drop a reference to a registered file or buffer; the last one posts its
@@ -700,8 +776,11 @@ kqring_bgroup_new(uint16_t bgid)
 {
 	struct kqring_bgroup *bg;
 
+	static u_int gen;
+
 	bg = malloc(sizeof(*bg), M_KQRING, M_WAITOK | M_ZERO);
 	bg->bgid = bgid;
+	bg->gen = atomic_fetchadd_int(&gen, 1) + 1;
 	STAILQ_INIT(&bg->bufs);
 	return (bg);
 }

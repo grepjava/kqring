@@ -672,7 +672,9 @@ sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
 	    POLLIN | POLLRDHUP, POLLPRI };
 	static const uint8_t steps[] = { KQRING_STEP_LEN_FROM_PREV,
 	    KQRING_STEP_STOP_ON_ZERO,
-	    KQRING_STEP_LEN_FROM_PREV | KQRING_STEP_STOP_ON_ZERO };
+	    KQRING_STEP_LEN_FROM_PREV | KQRING_STEP_STOP_ON_ZERO,
+	    KQRING_STEP_BUF_FROM_PREV,
+	    KQRING_STEP_BUF_FROM_PREV | KQRING_STEP_STOP_ON_ZERO };
 
 	memset(t, 0, sizeof(*t));
 	t->nsteps = chance(f, 95) ? (uint8_t)k : (uint8_t)rn(f, 10);

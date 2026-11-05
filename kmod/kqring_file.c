@@ -718,7 +718,7 @@ retry:
 		sx_xlock(&ctx->bg_sx);
 		sel.bg->busy = false;
 		if (done > 0)
-			cflags = kqring_buf_commit(ctx, &sel, done);
+			cflags = kqring_buf_commit_op(ctx, op, &sel, done);
 		sx_xunlock(&ctx->bg_sx);
 	}
 	if (error != 0 && done == 0) {
@@ -809,7 +809,7 @@ kqring_exec_read_multishot(struct kqring_ctx *ctx, struct kqring_op *op,
 			return (kqring_done(op, kqring_errno(error), 0));
 		return (kqring_done(op, 0, 0));
 	}
-	cqe_flags = kqring_buf_commit(ctx, &sel, n) | IORING_CQE_F_MORE;
+	cqe_flags = kqring_buf_commit_op(ctx, op, &sel, n) | IORING_CQE_F_MORE;
 	sx_xunlock(&ctx->bg_sx);
 	PIPE_LOCK(rpipe);
 	*more_out = rpipe->pipe_buffer.cnt > 0 || rpipe->pipe_pages.cnt > 0 ||

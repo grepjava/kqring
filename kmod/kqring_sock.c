@@ -466,7 +466,7 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	 */
 	if (buf_select) {
 		if (n > 0)
-			cqe_flags |= kqring_buf_commit(ctx, &sel, n);
+			cqe_flags |= kqring_buf_commit_op(ctx, op, &sel, n);
 		if (multishot)
 			drained = kqring_buf_drained(&sel);
 		if (bg_lock)
@@ -960,7 +960,7 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 			kqring_put_sock(op, fp, error);
 			return (kqring_done(op, -error, 0));
 		}
-		cqe_flags = kqring_buf_commit(ctx, &sel, n);
+		cqe_flags = kqring_buf_commit_op(ctx, op, &sel, n);
 		/*
 		 * As io_uring: a bundle goes on (IORING_CQE_F_MORE) while the
 		 * group has buffers; the batch that empties it ends it.
@@ -981,7 +981,7 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 		return (rc);
 	}
 	if (buf_select) {
-		cqe_flags = kqring_buf_commit(ctx, &sel, n);
+		cqe_flags = kqring_buf_commit_op(ctx, op, &sel, n);
 		if (bg_lock)
 			sx_xunlock(&ctx->bg_sx);
 	}
@@ -1185,7 +1185,7 @@ kqring_exec_recvmsg_multi(struct kqring_ctx *ctx, struct kqring_op *op,
 
 	n = hdr + MIN(n, biov.iov_len - hdr);
 	rc = kqring_done(op, kqring_xfer_res(n),
-	    kqring_buf_commit(ctx, &sel, n) | IORING_CQE_F_MORE);
+	    kqring_buf_commit_op(ctx, op, &sel, n) | IORING_CQE_F_MORE);
 	/* Out of buffers: go again, to end with ENOBUFS. */
 	*more_out = kqring_buf_drained(&sel) ||
 	    kqring_so_rcv_pending(so, true);
@@ -1274,7 +1274,7 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 		error = copyout(&oflags, &umsg->msg_flags, sizeof(oflags));
 	if (buf_select) {
 		if (n > 0)
-			cqe_flags |= kqring_buf_commit(ctx, &sel, n);
+			cqe_flags |= kqring_buf_commit_op(ctx, op, &sel, n);
 		if (bg_lock)
 			sx_xunlock(&ctx->bg_sx);
 	}
