@@ -436,8 +436,11 @@ kqring_wq_thread(void *arg)
 		/*
 		 * One idle worker spins for the next op; the rest sleep.  With
 		 * every idle worker spinning, each op sent them all at wq->mtx.
+		 * Not with every CPU taken: a spinner then only keeps the
+		 * thread with the next op, or its issuer, from running.
 		 */
-		if (mp_ncpus > 1 && wq->spinning[type] == 0) {
+		if (mp_ncpus > 1 && wq->spinning[type] == 0 &&
+		    sched_load() < mp_ncpus) {
 			wq->spinning[type]++;
 			mtx_unlock(&wq->mtx);
 			for (int s = 0; s < 2048; s++) {
@@ -511,6 +514,22 @@ kqring_op_will_block(const struct kqring_op *op)
 	default:
 		return (false);
 	}
+}
+
+/*
+ * Whether the issuer should spin for an op that needs no order.  Only for a
+ * program in lockstep, which has taken every CQE and now waits for this one:
+ * one that is filling a queue gains nothing, and the spin would run its
+ * requests one at a time.  Not with every CPU taken, as in kqring_wq_thread().
+ */
+static bool
+kqring_wq_spin_locked(struct kqring_ctx *ctx)
+{
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	return (ctx->shm != NULL &&
+	    atomic_load_acq_32(&ctx->shm->cq_tail) ==
+	    atomic_load_acq_32(&ctx->shm->cq_head) &&
+	    sched_load() < mp_ncpus);
 }
 
 /*
@@ -677,7 +696,8 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 		}
 		mtx_lock(&ctx->mtx);
 	}
-	if (sync && mp_ncpus > 1 && kqring_wq_can_wait_op_locked(ctx, op)) {
+	if (sync && mp_ncpus > 1 && kqring_wq_can_wait_op_locked(ctx, op) &&
+	    (!unordered || kqring_wq_spin_locked(ctx))) {
 		mtx_unlock(&ctx->mtx);
 		for (int s = 0; s < 2048; s++) {
 			if (op->wq_done || op->wq_blocking || op->cancelled ||

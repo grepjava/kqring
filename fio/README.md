@@ -41,4 +41,10 @@ sudo sh bench.sh $PWD/work/fio-fio-3.43/fio /dev/ada0p5 zroot/fiobench $PWD/out 
 
 The arguments are fio, a device to read, a ZFS dataset to create, an output directory, the repeats and the seconds per run. The device is opened read-only. All writes go to a file in the dataset, which the script creates and destroys, with data caching off so that reads reach the disk. It stops if the dataset isn't mounted or doesn't hold the test file.
 
+[`scale.sh`](scale.sh) runs one ring per thread on targets the disk doesn't limit, a file held in ZFS's cache and `md(4)` malloc disks, which it creates and removes:
+
+```sh
+sudo sh scale.sh $PWD/work/fio-fio-3.43/fio zroot/fioscale $PWD/out 3 10
+```
+
 On FreeBSD 15.1 `vfs.zfs.dio_enabled` is 0 by default, so ZFS treats `O_DIRECT` as ordinary I/O through its own buffers.
