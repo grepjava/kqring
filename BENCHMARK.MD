@@ -16,6 +16,7 @@ How `kqring` compares with FreeBSD's `kqueue(2)` on the same workloads. Where kq
 - **Batching and worker hand-off.** 32 `NOP`s per enter cost 63 ns each, against 296 ns for an empty `kevent(2)` and 326 ns for a single `NOP` enter. Bounded adaptive spinning between the issuer and worker threads cut the `IOSQE_ASYNC` worker round trip from `4,371 ns` to `1,049 ns` (4.2× faster).
 - **Timers are faster, accept is even (or 8% faster with busy-polling).** A 1 µs `TIMEOUT` completes 30–52% faster than a 1 µs `EVFILT_TIMER` (`4,904 ns`). A multishot `ACCEPT` is on par with kqueue plus `accept(2)`, and 8% faster with 50 µs `IORING_REGISTER_NAPI` busy-polling; see [Accept](#accept-a-tcp-loopback-connection-set-up-and-torn-down).
 - **Disk devices go straight to the driver.** 4 KiB random reads on an md(4) disk cost 41% less than through a worker, and 32 in flight cost 975 ns each, 78% less than `pread(2)`.
+- **On a real SSD, fio reaches what the drive can do with half of aio(4)'s CPU.** 98,297 IOPS at 32 in flight on the raw disk at 45% CPU, against 97% for aio, and 65,866 on a ZFS file at 35% against 69%. ZFS writes at 32 in flight are still 15–23% behind.
 - **Queued storage I/O keeps up with aio(4).** At 32 in flight on an md(4) disk, kqring matches aio(4) on 4 KiB random reads and is 14% ahead on writes. `O_DIRECT` reads of a ZFS file now use several workers at once: 41–53% more IOPS at 4–64 in flight than the previous build, at ZFS's own ceiling with aio and `pread` threads. See [Storage workloads](#storage-workloads-queue-depth-aio4-and-pread2-threads).
 - **Pipes: 18–19% faster than kqueue.** A `READ` on a pipe that has data runs inline, blocking or not (`832–840 ns` vs `1,024 ns`). Only a read that has to wait goes to a worker thread.
 - **Rings scale with threads.** With one ring per thread, single-`NOP` enters reach 12.5 M/s on 8 threads (6.5 M/s before this build) and ping-pong stays 17–29% ahead of kqueue at every thread count; see [Multi-threaded scaling](#multi-threaded-scaling-one-ring-per-thread).
@@ -274,6 +275,35 @@ Polling the CQ, `SQPOLL` one at a time is 18% faster than plain kqring (p50 4.2 
 
 `kqring_diskbench -V` checks every read against what was last written to that block and re-reads the whole area at the end. On this build, 3 s of mixed random reads and writes passed it on both the md disk and the ZFS file at 4 KiB for `pread`, aio (16 in flight), and kqring plain, `+F+B`, `+P`, `+I` and all four together (32 in flight), and for 4 kqring jobs of 64 in flight at 16 KiB.
 
+### fio on a real SSD
+
+[fio](fio/README.md) 3.43 with its own `io_uring` engine on kqring, against `posixaio` (`aio(4)`) and `psync`, on a 1 TB WD Blue 3D NAND SATA SSD (`WDS100T2B0A`, about 98,000 IOPS and 540 MB/s here). Each figure is the median of three 20-second runs after a 2-second ramp. `psync` runs one thread per I/O in flight. [`fio/bench.sh`](fio/bench.sh) reproduces them.
+
+**The raw disk, read-only** (the direct bio path), 4 KiB random reads:
+
+| In flight | kqring IOPS | CPU | aio IOPS | CPU | `psync` IOPS |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 9,775 | 17% | 9,743 | 18% | 10,076 |
+| 8 | 77,442 | 35% | 75,902 | 64% | 75,144 |
+| 32 | 98,297 | **45%** | 98,234 | 97% | 98,177 |
+
+Every engine reaches what the drive can do; kqring gets there with half of aio's CPU time. At 32 in flight, `--fixedbufs --registerfiles` (97,903) and `--sqthread_poll` (98,191) change nothing, since the drive is the limit. Sequential 128 KiB reads run at 540 MB/s through both kqring and aio, with kqring at 11% CPU against 16%.
+
+**A file on ZFS** (the worker path), 8 GiB, 4 KiB records, `primarycache=metadata` so that reads reach the disk. FreeBSD 15.1 has ZFS direct I/O off by default (`vfs.zfs.dio_enabled=0`), so `--direct=1` still goes through ZFS's buffers:
+
+| Random 4 KiB | In flight | kqring IOPS | CPU | aio IOPS | CPU | `psync` IOPS |
+|---|---:|---:|---:|---:|---:|---:|
+| Reads | 1 | **7,788** | 76% | 4,553 | 8% | 5,063 |
+| Reads | 32 | 65,866 | **35%** | 66,347 | 69% | 65,505 |
+| Writes | 1 | 9,251 | 57% | 8,655 | 13% | 8,807 |
+| Writes | 32 | 8,723 | 56% | 10,248 | 29% | 11,351 |
+
+One read at a time, kqring is 71% ahead of aio, spending a CPU on it: the issuer spins briefly for the worker rather than sleeping. At 32 in flight all three run level at about 66,000, and kqring uses half of aio's CPU.
+
+fio found a bug here. It submits one I/O per enter, and a read that found nothing else in flight waited for its worker, so the next read found the same: 32 in flight ran one at a time, at 7,753 IOPS. A read still running after the short spin now goes on without the issuer, which gives the 65,866 above. Benchmarks that submit in batches, such as `kqring_diskbench`, didn't show it.
+
+Writes at 32 in flight are still 15–23% behind, with a p99 of 17 ms against 13 ms for aio: see [Known gaps](#known-gaps).
+
 ### Timer: a 1 µs one-shot timer, armed and fired
 
 | Variant | ns/op | vs kqueue |
@@ -318,6 +348,7 @@ Against kqueue, the trigger (an [event-driven chain](docs/event-chains-spec.md),
 ## Known gaps
 
 - **A pipe read that has to wait goes through a worker thread**, as does a write to a full pipe. kqring first tries the pipe as if it were `O_NONBLOCK`: FreeBSD's `pipe_read()` and `pipe_write()` take that from the file's flags, so it calls them through a private file sharing the pipe, leaving the descriptor's own flags alone. On `EAGAIN` the request goes to a worker, and a partial write takes its progress with it, so another thread draining the pipe can't make the ring owner wait. A worker round trip costs about 4.4 µs (the `IOSQE_ASYNC` floor row). Waiting for data with `POLL_ADD` first avoids the worker.
+- **Writes to a file wait for their worker.** That keeps writes to one file in order, as io-wq's per-inode hashing does, but it holds them to one at a time: 32 in flight on ZFS run 15–23% behind `aio(4)` and `pwrite(2)` threads.
 - **Page-cache misses, and filesystems without the page-cache read path, go through a worker.** This covers file reads that need the disk, ZFS (which caches in the ARC, not the page cache), `O_DIRECT` on files, and reads using the file position (`off` = −1). Only disk devices themselves get the direct bio path: FreeBSD filesystems have no asynchronous read or write entry point, and sending bios under a filesystem would bypass its block allocation and locking. It also covers reads into a buffer that isn't mapped yet: the inline copy runs with page faults disabled, so the buffer's first use goes through the worker.
 - **One operation per enter costs about 60 ns more than an empty `kevent`.** That's the `NOP` floor: parsing an SQE and posting a CQE. Batching removes it.
 - **A wait that just misses its completion pays a full sleep.** When the completion comes from another thread (the TCP loopback netisr, for instance) a moment after the enter checks, the enter sleeps and pays a wake-up of about 1 µs; see [Accept](#accept-a-tcp-loopback-connection-set-up-and-torn-down). `IORING_REGISTER_NAPI` opts in to a busy-wait before sleeping. With 50 µs, multishot `ACCEPT` drops from about 15.9 to 14.1 µs, below the blocking `accept(2)` floor, at the cost of CPU time on waits that don't end quickly.

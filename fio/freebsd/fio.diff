@@ -1,0 +1,22 @@
+--- Makefile
++++ Makefile
+@@ -251,7 +251,8 @@
+   CPPFLAGS += -D__EXTENSIONS__
+ endif
+ ifeq ($(CONFIG_TARGET_OS), FreeBSD)
+-  SOURCE += trim.c
++  SOURCE += trim.c engines/io_uring.c engines/nvme.c engines/bsg.c
++  cmdprio_SRCS = engines/cmdprio.c
+   LIBS	 += -lpthread -lrt
+   LDFLAGS += -rdynamic
+ endif
+--- engines/io_uring.c
++++ engines/io_uring.c
+@@ -26,6 +26,7 @@
+ #include "zbd.h"
+ #include "nvme.h"
+ #include "bsg.h"
++#include "kqring-syscall.h"
+ 
+ #include <sys/stat.h>
+ 

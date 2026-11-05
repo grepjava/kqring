@@ -4,6 +4,7 @@
 
 ### Added
 
+- **fio's `io_uring` engine runs on kqring:** [`fio/`](fio/README.md) builds fio 3.43 with a 3-line patch and a small overlay, and `fio/bench.sh` runs the storage benchmarks in `BENCHMARK.MD`.
 - **kqring extensions**, opted into per ring with the new `KQRING_IOC_EXT_SETUP` ioctl, through one escape opcode (default `0xFF`) that never collides with an io_uring opcode. Rings that don't opt in are unchanged. See the README's *kqring extensions*.
 - **Event-driven chains** (`KQRING_EXT_TRIGGER`): a trigger watches a descriptor and runs the requests linked after it each time the descriptor is ready, with no system call per event, until it's cancelled or the descriptor hangs up. Serial and concurrent modes, a CQE per firing if asked, and an end on the first failed run if asked. [docs/event-chains-spec.md](docs/event-chains-spec.md) has the interface and the next phases.
 - `POLL_ADD` on a socket reports `POLLRDHUP` when the peer has shut down writing, as `poll(2)` and Linux do.
@@ -17,6 +18,7 @@
 
 ### Fixed
 
+- **Reads that had to wait for a disk ran one at a time if submitted one per enter.** A read that found nothing else in flight made the enter wait for it, so the next read found the same, however many the program allowed in flight. In fio on ZFS, 32 in flight went from 7,753 to 65,866 IOPS. Programs that submit in batches weren't affected.
 - **Closing a ring could take up to 50 ms** when its poller thread was running, which any ring waiting on an AF_UNIX socket now has. Closing now wakes the poller at once.
 - **An armed `RECV`, `POLL_ADD` or trigger on an AF_UNIX stream socket never completed when the peer called `shutdown(SHUT_WR)`.** FreeBSD 15 marks the input ended and wakes `poll(2)` and kqueue, but runs no socket upcall, which kqring waits on ([FreeBSD PR 300494](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=300494)). kqring now also watches such sockets with a knote that reports only end of input. Requests on fixed files only are still affected. [BSDBUG.MD](BSDBUG.MD) tracks this and other FreeBSD bugs kqring has found.
 - `IORING_UNREGISTER_RING_FDS` stopped with `EBADF` at the first empty slot, so unregistering a range left the slots after it registered (and their rings alive until exit). An empty slot now counts as done, as in io_uring. Found by the new fuzzer.
