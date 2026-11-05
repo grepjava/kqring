@@ -10235,6 +10235,102 @@ test_trigger_close(void)
 }
 
 /*
+ * Writes submitted one per enter.  O_DIRECT ones at their own offsets need
+ * no order and all land.  Writes to one offset without O_DIRECT, and
+ * O_DIRECT with O_APPEND, stay in submission order.
+ */
+static void
+test_file_write_order(void)
+{
+	char path[] = "/tmp/kqring_wo.XXXXXX";
+	struct test_ring r;
+	unsigned char *b;
+	unsigned char got[4096];
+	struct stat st;
+	int fd, dfd, afd;
+
+	ring_init(&r);
+	fd = mkstemp(path);
+	assert(fd >= 0);
+	dfd = open(path, O_RDWR | O_DIRECT);
+	afd = open(path, O_RDWR | O_DIRECT | O_APPEND);
+	assert(dfd >= 0 && afd >= 0);
+	assert(posix_memalign((void **)&b, 4096, 64 * 4096) == 0);
+	for (int i = 0; i < 64; i++)
+		memset(b + i * 4096, i + 1, 4096);
+
+	for (int i = 0; i < 64; i++) {
+		struct io_uring_sqe *sqe = ring_prep(&r, IORING_OP_WRITE, dfd,
+		    (uint64_t)i);
+
+		sqe->addr = (uint64_t)(uintptr_t)(b + i * 4096);
+		sqe->len = 4096;
+		sqe->off = (uint64_t)(63 - i) * 4096;
+		ring_push_sqe(&r);
+		ring_submit(&r);
+	}
+	assert(trig_collect(&r, 64, 5000) == 64);
+	for (int i = 0; i < 64; i++) {
+		struct io_uring_cqe c = ring_pop_cqe(&r);
+
+		assert(c.res == 4096);
+	}
+	for (int i = 0; i < 64; i++) {
+		assert(pread(fd, got, 4096, (off_t)(63 - i) * 4096) == 4096);
+		assert(got[0] == i + 1 && got[4095] == i + 1);
+	}
+
+	/* One offset, no O_DIRECT: the last submitted is what stays. */
+	for (int i = 0; i < 64; i++) {
+		struct io_uring_sqe *sqe = ring_prep(&r, IORING_OP_WRITE, fd,
+		    (uint64_t)i);
+
+		sqe->addr = (uint64_t)(uintptr_t)(b + i * 4096);
+		sqe->len = 4096;
+		sqe->off = 0;
+		ring_push_sqe(&r);
+		ring_submit(&r);
+		if (ring_cq_ready(&r) >= CQ_ENTRIES / 2)
+			ring_drain_cqes(&r);
+	}
+	while (trig_collect(&r, 1, 200) > 0)
+		ring_drain_cqes(&r);
+	assert(pread(fd, got, 4096, 0) == 4096);
+	assert(got[0] == 64);
+
+	/* O_APPEND: blocks land in the order submitted. */
+	assert(ftruncate(fd, 0) == 0);
+	for (int i = 0; i < 64; i++) {
+		struct io_uring_sqe *sqe = ring_prep(&r, IORING_OP_WRITE, afd,
+		    (uint64_t)i);
+
+		sqe->addr = (uint64_t)(uintptr_t)(b + i * 4096);
+		sqe->len = 4096;
+		sqe->off = 0;
+		ring_push_sqe(&r);
+		ring_submit(&r);
+		if (ring_cq_ready(&r) >= CQ_ENTRIES / 2)
+			ring_drain_cqes(&r);
+	}
+	while (trig_collect(&r, 1, 200) > 0)
+		ring_drain_cqes(&r);
+	assert(fstat(fd, &st) == 0 && st.st_size == 64 * 4096);
+	for (int i = 0; i < 64; i++) {
+		assert(pread(fd, got, 4096, (off_t)i * 4096) == 4096);
+		assert(got[0] == i + 1);
+	}
+
+	free(b);
+	close(afd);
+	close(dfd);
+	close(fd);
+	unlink(path);
+	close(r.fd);
+	printf("[PASS] file writes: O_DIRECT ones all land; one offset and "
+	    "O_APPEND stay in submission order\n");
+}
+
+/*
  * Closing a ring whose poller is asleep wakes it, rather than waiting out
  * its 50 ms sleep: an armed RECV on an AF_UNIX socket starts a poller, and
  * a program may open and close many such rings.
@@ -11387,6 +11483,7 @@ test_triggers(struct test_ring *plain)
 	test_trigger_close();
 	test_unix_peer_shutdown();
 	test_close_with_poller();
+	test_file_write_order();
 }
 
 int

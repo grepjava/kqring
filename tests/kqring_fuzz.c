@@ -19,7 +19,8 @@
  * requests are well formed for their opcode (reads and writes on real
  * descriptors, provided and fixed buffers, multishot receives and polls,
  * timeouts, cancellations and poll removals aimed at recent requests,
- * MSG_RING, futexes, splice), chained with links and link timeouts, with
+ * MSG_RING, futexes, splice; its file is O_DIRECT half the time), chained
+ * with links and link timeouts, with
  * data written to the other ends of the pipes and sockets they wait on.
  * Half of those rings (and a few others) opt in to kqring's extensions,
  * sometimes with bad arguments, and get event-driven chains: triggers on
@@ -102,6 +103,8 @@ static _Atomic uint64_t	st_kev;
 static _Atomic uint64_t	st_kqb;
 /* BUF_FROM_PREV pairs submitted; sends of a buffer that was passed. */
 static _Atomic uint64_t	st_echo, st_echo_sent;
+/* Scratch files opened with and without O_DIRECT. */
+static _Atomic uint64_t	st_direct, st_buffered;
 static _Atomic int	cq_bad, nfinished;
 
 struct fz {
@@ -414,7 +417,11 @@ pool_open(struct fz *f, int i)
 		break;
 	case 4:
 		snprintf(path, sizeof(path), "t%d", f->id);
-		fd = open(path, O_RDWR | O_CREAT, 0600);
+		/* O_DIRECT: its writes leave the issuer, as reads do. */
+		fd = open(path, O_RDWR | O_CREAT |
+		    (chance(f, 50) ? O_DIRECT : 0), 0600);
+		atomic_fetch_add(fd >= 0 && (fcntl(fd, F_GETFL) & O_DIRECT) != 0 ?
+		    &st_direct : &st_buffered, 1);
 		break;
 	case 5:
 		fd = open(".", O_RDONLY | O_DIRECTORY);
@@ -1930,6 +1937,8 @@ main(int argc, char **argv)
 	printf("kqring_fuzz: kqueue bridges %ju\n", (uintmax_t)st_kqb);
 	printf("kqring_fuzz: buffer-passing pairs %ju, buffers sent %ju\n",
 	    (uintmax_t)st_echo, (uintmax_t)st_echo_sent);
+	printf("kqring_fuzz: scratch files O_DIRECT %ju, buffered %ju\n",
+	    (uintmax_t)st_direct, (uintmax_t)st_buffered);
 	if (atomic_load(&cq_bad)) {
 		fprintf(stderr, "kqring_fuzz: FAIL: a CQ ring overran\n");
 		rc = 1;

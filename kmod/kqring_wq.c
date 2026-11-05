@@ -513,6 +513,37 @@ kqring_op_will_block(const struct kqring_op *op)
 	}
 }
 
+/*
+ * Whether op needs no order against other requests on its file: a read, or
+ * an O_DIRECT write at an offset of its own.  As io-wq, which hashes buffered
+ * writes per inode, but not O_DIRECT ones where the filesystem can run them
+ * in parallel.  Writes that use the file position or append stay in order.
+ */
+static bool
+kqring_op_wq_unordered(const struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct thread *td = curthread;
+	struct file *fp;
+	bool direct;
+
+	if (kqring_op_is_read(sqe->opcode))
+		return (true);
+	if (!kqring_op_is_write(sqe->opcode) || (off_t)sqe->off == (off_t)-1 ||
+	    sqe->rw_flags != 0)
+		return (false);
+	if (op->ffile != NULL)
+		fp = op->ffile->fp;
+	else if (fget(td, sqe->fd, &cap_no_rights, &fp) != 0)
+		return (false);
+	direct = fp->f_type == DTYPE_VNODE && fp->f_vnode != NULL &&
+	    fp->f_vnode->v_type == VREG &&
+	    (fp->f_flag & (O_DIRECT | O_APPEND)) == O_DIRECT;
+	if (op->ffile == NULL)
+		fdrop(fp, td);
+	return (direct);
+}
+
 int
 kqring_op_wq_type(const struct kqring_op *op)
 {
@@ -591,12 +622,13 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 {
 	struct thread *td = curthread;
 	struct kqring_wq *wq = ctx->wq;
-	bool need_spawn = false, sync;
+	bool need_spawn = false, sync, unordered;
 
 	if (op->cred == NULL)
 		op->cred = crhold(td->td_ucred);
 	op->wq_type = (uint8_t)type;
 	op->wq_blocking = kqring_op_will_block(op);
+	unordered = kqring_op_wq_unordered(op);
 
 	mtx_lock(&ctx->mtx);
 	mtx_lock(&wq->mtx);
@@ -608,16 +640,17 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 	TAILQ_INSERT_TAIL(&wq->ops[type], op, wq_link);
 	wq->pending[type]++;
 	/*
-	 * A read waits for its worker below only when nothing else could run
-	 * meanwhile: no more SQEs in this submission and no other op on its
-	 * type's workers.  Otherwise a batch of file reads would go to them
-	 * one at a time; the issuer collects completions in its enter wait.
-	 * Other ops always wait, so that writes to one file stay in order, as
-	 * io-wq's per-inode hashing keeps them.  An op not waited for is
+	 * A read or O_DIRECT write (kqring_op_wq_unordered()) waits for its
+	 * worker below only when nothing else could run meanwhile: no more
+	 * SQEs in this submission and no other op on its type's workers.
+	 * Otherwise a batch of them would go to the workers one at a time;
+	 * the issuer collects completions in its enter wait.  Other ops always
+	 * wait, so that writes to one file stay in order, as io-wq's per-inode
+	 * hashing keeps them.  An op not waited for is
 	 * posted by its worker, as a blocking one is (set before any worker
 	 * can take it).
 	 */
-	sync = !kqring_op_is_read(op->sqe.opcode) ||
+	sync = !unordered ||
 	    (!(ctx->submitting && ctx->submit_more) &&
 	    wq->pending[type] + wq->busy[type] == 1);
 	if (!sync)
@@ -656,12 +689,12 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 		mtx_lock(&ctx->mtx);
 	}
 	/*
-	 * A read still running after the spin is waiting for the disk.  Leave
-	 * it to its worker: waiting here would hold back the next enter, and
-	 * a program submitting one read per enter would then only ever have
-	 * one in flight, however many it allows.
+	 * One still running after the spin is waiting for the disk.  Leave it
+	 * to its worker: waiting here would hold back the next enter, and a
+	 * program submitting one per enter would then only ever have one in
+	 * flight, however many it allows.
 	 */
-	if (sync && kqring_op_is_read(op->sqe.opcode) && !op->wq_done) {
+	if (sync && unordered && !op->wq_done) {
 		op->wq_blocking = true;
 		sync = false;
 	}
