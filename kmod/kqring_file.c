@@ -564,6 +564,7 @@ kqring_file_rw(struct kqring_ctx *ctx, struct kqring_op *op, bool is_write,
 	u_int iovcnt = 1;
 	uint32_t cflags = 0;
 	bool buf_select = (sqe->flags & IOSQE_BUFFER_SELECT) != 0;
+	bool ordered;
 	int error, flags;
 
 	*punt = false;
@@ -596,7 +597,14 @@ again:
 		 * On a worker, another read holding the group's head buffer
 		 * (for as long as its fo_read() takes) is waited for rather
 		 * than failed with ENOBUFS, as io_uring readers share a group.
+		 * The issuer leaves such a read to a worker.
 		 */
+		if (error == ENOBUFS && nowait &&
+		    (bg = kqring_bgroup_find(ctx, sqe->buf_group)) != NULL &&
+		    bg->busy) {
+			sx_xunlock(&ctx->bg_sx);
+			goto punt;
+		}
 		if (error == ENOBUFS && op->wq_running && !op->wq_canceled &&
 		    !op->cancelled && !ctx->closing &&
 		    (bg = kqring_bgroup_find(ctx, sqe->buf_group)) != NULL &&
@@ -652,19 +660,53 @@ retry:
 			return (kqring_done(op, kqring_errno(error), 0));
 		}
 	}
-	if (nowait) {
+	/*
+	 * Reads of a pipe post their CQEs in the order they got the data, as
+	 * in io_uring, where the read and the CQE are one step.  A worker
+	 * keeps pipe_sx until its op is on taskwork_ops (kqring_wq_thread()),
+	 * so it must not wait for the pipe with it.  The issuer posts its own
+	 * CQE before it runs any taskwork, so it only has to leave a read to
+	 * a worker while older ones are still to post, unless RWF_NOWAIT
+	 * would turn that into a failure.
+	 */
+	ordered = !is_write && fp->f_type == DTYPE_PIPE &&
+	    (sqe->rw_flags & KQRING_RWF_NOWAIT) == 0 &&
+	    (nowait || op->wq_running);
+	if (ordered && nowait) {
+		if (!sx_try_xlock(&ctx->pipe_sx)) {
+			error = EAGAIN;
+			goto read_busy;
+		}
+		if (!TAILQ_EMPTY(&ctx->taskwork_ops)) {
+			sx_xunlock(&ctx->pipe_sx);
+			error = EAGAIN;
+			goto read_busy;
+		}
+	} else if (ordered) {
+		/* Through taskwork_ops: the issuer mustn't post it at once. */
+		kqring_wq_mark_blocking(ctx, op);
+		sx_xlock(&ctx->pipe_sx);
+	}
+	if (nowait || ordered) {
 		error = kqring_pipe_rw_nowait(fp, &auio, is_write, flags, td);
+		if (nowait && ordered)
+			sx_xunlock(&ctx->pipe_sx);
 	} else {
 		if (kqring_pipe_will_block(fp, is_write, (size_t)want))
 			kqring_wq_mark_blocking(ctx, op);
 		error = is_write ? fo_write(fp, &auio, td->td_ucred, flags,
 		    td) : fo_read(fp, &auio, td->td_ucred, flags, td);
+	}
+read_busy:
+	if (!nowait) {
 		/*
-		 * Another reader drained an O_NONBLOCK pipe between the
-		 * wake-up and fo_read(): wait for it again.
+		 * Another reader drained the pipe between the wake-up and the
+		 * read: wait for it again.
 		 */
 		if (!is_write && error == EAGAIN && fp->f_type == DTYPE_PIPE &&
 		    auio.uio_resid == want) {
+			if (ordered)
+				sx_xunlock(&ctx->pipe_sx);
 			if (!buf_select)
 				goto retry;
 			sx_xlock(&ctx->bg_sx);

@@ -910,6 +910,13 @@ struct kqring_ctx {
 	struct kqring_op_list	free_ops;
 	int			nfree;
 	struct kqring_sowatch	*sw_cache[2];
+	/*
+	 * Keeps CQEs in the order of the data for reads of a pipe: a worker
+	 * holds it from its read until the op is on taskwork_ops, as only
+	 * the issuer posts, in that list's order.  See kqring_file_rw().
+	 * Before bg_sx, ctx->mtx and wq->mtx.
+	 */
+	struct sx		pipe_sx;
 };
 
 #define	KQRING_OP_CACHE_MAX	32

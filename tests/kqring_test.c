@@ -10235,6 +10235,84 @@ test_trigger_close(void)
 }
 
 /*
+ * Reads waiting on one pipe post their CQEs in the order they got the data,
+ * on warm workers, where the race was.  One more read arrives after the
+ * data, while the others are running: on the issuer, or a worker if they
+ * are still to post.  With a provided buffer every second round.
+ */
+static void
+test_pipe_read_order(void)
+{
+	static char bufs[6][64];
+	struct test_ring r;
+	int bad = 0;
+
+	ring_init(&r);
+	for (int round = 0; round < 3000; round++) {
+		bool select = (round & 1) != 0;
+		int p[2];
+
+		assert(pipe(p) == 0);
+		for (int i = 0; select && i < 6; i++) {
+			struct io_uring_sqe *sqe = ring_prep(&r,
+			    IORING_OP_PROVIDE_BUFFERS, 1, 1000 + i);
+
+			sqe->addr = (uint64_t)(uintptr_t)bufs[i];
+			sqe->len = 64;
+			sqe->off = i;
+			sqe->buf_group = 3;
+			ring_push_sqe(&r);
+		}
+		if (select) {
+			ring_submit(&r);
+			assert(trig_collect(&r, 6, 5000) == 6);
+			for (int i = 0; i < 6; i++)
+				assert(ring_pop_cqe(&r).res == 0);
+		}
+		for (int i = 0; i < 6; i++) {
+			struct io_uring_sqe *sqe = ring_prep(&r,
+			    IORING_OP_READ, p[0], (uint64_t)i);
+
+			sqe->len = 1;
+			sqe->off = (uint64_t)-1;
+			if (select) {
+				sqe->flags = IOSQE_BUFFER_SELECT;
+				sqe->buf_group = 3;
+			} else {
+				sqe->addr = (uint64_t)(uintptr_t)bufs[i];
+			}
+			ring_push_sqe(&r);
+			if (i == 4) {
+				ring_submit(&r);
+				assert(write(p[1], "012345", 6) == 6);
+			}
+		}
+		ring_submit(&r);
+		assert(trig_collect(&r, 6, 5000) == 6);
+		for (int i = 0; i < 6; i++) {
+			struct io_uring_cqe c = ring_pop_cqe(&r);
+			unsigned b = select ? c.flags >> IORING_CQE_BUFFER_SHIFT :
+			    (unsigned)c.user_data;
+
+			if (c.res != 1 || b >= 6)
+				printf("[FAIL] pipe read: res %d, buffer %u, round %d\n",
+				    c.res, b, round);
+			assert(c.res == 1 && b < 6);
+			if (bufs[b][0] != '0' + i)
+				bad++;
+		}
+		close(p[0]);
+		close(p[1]);
+	}
+	close(r.fd);
+	if (bad != 0)
+		printf("[FAIL] pipe reads: %d CQEs out of data order\n", bad);
+	assert(bad == 0);
+	printf("[PASS] Waiting pipe reads complete in data order "
+	    "(3000 rounds)\n");
+}
+
+/*
  * Writes submitted one per enter.  O_DIRECT ones at their own offsets need
  * no order and all land.  Writes to one offset without O_DIRECT, and
  * O_DIRECT with O_APPEND, stay in submission order.
@@ -11484,6 +11562,7 @@ test_triggers(struct test_ring *plain)
 	test_unix_peer_shutdown();
 	test_close_with_poller();
 	test_file_write_order();
+	test_pipe_read_order();
 }
 
 int

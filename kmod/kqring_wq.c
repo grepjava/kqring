@@ -428,6 +428,9 @@ kqring_wq_thread(void *arg)
 			if (ctx->sleeping && !deferred)
 				wakeup(&ctx->wakeup_chan);
 			mtx_unlock(&ctx->mtx);
+			/* A read of a pipe: see kqring_file_rw(). */
+			if (sx_xlocked(&ctx->pipe_sx))
+				sx_xunlock(&ctx->pipe_sx);
 			kqring_ctx_rele(ctx);
 			mtx_lock(&wq->mtx);
 			continue;

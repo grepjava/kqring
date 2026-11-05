@@ -19,8 +19,8 @@
  * requests are well formed for their opcode (reads and writes on real
  * descriptors, provided and fixed buffers, multishot receives and polls,
  * timeouts, cancellations and poll removals aimed at recent requests,
- * MSG_RING, futexes, splice; its file is O_DIRECT half the time), chained
- * with links and link timeouts, with
+ * MSG_RING, futexes, splice; its file is O_DIRECT half the time), bursts of
+ * reads of one pipe, chained with links and link timeouts, with
  * data written to the other ends of the pipes and sockets they wait on.
  * Half of those rings (and a few others) opt in to kqring's extensions,
  * sometimes with bad arguments, and get event-driven chains: triggers on
@@ -85,6 +85,7 @@
 #define NDYN		64		/* descriptors a ring made, to close */
 #define NOPS		256		/* opcode and addr per user_data slot */
 #define OP_ECHO		0xfd		/* in ops[]: a step sending a passed buffer */
+#define OP_PIPERD	0xfc		/* in ops[]: a read of a pipe burst */
 #define HANG_NS		(30ULL * 1000000000ULL)
 #define KICK_NS		(2ULL * 1000000000ULL)
 #define REG_RINGS	16
@@ -105,6 +106,8 @@ static _Atomic uint64_t	st_kqb;
 static _Atomic uint64_t	st_echo, st_echo_sent;
 /* Scratch files opened with and without O_DIRECT. */
 static _Atomic uint64_t	st_direct, st_buffered;
+/* Reads in pipe bursts submitted; those that got data. */
+static _Atomic uint64_t	st_piperd, st_piperd_data;
 static _Atomic int	cq_bad, nfinished;
 
 struct fz {
@@ -148,6 +151,8 @@ struct fz {
 	unsigned	tmpl_left;	/* templates still due after a trigger */
 	bool		tmpl_echo;	/* they are a buffer-passing pair */
 	int		echo_fd;	/* on this socket */
+	unsigned	pipe_left;	/* reads of a burst still due */
+	int		pipe_fd;	/* on this pipe */
 };
 
 #define PBUF_BGID	7
@@ -1094,6 +1099,33 @@ pool_fd(struct fz *f, int kind)
 	}
 }
 
+/*
+ * One of a burst of reads of a pipe, in place of the request sqe_fill() put
+ * in s: they wait on workers together and take turns at the data, which
+ * random requests hardly ever do.
+ */
+static void
+sqe_pipe_read(struct fz *f, struct io_uring_sqe *s)
+{
+	uint64_t ud = s->user_data;
+
+	memset(s, 0, f->sqe_size);
+	s->user_data = ud;
+	s->opcode = IORING_OP_READ;
+	s->fd = f->pipe_fd;
+	s->off = (uint64_t)-1;
+	s->len = 1 + (uint32_t)rn(f, 64);
+	if (f->pbuf && chance(f, 50)) {
+		s->flags = IOSQE_BUFFER_SELECT;
+		s->buf_group = PBUF_BGID;
+	} else {
+		s->addr = arena_buf(f, s->len);
+	}
+	f->ops[ud % NOPS].op = OP_PIPERD;
+	f->ops[ud % NOPS].addr = 0;
+	atomic_fetch_add(&st_piperd, 1);
+}
+
 /* Use the fixed-file slot of pool slot i instead, if there is one. */
 static void
 maybe_fixed(struct fz *f, struct io_uring_sqe *s)
@@ -1420,6 +1452,8 @@ reap(struct fz *f)
 		atomic_fetch_add(&st_cqes, 1);
 		if (op == OP_ECHO && c->res > 0)
 			atomic_fetch_add(&st_echo_sent, 1);
+		if (op == OP_PIPERD && c->res > 0)
+			atomic_fetch_add(&st_piperd_data, 1);
 		if (f->ext_op != 0 && op == f->ext_op) {
 			if ((c->flags & IORING_CQE_F_MORE) != 0)
 				atomic_fetch_add(&st_trig_fire, 1);
@@ -1508,6 +1542,15 @@ do_submit(struct fz *f)
 				continue;
 			}
 			sqe_fill(f, s);
+			if (f->valid && f->tmpl_left == 0 &&
+			    f->pipe_left == 0 && chance(f, 3)) {
+				f->pipe_left = 2 + (unsigned)rn(f, 5);
+				f->pipe_fd = pool_fd(f, 1);
+			}
+			if (f->pipe_left > 0 && f->tmpl_left == 0) {
+				sqe_pipe_read(f, s);
+				f->pipe_left--;
+			}
 			/*
 			 * Chains: link to the next request, and sometimes
 			 * make that a LINK_TIMEOUT of this one.
@@ -1939,6 +1982,8 @@ main(int argc, char **argv)
 	    (uintmax_t)st_echo, (uintmax_t)st_echo_sent);
 	printf("kqring_fuzz: scratch files O_DIRECT %ju, buffered %ju\n",
 	    (uintmax_t)st_direct, (uintmax_t)st_buffered);
+	printf("kqring_fuzz: pipe burst reads %ju, with data %ju\n",
+	    (uintmax_t)st_piperd, (uintmax_t)st_piperd_data);
 	if (atomic_load(&cq_bad)) {
 		fprintf(stderr, "kqring_fuzz: FAIL: a CQ ring overran\n");
 		rc = 1;

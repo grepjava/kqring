@@ -18,6 +18,8 @@
 
 ### Fixed
 
+- **Reads waiting on one pipe could complete out of order.** One worker could read first and post its CQE second, in about 30% of five-read bursts on a ring with warm workers. CQEs now follow the order of the data, as on Linux, which also ends the rare failure of liburing's `read-write`. A read of a pipe costs about 20 ns more.
+- **A read with a provided buffer could fail with `-ENOBUFS` with buffers free.** It happened when a read on a ready pipe arrived while a worker was reading into the same group. The read now goes to a worker.
 - **Several rings on a machine with no CPUs to spare ran far slower than one.** Workers and issuers spinning for each other took the CPU from the threads with work to do: in fio, 8 threads reading a ZFS file from the ARC ran at 108,000 IOPS where 4 ran at 471,000. They now spin only with a CPU to spare, and an issuer only for a program that has taken every CQE. The same run now gives 532,000, and 1 thread 424,000 rather than 243,000.
 - **Reads that had to wait for a disk ran one at a time if submitted one per enter.** A read that found nothing else in flight made the enter wait for it, so the next read found the same, however many the program allowed in flight. In fio on ZFS, 32 in flight went from 7,753 to 63,898 IOPS. Programs that submit in batches weren't affected.
 - **`O_DIRECT` writes to a file ran one at a time.** Every write made the enter wait for its worker, to keep writes in order. One at an explicit offset needs no order, as on Linux, and now runs in parallel: in fio on ZFS, 32 in flight went from 56% CPU to 14% at 9,400 IOPS or more. Buffered writes, and those that append or use the file position, stay in order.

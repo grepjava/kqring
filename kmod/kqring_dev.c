@@ -551,6 +551,7 @@ kqring_ctx_free_final(struct kqring_ctx *ctx)
 	kqring_rmem_free(&ctx->mem);
 	sx_destroy(&ctx->sq_sx);
 	sx_destroy(&ctx->bg_sx);
+	sx_destroy(&ctx->pipe_sx);
 	mtx_destroy(&ctx->mtx);
 	free(ctx, M_KQRING);
 }
@@ -885,6 +886,7 @@ kqring_fdopen(struct cdev *dev __unused, int fflags __unused,
 	callout_init_mtx(&ctx->wq_abort_callout, &ctx->mtx, 0);
 	TASK_INIT(&ctx->cancel_task, 0, kqring_ctx_cancel_task, ctx);
 	sx_init(&ctx->bg_sx, "kqring bg");
+	sx_init(&ctx->pipe_sx, "kqring pipe");
 	sx_init_flags(&ctx->sq_sx, "kqring sq", SX_DUPOK);
 	ctx->wq = kqring_wq_alloc(td);
 	TAILQ_INIT(&ctx->retired_ops);
@@ -916,6 +918,7 @@ kqring_fdopen(struct cdev *dev __unused, int fflags __unused,
 		knlist_destroy(&ctx->rsel.si_note);
 		sx_destroy(&ctx->sq_sx);
 		sx_destroy(&ctx->bg_sx);
+		sx_destroy(&ctx->pipe_sx);
 		mtx_destroy(&ctx->mtx);
 		free(ctx, M_KQRING);
 		return (ENODEV);

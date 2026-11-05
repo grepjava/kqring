@@ -55,8 +55,6 @@ liburing's two AddressSanitizer tests (`xfail_*`) aren't built. liburing itself 
 
 ### Differences in kqring
 
-`read-write` passes, but can rarely fail in `test_buf_select_pipe`, which expects blocked pipe reads to complete in data order (see [Known gaps](../BENCHMARK.MD#known-gaps)).
-
 | Tests | Why they fail |
 |---|---|
 | `io-cancel`, `timeout` | A forked child submits to, or cancels on, its parent's ring. kqring rings belong to one process: workers resolve descriptors in the owner's table, so allowing another process could let it reach files it can't see, for example from inside a Capsicum sandbox. The child gets `EEXIST`. |

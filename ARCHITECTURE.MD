@@ -367,7 +367,7 @@ To prevent deadlocks across synchronous submission, socket upcalls, callouts, wo
 ```mermaid
 flowchart TD
     L1["1. Process / Global Registry Locks<br/>kqring_proc_mtx (MTX_DEF)"]
-    L2["2. Serialization SX Locks (sleepable)<br/>ctx->sq_sx (SQPOLL vs enter/register)<br/>ctx->bg_sx (provided-buffer groups)"]
+    L2["2. Serialization SX Locks (sleepable)<br/>ctx->sq_sx (SQPOLL vs enter/register)<br/>ctx->pipe_sx (order of pipe reads)<br/>ctx->bg_sx (provided-buffer groups)"]
     L3["3. Socket I/O Lock (sleepable)<br/>SOCK_IO_SEND_LOCK(so) / SOCK_IO_RECV_LOCK(so)"]
     L4["4. Subsystem Leaf Mutexes (MTX_DEF)<br/>kqring_futex_mtx / kqring_zc_mtx / SOCK_LOCK(so) / SOCK_BUF_LOCK(so, which)"]
     L5["5. Ring Context Mutex (MTX_DEF)<br/>ctx->mtx"]
@@ -381,6 +381,7 @@ flowchart TD
 |---|---|---|---|
 | `kqring_proc_mtx` | `MTX_DEF` | `kqring_proc_hash`, `kqring_ctx_list`, `kqring_live_workers`, `kqring_live_zc`, `kqring_nfiles`, `kqring_unloading` | Acquired before `ctx->mtx` or `wq->mtx` during process `exit`/`exec`/`fork` and module unload. |
 | `ctx->sq_sx` | `struct sx` | Serializes `kqring_sqpoll_thread`, enter submission/taskwork, register, setup, and teardown (`kqring_ctx_cancel_all`) | Sleepable outer lock; never held by upcalls, callouts, or workers. Enter skips it when the ring has no SQPOLL thread and its worker pool belongs to the caller's process: then nothing else can run that code concurrently (close waits for the enter's file reference, and the owner's own exit or exec waits for the owner to leave the kernel). |
+| `ctx->pipe_sx` | `struct sx` | A worker's read of a pipe, from the read until the op is on `taskwork_ops`, so CQEs follow the order of the data | The read doesn't wait for the pipe while holding it. The issuer only tries it, and leaves the read to a worker if it is held or taskwork is queued. Outside `ctx->bg_sx` and `ctx->mtx`. |
 | `ctx->bg_sx` | `struct sx` | `ctx->bgroups` hash, `PROVIDED_BUFFERS`, `PBUF_RING` selection/commit | Sleepable lock; nests inside `ctx->sq_sx` and outside `SOCK_BUF_LOCK` / `ctx->mtx`. |
 | `SOCK_IO_SEND_LOCK` | `struct sx` | Serializes socket send operations (`kqring_send_zc_iov`, `sosend`) | Acquired before `SOCK_BUF_LOCK`, `kqring_zc_mtx`, and `ctx->mtx`. |
 | `SOCK_BUF_LOCK` | `MTX_DEF` | Socket buffer state (`so_rcv` / `so_snd`) and `sb_upcall` | Acquired **before** `ctx->mtx` (matching the order in which `sowakeup` -> `kqring_soupcall` enters `kqring`). |
