@@ -5,6 +5,7 @@ FreeBSD kernel bugs that kqring's development turned up: what each one is, how k
 | # | Summary | Found | Upstream | kqring |
 |---|---|---|---|---|
 | 1 | [AF_UNIX stream `shutdown(SHUT_WR)` runs no `SO_RCV` upcall on the peer](#1-af_unix-stream-shutdownshut_wr-runs-no-so_rcv-upcall-on-the-peer) | 2026-11-04 | [PR 300494](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=300494), open | Worked around (descriptors; not fixed files) |
+| 2 | [`EVFILT_USER`: `NOTE_TRIGGER` given with `EV_ADD` is ignored](#2-evfilt_user-note_trigger-given-with-ev_add-is-ignored) | 2026-11-05 | Not filed | Not affected (its tests add, then trigger) |
 
 How to add one: give it the next number, a row in the table, and a section below with the same headings. Put any reproducer in `tests/bsdbugs/<name>/`. Once it's filed, record the PR number and its URL, and keep the status up to date.
 
@@ -65,3 +66,15 @@ module_register_init: MOD_LOAD (unix_shutdown_upcall, 0xffffffff84248000, 0) err
 **Suggested fix:** have `uipc_cantrcvmore()` run the full receive wakeup. For example, keep its locking and replace the two lines 52c0aa086d6b added with what `sorwakeup_locked()` does, or call `sowakeup(so, SO_RCV)` there (it drops the receive buffer lock), and then take the `uipc_wakeup_writer()` step under the lock again. We haven't tested a patch.
 
 ---
+
+## 2. `EVFILT_USER`: `NOTE_TRIGGER` given with `EV_ADD` is ignored
+
+- **Found:** 2026-11-05, by a test of kqring's kqueue bridge that expected an event added and triggered in one `kevent(2)` call.
+- **Affects:** FreeBSD 15.1-RELEASE (seen on `GENERIC`, amd64). Not checked against `main`.
+- **Upstream:** not filed. It may be long-standing behaviour that programs rely on, so check `main` and other BSDs first.
+- **kqring workaround:** none needed. kqring passes events through as `kevent(2)` reports them; its tests and fuzzer add an event, then trigger it in a second call.
+- **Reproducer:** add with `EV_SET(&k, 2, EVFILT_USER, EV_ADD | EV_CLEAR, NOTE_TRIGGER, 0, 0)`, then `kevent(2)` with a zero timeout returns 0. A second change with `flags` 0 and `NOTE_TRIGGER` makes it return 1.
+
+**Cause:** `filt_userattach()` tests `kn->kn_fflags & NOTE_TRIGGER`, so it means to honour the flag at attach. But `kqueue_register()` stores the flags in `kn_sfflags`, clears `kev->fflags`, and then copies `kev` into `kn_kevent`, so `kn_fflags` is always 0 at that point.
+
+**Possible fix:** test `kn->kn_sfflags` in `filt_userattach()`, or remove the check if ignoring the flag is the intended behaviour, and say which in `kqueue(2)`.

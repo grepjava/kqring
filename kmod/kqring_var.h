@@ -326,6 +326,11 @@ struct kqring_op {
 	 * whose res becomes the byte count (kqring_kev_count()).
 	 */
 	short			kev_count;
+	/*
+	 * A KQRING_EXT_KQUEUE request: a multishot POLL_ADD of the kqueue
+	 * whose wakeups take its events (kqring_kq_take()).
+	 */
+	bool			kq_bridge;
 	/* A trigger's kevent waiter: its kevent, instead of sqe->addr. */
 	const struct kevent	*trig_kev;
 	bool			listening;	/* armed via solisten_upcall_set */
@@ -763,6 +768,7 @@ struct kqring_ctx {
 	 * Set from knote() with no ring lock; atomic.
 	 */
 	u_int			kp_kick;
+	u_int			kq_bridges;	/* armed KQRING_EXT_KQUEUE */
 	uint64_t		kp_next_id;
 	TAILQ_HEAD(, kqring_op)	kp_ops[KQRING_KP_HASH];
 	/*
@@ -1423,6 +1429,7 @@ void	kqring_chain_queue(struct kqring_ctx *ctx, struct kqring_op *head);
  */
 #define	KQRING_IOP_TRIGGER	IORING_OP_LAST
 #define	KQRING_IOP_KEVENT	(IORING_OP_LAST + 1)
+#define	KQRING_IOP_KQUEUE	(IORING_OP_LAST + 2)
 
 /* A trigger: alive from its issue until its final CQE and last run. */
 struct kqring_trig {
@@ -1757,6 +1764,9 @@ void	kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op);
 int	kqring_kev_prep(struct kqring_op *op);
 int	kqring_kev_check(const struct kevent *k);
 int32_t	kqring_kev_count(const struct kqring_op *op, struct file *fp);
+int	kqring_kq_prep(struct kqring_op *op);
+int	kqring_kq_check(struct kqring_ctx *ctx, const struct kqring_op *op);
+void	kqring_kq_rescan(struct kqring_ctx *ctx);
 void	kqring_kev_issue(struct kqring_ctx *ctx, struct kqring_op *op);
 int	kqring_kpoll_stop(struct kqring_ctx *ctx, bool nowait);
 void	kqring_kpoll_close(struct kqring_ctx *ctx);

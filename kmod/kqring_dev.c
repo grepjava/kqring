@@ -1300,6 +1300,9 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 
 	wait = (ea->flags & IORING_ENTER_GETEVENTS) != 0 &&
 	    (ea->min_complete != 0 || iopoll);
+	/* Waiting for events is when kevent(2) would look at a kqueue. */
+	if ((ea->flags & IORING_ENTER_GETEVENTS) != 0)
+		kqring_kq_rescan(ctx);
 
 	/*
 	 * 1. Validate the optional IORING_ENTER_EXT_ARG before consuming

@@ -10581,6 +10581,341 @@ test_kevent_counts(void)
 	    "waiting, a pipe's FIONREAD\n");
 }
 
+/* ---- The kqueue bridge (KQRING_EXT_KQUEUE) ---- */
+
+static struct io_uring_sqe *
+kqb_prep(struct test_ring *r, int kq, uint64_t ud)
+{
+	struct io_uring_sqe *sqe = ring_prep(r, KQRING_EXT_OPCODE_DEFAULT, kq,
+	    ud);
+
+	sqe->ioprio = KQRING_EXT_KQUEUE;
+	return (sqe);
+}
+
+static void
+kqb_attach(struct test_ring *r, int kq, uint64_t ud)
+{
+	kqb_prep(r, kq, ud);
+	ring_push_sqe(r);
+	ring_submit(r);
+}
+
+/* Register one event on kq, as the code that owns the kqueue would. */
+static void
+kqb_add(int kq, uintptr_t ident, short filter, u_short flags, u_int fflags,
+    uint64_t udata)
+{
+	struct kevent k;
+
+	EV_SET(&k, ident, filter, flags, fflags, 0, (void *)(uintptr_t)udata);
+	assert(kevent(kq, &k, 1, NULL, 0, NULL) == 0);
+}
+
+/* The next CQE: an event of an attached kqueue. */
+static struct io_uring_cqe
+kqb_event(struct test_ring *r, uint64_t udata, int32_t res)
+{
+	struct io_uring_cqe c;
+
+	assert(trig_collect(r, 1, 2000) >= 1);
+	c = ring_pop_cqe(r);
+	assert(c.user_data == udata && c.res == res &&
+	    (c.flags & IORING_CQE_F_MORE) != 0);
+	return (c);
+}
+
+/*
+ * Events registered with kevent(2), before and after the kqueue is
+ * attached, arrive as CQEs with their udata; a cancel stops that and leaves
+ * the events on the kqueue.
+ */
+static void
+test_kqueue_bridge(void)
+{
+	struct timespec zero = { 0, 0 };
+	struct test_ring r;
+	struct kevent out;
+	int kq, p[2];
+
+	trig_ring(&r);
+	kq = kqueue();
+	assert(kq >= 0);
+	assert(pipe(p) == 0);
+	kqb_add(kq, 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0x1111);
+	kqb_add(kq, p[0], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0x2222);
+	kqb_attach(&r, kq, 50);
+	assert(ring_wait(&r, 1, 30) == ETIMEDOUT);
+
+	kqb_add(kq, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0x1111);
+	(void)kqb_event(&r, 0x1111, 0);
+	assert(write(p[1], "hello", 5) == 5);
+	(void)kqb_event(&r, 0x2222, 5);
+	/* Registered after attaching. */
+	kqb_add(kq, 2, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0x3333);
+	kqb_add(kq, 2, EVFILT_USER, 0, NOTE_TRIGGER, 0x3333);
+	(void)kqb_event(&r, 0x3333, 0);
+	/* Woken again and again: taking events must not hide the next. */
+	for (int i = 0; i < 50; i++) {
+		kqb_add(kq, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0x1111);
+		(void)kqb_event(&r, 0x1111, 0);
+	}
+
+	/* More at once than one scan takes. */
+	for (int i = 0; i < 100; i++)
+		kqb_add(kq, 1000 + (uintptr_t)i, EVFILT_USER,
+		    EV_ADD | EV_ONESHOT, 0, 0x5000 + (uint64_t)i);
+	for (int i = 0; i < 100; i++)
+		kqb_add(kq, 1000 + (uintptr_t)i, EVFILT_USER, 0, NOTE_TRIGGER,
+		    0x5000 + (uint64_t)i);
+	assert(trig_collect(&r, 100, 2000) == 100);
+	for (int i = 0; i < 100; i++) {
+		struct io_uring_cqe c = ring_pop_cqe(&r);
+
+		assert(c.user_data >= 0x5000 && c.user_data < 0x5000 + 100);
+	}
+
+	trig_cancel(&r, 50);
+	assert(trig_final(&r, 50, 2000).res == -ECANCELED);
+	while (ring_cq_ready(&r) > 0)
+		(void)ring_pop_cqe(&r);
+	kqb_add(kq, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0x1111);
+	assert(ring_wait(&r, 1, 30) == ETIMEDOUT);
+	assert(kevent(kq, NULL, 0, &out, 1, &zero) == 1);
+	assert((uintptr_t)out.udata == 0x1111);
+
+	close(p[0]);
+	close(p[1]);
+	close(kq);
+	close(r.fd);
+	printf("[PASS] KQUEUE bridge: kevent(2) registrations arrive as CQEs "
+	    "with their udata, before and after attaching; cancel leaves "
+	    "events on the kqueue\n");
+}
+
+/*
+ * An event that isn't EV_CLEAR, as libevent and libuv register them: each
+ * enter reports it while its condition lasts, as each kevent(2) would, and
+ * new data after it ended wakes an enter already waiting.
+ */
+static void
+test_kqueue_bridge_level(void)
+{
+	struct test_ring r;
+	char buf[16];
+	int kq, p[2];
+	pid_t pid;
+
+	trig_ring(&r);
+	kq = kqueue();
+	assert(kq >= 0);
+	assert(pipe(p) == 0);
+	kqb_add(kq, p[0], EVFILT_READ, EV_ADD, 0, 0x4444);
+	assert(write(p[1], "abc", 3) == 3);
+	kqb_attach(&r, kq, 51);
+	(void)kqb_event(&r, 0x4444, 3);
+	(void)kqb_event(&r, 0x4444, 3);		/* still readable */
+	assert(read(p[0], buf, sizeof(buf)) == 3);
+	assert(ring_wait(&r, 1, 30) == ETIMEDOUT);
+
+	/* Repeatedly, with the data written while an enter waits. */
+	for (int i = 0; i < 3; i++) {
+		pid = fork();
+		assert(pid >= 0);
+		if (pid == 0) {
+			usleep(50000);
+			_exit(write(p[1], "xy", 2) == 2 ? 0 : 1);
+		}
+		assert(ring_wait(&r, 1, 2000) == 0);
+		(void)kqb_event(&r, 0x4444, 2);
+		assert(waitpid(pid, NULL, 0) == pid);
+		assert(read(p[0], buf, sizeof(buf)) == 2);
+		assert(ring_wait(&r, 1, 30) == ETIMEDOUT);
+	}
+	trig_cancel(&r, 51);
+	assert(trig_final(&r, 51, 2000).res == -ECANCELED);
+	close(p[0]);
+	close(p[1]);
+	close(kq);
+	close(r.fd);
+	printf("[PASS] KQUEUE bridge, level-triggered: reported at each enter "
+	    "until read, then new data wakes a waiting enter\n");
+}
+
+/* What ends a bridge, and what it refuses. */
+static void
+test_kqueue_bridge_ends(struct test_ring *plain)
+{
+	struct kqring_trigger t = { .nsteps = 1 };
+	struct timespec zero = { 0, 0 };
+	struct test_ring r;
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	struct kevent out[64];
+	int kq, p[2], left = 0;
+
+	trig_ring(&r);
+	assert(pipe(p) == 0);
+
+	/* A full CQ ends it with what didn't fit still on the kqueue. */
+	kq = kqueue();
+	assert(kq >= 0);
+	for (int i = 0; i < CQ_ENTRIES + 20; i++) {
+		kqb_add(kq, 1 + (uintptr_t)i, EVFILT_USER, EV_ADD | EV_ONESHOT,
+		    0, 0x7000);
+		kqb_add(kq, 1 + (uintptr_t)i, EVFILT_USER, 0, NOTE_TRIGGER,
+		    0x7000);
+	}
+	kqb_attach(&r, kq, 52);
+	assert(trig_final(&r, 52, 2000).res == -EOVERFLOW);
+	for (int n; (n = kevent(kq, NULL, 0, out, 64, &zero)) > 0;)
+		left += n;
+	assert(left == 20);
+
+	/* Closing the kqueue: seen at the next enter. */
+	kqb_attach(&r, kq, 53);
+	assert(ring_wait(&r, 1, 30) == ETIMEDOUT);
+	close(kq);
+	assert(trig_final(&r, 53, 2000).res == -EBADF);
+
+	kq = kqueue();
+	assert(kq >= 0);
+	/* One bridge per kqueue. */
+	kqb_attach(&r, kq, 54);
+	kqb_attach(&r, kq, 55);
+	assert(trig_final(&r, 55, 2000).res == -EBUSY);
+	trig_cancel(&r, 54);
+	assert(trig_final(&r, 54, 2000).res == -ECANCELED);
+
+	/*
+	 * Not a kqueue, refused at once: a pipe, a socket (which would arm
+	 * by upcall), and a device, whose file has no f_data.
+	 */
+	int sv[2], dn = open("/dev/null", O_RDONLY);
+
+	assert(dn >= 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	kqb_attach(&r, p[0], 56);
+	assert(trig_final(&r, 56, 2000).res == -EINVAL);
+	kqb_attach(&r, sv[0], 57);
+	assert(trig_final(&r, 57, 2000).res == -EINVAL);
+	kqb_attach(&r, dn, 58);
+	assert(trig_final(&r, 58, 2000).res == -EINVAL);
+	kqb_attach(&r, 12345, 59);
+	assert(trig_final(&r, 59, 2000).res == -EBADF);
+	close(sv[0]);
+	close(sv[1]);
+	close(dn);
+	/* Arguments. */
+	for (int i = 0; i < 4; i++) {
+		sqe = kqb_prep(&r, kq, 60 + (uint64_t)i);
+		switch (i) {
+		case 0: sqe->addr = 1; break;
+		case 1: sqe->len = 1; break;
+		case 2: sqe->rw_flags = 1; break;
+		case 3: sqe->off = 1; break;
+		}
+		ring_push_sqe(&r);
+		(void)kqring_enter(r.fd, 1, 0, 0, NULL, 0);
+		assert(ring_cq_ready(&r) == 1);
+		c = ring_pop_cqe(&r);
+		assert(c.user_data == 60 + (uint64_t)i && c.res == -EINVAL);
+	}
+	/* Not a trigger template. */
+	trig_prep(&r, p[0], POLLIN, 70, &t);
+	ring_push_sqe(&r);
+	kqb_prep(&r, kq, 71);
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(trig_final(&r, 70, 2000).res == -EINVAL);
+	while (ring_cq_ready(&r) > 0)
+		(void)ring_pop_cqe(&r);
+	close(p[0]);
+	close(p[1]);
+	close(r.fd);
+
+	/* Without the opt-in, an unknown opcode. */
+	kqb_prep(plain, kq, 80);
+	ring_push_sqe(plain);
+	(void)kqring_enter(plain->fd, 1, 0, 0, NULL, 0);
+	assert(ring_cq_ready(plain) == 1);
+	c = ring_pop_cqe(plain);
+	assert(c.user_data == 80 && c.res == -EINVAL);
+	close(kq);
+	printf("[PASS] KQUEUE bridge ends: -EOVERFLOW with the rest left on "
+	    "the kqueue, -EBADF on close, -EBUSY, -EINVAL\n");
+}
+
+/* A CQE32 ring gets the ident, filter, flags and fflags too. */
+static void
+test_kqueue_bridge_cqe32(void)
+{
+	struct io_uring_params p;
+	struct kqring_ext_setup es = { .version = KQRING_EXT_VERSION };
+	struct __kernel_timespec ts = { .tv_sec = 2 };
+	struct io_uring_getevents_arg ga = { .ts = (uint64_t)(uintptr_t)&ts };
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe *c;
+	int fd, kq, pp[2];
+
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+	    IORING_SETUP_CQE32;
+	fd = (int)kqring_setup(4, &p);
+	assert(fd >= 0);
+	assert(ioctl(fd, KQRING_IOC_EXT_SETUP, &es) == 0);
+	assert((es.features & KQRING_EXT_F_KQUEUE) != 0);
+	size_t ring_len = p.cq_off.cqes +
+	    (size_t)p.cq_entries * sizeof(struct io_uring_cqe) * 2;
+	char *base = mmap(NULL, ring_len, PROT_READ | PROT_WRITE, MAP_SHARED,
+	    fd, IORING_OFF_SQ_RING);
+	struct io_uring_sqe *sqes = mmap(NULL,
+	    p.sq_entries * sizeof(struct io_uring_sqe), PROT_READ | PROT_WRITE,
+	    MAP_SHARED, fd, IORING_OFF_SQES);
+	assert(base != MAP_FAILED && sqes != MAP_FAILED);
+	unsigned *sq_array = (unsigned *)(base + p.sq_off.array);
+	_Atomic unsigned *sq_ktail = (_Atomic unsigned *)(base +
+	    p.sq_off.tail);
+	_Atomic unsigned *cq_khead = (_Atomic unsigned *)(base +
+	    p.cq_off.head);
+	_Atomic unsigned *cq_ktail = (_Atomic unsigned *)(base +
+	    p.cq_off.tail);
+	struct io_uring_cqe *cqes = (struct io_uring_cqe *)(base +
+	    p.cq_off.cqes);
+
+	kq = kqueue();
+	assert(kq >= 0);
+	assert(pipe(pp) == 0);
+	kqb_add(kq, pp[0], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0x9999);
+	sqe = &sqes[0];
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->opcode = KQRING_EXT_OPCODE_DEFAULT;
+	sqe->ioprio = KQRING_EXT_KQUEUE;
+	sqe->fd = kq;
+	sqe->user_data = 78;
+	sq_array[0] = 0;
+	atomic_store_explicit(sq_ktail, 1, memory_order_release);
+	assert(kqring_enter(fd, 1, 0, 0, NULL, 0) == 1);
+	assert(write(pp[1], "four", 4) == 4);
+	close(pp[1]);			/* EV_EOF in the event's flags */
+	(void)kqring_enter(fd, 0, 1, IORING_ENTER_GETEVENTS |
+	    IORING_ENTER_EXT_ARG, &ga, sizeof(ga));
+	assert(atomic_load(cq_ktail) - atomic_load(cq_khead) >= 1);
+	c = &cqes[(atomic_load(cq_khead) & *(unsigned *)(base +
+	    p.cq_off.ring_mask)) * 2];
+	assert(c->user_data == 0x9999 && c->res == 4);
+	assert((c->flags & IORING_CQE_F_MORE) != 0);
+	assert(c->big_cqe[0] == (uint64_t)pp[0]);
+	assert(KQRING_KQ_FILTER(c->big_cqe[1]) == EVFILT_READ);
+	assert((KQRING_KQ_FLAGS(c->big_cqe[1]) & EV_EOF) != 0);
+	assert(KQRING_KQ_FFLAGS(c->big_cqe[1]) == 0);
+	close(pp[0]);
+	close(kq);
+	close(fd);
+	printf("[PASS] KQUEUE bridge, CQE32: ident, filter, flags and fflags "
+	    "in big_cqe\n");
+}
+
 /* Arguments the kevent request refuses, and one knote per ident. */
 static void
 test_kevent_bad(struct test_ring *plain)
@@ -10842,6 +11177,10 @@ test_kevents(struct test_ring *plain)
 	test_kevent_proc_exit();
 	test_kevent_counts();
 	test_kevent_bad(plain);
+	test_kqueue_bridge();
+	test_kqueue_bridge_level();
+	test_kqueue_bridge_ends(plain);
+	test_kqueue_bridge_cqe32();
 	test_kevent_trigger_vnode();
 	test_kevent_trigger_proc();
 	test_kevent_trigger_signal();

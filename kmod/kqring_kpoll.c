@@ -630,6 +630,9 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 
 	if (op->ffile != NULL)
 		return (EOPNOTSUPP);
+	/* The descriptor may have changed since kqring_kq_check(). */
+	if (op->kq_bridge && fp->f_type != DTYPE_KQUEUE)
+		return (EINVAL);
 	if ((events & (POLLOUT | POLLWRNORM)) != 0)
 		filters |= KQRING_KP_WRITE;
 	if ((events & ~(uint32_t)(POLLOUT | POLLWRNORM)) != 0 || filters == 0)
@@ -656,6 +659,8 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	op->kp_seen[0] = op->kp_seen[1] = 0;
 	op->kp_on = true;
 	op->cancelled = false;
+	if (op->kq_bridge)
+		ctx->kq_bridges++;
 	TAILQ_INSERT_TAIL(KQRING_KP_BUCKET(ctx, op->kp_fd), op, kp_link);
 	kqring_op_arm_locked(ctx, op);
 	mtx_unlock(&ctx->mtx);
@@ -668,7 +673,13 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	    (!level ? EV_CLEAR : 0));
 	error = kqring_kp_change(ctx, kev, n);
 	if (error == 0) {
-		kqring_kp_wrap(ctx, kev, n, false);
+		/*
+		 * Not a bridge's: the counting filter drops a wakeup that shows
+		 * no more than it last saw, and taking a kqueue's events tells
+		 * no filter that the count fell.
+		 */
+		if (!op->kq_bridge)
+			kqring_kp_wrap(ctx, kev, n, false);
 		return (0);
 	}
 	mtx_lock(&ctx->mtx);
@@ -699,6 +710,8 @@ kqring_kpoll_disarm_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 	if (!op->kp_on)
 		return;
 	op->kp_on = false;
+	if (op->kq_bridge)
+		ctx->kq_bridges--;
 	TAILQ_REMOVE(KQRING_KP_BUCKET(ctx, op->kp_fd), op, kp_link);
 	if (curthread->td_proc != ctx->owner_proc)
 		return;
@@ -908,6 +921,172 @@ kqring_kev_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 	kqring_req_complete(ctx, op, res, 0);
 }
 
+/* ------------------------------------------------------------------------
+ * KQRING_EXT_KQUEUE: a kqueue's events as CQEs (include/sys/kqring.h).
+ * The request is a multishot POLL_ADD of the kqueue, whose knote says that
+ * events came; delivery takes them with kevent(2)'s own scan.
+ *
+ * A kqueue only wakes its pollers when an event is queued, and an event
+ * that isn't EV_CLEAR is queued again by each scan that reports it, so new
+ * activity on it wakes nothing.  So an enter looks too, as a kevent(2)
+ * call would (kqring_kq_rescan()), which also drops such an event once
+ * its condition has ended, and the next activity queues it afresh.
+ * ------------------------------------------------------------------------
+ */
+
+int
+kqring_kq_prep(struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+
+	if (sqe->addr != 0 || sqe->len != 0 || sqe->off != 0 ||
+	    sqe->rw_flags != 0 || sqe->buf_index != 0 ||
+	    sqe->file_index != 0 ||
+	    (sqe->flags & (IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT)) != 0)
+		return (EINVAL);
+	op->kq_bridge = true;
+	op->sqe.opcode = IORING_OP_POLL_ADD;
+	op->sqe.ioprio = 0;
+	op->sqe.len = IORING_POLL_ADD_MULTI;
+	op->sqe.poll32_events = POLLIN | POLLRDNORM;
+	return (0);
+}
+
+/*
+ * Take fp's events as CQEs while the CQ has room.  Returns 0, or what ends
+ * the request.  Stops short of overflowing: what isn't taken stays on the
+ * kqueue, so no event is lost.
+ */
+static int32_t
+kqring_kq_take(struct kqring_ctx *ctx, struct file *fp)
+{
+	struct thread *td = curthread;
+	struct kevent kev[KQRING_KP_NEVENTS];
+	struct kqring_kp_io io;
+	struct kevent_copyops ops = {
+		.arg = &io,
+		.k_copyin = kqring_kp_copyin,
+		.k_copyout = kqring_kp_copyout,
+		.kevent_size = sizeof(struct kevent),
+	};
+	struct timespec zero = { 0, 0 };
+	const struct kqring_shm_header *shm = ctx->shm;
+	register_t saved[2] = { td->td_retval[0], td->td_retval[1] };
+	uint32_t used;
+	int error;
+
+	for (;;) {
+		used = atomic_load_acq_32(&shm->cq_tail) -
+		    atomic_load_acq_32(&shm->cq_head);
+		if (kqring_cq_full(ctx) || used >= ctx->cq_entries)
+			return (((struct kqueue *)fp->f_data)->kq_count > 0 ?
+			    -EOVERFLOW : 0);
+		io.kev = kev;
+		io.n = 0;
+		io.max = (int)MIN(nitems(kev), ctx->cq_entries - used);
+		error = kern_kevent_fp(td, fp, 0, io.max, &ops, &zero);
+		td->td_retval[0] = saved[0];
+		td->td_retval[1] = saved[1];
+		if (error != 0)
+			return (-error);
+		for (int i = 0; i < io.n; i++) {
+			const struct kevent *k = &kev[i];
+			uint64_t extra[2];
+
+			extra[0] = k->ident;
+			extra[1] = (uint64_t)(uint16_t)k->filter |
+			    (uint64_t)k->flags << 16 |
+			    (uint64_t)k->fflags << 32;
+			ctx->cq_seq++;
+			kqring_post_cqe_extra(ctx,
+			    (uint64_t)(uintptr_t)k->udata,
+			    (int32_t)MIN(MAX(k->data, 0), INT32_MAX),
+			    IORING_CQE_F_MORE, extra);
+		}
+		if (io.n < io.max)
+			return (0);
+	}
+}
+
+/*
+ * Issue: can op attach what its descriptor names?  Before it is armed,
+ * which a multishot POLL_ADD is with no inline attempt, and on a socket
+ * would be by upcall.  What is armed takes the events a kqueue has by then:
+ * its knote fires as it is added.
+ */
+int
+kqring_kq_check(struct kqring_ctx *ctx, const struct kqring_op *op)
+{
+	struct thread *td = curthread;
+	cap_rights_t rights;
+	struct file *fp;
+	int error;
+
+	if (ctx->owner_proc != td->td_proc)
+		return (EOPNOTSUPP);
+	error = fget(td, op->sqe.fd,
+	    cap_rights_init_one(&rights, CAP_KQUEUE_EVENT), &fp);
+	if (error != 0)
+		return (error);
+	error = fp->f_type == DTYPE_KQUEUE ? 0 : EINVAL;
+	fdrop(fp, td);
+	return (error);
+}
+
+/* The knote fired or an enter looked (taskwork). */
+static void
+kqring_kq_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	struct thread *td = curthread;
+	cap_rights_t rights;
+	struct file *fp;
+	int32_t res;
+
+	/*
+	 * Another process sharing the ring has none of the owner's
+	 * descriptors, and the owner's next enter looks anyway.
+	 */
+	if (td->td_proc != ctx->owner_proc)
+		return;
+	if (fget(td, op->kp_fd, cap_rights_init_one(&rights, CAP_KQUEUE_EVENT),
+	    &fp) != 0)
+		res = -EBADF;
+	else {
+		/* The descriptor may name something else by now. */
+		res = fp->f_type != DTYPE_KQUEUE || fp->f_data != op->kp_data ?
+		    -EBADF : kqring_kq_take(ctx, fp);
+		fdrop(fp, td);
+	}
+	if (res == 0)
+		return;
+	mtx_lock(&ctx->mtx);
+	kqring_op_unarm_locked(ctx, op);
+	mtx_unlock(&ctx->mtx);
+	kqring_req_complete(ctx, op, res, 0);
+}
+
+/* An enter by the owner: its attached kqueues are looked at, as taskwork. */
+void
+kqring_kq_rescan(struct kqring_ctx *ctx)
+{
+	struct kqring_op *op;
+
+	if (atomic_load_int(&ctx->kq_bridges) == 0 ||
+	    ctx->owner_proc != curproc)
+		return;
+	mtx_lock(&ctx->mtx);
+	for (int i = 0; i < KQRING_KP_HASH; i++) {
+		TAILQ_FOREACH(op, &ctx->kp_ops[i], kp_link) {
+			if (!op->kq_bridge || !op->kp_on || op->cancelled)
+				continue;
+			op->kp_revents |= POLLIN;
+			op->kp_nev++;
+			kqring_taskwork_add_locked(ctx, op);
+		}
+	}
+	mtx_unlock(&ctx->mtx);
+}
+
 /*
  * Post what the poller saw for op (run as taskwork): its CQE, or for a
  * multishot request one per event, with F_MORE.  A multishot request
@@ -942,6 +1121,10 @@ kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 	mtx_unlock(&ctx->mtx);
 	if (rev == 0)
 		return;
+	if (op->kq_bridge) {
+		kqring_kq_deliver(ctx, op);
+		return;
+	}
 	/* A byte-count kevent request: how much, not which events. */
 	if (op->kev_count != 0) {
 		struct file *fp;

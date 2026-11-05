@@ -1396,6 +1396,9 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		case KQRING_EXT_KEVENT:
 			op->sqe.opcode = KQRING_IOP_KEVENT;
 			break;
+		case KQRING_EXT_KQUEUE:
+			op->sqe.opcode = KQRING_IOP_KQUEUE;
+			break;
 		default:
 			return (EINVAL);
 		}
@@ -1607,6 +1610,13 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		/* Before prep: a byte-count request becomes a POLL_ADD. */
 		multishot = (sqe->rw_flags & KQRING_KEV_MULTISHOT) != 0;
 		error = kqring_kev_prep(op);
+		if (error != 0)
+			return (error);
+		break;
+	case KQRING_IOP_KQUEUE:
+		/* Becomes a POLL_ADD; multishot keeps it out of templates. */
+		multishot = true;
+		error = kqring_kq_prep(op);
 		if (error != 0)
 			return (error);
 		break;
@@ -2220,6 +2230,14 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 	case IORING_OP_CONNECT:
 	case IORING_OP_ACCEPT:
 	case IORING_OP_POLL_ADD:
+		if (__predict_false(op->kq_bridge)) {
+			int kerr = kqring_kq_check(ctx, op);
+
+			if (kerr != 0) {
+				kqring_req_complete(ctx, op, -kerr, 0);
+				return;
+			}
+		}
 		/*
 		 * Try inline first (unless IOSQE_ASYNC asks to defer), even
 		 * with POLL_FIRST (a hint) or multishot: data that arrived

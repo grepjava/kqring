@@ -952,10 +952,44 @@ struct kqring_ext_setup {
 
 #define KQRING_EXT_F_TRIGGER	(1ULL << 0)
 #define KQRING_EXT_F_KEVENT	(1ULL << 1)
+#define KQRING_EXT_F_KQUEUE	(1ULL << 2)
 
 /* Sub-opcodes (sqe->ioprio of the escape opcode). */
 #define KQRING_EXT_TRIGGER	1
 #define KQRING_EXT_KEVENT	2
+#define KQRING_EXT_KQUEUE	3
+
+/*
+ * KQRING_EXT_KQUEUE: attach a kqueue to the ring, to move a program to
+ * kqring one part at a time.  sqe->fd is the kqueue (a descriptor, not a
+ * fixed file); addr, len, off and rw_flags are 0.  Whatever registers
+ * events on that kqueue, such as libevent or libuv, carries on doing so
+ * with kevent(2), and the ring takes the events as kevent(2) would, so
+ * EV_CLEAR, EV_ONESHOT and EV_DISPATCH mean what they always do.  Each
+ * becomes a CQE:
+ *
+ *   user_data  the event's udata (not the request's)
+ *   res        its data, as 0 .. INT32_MAX
+ *   flags      IORING_CQE_F_MORE
+ *   big_cqe    on a CQE32 ring: [0] ident, [1] KQRING_KQ_FILTER() and
+ *              the flags and fflags macros below
+ *
+ * Without CQE32 only udata and data arrive, so give each event a udata that
+ * says what it is.  An io_uring_enter() with IORING_ENTER_GETEVENTS looks
+ * at the kqueue as a kevent(2) call would: an event that is not EV_CLEAR
+ * is reported at each one until its condition ends.  Take events with
+ * kevent(2) as well, and each goes to whichever looks first.
+ *
+ * The request runs until cancelled (by the SQE's user_data): its final CQE
+ * has the SQE's user_data, no F_MORE, and res -ECANCELED; -EOVERFLOW if the
+ * CQ filled (events not taken stay on the kqueue: attach again); -EBADF if
+ * the descriptor was closed (seen at the next enter).  -EINVAL if fd isn't
+ * a kqueue, -EBUSY if the ring already watches it, -EOPNOTSUPP from a
+ * process that doesn't own the ring.  Not a trigger template or a source.
+ */
+#define KQRING_KQ_FILTER(big1)	((short)((big1) & 0xffff))
+#define KQRING_KQ_FLAGS(big1)	((unsigned short)(((big1) >> 16) & 0xffff))
+#define KQRING_KQ_FFLAGS(big1)	((unsigned int)((big1) >> 32))
 
 /*
  * KQRING_EXT_KEVENT: wait for a kqueue event io_uring has no request for.

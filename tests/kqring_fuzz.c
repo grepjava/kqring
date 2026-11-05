@@ -97,6 +97,7 @@ static _Atomic uint64_t	st_rings, st_setup_fail, st_sqes, st_enters,
 /* Triggers submitted; their per-event and final CQEs; finals not -EINVAL. */
 static _Atomic uint64_t	st_trig, st_trig_fire, st_trig_end, st_trig_live;
 static _Atomic uint64_t	st_kev;
+static _Atomic uint64_t	st_kqb;
 static _Atomic int	cq_bad, nfinished;
 
 struct fz {
@@ -108,6 +109,7 @@ struct fz {
 	char		*arena;		/* ARENA_SIZE, guard pages around */
 	char		*hole;		/* a PROT_NONE page */
 	int		pool[NPOOL];
+	int		kq;		/* what KQRING_EXT_KQUEUE attaches */
 	int		dyn[NDYN];
 	int		ndyn;
 	struct { uint8_t op; uint64_t addr; } ops[NOPS];
@@ -431,6 +433,7 @@ pool_init(struct fz *f)
 	for (int i = 0; i < NPOOL; i++)
 		if (i < 6 || i >= 10)
 			f->pool[i] = pool_open(f, i);
+	f->kq = kqueue();
 }
 
 static void
@@ -441,6 +444,10 @@ pool_close(struct fz *f)
 			close(f->pool[i]);
 			f->pool[i] = -1;
 		}
+	if (f->kq >= 0) {
+		close(f->kq);
+		f->kq = -1;
+	}
 }
 
 static void
@@ -726,6 +733,48 @@ sqe_trigger(struct fz *f, struct io_uring_sqe *s, unsigned k)
 	atomic_fetch_add(&st_trig, 1);
 	f->recent[f->nrecent++ % nitems(f->recent)] = f->ud;
 	f->ops[f->ud % NOPS].op = s->opcode;
+	f->ops[f->ud % NOPS].addr = s->addr;
+	f->ud++;
+}
+
+/*
+ * A kqueue bridge (KQRING_EXT_KQUEUE) of f's kqueue, with a few events
+ * registered on it as other code would: user events, and pool descriptors
+ * level-triggered or not.  Their udata is this request's, which the CQE
+ * checks know.
+ */
+static void
+sqe_kqueue(struct fz *f, struct io_uring_sqe *s)
+{
+	void *ud = (void *)(uintptr_t)f->ud;
+	struct kevent k;
+
+	for (unsigned n = (unsigned)rn(f, 4); n > 0 && f->kq >= 0; n--) {
+		if (chance(f, 50))
+			EV_SET(&k, rn(f, 64), EVFILT_USER, EV_ADD |
+			    (chance(f, 70) ? EV_CLEAR : EV_ONESHOT), 0, 0, ud);
+		else
+			EV_SET(&k, pool_fd(f, 3), chance(f, 70) ? EVFILT_READ :
+			    EVFILT_WRITE, EV_ADD | (chance(f, 50) ? EV_CLEAR :
+			    0), 0, 0, ud);
+		(void)kevent(f->kq, &k, 1, NULL, 0, NULL);
+		/* NOTE_TRIGGER does nothing along with EV_ADD. */
+		if (k.filter == EVFILT_USER && chance(f, 70)) {
+			k.flags = 0;
+			k.fflags = NOTE_TRIGGER;
+			(void)kevent(f->kq, &k, 1, NULL, 0, NULL);
+		}
+	}
+	memset(s, 0, f->sqe_size);
+	s->opcode = f->ext_op;
+	s->ioprio = KQRING_EXT_KQUEUE;
+	s->fd = chance(f, 90) ? f->kq : pool_fd(f, 3);
+	s->addr = chance(f, 97) ? 0 : gen_ptr(f);
+	s->user_data = f->ud;
+	atomic_fetch_add(&st_kqb, 1);
+	f->recent[f->nrecent++ % nitems(f->recent)] = f->ud;
+	/* Its CQEs aren't a trigger's. */
+	f->ops[f->ud % NOPS].op = IORING_OP_NOP;
 	f->ops[f->ud % NOPS].addr = s->addr;
 	f->ud++;
 }
@@ -1393,6 +1442,13 @@ do_submit(struct fz *f)
 				f->sq_tail++;
 				continue;
 			}
+			if (f->ext_op != 0 && f->tmpl_left == 0 &&
+			    chance(f, f->valid ? 2 : 1)) {
+				sqe_kqueue(f, s);
+				prev = s;
+				f->sq_tail++;
+				continue;
+			}
 			sqe_fill(f, s);
 			/*
 			 * Chains: link to the next request, and sometimes
@@ -1815,6 +1871,7 @@ main(int argc, char **argv)
 	    (uintmax_t)st_trig_end, (uintmax_t)st_trig_live,
 	    (uintmax_t)st_trig_fire);
 	printf("kqring_fuzz: kevent requests %ju\n", (uintmax_t)st_kev);
+	printf("kqring_fuzz: kqueue bridges %ju\n", (uintmax_t)st_kqb);
 	if (atomic_load(&cq_bad)) {
 		fprintf(stderr, "kqring_fuzz: FAIL: a CQ ring overran\n");
 		rc = 1;

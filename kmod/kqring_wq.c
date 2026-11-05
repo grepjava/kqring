@@ -713,6 +713,11 @@ kqring_arm_nonsock_op(struct kqring_ctx *ctx, struct kqring_op *op)
 				kqring_req_complete(ctx, op, -error, 0);
 				return (false);
 			}
+			/* A bridge has no worker: the ring has this kqueue. */
+			if (op->kq_bridge) {
+				kqring_req_complete(ctx, op, -EBUSY, 0);
+				return (false);
+			}
 			error = kqring_op_fget(op,
 			    cap_rights_init_one(&rights, CAP_POLL_EVENT), 0,
 			    &fp);
