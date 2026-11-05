@@ -655,6 +655,16 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 		}
 		mtx_lock(&ctx->mtx);
 	}
+	/*
+	 * A read still running after the spin is waiting for the disk.  Leave
+	 * it to its worker: waiting here would hold back the next enter, and
+	 * a program submitting one read per enter would then only ever have
+	 * one in flight, however many it allows.
+	 */
+	if (sync && kqring_op_is_read(op->sqe.opcode) && !op->wq_done) {
+		op->wq_blocking = true;
+		sync = false;
+	}
 	while (sync && kqring_wq_can_wait_op_locked(ctx, op)) {
 		int error;
 
