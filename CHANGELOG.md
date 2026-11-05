@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- **Closing a ring could take up to 50 ms** when its poller thread was running, which any ring waiting on an AF_UNIX socket now has. Closing now wakes the poller at once.
 - **An armed `RECV`, `POLL_ADD` or trigger on an AF_UNIX stream socket never completed when the peer called `shutdown(SHUT_WR)`.** FreeBSD 15 marks the input ended and wakes `poll(2)` and kqueue, but runs no socket upcall, which kqring waits on ([FreeBSD PR 300494](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=300494)). kqring now also watches such sockets with a knote that reports only end of input. Requests on fixed files only are still affected. [BSDBUG.MD](BSDBUG.MD) tracks this and other FreeBSD bugs kqring has found.
 - `IORING_UNREGISTER_RING_FDS` stopped with `EBADF` at the first empty slot, so unregistering a range left the slots after it registered (and their rings alive until exit). An empty slot now counts as done, as in io_uring. Found by the new fuzzer.
 - **A `READ` of an `O_NONBLOCK` pipe could hang its process for good.** If another reader drained the pipe after kqring saw it ready, the submitting thread spun in `kqring_enter()` until more data came, and the process couldn't exit until then. It now goes to a worker. A worker that lost the data the same way failed the read with `EAGAIN`; it now waits again. Found by the fuzzer.

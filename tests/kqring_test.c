@@ -10235,6 +10235,47 @@ test_trigger_close(void)
 }
 
 /*
+ * Closing a ring whose poller is asleep wakes it, rather than waiting out
+ * its 50 ms sleep: an armed RECV on an AF_UNIX socket starts a poller, and
+ * a program may open and close many such rings.
+ */
+static void
+test_close_with_poller(void)
+{
+	char buf[8];
+	uint64_t total = 0;
+	int sv[2];
+
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	for (int i = 0; i < 40; i++) {
+		struct io_uring_sqe *sqe;
+		struct test_ring r;
+		uint64_t t0;
+
+		ring_setup(&r);
+		assert(kqring_register(r.fd, IORING_REGISTER_ENABLE_RINGS, NULL,
+		    0) == 0);
+		sqe = ring_prep(&r, IORING_OP_RECV, sv[0], 1);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		ring_push_sqe(&r);
+		ring_submit(&r);
+		usleep(2000);	/* The poller is in kevent by now. */
+		munmap(r.sqes, r.sqes_len);
+		munmap(r.ring_map, r.ring_map_len);
+		t0 = now_ns();
+		close(r.fd);
+		total += now_ns() - t0;
+	}
+	close(sv[0]);
+	close(sv[1]);
+	printf("  close with a poller: %ju us on average\n",
+	    (uintmax_t)(total / 40 / 1000));
+	assert(total / 40 < 10000000ULL);
+	printf("[PASS] closing a ring wakes its sleeping poller\n");
+}
+
+/*
  * The peer of an AF_UNIX stream socket shuts down writing while a RECV,
  * a POLL_ADD and a trigger wait on it: FreeBSD runs no socket upcall for
  * that, so kqring watches for it with a knote (kqring_kpoll_soeof_watch()).
@@ -11345,6 +11386,7 @@ test_triggers(struct test_ring *plain)
 	test_trigger_buf_from_prev_edges();
 	test_trigger_close();
 	test_unix_peer_shutdown();
+	test_close_with_poller();
 }
 
 int

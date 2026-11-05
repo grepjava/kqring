@@ -357,6 +357,8 @@ kqring_kp_event(struct kqring_ctx *ctx, const struct kevent *kev)
 	uint64_t id = (uint64_t)(uintptr_t)kev->udata;
 	struct kqring_op *op;
 
+	if (kev->udata == KQRING_KP_WAKE)
+		return;
 	if (kev->udata == KQRING_KP_SOEOF) {
 		kqring_so_eof_kick(curthread, (int)kev->ident);
 		return;
@@ -470,6 +472,7 @@ kqring_kp_start(struct kqring_ctx *ctx)
 {
 	struct thread *td = curthread;
 	register_t saved[2] = { td->td_retval[0], td->td_retval[1] };
+	struct kevent wake;
 	struct file *fp;
 	int error, fd;
 	bool need;
@@ -506,6 +509,10 @@ kqring_kp_start(struct kqring_ctx *ctx)
 		mtx_unlock(&ctx->mtx);
 		if (fp != NULL)
 			fdrop(fp, td);
+		/* If this fails, closing waits for the poller's next wakeup. */
+		EV_SET(&wake, 0, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0,
+		    KQRING_KP_WAKE);
+		(void)kqring_kp_change(ctx, &wake, 1);
 	}
 
 	mtx_lock(&ctx->mtx);
@@ -1258,6 +1265,16 @@ int
 kqring_kpoll_stop(struct kqring_ctx *ctx, bool nowait)
 {
 	mtx_assert(&ctx->mtx, MA_OWNED);
+	/* It may be asleep in kevent: don't wait out KQRING_KP_IDLE_NS. */
+	if (ctx->kp_running && curthread != ctx->kp_td) {
+		struct kevent wake;
+
+		mtx_unlock(&ctx->mtx);
+		EV_SET(&wake, 0, EVFILT_USER, 0, NOTE_TRIGGER, 0,
+		    KQRING_KP_WAKE);
+		(void)kqring_kp_change(ctx, &wake, 1);
+		mtx_lock(&ctx->mtx);
+	}
 	while (ctx->kp_running && curthread != ctx->kp_td) {
 		if (nowait)
 			return (EWOULDBLOCK);

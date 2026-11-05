@@ -1756,6 +1756,8 @@ kqring_soeof_cached_locked(struct kqring_ctx *ctx, int fd,
 }
 /* The udata of end-of-input knotes; a kp_id never reaches it. */
 #define	KQRING_KP_SOEOF		((void *)(uintptr_t)UINT64_MAX)
+/* The udata of the knote that ends the poller's sleep at ring close. */
+#define	KQRING_KP_WAKE		((void *)(uintptr_t)(UINT64_MAX - 1))
 int	kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	    const struct file *fp);
 void	kqring_kpoll_disarm_locked(struct kqring_ctx *ctx,
