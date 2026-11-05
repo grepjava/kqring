@@ -24,7 +24,7 @@ It has its own functional test suite and benchmarks, and has been reviewed again
 
 ## Quick start
 
-Built and tested on FreeBSD 15.1-RELEASE, amd64, `GENERIC` kernel; other versions are untested. Kernel sources must be installed in `/usr/src` and match the running kernel (`freebsd-version -ku`). Version 0.2.0 is an experimental preview; see [`CHANGELOG.md`](CHANGELOG.md).
+Built and tested on FreeBSD 15.1-RELEASE, amd64, `GENERIC` kernel; other versions are untested. Kernel sources must be installed in `/usr/src` and match the running kernel (`freebsd-version -ku`). Version 0.3.0 is an experimental preview; see [`CHANGELOG.md`](CHANGELOG.md).
 
 ```sh
 make                                   # builds kmod/kqring.ko, tests/kqring_test, tests/kqring_bench

@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-11-06
+
+Still an **experimental preview**, for test systems only: the same caveats as 0.1.0 apply. This release adds kqring's first extensions beyond io_uring (event-driven chains, kevent requests and the kqueue bridge), runs fio's `io_uring` engine, and fixes what fio on a real SSD and on several rings exposed. The ABI only gains additions; rebuild the module and reload it.
 
 ### Added
 
@@ -36,6 +38,7 @@
 - Event-driven chains have their own tests (`kqring_test trig` runs only those): serial and concurrent runs, per-firing CQEs, an event never consumed, hang-up, bad templates, `STOP_ON_ERROR`, and closing the ring mid-run. The fuzzer opts half its well-formed rings in and submits triggers with random modes and templates: a 30-minute run on a `GENERIC-DEBUG` kernel submitted 119,000 triggers with no failures or lock-order warnings.
 - Kevent requests have tests of their own (a file written, a signal delivered three times, a child's exit with its status, bad arguments), and the fuzzer submits them on rings that opted in: a 30-minute run on `GENERIC-DEBUG` sent 68,000 with no failures or leaks.
 - Step flags have tests of their own: an echo server (300 messages and a 256 KiB stream, no CQE per message), an event-driven file copy that stops at end of file, and bad step flags. The fuzzer gives its triggers valid step flags 40% of the time; a 30-minute run on `GENERIC-DEBUG` submitted 124,000 triggers with no failures.
+- kqring's own suite has 120 tests, and liburing's results are unchanged at 144 passed with `RLIMIT_MEMLOCK` raised, with all 17 failures explained in [`liburing/README.md`](liburing/README.md).
 - The suite, fuzzer and stress tests were run on a KASAN kernel with `kqring.ko` instrumented: 7 full 30-minute fuzz runs, with no report from kqring. A deliberate overread in a test module confirmed that reports reach a module.
 - The fuzzer no longer dies with `SIGBUS` now and then. Its requests close other threads' rings on purpose, and a file that took a new ring's descriptor number was mapped in the ring's place, beyond the file's end. It now maps a checked descriptor of its own, and reports where it faulted if it ever does.
 - `test_send_armed` no longer fails now and then on slow kernels when its `POLLIN | POLLOUT` poll rightly completes for writability alone.
