@@ -34,6 +34,7 @@
  *  - a system call that does not return for 30 s, signals included, or a
  *    teardown (closing everything, reaping children) that takes 120 s;
  *  - a CQ ring that holds more entries than it has room for;
+ *  - SIGBUS or SIGSEGV in the fuzzer, which says where and dies;
  *  - kqring memory, user-wired pages or sockets nothing refers to still
  *    held once everything is closed.
  *
@@ -72,6 +73,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include <sys/kqring.h>
@@ -106,6 +108,8 @@ static _Atomic uint64_t	st_kqb;
 static _Atomic uint64_t	st_echo, st_echo_sent;
 /* Scratch files opened with and without O_DIRECT. */
 static _Atomic uint64_t	st_direct, st_buffered;
+/* New rings closed under us before they could be mapped. */
+static _Atomic uint64_t	st_ring_gone;
 /* Reads in pipe bursts submitted; those that got data. */
 static _Atomic uint64_t	st_piperd, st_piperd_data;
 static _Atomic int	cq_bad, nfinished;
@@ -163,6 +167,7 @@ struct fz {
 static struct fz	fzs[MAX_THREADS];
 static _Atomic int	ring_fds[MAX_THREADS];	/* MSG_RING targets */
 static char		*names;			/* read-only name table */
+static dev_t		kqring_rdev;		/* of /dev/kqring */
 
 /* Offsets into names[]. */
 #define NAME_PATHS	0	/* 16 paths, 32 bytes each */
@@ -184,6 +189,7 @@ now_ns(void)
  * tables): the output goes to these instead, which are out of reach.
  */
 #define OUT_FD		900
+#define MAP_FD		800		/* + thread: a ring while it's mapped */
 #define ERR_FD		901
 
 static void
@@ -531,6 +537,28 @@ ring_close(struct fz *f)
 		}
 }
 
+/*
+ * A descriptor of the new ring to map, out of reach of the numbers requests
+ * use, or -1 if it has gone.  Other threads' requests close ring descriptors
+ * on purpose, and a file that took the number would map beyond its end, so
+ * that the first touch of the SQEs raised SIGBUS here.
+ */
+static int
+ring_map_fd(struct fz *f)
+{
+	struct stat st;
+	int fd = fcntl(f->ring, F_DUPFD_CLOEXEC, MAP_FD + f->id);
+
+	if (fd < 0)
+		return (-1);
+	if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode) ||
+	    st.st_rdev != kqring_rdev) {
+		close(fd);
+		return (-1);
+	}
+	return (fd);
+}
+
 static void
 ring_open(struct fz *f)
 {
@@ -635,14 +663,22 @@ ring_open(struct fz *f)
 		f->sqmap_len = MAX((size_t)p->sq_off.array +
 		    p->sq_entries * sizeof(unsigned),
 		    (size_t)p->cq_off.cqes + p->cq_entries * cqe);
-		base = mmap(NULL, f->sqmap_len, PROT_READ | PROT_WRITE,
-		    MAP_SHARED, f->ring, IORING_OFF_SQ_RING);
-		if (base == MAP_FAILED)
+		int mfd = ring_map_fd(f);
+
+		if (mfd < 0) {
+			atomic_fetch_add(&st_ring_gone, 1);
 			return;
+		}
+		base = mmap(NULL, f->sqmap_len, PROT_READ | PROT_WRITE,
+		    MAP_SHARED, mfd, IORING_OFF_SQ_RING);
+		if (base == MAP_FAILED) {
+			close(mfd);
+			return;
+		}
 		f->sqmap = f->cqmap = base;
 		f->sqes = mmap(NULL, (size_t)p->sq_entries * f->sqe_size,
-		    PROT_READ | PROT_WRITE, MAP_SHARED, f->ring,
-		    IORING_OFF_SQES);
+		    PROT_READ | PROT_WRITE, MAP_SHARED, mfd, IORING_OFF_SQES);
+		close(mfd);
 		if (f->sqes == MAP_FAILED) {
 			f->sqes = NULL;
 			return;
@@ -1842,6 +1878,33 @@ teardown_watch(void *arg __unused)
 	_exit(3);
 }
 
+/*
+ * The fuzzer itself faulted: say where, and what each thread has mapped.
+ * sudo leaves no core file, and a ring mapping that faults is a kernel bug.
+ */
+static void
+on_fault(int sig, siginfo_t *si, void *ucv)
+{
+	const ucontext_t *uc = ucv;
+
+	dprintf(ERR_FD, "kqring_fuzz: signal %d code %d at %p, rip %#lx\n",
+	    sig, si->si_code, si->si_addr, (u_long)uc->uc_mcontext.mc_rip);
+	for (int i = 0; i < nthreads; i++) {
+		struct fz *f = &fzs[i];
+		const char *call = atomic_load(&f->call);
+
+		dprintf(ERR_FD, "  thread %d: ring %d flags %#x sq %u cq %u "
+		    "sqe %u sqmap %p+%zu cqmap %p+%zu sqes %p arena %p "
+		    "pbuf %p user_mem %p %p call %s\n", i, f->ring, f->p.flags,
+		    f->p.sq_entries, f->p.cq_entries, f->sqe_size, f->sqmap,
+		    f->sqmap_len, f->cqmap, f->cqmap_len, f->sqes, f->arena,
+		    f->pbuf_page, f->user_mem[0], f->user_mem[1],
+		    call != NULL ? call : "-");
+	}
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1879,11 +1942,23 @@ main(int argc, char **argv)
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_usr1;		/* no SA_RESTART: EINTR */
 	sigaction(SIGUSR1, &sa, NULL);
+	sa.sa_handler = NULL;
+	sa.sa_sigaction = on_fault;
+	sa.sa_flags = SA_SIGINFO;
+	sigaction(SIGBUS, &sa, NULL);
+	sigaction(SIGSEGV, &sa, NULL);
 	signal(SIGPIPE, SIG_IGN);
 
 	strlcpy(scratch, "/tmp/kqring_fuzz.XXXXXX", sizeof(scratch));
 	if (mkdtemp(scratch) == NULL || chdir(scratch) != 0)
 		die("scratch directory: %s", strerror(errno));
+	{
+		struct stat st;
+
+		if (stat("/dev/kqring", &st) != 0)
+			die("/dev/kqring: %s", strerror(errno));
+		kqring_rdev = st.st_rdev;
+	}
 	prime_ring_table();
 	socks0 = open_sockets();
 	wired0 = sysctl_num("vm.stats.vm.v_user_wire_count");
@@ -1982,6 +2057,8 @@ main(int argc, char **argv)
 	    (uintmax_t)st_echo, (uintmax_t)st_echo_sent);
 	printf("kqring_fuzz: scratch files O_DIRECT %ju, buffered %ju\n",
 	    (uintmax_t)st_direct, (uintmax_t)st_buffered);
+	printf("kqring_fuzz: new rings closed before mapping %ju\n",
+	    (uintmax_t)st_ring_gone);
 	printf("kqring_fuzz: pipe burst reads %ju, with data %ju\n",
 	    (uintmax_t)st_piperd, (uintmax_t)st_piperd_data);
 	if (atomic_load(&cq_bad)) {
