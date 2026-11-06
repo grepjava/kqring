@@ -374,6 +374,7 @@ kqring_resize_rings(struct kqring_ctx *ctx,
 	struct io_uring_params p;
 	struct kqring_layout l;
 	struct kqring_rmem m, old;
+	struct mtx *kqlock;
 	uint32_t sq_entries, cq_entries, head, tail, chead, ctail;
 	uint32_t *narray;
 	size_t sqe_size, cqe_size;
@@ -454,6 +455,9 @@ kqring_resize_rings(struct kqring_ctx *ctx,
 		memcpy(ncqes + (i & (cq_entries - 1)) * cqe_size,
 		    (char *)ctx->cqes + (i & ctx->cq_mask) * cqe_size,
 		    cqe_size);
+	kqlock = kqring_kp_shm_lock(ctx);
+	if (kqlock != NULL)
+		mtx_lock(kqlock);
 	nshm->sq_head = head;
 	nshm->sq_tail = tail;
 	nshm->cq_head = chead;
@@ -464,6 +468,8 @@ kqring_resize_rings(struct kqring_ctx *ctx,
 	nshm->cq_overflow = shm->cq_overflow;
 	old = ctx->mem;
 	kqring_ring_install(ctx, &m, &l, sq_entries, cq_entries);
+	if (kqlock != NULL)
+		mtx_unlock(kqlock);
 	mtx_unlock(&ctx->mtx);
 	kqring_rmem_free(&old);
 	return (0);
@@ -1382,6 +1388,14 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	}
 
 	/*
+	 * Events a knote kicked the ring with become taskwork for step 3, so
+	 * that an enter made on seeing IORING_SQ_TASKRUN finds what it was
+	 * set for, whether or not it goes on to wait.
+	 */
+	if ((ea->flags & IORING_ENTER_GETEVENTS) != 0)
+		kqring_kpoll_kicked(ctx);
+
+	/*
 	 * 2. Drain and submit queued SQEs.  Nothing is done yet: a stop
 	 * restarts the call (ERESTART).
 	 */
@@ -2275,7 +2289,7 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 		rm_init(&kqring_rings_rm, "kqring rings");
 		mtx_init(&kqring_zc_mtx, "kqring zc", NULL, MTX_DEF);
 		for (int i = 0; i < KQRING_FUTEX_HASH; i++)
-			LIST_INIT(&kqring_futex_hash[i]);
+			TAILQ_INIT(&kqring_futex_hash[i]);
 		for (int i = 0; i < KQRING_PROC_HASH; i++)
 			LIST_INIT(&kqring_proc_hash[i]);
 		kqring_teardown_tq = taskqueue_create("kqring teardown",

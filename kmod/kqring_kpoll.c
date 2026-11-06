@@ -118,6 +118,28 @@ kqring_kp_copyout(void *arg, struct kevent *kevp, int count)
  */
 static struct file *kqring_kp_getfp(struct kqring_ctx *ctx);
 
+/*
+ * A wakeup from anywhere (another process's write(2), say): wake an enter
+ * waiting on the ring, which then takes the event itself, rather than wait
+ * for the poller to take it and wake the enter in turn.  Only flags and
+ * wakeup(): the file's lock is held, which ctx->mtx must not nest inside.
+ * A wakeup missed as the enter goes to sleep leaves it to the poller.
+ *
+ * IORING_SQ_TASKRUN is set here too, as io_uring's waker sets it: a program
+ * that peeks at the CQ after firing a poll then knows to enter, rather than
+ * find nothing until the poller has looked.  The kq lock, which knote()
+ * holds, keeps ctx->shm from going away (kqring_kp_shm_lock()).
+ */
+static inline void
+kqring_kp_kick(struct kqring_ctx *ctx)
+{
+	if ((ctx->flags & IORING_SETUP_TASKRUN_FLAG) != 0)
+		atomic_set_32(&ctx->shm->sq_flags, IORING_SQ_TASKRUN);
+	atomic_store_rel_int(&ctx->kp_kick, 1);
+	if (atomic_load_int(&ctx->cq_sleepers) != 0)
+		wakeup(&ctx->wakeup_chan);
+}
+
 struct kqring_kp_fops {
 	struct filterops	fo;
 	const struct filterops	*orig;
@@ -159,19 +181,8 @@ kqring_kp_filt_event(struct knote *kn, long hint)
 		if (!ready || (prev != KQRING_KP_NOTREADY && last <= prev))
 			return (0);
 		ext[2]++;
-		/*
-		 * A wakeup from anywhere (another process's write(2), say):
-		 * wake an enter waiting on the ring, which then takes the
-		 * event itself, rather than wait for the poller to take it and
-		 * wake the enter in turn.  Only a flag and wakeup(): the file's
-		 * lock is held, which ctx->mtx must not nest inside.  A wakeup
-		 * missed as the enter goes to sleep leaves it to the poller.
-		 */
-		if (ctx != NULL) {
-			atomic_store_rel_int(&ctx->kp_kick, 1);
-			if (atomic_load_int(&ctx->cq_sleepers) != 0)
-				wakeup(&ctx->wakeup_chan);
-		}
+		if (ctx != NULL)
+			kqring_kp_kick(ctx);
 		return (1);
 	}
 	pending = (uint32_t)ext[2] != (uint32_t)(ext[3] >> 32);
@@ -182,7 +193,7 @@ kqring_kp_filt_event(struct knote *kn, long hint)
 /*
  * An end-of-input watch: report only end of input or an error, never
  * data, which the socket's upcall reports.  From knote() (kq lock held),
- * wake an enter waiting on the ring, as kqring_kp_filt_event() does.
+ * kick the ring, as kqring_kp_filt_event() does.
  */
 static int
 kqring_kp_eof_event(struct knote *kn, long hint)
@@ -196,11 +207,8 @@ kqring_kp_eof_event(struct knote *kn, long hint)
 		return (0);
 	if (mtx_owned(&kn->kn_kq->kq_lock)) {
 		ctx = (struct kqring_ctx *)(uintptr_t)kn->kn_kevent.ext[1];
-		if (ctx != NULL) {
-			atomic_store_rel_int(&ctx->kp_kick, 1);
-			if (atomic_load_int(&ctx->cq_sleepers) != 0)
-				wakeup(&ctx->wakeup_chan);
-		}
+		if (ctx != NULL)
+			kqring_kp_kick(ctx);
 	}
 	return (1);
 }
@@ -1353,6 +1361,18 @@ kqring_kpoll_stop(struct kqring_ctx *ctx, bool nowait)
 			return (EINTR);
 	}
 	return (0);
+}
+
+/*
+ * The lock to hold, inside ctx->mtx, while replacing ctx->shm: the kq lock,
+ * under which kqring_kp_kick() uses it.  NULL if the ring has no kqueue.
+ */
+struct mtx *
+kqring_kp_shm_lock(struct kqring_ctx *ctx)
+{
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	return (ctx->kp_fp != NULL ?
+	    &((struct kqueue *)ctx->kp_fp->f_data)->kq_lock : NULL);
 }
 
 /* Close the ring's kqueue (its knotes go with it). */

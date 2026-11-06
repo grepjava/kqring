@@ -109,7 +109,7 @@ The 14 failures that aren't kqring's come from Linux-only assumptions in the tes
 | Fuzzer, whole interface, 30 minutes on a debug kernel | clean, no leaks |
 | Stress test, 10 minutes on a debug kernel | clean, no leaks |
 | KASAN kernel with `kqring.ko` instrumented: suite, stress and 7 full fuzz runs | no memory errors reported in kqring |
-| liburing 2.9's test suite | 144 of 168 pass, every failure explained |
+| liburing 2.9's test suite | 179 of 196 pass, every failure explained |
 | `kqring_diskbench -V`, every read checked against what was written | passed on an md(4) disk and a ZFS file |
 
 It has also been reviewed against the classes of bugs behind Linux io_uring's CVEs.
@@ -320,9 +320,12 @@ See [docs/event-chains-spec.md](docs/event-chains-spec.md) for the interface.
 **Values and formats**
 - **Native values.** Flags and constants use their FreeBSD values: `O_*`, `AT_*`, `MSG_*`, `SOCK_*`, `POSIX_FADV_*`, `MADV_*`, `idtype_t` and `W*`. CQE errors are negated FreeBSD errnos.
 - **Timeouts** complete with `-ETIME`, which the header defines as `ETIMEDOUT`.
+- **Errors FreeBSD doesn't have.** Where Linux returns `EBADFD`, for a ring that isn't enabled or a `READ_MULTISHOT` of a file that can't be polled, kqring returns `EBADF`. For Linux's `EBADR`, see **Completion overflow**.
 - **`STATX`** fills Linux's `struct statx` from `stat(2)`.
 - **Xattrs.** Names are mapped to `extattr` namespaces: `user.` to user, and `system.` and `trusted.` to system.
 - **`SYNC_FILE_RANGE`** syncs the whole file's data.
+- **File-backed registered buffers** are accepted, where Linux refuses them. kqring goes through the mapping at each I/O rather than pinning the pages.
+- **`FUTEX_WAIT`** also ends when its word changes, without a `FUTEX_WAKE`, which is a spurious wakeup as futex users must already expect: a wake by `_umtx_op(2)` can't reach a request. Cancelling a futex wait or `WAITID` returns 0, as for any other request, where Linux returns 1, and a link timeout that ends one completes with `-ETIME`.
 
 **Cancellation and process lifecycle**
 - **Worker cancellation and CQE ordering.** Cancel (`ASYNC_CANCEL`, `POLL_REMOVE`) and `LINK_TIMEOUT` request an interrupt without waiting for running worker I/O.

@@ -823,8 +823,10 @@ kqring_exec_read_multishot(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (error != 0)
 		return (kqring_done(op, -error, 0));
 	if (fp->f_type != DTYPE_PIPE) {
+		/* A file that can't be polled is Linux's EBADFD. */
+		error = fp->f_type == DTYPE_VNODE ? EBADF : EOPNOTSUPP;
 		fdrop(fp, td);
-		return (kqring_done(op, -EOPNOTSUPP, 0));
+		return (kqring_done(op, -error, 0));
 	}
 	rpipe = fp->f_data;
 	PIPE_LOCK(rpipe);

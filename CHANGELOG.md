@@ -8,6 +8,16 @@
 
 - A poll on another ring now always completes before the enter that fired it returns, on a ring without `DEFER_TASKRUN` or SQPOLL. It used to complete just after, about once in tens of thousands of rounds, when the ring's poller had taken the event and not yet recorded it, or when the ring's completion thread was posting it. Past 8 polling rings in a process, or 32 events on one ring, the rest also had to wait for the poller.
 
+- `FUTEX_WAKE` now wakes waiters in the order they came, where it woke the newest first.
+- `IORING_REGISTER_RESTRICTIONS` now accepts an empty set, which denies everything, as on Linux. It used to fail with `EINVAL`.
+- `IORING_SQ_TASKRUN` is now set by whatever fires a poll, on a ring with `IORING_SETUP_TASKRUN_FLAG`, and an enter that doesn't wait now posts that poll's CQE. A program that peeked at the CQ straight after firing a poll could find nothing and no sign that it should enter, until the ring's poller had looked.
+- `READ_MULTISHOT` of a file that can't be polled now completes with `EBADF`, where Linux has `EBADFD`, rather than `EOPNOTSUPP`, with or without `IOSQE_ASYNC`.
+
+### Testing
+
+- `tests/kqring_fuzz.c` now really exercises futexes, whose wake masks all failed validation before, and resizes rings with requests in flight.
+- liburing 2.9: 179 of 196 tests pass, up from 144 of 168. 28 of the 32 tests that weren't built now are, and the other 4 are listed as not portable. Tests that stopped on portability problems, or on an early failure, before they reached what they test now run, and `regbuf-merge` now really calls kqring: it used to pass by making unrelated FreeBSD system calls. Every adapted test is listed in [`liburing/README.md`](liburing/README.md#adapted-tests).
+
 ### Documentation
 
 - `README.md` now explains what kqring is and why it exists, and `ARCHITECTURE.MD` covers kernel threads, where a request goes, disk I/O, read ordering, the extensions and testing, and no longer describes names the code has dropped. Its description of the ring header was wrong: all the indices share one 64-byte cache line.

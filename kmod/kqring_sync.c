@@ -59,7 +59,7 @@ kqring_futex_unhash_locked(struct kqring_op *op)
 	mtx_lock(&kqring_futex_mtx);
 	for (; i < op->nfwait; i++) {
 		if (fw[i].hashed) {
-			LIST_REMOVE(&fw[i], link);
+			TAILQ_REMOVE(kqring_futex_bucket(&fw[i].key), &fw[i], link);
 			fw[i].hashed = false;
 		}
 	}
@@ -114,7 +114,7 @@ kqring_futex_arm(struct kqring_ctx *ctx, struct kqring_op *op)
 	/* Hash before reading the words, so a racing FUTEX_WAKE is seen. */
 	mtx_lock(&kqring_futex_mtx);
 	for (i = 0; i < op->nfwait; i++) {
-		LIST_INSERT_HEAD(kqring_futex_bucket(&fw[i].key), &fw[i], link);
+		TAILQ_INSERT_TAIL(kqring_futex_bucket(&fw[i].key), &fw[i], link);
 		fw[i].hashed = true;
 	}
 	mtx_unlock(&kqring_futex_mtx);
@@ -158,7 +158,8 @@ kqring_futex_wake(const struct io_uring_sqe *sqe)
 	if (error != 0)
 		return (-error);
 	mtx_lock(&kqring_futex_mtx);
-	LIST_FOREACH(fw, kqring_futex_bucket(&key), link) {
+	/* Oldest first: a wake takes waiters in the order they came. */
+	TAILQ_FOREACH(fw, kqring_futex_bucket(&key), link) {
 		struct kqring_op *op = fw->op;
 
 		if ((uint64_t)n >= nr)

@@ -184,7 +184,7 @@ kqring_restrictions_register(struct kqring_ctx *ctx,
 		return (EBADF);
 	if (r->registered)
 		return (EBUSY);
-	if (ra->arg == NULL || ra->nr_args == 0 || ra->nr_args >
+	if (ra->arg == NULL || ra->nr_args >
 	    IORING_RESTRICTION_LAST + IORING_REGISTER_LAST + IORING_OP_LAST)
 		return (EINVAL);
 	for (uint32_t i = 0; i < ra->nr_args && error == 0; i++) {

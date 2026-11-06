@@ -2244,9 +2244,11 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 		 * before submission completes in this same enter, without an
 		 * upcall + taskwork round trip.  A multishot poll is armed
 		 * directly, so that readiness that already exists is reported
-		 * once (through ready_now).
+		 * once (through ready_now).  READ_MULTISHOT has no worker to
+		 * defer to, so it tries here regardless.
 		 */
-		if ((sqe->flags & IOSQE_ASYNC) == 0 &&
+		if (((sqe->flags & IOSQE_ASYNC) == 0 ||
+		    sqe->opcode == IORING_OP_READ_MULTISHOT) &&
 		    (sqe->opcode != IORING_OP_POLL_ADD ||
 		    (sqe->len & IORING_POLL_ADD_MULTI) == 0)) {
 			if (kqring_op_attempt(ctx, op, NULL) == 0) {

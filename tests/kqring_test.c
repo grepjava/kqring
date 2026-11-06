@@ -4152,6 +4152,21 @@ test_futex_wake(struct test_ring *r)
 	expect_cqe(r, 31002, 1);
 	expect_cqe(r, 31001, 0);
 
+	/* A wake takes waiters in the order they came. */
+	prep_futex(r, IORING_OP_FUTEX_WAIT, &w, 0, 0, 31020);
+	prep_futex(r, IORING_OP_FUTEX_WAIT, &w, 0, 0, 31021);
+	ring_submit(r);
+	prep_futex(r, IORING_OP_FUTEX_WAKE, &w, 1, 0, 31022);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	expect_cqe(r, 31022, 1);
+	expect_cqe(r, 31020, 0);
+	prep_futex(r, IORING_OP_FUTEX_WAKE, &w, 1, 0, 31023);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	expect_cqe(r, 31023, 1);
+	expect_cqe(r, 31021, 0);
+
 	/* Masks must intersect. */
 	prep_futex(r, IORING_OP_FUTEX_WAIT, &w, 0, 0x1, 31003);
 	ring_submit(r);
@@ -4478,13 +4493,17 @@ test_read_multishot(struct test_ring *r)
 	assert((c.flags & (IORING_CQE_F_MORE | IORING_CQE_F_BUFFER)) == 0);
 	close(pfd[0]);
 
-	/* Regular files are not supported for READ_MULTISHOT. */
+	/* A file that can't be polled: EBADF, Linux's EBADFD. */
 	int nfd = open("/dev/null", O_RDONLY);
 	assert(nfd >= 0);
 	sqe = ring_prep(r, IORING_OP_READ_MULTISHOT, nfd, 35003);
 	sqe->flags = IOSQE_BUFFER_SELECT;
 	ring_push_sqe(r);
-	assert(submit_one(r) == -EOPNOTSUPP);
+	assert(submit_one(r) == -EBADF);
+	sqe = ring_prep(r, IORING_OP_READ_MULTISHOT, nfd, 35004);
+	sqe->flags = IOSQE_BUFFER_SELECT | IOSQE_ASYNC;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EBADF);
 	close(nfd);
 	printf("[PASS] READ_MULTISHOT on socket and pipe, until EOF\n");
 }
@@ -5645,6 +5664,16 @@ test_restrictions(struct test_ring *r)
 
 	/* Only on a ring that is still disabled. */
 	assert(reg(r, IORING_REGISTER_RESTRICTIONS, res, 1) == -EBADF);
+
+	/* An empty set is allowed, and denies everything. */
+	ring_setup(&t);
+	assert(reg(&t, IORING_REGISTER_RESTRICTIONS, res, 0) == 0);
+	assert(reg(&t, IORING_REGISTER_ENABLE_RINGS, NULL, 0) == 0);
+	assert(reg(&t, IORING_REGISTER_PROBE, probe, 4) == -EACCES);
+	prep_nop(&t, 47000, 0);
+	assert(submit_one(&t) == -EACCES);
+	close(t.fd);
+
 	ring_setup(&t);
 	assert(reg(&t, IORING_REGISTER_RESTRICTIONS, &badres, 1) == -EINVAL);
 	assert(reg(&t, IORING_REGISTER_RESTRICTIONS, res, 3) == 0);
@@ -8268,6 +8297,83 @@ poll_test_gap(unsigned us)
  * tens of thousands, so debug kernels hold the poller in the gap to make
  * it every round.
  */
+static _Atomic bool taskrun_stop;
+
+static void *
+taskrun_writer(void *arg)
+{
+	int *p = arg;
+	char ch = 0;
+
+	while (!atomic_load(&taskrun_stop)) {
+		assert(write(p[1], &ch, 1) == 1);
+		assert(read(p[0], &ch, 1) == 1);
+	}
+	return (NULL);
+}
+
+/*
+ * IORING_SQ_TASKRUN is up by the time the write that fired a poll returns,
+ * and an enter that doesn't wait then posts the CQE, as a program that peeks
+ * at the CQ relies on.  The waker sets it through
+ * ctx->shm, which RESIZE_RINGS replaces and frees under it.
+ */
+static void
+test_taskrun_on_wakeup(void)
+{
+	struct io_uring_params p;
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	pthread_t th;
+	int fds[2], late = 0, resized = 0;
+	char ch = 0;
+
+	ring_init(&t);
+	assert(pipe(fds) == 0);
+	for (int i = 0; i < 2000; i++) {
+		poll_ring_arm(&t, fds[0], 77800);
+		assert(write(fds[1], &ch, 1) == 1);
+		if ((atomic_load(t.sq_kflags) & IORING_SQ_TASKRUN) == 0)
+			late++;
+		assert(kqring_enter(t.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL,
+		    0) == 0);
+		if (ring_cq_ready(&t) == 0) {
+			late++;
+			assert(ring_wait(&t, 1, 2000) == 0);
+		}
+		assert(ring_pop_cqe(&t).user_data == 77800);
+		assert(read(fds[0], &ch, 1) == 1);
+	}
+	assert(late == 0);
+
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, fds[0], 77801);
+	sqe->poll32_events = POLLIN;
+	sqe->len = IORING_POLL_ADD_MULTI;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	atomic_store(&taskrun_stop, false);
+	assert(pthread_create(&th, NULL, taskrun_writer, fds) == 0);
+	for (int i = 0; i < 2000; i++) {
+		int rc;
+
+		memset(&p, 0, sizeof(p));
+		p.sq_entries = (i & 1) != 0 ? 8 : 16;
+		p.cq_entries = p.sq_entries * 2;
+		p.flags = IORING_SETUP_CQSIZE;
+		rc = reg(&t, IORING_REGISTER_RESIZE_RINGS, &p, 1);
+		assert(rc == 0 || rc == -EOVERFLOW);
+		resized += rc == 0;
+	}
+	atomic_store(&taskrun_stop, true);
+	assert(pthread_join(th, NULL) == 0);
+	assert(resized > 0);
+	close(t.fd);
+	close(fds[0]);
+	close(fds[1]);
+	printf("[PASS] IORING_SQ_TASKRUN set by the waker, %d resizes under "
+	    "wakeups\n", resized);
+}
+
 static void
 test_poll_before_return(void)
 {
@@ -11998,6 +12104,7 @@ main(int argc, char **argv)
 		test_resize_rings();
 		test_poll_same_thread();
 		test_poll_before_return();
+		test_taskrun_on_wakeup();
 		test_cq_backpressure();
 		test_sync_cancel_worker();
 		test_tag_failed_register();

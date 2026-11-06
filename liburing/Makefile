@@ -30,7 +30,8 @@ CPPFLAGS=	-D_GNU_SOURCE \
 		-include ${OVERLAY}/include/config-host.h
 LIB_SRCS=	setup.c queue.c register.c syscall.c version.c
 # Test programs only: Linux behaviour they depend on (see the header).
-TEST_CPPFLAGS=	-include ${OVERLAY}/include/test-compat.h
+TEST_CPPFLAGS=	-I${OVERLAY}/test-include \
+		-include ${OVERLAY}/include/test-compat.h
 
 .PHONY: all lib examples tests check clean
 
@@ -44,6 +45,7 @@ ${WRKSRC}/.patched:
 	    { echo "${DISTFILE}: checksum mismatch"; exit 1; }
 	cd ${WRKDIR} && tar xzf ${DISTFILE}
 	cd ${WRKSRC} && patch -s -p0 < ${OVERLAY}/freebsd.diff
+	cd ${WRKSRC} && patch -s -p0 < ${OVERLAY}/tests.diff
 	mkdir -p ${WRKSRC}/src/arch/freebsd
 	printf '#ifndef LIBURING_VERSION_H\n#define LIBURING_VERSION_H\n#define IO_URING_VERSION_MAJOR %s\n#define IO_URING_VERSION_MINOR %s\n#endif\n' \
 	    ${LIBURING_VERSION:R} ${LIBURING_VERSION:E} \

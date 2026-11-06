@@ -8,7 +8,8 @@ The port is a small overlay, not a fork:
 - [`freebsd/freebsd.diff`](freebsd/freebsd.diff) is a 35-line patch to liburing's `src/syscall.h`, `queue.c` and `register.c`.
 - [`freebsd/syscall.h`](freebsd/syscall.h) routes liburing's three system calls to `kqring_setup()`, `kqring_enter()` and `kqring_register()`.
 - [`freebsd/include/`](freebsd/include/) holds a few small Linux headers (`linux/types.h`, `linux/time_types.h`, …), `liburing/compat.h`, and `config-host.h`, which stands in for liburing's `configure` output.
-- [`freebsd/include/test-compat.h`](freebsd/include/test-compat.h) is included into liburing's test programs only, never the library. It supplies two pieces of Linux behaviour some tests depend on (see [Test results](#test-results)).
+- [`freebsd/include/test-compat.h`](freebsd/include/test-compat.h) and [`freebsd/test-include/`](freebsd/test-include/) go into liburing's test programs only, never the library. They supply the Linux headers and behaviour the tests depend on.
+- [`freebsd/tests.diff`](freebsd/tests.diff) changes a few lines in some tests (see [Adapted tests](#adapted-tests)).
 
 ## Building
 
@@ -28,28 +29,26 @@ As with the raw interface, flag values passed through SQEs (`O_*`, `MSG_*`, `SOC
 
 ## Test results
 
-liburing's test suite, run on FreeBSD 15.1 with `kqring.ko` from this tree (November 2026, with the test directory on ZFS):
+liburing's test suite, run on FreeBSD 15.1 with `kqring.ko` from this tree (November 2026, with the test directory on ZFS and `RLIMIT_MEMLOCK` raised):
 
 | | Tests |
 |---|---|
-| Built | 168 (32 more need Linux-only headers or system calls) |
-| Passed | **142** (144 with `RLIMIT_MEMLOCK` raised) |
-| Skipped | 7 (the test found a feature missing and said so) |
-| Failed | 19, explained below |
+| In liburing 2.9 | 202 |
+| Built | 196 |
+| Passed | **179** |
+| Skipped | 10 (the test found a feature missing and said so) |
+| Failed | 7, explained below |
+| Not built | 4 not portable, 2 AddressSanitizer only, explained below |
 
-liburing's two AddressSanitizer tests (`xfail_*`) aren't built. liburing itself only builds them with ASan, and without it they wait forever by design.
+`fixed-buf-merge` and `read-write` register more buffer memory than FreeBSD's default `RLIMIT_MEMLOCK` (64 KiB; Linux uses 8 MiB), so they need it raised: `ulimit -l 65536` as root, or `memorylocked` in `login.conf(5)`.
+
+These results aren't a compatibility percentage. Some of the tests are adapted, as listed below, and a test stops at its first failure, so the subtests after it haven't run. That applies to `pipe-reuse` and `splice` in particular, which stop early.
 
 ### Failures that are not kqring's
 
 | Tests | Why they fail |
 |---|---|
-| `fixed-buf-merge`, `read-write` | They register more buffer memory than FreeBSD's default `RLIMIT_MEMLOCK` (64 KiB; Linux uses 8 MiB). Both pass with the limit raised: `ulimit -l 65536` as root, or `memorylocked` in `login.conf(5)`. |
-| `socket`, `send_recv`, `send_recvmsg`, `recv-msgall-stream`, `across-fork` | The test unlocks a `pthread_mutex` from a thread that doesn't own it. glibc allows this; FreeBSD's libthr rejects it, and the test then crashes. |
-| `232c93d07b74`, `accept-test` | Linux's abstract AF_UNIX addresses (a name starting with `\0`). |
-| `recv-multishot` | Passes a one-byte `bool` to `setsockopt(2)`, which FreeBSD rejects with `EINVAL`. |
-| `bind-listen` | Uses an uninitialised `struct __kernel_timespec`. |
-| `self` | Reads `/proc/self`. |
-| `truncate` | Passes Linux-only flags to `mkostemp(3)`. |
+| `self` | Reads `/proc/self`, and the test host has no procfs mounted. |
 | `fallocate` | Fails only when the test directory is on ZFS, which doesn't support preallocation: the `FALLOCATE` completes with `EOPNOTSUPP`. |
 | `pipe-reuse`, `splice` | FreeBSD writes large blocks to a pipe directly from the writer's pages, and such a `write(2)` blocks until a reader has taken all of it, which these tests don't expect. |
 
@@ -57,17 +56,57 @@ liburing's two AddressSanitizer tests (`xfail_*`) aren't built. liburing itself 
 
 | Tests | Why they fail |
 |---|---|
-| `io-cancel`, `timeout` | A forked child submits to, or cancels on, its parent's ring. kqring rings belong to one process: workers resolve descriptors in the owner's table, so allowing another process could let it reach files it can't see, for example from inside a Capsicum sandbox. The child gets `EEXIST`. |
-| `waitid` | Expects Linux's result for a `WAITID` cancelled by a link timeout, which reflects an implementation detail of Linux rather than a documented rule. |
+| `across-fork` | A forked child submits to its parent's ring. kqring rings belong to one process: workers resolve descriptors in the owner's table, so allowing another process could let it reach files it can't see, for example from inside a Capsicum sandbox. The child gets `EEXIST`. |
+| `io_uring_register` | Registers a file-backed buffer and expects a refusal. Linux refuses because it pins the pages for as long as the buffer is registered. kqring goes through the mapping at each I/O, so it has no such problem, and accepts the buffer. |
+
+### Not implemented yet
+
+| Tests | Why they fail |
+|---|---|
+| `reg-wait` | Needs `IORING_REGISTER_MEM_REGION` and registered waits, which are [phase 3 of the roadmap](../ROADMAP.MD#phase-3-wait-semantics). |
 
 ### Skipped tests
 
-The 7 skips are tests that check for a feature and report its absence:
+The 10 skips are tests that check for a feature and report its absence:
 
 - **Not implemented in kqring:**
   - `IOPOLL` on an `O_DIRECT` file in the test's directory, which completes with `-EOPNOTSUPP` (`500f9fbadef8`).
-- **Linux-only facilities:** fault injection (`fc2a85cb02ef`), fsnotify (`fsnotify`), ublk (`uring_cmd_ublk`), and `/proc` paths (`wq-aff`).
+- **Linux-only facilities:** fault injection (`fc2a85cb02ef`), fsnotify (`fsnotify`), ublk (`uring_cmd_ublk`), `/proc` paths (`wq-aff`), and requested huge pages (`fixed-hugepage`).
+- **`napi-test`** needs root and a script that sets up Linux network namespaces.
 - **`ring-leak`** skips because a ring descriptor can't be sent with `SCM_RIGHTS`, as on Linux 6.7 and later. FreeBSD refuses with `EOPNOTSUPP` where Linux uses `EINVAL`, and `test-compat.h` maps one to the other for the tests.
 - **`read-mshot-stdin`** only runs when given an argument; it skips in an unattended run, as on Linux.
+- **`socket-io-cmd`** skips its last part without root, which needs a raw socket. The rest passes first, and the whole test passes as root.
+
+### Tests that aren't built
+
+| Tests | Why |
+|---|---|
+| `pollfree`, `sigfd-deadlock` | They test `signalfd(2)`, which FreeBSD doesn't have. |
+| `cmd-discard` | Linux's block-device commands through `URING_CMD`, which kqring doesn't support. |
+| `io_uring_passthrough` | NVMe passthrough through `URING_CMD`, which kqring doesn't support. |
+| `xfail_*` (2) | liburing only builds these with AddressSanitizer. Without it, they wait forever by design. |
+
+### Adapted tests
+
+Everything the tests need beyond liburing's own sources is in the overlay, so what differs from upstream can be read there. [`test-include/`](freebsd/test-include/) and `test-compat.h` supply Linux headers and calls: an epoll over kqueue, `prctl(PR_SET_PDEATHSIG)` through `procctl(2)`, futex calls through `_umtx_op(2)`, and `EBADFD` and `EBADR` as the errors kqring returns for them.
+
+The tests that are changed, or that test something else, are:
+
+| Tests | Change | Why |
+|---|---|---|
+| `statx` | Compares with `fstatat(2)`, through `test-compat.h` | FreeBSD has no `statx(2)`. Without a reference, the test would pass without comparing anything. |
+| `regbuf-merge` | Linux's system call numbers go to kqring, through `test-compat.h` | Otherwise it makes whichever FreeBSD system calls have those numbers, and never reaches kqring. |
+| `socket-getsetsock-cmd` | Uses `TCP_KEEPIDLE` for `TCP_USER_TIMEOUT`, `SO_TYPE` for `SO_PEERNAME`, and compares `SO_REUSEPORT` as true or false | FreeBSD has neither option, and `getsockopt(2)` returns the option's bit rather than 1. |
+| `socket-io-cmd` | Waits 300 ms after sending | FreeBSD counts data as sent until a delayed ACK comes back, so it shows on both ends at first. |
+| `futex` | A wake doesn't change the word, and a cancel expects 0 | See [Differences from Linux](../README.md#differences-from-linux). |
+| `waitid` | Expects `-ETIME` from a link timeout and 0 from a cancel | Linux's 1 for both is what cancelling a `WAITID` returns inside the kernel, not a documented result. |
+| `io-cancel`, `timeout` | Leave out the subtests in which a forked child uses its parent's ring | See `across-fork` above. |
+| `poll-v-poll` | Takes `EOPNOTSUPP` as `EPOLL_CTL` not being supported, as it does `EINVAL` | FreeBSD has no epoll. The test polls a kqueue in place of an epoll descriptor. |
+| `socket`, `send_recv`, `send_recvmsg`, `recv-msgall-stream` | A semaphore replaces a mutex used as a signal ([`mutex-signal.h`](freebsd/test-include/mutex-signal.h)) | The tests unlock a mutex from a thread that doesn't own it, which glibc allows and FreeBSD's libthr refuses. |
+| `232c93d07b74`, `accept-test` | Socket paths in `/tmp` | FreeBSD has no abstract AF_UNIX addresses. |
+| `across-fork` | `mmap(2)` with a descriptor of -1 | FreeBSD refuses descriptor 0 for an anonymous mapping. |
+| `bind-listen` | Sets a timeout it leaves uninitialised | |
+| `recv-multishot` | An `int` for a one-byte `bool` passed to `setsockopt(2)` | FreeBSD refuses the `bool` with `EINVAL`. |
+| `truncate` | `mkstemp(3)` for `mkostemp(3)` | The test passes flags that FreeBSD's `mkostemp(3)` refuses. |
 
 To run a single test: `cd work/out/test && ./<name>.t` (exit 0 = pass, 77 = skip).

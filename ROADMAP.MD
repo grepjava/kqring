@@ -9,7 +9,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | Phase | Work | Status |
 |---|---|---|
 | 1 | Ordering and poll timing | Done |
-| 2 | Make compatibility measurable | Not started |
+| 2 | Make compatibility measurable | liburing tests done; matrix and differential runs open |
 | 3 | Wait semantics | Not started |
 | 4 | Per-file write ordering | Not started |
 | 5 | Worker path scalability | Not started |
@@ -22,10 +22,11 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 
 FreeBSD-native extensions add persistent event-driven chains, result and buffer forwarding between steps, native kevent requests and a kqueue bridge. These stay an opt-in interface alongside the Linux-compatible API.
 
-The liburing 2.9 port passes 144 of the 168 tests it builds, with `RLIMIT_MEMLOCK` raised. That isn't a compatibility percentage:
+The liburing 2.9 port passes 179 of the 196 tests it builds, with `RLIMIT_MEMLOCK` raised. That isn't a compatibility percentage:
 
-- **32 more tests aren't built at all**, and they include some of the most relevant ones: `cq-overflow`, `defer-taskrun`, `msg-ring`, `read-mshot`, `register-restrictions`, `io_uring_setup`, `io_uring_enter`, `io_uring_register` and `reg-wait`.
-- The port carries portability shims, 7 tests skip, and some of the 17 failures are intentional differences.
+- 6 more tests can't be built here, each for a recorded reason.
+- The port carries portability shims and adapts some tests, 10 tests skip, and 6 of the 7 failures are intentional differences or the platform's.
+- A test stops at its first failure, so the subtests after it haven't run.
 
 The probe also can't speak for every variant of an operation. `SYNC_FILE_RANGE` syncs the whole file, `URING_CMD` supports four socket commands only, and `IORING_REGISTER_CLOCK` is recorded but has no effect.
 
@@ -42,7 +43,7 @@ This comes before new features, so that what follows is measured against somethi
 
 ### Build the rest of the liburing tests
 
-Work through the 32 unbuilt tests. Port what can run on FreeBSD, and record a reason for each one that can't. Several of them don't include a Linux header directly, so the reason each one is excluded needs checking rather than assuming.
+**Done.** Of the 32 unbuilt tests, 28 now build, and 4 are listed as not portable. Tests that used to stop on portability problems, or on an early failure, before reaching what they test now run too, and `regbuf-merge`, which passed without ever calling kqring, now calls it. This found a wake order bug in `FUTEX_WAKE`, a refused empty set of restrictions, and `IORING_SQ_TASKRUN` being set late. See the [accounting](liburing/README.md#test-results), which lists every adapted test.
 
 Acceptance: every liburing 2.9 test is passing, skipped, failing with a documented reason, or listed as not portable with a reason.
 

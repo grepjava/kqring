@@ -592,6 +592,8 @@ ring_open(struct fz *f)
 	/* Setups io_uring programs use, plus a few optional flags. */
 	static const uint32_t templates[] = {
 		IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN,
+		IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+		    IORING_SETUP_TASKRUN_FLAG,
 		0,
 		IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG,
 		IORING_SETUP_SQPOLL,
@@ -1342,14 +1344,18 @@ sqe_struct(struct fz *f, struct io_uring_sqe *s)
 		s->file_index = (uint32_t)rn(f, 17);
 		break;
 	case 16: {
+		/* Mostly a few shared words, for wakes to find their waits. */
+		static uint32_t words[4];
 		uint32_t *w = (void *)(uintptr_t)arena_buf(f, 4);
 
 		w = (uint32_t *)((uintptr_t)w & ~(uintptr_t)3);
+		if (chance(f, 80))
+			w = &words[rn(f, nitems(words))];
 		s->opcode = chance(f, 50) ? IORING_OP_FUTEX_WAIT :
 		    IORING_OP_FUTEX_WAKE;
 		s->addr = (uint64_t)(uintptr_t)w;
 		s->addr2 = s->opcode == IORING_OP_FUTEX_WAIT ? *w : rn(f, 4);
-		s->addr3 = ~0ULL;
+		s->addr3 = chance(f, 90) ? UINT32_MAX : ~0ULL;
 		s->fd = FUTEX2_SIZE_U32;
 		break;
 	}
@@ -1708,11 +1714,22 @@ do_register(struct fz *f)
 	    (unsigned)rnd(f);
 	void *arg = (void *)(uintptr_t)gen_ptr(f);
 	unsigned nr = (unsigned)(chance(f, 80) ? rn(f, 17) : rnd(f));
+	struct io_uring_params rp;
 	long r;
 
 	if (op == IORING_REGISTER_ENABLE_RINGS || op == IORING_REGISTER_PROBE ||
 	    chance(f, 5))
 		nr = op == IORING_REGISTER_PROBE ? (unsigned)rn(f, 300) : 0;
+	/* A resize that can work, under whatever the ring has in flight. */
+	if ((f->p.flags & IORING_SETUP_DEFER_TASKRUN) != 0 && chance(f, 10)) {
+		memset(&rp, 0, sizeof(rp));
+		rp.sq_entries = 1U << (1 + rn(f, 6));
+		rp.cq_entries = rp.sq_entries * 2;
+		rp.flags = IORING_SETUP_CQSIZE;
+		op = IORING_REGISTER_RESIZE_RINGS;
+		arg = &rp;
+		nr = 1;
+	}
 	r = CALL(f, "kqring_register", kqring_register(f->ring, op, arg, nr));
 	atomic_fetch_add(&st_regs, 1);
 	/* A resized ring is mapped anew; this one just closes. */

@@ -451,7 +451,7 @@ LIST_HEAD(kqring_poll_head, kqring_op);
  * then ctx->mtx.
  */
 struct kqring_fwait {
-	LIST_ENTRY(kqring_fwait) link;
+	TAILQ_ENTRY(kqring_fwait) link;
 	struct kqring_op	*op;
 	struct umtx_key		key;
 	uint64_t		uaddr;
@@ -465,7 +465,7 @@ struct kqring_fwait {
 
 #define	KQRING_FUTEX_HASH	256
 
-LIST_HEAD(kqring_fwait_list, kqring_fwait);
+TAILQ_HEAD(kqring_fwait_list, kqring_fwait);
 extern struct kqring_fwait_list kqring_futex_hash[KQRING_FUTEX_HASH];
 extern struct mtx kqring_futex_mtx;
 
@@ -1786,6 +1786,7 @@ void	kqring_kq_rescan(struct kqring_ctx *ctx);
 void	kqring_kev_issue(struct kqring_ctx *ctx, struct kqring_op *op);
 int	kqring_kpoll_stop(struct kqring_ctx *ctx, bool nowait);
 void	kqring_kpoll_close(struct kqring_ctx *ctx);
+struct mtx *kqring_kp_shm_lock(struct kqring_ctx *ctx);
 
 /* Whether the ring has a kthread (SQPOLL, or completions only). */
 static inline bool
