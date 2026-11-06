@@ -5,7 +5,7 @@
 ### Documentation
 
 - `README.md` now explains what kqring is and why it exists, and `ARCHITECTURE.MD` covers kernel threads, where a request goes, disk I/O, read ordering, the extensions and testing, and no longer describes names the code has dropped. Its description of the ring header was wrong: all the indices share one 64-byte cache line.
-- Every table in `BENCHMARK.MD` is re-measured on `v0.3.0`, with the raw runs in `docs/bench/data/`, and the charts are redrawn. md(4) disks are now filled first. Reads of unwritten blocks are far cheaper, so 32 reads per enter are about 2.9× `pread(2)`, not 4.5×.
+- Every table in `BENCHMARK.MD` is re-measured on `v0.3.0`, with the raw runs in `docs/bench/data/`, and the charts are redrawn. md(4) disks are now filled first. Reads of unwritten blocks are far cheaper, so 32 reads per enter are about 2.9× `pread(2)`, not 4.5×. `tests/bench_doc.py` writes the document from those runs.
 
 ## 0.3.0 — 2026-11-06
 

@@ -38,7 +38,7 @@ Every figure here is from one build, [`v0.3.0`](https://github.com/grepjava/kqri
 - A run measures the mean wall-clock time per operation over 20,000–524,288 operations. An operation is one message received or sent, one connection accepted, one read or one timer.
 - `kqring_bench` is **single-threaded on loopback**, and the process isn't pinned to a CPU. The sender and receiver are the same thread, so it measures the per-operation cost of each mechanism, not throughput under load. The echo group uses two threads.
 - Most rows vary less than 5% between runs. The exceptions are sends of 16–64 KiB (up to 10%), the kqueue timer (19%), 32 disk reads through workers (13%), one fan-in row with a single slow run (35%, at N = 16 batched), and ZFS file reads (see [Pipes and files](#pipes-and-files-inline-or-through-a-worker)).
-- The charts are drawn from the raw runs by [`tests/bench_report.py`](tests/bench_report.py).
+- The charts are drawn from the raw runs by [`tests/bench_report.py`](tests/bench_report.py), and this document is written from them by [`tests/bench_doc.py`](tests/bench_doc.py).
 
 ## Results
 
@@ -350,6 +350,7 @@ Each line of output is `ROW <group> <variant> <ns/op>`. To match these tables, r
 
 ```sh
 python3 tests/bench_report.py docs/bench docs/bench/data/*
+python3 tests/bench_doc.py
 ```
 
 Runs on other file systems and disks are selected by name and environment: `KQRING_BENCH_FILE_DIR` puts the `file` group's 64 MiB temporary file in a directory of your choice (these tables use a UFS file system on an md(4) disk, saved as `ufs.*.out`), and the `disk` group runs only with `KQRING_BENCH_DISK` set to a device it may overwrite (`sudo mdconfig -a -t malloc -s 64m -u 9 && sudo chown $USER /dev/md9`, filled with `dd if=/dev/urandom of=/dev/md9 bs=1m`, saved as `disk.*.out`).
