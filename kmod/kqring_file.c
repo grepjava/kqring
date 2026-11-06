@@ -13,6 +13,17 @@
 static int	kqring_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 	    bool is_write, bool nowait, bool *punt);
 
+/*
+ * A FIFO's file is a pipe's for reading: pipeops, a struct pipe in f_data,
+ * and PIPE_EOF as read(2) sees it.  Not for writing, where a FIFO is its own
+ * peer (PIPE_PEER()) and has no pipe_peer to look at.
+ */
+static bool
+kqring_pipe_reads(const struct file *fp)
+{
+	return (fp->f_type == DTYPE_PIPE || fp->f_type == DTYPE_FIFO);
+}
+
 static bool
 kqring_pipe_readable(const struct file *fp)
 {
@@ -20,7 +31,7 @@ kqring_pipe_readable(const struct file *fp)
 	bool ok;
 
 	/* O_NONBLOCK too: io_uring waits for a non-blocking pipe's data. */
-	if (fp->f_type != DTYPE_PIPE)
+	if (!kqring_pipe_reads(fp))
 		return (true);
 	rpipe = fp->f_data;
 	PIPE_LOCK(rpipe);
@@ -36,7 +47,8 @@ kqring_pipe_will_block(const struct file *fp, bool is_write, size_t want)
 	struct pipe *p, *wpipe;
 	bool block;
 
-	if (fp->f_type != DTYPE_PIPE || (fp->f_flag & FNONBLOCK) != 0 ||
+	if (!(is_write ? fp->f_type == DTYPE_PIPE : kqring_pipe_reads(fp)) ||
+	    (fp->f_flag & FNONBLOCK) != 0 ||
 	    (fp->f_flag & (is_write ? FWRITE : FREAD)) == 0)
 		return (false);
 	p = fp->f_data;
@@ -362,8 +374,9 @@ kqring_file_bio_try(struct kqring_ctx *ctx, struct kqring_op *op,
  * that cannot block it, as io_uring tries non-blocking I/O before punting
  * to io-wq:
  *
- *  - A pipe with data to read (or room to write), blocking or not, read
- *    or written as if O_NONBLOCK (kqring_pipe_rw_nowait()).  If another
+ *  - A pipe with data to read (or room to write), or a FIFO with data to
+ *    read, blocking or not, read or written as if O_NONBLOCK
+ *    (kqring_pipe_rw_nowait()).  If another
  *    reader drained it since the check, the read goes to a worker; a
  *    write that filled it leaves the rest to a worker.
  *  - A positioned read of a regular file that the page cache satisfies.
@@ -414,8 +427,9 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	 * O_NONBLOCK, as io_uring polls rather than fail with EAGAIN; with
 	 * RWF_NOWAIT the issuer fails it instead.
 	 */
-	if (fp->f_type == DTYPE_PIPE && (is_write ?
-	    !kqring_pipe_will_block(fp, true, 1) : kqring_pipe_readable(fp))) {
+	if (is_write ? fp->f_type == DTYPE_PIPE &&
+	    !kqring_pipe_will_block(fp, true, 1) :
+	    kqring_pipe_reads(fp) && kqring_pipe_readable(fp)) {
 		bool punt;
 
 		fdrop(fp, td);
@@ -661,15 +675,15 @@ retry:
 		}
 	}
 	/*
-	 * Reads of a pipe post their CQEs in the order they got the data, as
-	 * in io_uring, where the read and the CQE are one step.  A worker
-	 * keeps pipe_sx until its op is on taskwork_ops (kqring_wq_thread()),
-	 * so it must not wait for the pipe with it.  The issuer posts its own
-	 * CQE before it runs any taskwork, so it only has to leave a read to
-	 * a worker while older ones are still to post, unless RWF_NOWAIT
-	 * would turn that into a failure.
+	 * Reads of a pipe or FIFO post their CQEs in the order they got the
+	 * data, as in io_uring, where the read and the CQE are one step.  A
+	 * worker keeps pipe_sx until its op is on taskwork_ops
+	 * (kqring_wq_thread()), so it must not wait for the pipe with it.
+	 * The issuer posts its own CQE before it runs any taskwork, so it
+	 * only has to leave a read to a worker while older ones are still to
+	 * post, unless RWF_NOWAIT would turn that into a failure.
 	 */
-	ordered = !is_write && fp->f_type == DTYPE_PIPE &&
+	ordered = !is_write && kqring_pipe_reads(fp) &&
 	    (sqe->rw_flags & KQRING_RWF_NOWAIT) == 0 &&
 	    (nowait || op->wq_running);
 	if (ordered && nowait) {
@@ -703,7 +717,7 @@ read_busy:
 		 * Another reader drained the pipe between the wake-up and the
 		 * read: wait for it again.
 		 */
-		if (!is_write && error == EAGAIN && fp->f_type == DTYPE_PIPE &&
+		if (!is_write && error == EAGAIN && kqring_pipe_reads(fp) &&
 		    auio.uio_resid == want) {
 			if (ordered)
 				sx_xunlock(&ctx->pipe_sx);

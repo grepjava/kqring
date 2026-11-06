@@ -587,6 +587,8 @@ sequenceDiagram
 
 The worker waits for data before it takes the lock, and reads without blocking while it holds it, so a slow writer can't stall the others. An issuer reading a ready pipe inline only tries the lock, and leaves the read to a worker if the lock is held or older completions are still queued (except `RWF_NOWAIT`, which would turn that into a failure). The issuer doing all the reads, as Linux's task_work does, would be simpler, but a thread blocked writing to its own pipe could then never drain it. Named FIFOs block inside `fo_read()` and aren't covered.
 
+A FIFO's reads take the same path: its file has `pipeops` and a `struct pipe`, and reads it as a pipe, end of file included. Its writes don't, because a FIFO has no `pipe_peer`.
+
 ---
 
 ## 8. Locking Hierarchy & Concurrency Invariants

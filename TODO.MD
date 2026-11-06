@@ -4,7 +4,6 @@ Known limits are in [BENCHMARK.MD](BENCHMARK.MD#known-gaps) and [Differences fro
 
 ## Correctness
 
-- **Keep reads of a named FIFO in data order**, as reads of a pipe are. They block inside `fo_read()` on their workers.
 - **Post a poll on another ring before the enter that fired it returns, every time.** The gap is an event the poller has taken from the kqueue and not yet recorded.
 
 ## Performance

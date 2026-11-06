@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Reads of a named FIFO now complete in the order of the data, as reads of a pipe do. They also read as a pipe's do otherwise: one with data ready completes without a worker, and an empty `O_NONBLOCK` FIFO waits for data, as in io_uring, rather than failing with `EAGAIN`. `RWF_NOWAIT` still fails it.
+
 ### Documentation
 
 - `README.md` now explains what kqring is and why it exists, and `ARCHITECTURE.MD` covers kernel threads, where a request goes, disk I/O, read ordering, the extensions and testing, and no longer describes names the code has dropped. Its description of the ring header was wrong: all the indices share one 64-byte cache line.

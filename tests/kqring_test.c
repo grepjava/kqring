@@ -6621,22 +6621,17 @@ expect_cancel_pair(struct test_ring *r, uint64_t target, uint64_t cancel)
 	    a.user_data == cancel && a.res == 0));
 }
 
-/* A FIFO blocks in fo_read after selection, unlike the pipe pre-wait. */
+/* A pty blocks in fo_read after selection, unlike the pipe pre-wait. */
 static void
 test_worker_buffer_reservation(void)
 {
 	struct test_ring t;
 	struct io_uring_sqe *sqe;
-	char dir[] = "/tmp/kqring-reserve.XXXXXX", path[128], buf[16];
-	int fd, flags;
+	char buf[16];
+	int fd;
 
-	assert(mkdtemp(dir) != NULL);
-	snprintf(path, sizeof(path), "%s/fifo", dir);
-	assert(mkfifo(path, 0600) == 0);
-	fd = open(path, O_RDWR | O_NONBLOCK);
+	fd = posix_openpt(O_RDWR | O_NOCTTY);
 	assert(fd >= 0);
-	flags = fcntl(fd, F_GETFL);
-	assert(flags >= 0 && fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == 0);
 	ring_init(&t);
 	sqe = ring_prep(&t, IORING_OP_PROVIDE_BUFFERS, 1, 61900);
 	sqe->addr = (uint64_t)(uintptr_t)buf;
@@ -6677,9 +6672,7 @@ test_worker_buffer_reservation(void)
 	assert(submit_one(&t) == 1);
 	close(t.fd);
 	close(fd);
-	unlink(path);
-	rmdir(dir);
-	printf("[PASS] Blocking FIFO buffer reservation and deferred cancel\n");
+	printf("[PASS] Blocking read buffer reservation and deferred cancel\n");
 }
 
 static void
@@ -10235,24 +10228,39 @@ test_trigger_close(void)
 }
 
 /*
- * Reads waiting on one pipe post their CQEs in the order they got the data,
- * on warm workers, where the race was.  One more read arrives after the
- * data, while the others are running: on the issuer, or a worker if they
- * are still to post.  With a provided buffer every second round.
+ * Reads waiting on one pipe or FIFO post their CQEs in the order they got
+ * the data, on warm workers, where the race was.  One more read arrives
+ * after the data, while the others are running: on the issuer, or a worker
+ * if they are still to post.  With a provided buffer every second round.
  */
 static void
-test_pipe_read_order(void)
+test_pipe_read_order(bool fifo)
 {
 	static char bufs[6][64];
+	char dir[] = "/tmp/kqring_ro.XXXXXX", path[64];
 	struct test_ring r;
 	int bad = 0;
 
+	if (fifo) {
+		assert(mkdtemp(dir) != NULL);
+		snprintf(path, sizeof(path), "%s/f", dir);
+		assert(mkfifo(path, 0600) == 0);
+	}
 	ring_init(&r);
 	for (int round = 0; round < 3000; round++) {
 		bool select = (round & 1) != 0;
 		int p[2];
 
-		assert(pipe(p) == 0);
+		if (fifo) {
+			/* Non-blocking: the open mustn't wait for a writer. */
+			p[0] = open(path, O_RDONLY | O_NONBLOCK);
+			assert(p[0] >= 0);
+			p[1] = open(path, O_WRONLY);
+			assert(p[1] >= 0);
+			assert(fcntl(p[0], F_SETFL, 0) == 0);
+		} else {
+			assert(pipe(p) == 0);
+		}
 		for (int i = 0; select && i < 6; i++) {
 			struct io_uring_sqe *sqe = ring_prep(&r,
 			    IORING_OP_PROVIDE_BUFFERS, 1, 1000 + i);
@@ -10295,8 +10303,8 @@ test_pipe_read_order(void)
 			    (unsigned)c.user_data;
 
 			if (c.res != 1 || b >= 6)
-				printf("[FAIL] pipe read: res %d, buffer %u, round %d\n",
-				    c.res, b, round);
+				printf("[FAIL] %s read: res %d, buffer %u, round %d\n",
+				    fifo ? "FIFO" : "pipe", c.res, b, round);
 			assert(c.res == 1 && b < 6);
 			if (bufs[b][0] != '0' + i)
 				bad++;
@@ -10305,11 +10313,98 @@ test_pipe_read_order(void)
 		close(p[1]);
 	}
 	close(r.fd);
+	if (fifo) {
+		unlink(path);
+		rmdir(dir);
+	}
 	if (bad != 0)
-		printf("[FAIL] pipe reads: %d CQEs out of data order\n", bad);
+		printf("[FAIL] %s reads: %d CQEs out of data order\n",
+		    fifo ? "FIFO" : "pipe", bad);
 	assert(bad == 0);
-	printf("[PASS] Waiting pipe reads complete in data order "
-	    "(3000 rounds)\n");
+	printf("[PASS] Waiting %s reads complete in data order "
+	    "(3000 rounds)\n", fifo ? "FIFO" : "pipe");
+}
+
+/*
+ * A FIFO reads as a pipe does: at once with data, waiting without any even
+ * O_NONBLOCK, failing under RWF_NOWAIT, and 0 once the last writer has gone.
+ */
+static void
+test_fifo_read(void)
+{
+	char dir[] = "/tmp/kqring_fr.XXXXXX", path[64], buf[16];
+	struct io_uring_sqe *sqe;
+	struct test_ring r;
+	int rd, wr;
+
+	assert(mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/f", dir);
+	assert(mkfifo(path, 0600) == 0);
+	rd = open(path, O_RDONLY | O_NONBLOCK);
+	assert(rd >= 0);
+	wr = open(path, O_WRONLY);
+	assert(wr >= 0);
+	ring_init(&r);
+
+	assert(write(wr, "now", 3) == 3);
+	sqe = ring_prep(&r, IORING_OP_READ, rd, 8301);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&r);
+	assert(submit_one(&r) == 3);
+	assert(memcmp(buf, "now", 3) == 0);
+
+	sqe = ring_prep(&r, IORING_OP_READ, rd, 8302);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->off = (uint64_t)-1;
+	sqe->rw_flags = KQRING_RWF_NOWAIT;
+	ring_push_sqe(&r);
+	assert(submit_one(&r) == -EAGAIN);
+
+	sqe = ring_prep(&r, IORING_OP_READ, rd, 8303);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(ring_wait(&r, 1, 50) == ETIMEDOUT);
+	assert(write(wr, "later", 5) == 5);
+	assert(ring_wait(&r, 1, 2000) == 0);
+	expect_cqe(&r, 8303, 5);
+	assert(memcmp(buf, "later", 5) == 0);
+
+	sqe = ring_prep(&r, IORING_OP_READ, rd, 8304);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(ring_wait(&r, 1, 50) == ETIMEDOUT);
+	sqe = ring_prep(&r, IORING_OP_ASYNC_CANCEL, -1, 8305);
+	sqe->addr = 8304;
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	expect_cancel_pair(&r, 8304, 8305);
+
+	sqe = ring_prep(&r, IORING_OP_READ, rd, 8306);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->off = (uint64_t)-1;
+	ring_push_sqe(&r);
+	ring_submit(&r);
+	assert(ring_wait(&r, 1, 50) == ETIMEDOUT);
+	close(wr);
+	assert(ring_wait(&r, 1, 2000) == 0);
+	expect_cqe(&r, 8306, 0);
+
+	close(r.fd);
+	close(rd);
+	unlink(path);
+	rmdir(dir);
+	printf("[PASS] FIFO reads: data, O_NONBLOCK wait, RWF_NOWAIT, cancel, "
+	    "end of file\n");
 }
 
 /*
@@ -11562,7 +11657,9 @@ test_triggers(struct test_ring *plain)
 	test_unix_peer_shutdown();
 	test_close_with_poller();
 	test_file_write_order();
-	test_pipe_read_order();
+	test_pipe_read_order(false);
+	test_pipe_read_order(true);
+	test_fifo_read();
 }
 
 int

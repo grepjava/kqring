@@ -20,7 +20,7 @@
  * descriptors, provided and fixed buffers, multishot receives and polls,
  * timeouts, cancellations and poll removals aimed at recent requests,
  * MSG_RING, futexes, splice; its file is O_DIRECT half the time), bursts of
- * reads of one pipe, chained with links and link timeouts, with
+ * reads of one pipe or FIFO, chained with links and link timeouts, with
  * data written to the other ends of the pipes and sockets they wait on.
  * Half of those rings (and a few others) opt in to kqring's extensions,
  * sometimes with bad arguments, and get event-driven chains: triggers on
@@ -112,6 +112,8 @@ static _Atomic uint64_t	st_direct, st_buffered;
 static _Atomic uint64_t	st_ring_gone;
 /* Reads in pipe bursts submitted; those that got data. */
 static _Atomic uint64_t	st_piperd, st_piperd_data;
+/* Pipe slots opened as FIFOs. */
+static _Atomic uint64_t	st_fifo;
 static _Atomic int	cq_bad, nfinished;
 
 struct fz {
@@ -400,14 +402,26 @@ pool_open(struct fz *f, int i)
 	char path[32];
 	int sv[2], fd = -1;
 
-	/* Slots 0-3 hold one end of a pipe or socketpair, 6-9 the other. */
+	/* Slots 0-3 hold one end of a pipe, FIFO or socketpair, 6-9 the other. */
 	if (i < 4 && f->pool[i + 6] >= 0) {
 		close(f->pool[i + 6]);
 		f->pool[i + 6] = -1;
 	}
 	switch (i) {
 	case 0: case 1:
-		if (pipe2(sv, O_CLOEXEC | (i == 1 ? O_NONBLOCK : 0)) == 0) {
+		if (chance(f, 50)) {
+			snprintf(path, sizeof(path), "q%d.%d", f->id, i);
+			(void)mkfifo(path, 0600);
+			fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+			if (fd >= 0) {
+				f->pool[i + 6] = open(path, O_WRONLY |
+				    O_NONBLOCK | O_CLOEXEC);
+				if (i == 0)
+					(void)fcntl(fd, F_SETFL, 0);
+				atomic_fetch_add(&st_fifo, 1);
+			}
+		} else if (pipe2(sv, O_CLOEXEC |
+		    (i == 1 ? O_NONBLOCK : 0)) == 0) {
 			fd = sv[0];
 			f->pool[i + 6] = sv[1];
 		}
@@ -2059,8 +2073,9 @@ main(int argc, char **argv)
 	    (uintmax_t)st_direct, (uintmax_t)st_buffered);
 	printf("kqring_fuzz: new rings closed before mapping %ju\n",
 	    (uintmax_t)st_ring_gone);
-	printf("kqring_fuzz: pipe burst reads %ju, with data %ju\n",
-	    (uintmax_t)st_piperd, (uintmax_t)st_piperd_data);
+	printf("kqring_fuzz: pipe burst reads %ju, with data %ju, FIFOs %ju\n",
+	    (uintmax_t)st_piperd, (uintmax_t)st_piperd_data,
+	    (uintmax_t)st_fifo);
 	if (atomic_load(&cq_bad)) {
 		fprintf(stderr, "kqring_fuzz: FAIL: a CQ ring overran\n");
 		rc = 1;
