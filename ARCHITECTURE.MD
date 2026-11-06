@@ -22,6 +22,8 @@ Three ideas shape the design:
 | [10](#10-kqring-extensions) | Extensions beyond io_uring |
 | [11](#11-how-its-tested) | How it's tested |
 
+**Colors in the diagrams** mean the same thing throughout: dark blue is the program, light blue the kernel core that issues and completes requests, green the code that runs operations, orange worker threads, amber memory and registered resources, pink queues and rings, and gray anything else. In the lock order diagram, orange marks the locks that can sleep.
+
 ---
 
 ## 1. Module & Source Layout
@@ -71,6 +73,17 @@ flowchart TB
     REQ --> KPOLL
     REQ --> TRIG
     TRIG --> KPOLL
+
+    classDef app fill:#0072b2,stroke:#005a8c,color:#ffffff
+    classDef core fill:#56b4e9,stroke:#2b83b8,color:#111111
+    classDef ops fill:#009e73,stroke:#007a59,color:#111111
+    classDef worker fill:#d55e00,stroke:#a84a00,color:#111111
+    classDef mem fill:#e69f00,stroke:#b37b00,color:#111111
+    class App,UAPI app
+    class DEV,REG,REQ core
+    class SOCK,FILE,SYNC,KPOLL,TRIG ops
+    class WQ worker
+    class RSRC,ZC mem
 ```
 
 ![kqring.ko by source file](docs/bench/modules.svg)
@@ -116,6 +129,11 @@ flowchart LR
     subgraph SHM3["SHM Region 3: IORING_OFF_PBUF_RING | (bgid << 16) (bg->ring_obj)"]
         PBUF["Mapped Provided-Buffer Ring<br/>struct io_uring_buf_ring<br/>(shared tail + io_uring_buf entries)"]
     end
+
+    classDef mem fill:#e69f00,stroke:#b37b00,color:#111111
+    classDef queue fill:#cc79a7,stroke:#a35684,color:#111111
+    class H1,PBUF mem
+    class SQA,CQA,SQES queue
 ```
 
 - **One header, one cache line:** [`struct kqring_shm_header`](kmod/kqring_var.h) holds every ring index, mask and flag in 64 bytes, checked by a `_Static_assert`. `io_uring_params` gives the program the offsets, so the layout is private to kqring.
@@ -174,6 +192,15 @@ flowchart LR
     RUN --> COMP
     CHK --> COMP
     COMP --> CQR
+
+    classDef core fill:#56b4e9,stroke:#2b83b8,color:#111111
+    classDef ops fill:#009e73,stroke:#007a59,color:#111111
+    classDef worker fill:#d55e00,stroke:#a84a00,color:#111111
+    classDef queue fill:#cc79a7,stroke:#a35684,color:#111111
+    class UP,TM,ZC_CB,MR ops
+    class WK worker
+    class TW,RCQ,CQR queue
+    class RUN,SUB,CHK,COMP core
 ```
 
 ### 3a. Kernel Threads
@@ -212,6 +239,15 @@ flowchart TB
     TW --> SQP
     Owner --> CQ
     SQP --> CQ
+
+    classDef core fill:#56b4e9,stroke:#2b83b8,color:#111111
+    classDef ops fill:#009e73,stroke:#007a59,color:#111111
+    classDef worker fill:#d55e00,stroke:#a84a00,color:#111111
+    classDef queue fill:#cc79a7,stroke:#a35684,color:#111111
+    class Owner,SQP core
+    class Workers,Poller worker
+    class Upcall,Timer,Bio ops
+    class TW,CQ queue
 ```
 
 ---
@@ -235,17 +271,30 @@ stateDiagram-v2
     Issuing --> ArmedWorker: Blocking file/pipe/VFS or IOSQE_ASYNC<br/>(kqring_wq_enqueue)
     Issuing --> ArmedSync: FUTEX_WAIT / WAITID / TIMEOUT<br/>(active_ops + subsystem list)
 
-    ArmedSocket --> Taskwork: Socket upcall fires<br/>(kqring_taskwork_add_locked)
+    ArmedSocket --> Taskwork: Upcall fires
     ArmedWorker --> Taskwork: Worker finishes I/O<br/>(op->wq_done = true)
     ArmedWorker --> Retired: Cancelled / timed out while running<br/>(op->wq_retired = true)
     ArmedSync --> Taskwork: Futex woken / timer expired
 
-    Taskwork --> ArmedSocket: Spurious wakeup or<br/>multishot burst continues (EAGAIN)<br/>(posts intermediate CQE_F_MORE)
+    Taskwork --> ArmedSocket: EAGAIN:<br/>re-arm
     Taskwork --> Completed: Final result ready<br/>(kqring_op_unarm_locked)
 
     Retired --> Completed: Cancelled CQE (-ECANCELED / -ETIME)<br/>posted on issuer path
     Completed --> [*]: kqring_op_free()<br/>(after worker drops op if wq_running)
+
+    classDef core fill:#56b4e9,stroke:#2b83b8,color:#111111
+    classDef ops fill:#009e73,stroke:#007a59,color:#111111
+    classDef worker fill:#d55e00,stroke:#a84a00,color:#111111
+    classDef queue fill:#cc79a7,stroke:#a35684,color:#111111
+    classDef plain fill:#cbd5e1,stroke:#64748b,color:#111111
+    class Allocated, Prepped, Deferred, Ready, Retired plain
+    class Issuing core
+    class ArmedSocket, ArmedSync ops
+    class ArmedWorker worker
+    class Taskwork, Completed queue
 ```
+
+A socket request goes back to `ArmedSocket` on `EAGAIN`: after a spurious wakeup, or when a multishot burst continues, which posts an intermediate CQE with `IORING_CQE_F_MORE`. The upcall queues it with `kqring_taskwork_add_locked()`.
 
 ### Key Invariants
 - **`IORING_FEAT_SUBMIT_STABLE`:** `kqring_req_prep()` copies all indirect user arguments (`iovec` arrays, `msghdr`, `sockaddr`, file paths, `open_how`, xattr names/values, futex vectors, and `timespec`s) into kernel memory (`op->args`, charged against `ctx->args_bytes <= KQRING_MAX_ARG_BYTES`) at submission time. Userspace can reuse or free argument memory immediately after `kqring_submit_sqes()` consumes the SQE.
@@ -279,6 +328,17 @@ flowchart TD
     Q --> T
     W --> T
     T --> C
+
+    classDef core fill:#56b4e9,stroke:#2b83b8,color:#111111
+    classDef ops fill:#009e73,stroke:#007a59,color:#111111
+    classDef worker fill:#d55e00,stroke:#a84a00,color:#111111
+    classDef queue fill:#cc79a7,stroke:#a35684,color:#111111
+    classDef plain fill:#cbd5e1,stroke:#64748b,color:#111111
+    class S,T,C queue
+    class A,K,SK,P,F plain
+    class I core
+    class U,B,Q ops
+    class W worker
 ```
 
 Each path costs more than the one before it, and these are measured on an i5-8250U ([BENCHMARK.MD](BENCHMARK.MD)):
@@ -293,10 +353,16 @@ Socket operations (`RECV`, `SEND`, `RECVMSG`, `SENDMSG`, `SEND_ZC`, `SENDMSG_ZC`
 
 ```mermaid
 sequenceDiagram
-    participant App as Userspace (Owner)
-    participant Req as kqring_req.c
-    participant Sock as kqring_sock.c
-    participant SB as FreeBSD Socket Buffer (so_rcv / so_snd)
+    box rgba(0,114,178,0.2) Program
+        participant App as Userspace (Owner)
+    end
+    box rgba(86,180,233,0.2) kqring.ko
+        participant Req as kqring_req.c
+        participant Sock as kqring_sock.c
+    end
+    box rgba(0,158,115,0.2) FreeBSD
+        participant SB as FreeBSD Socket Buffer (so_rcv / so_snd)
+    end
 
     App->>Req: kqring_enter(2) (submit RECV)
     Req->>Sock: kqring_op_attempt(ctx, op, NULL)
@@ -352,10 +418,16 @@ Pipes, FIFOs, eventfds, ttys, kqueues, ring descriptors and devices with a `d_kq
 
 ```mermaid
 sequenceDiagram
-    participant App as Userspace
-    participant Sock as kqring_send_zc_iov()
-    participant ZC as kqring_zc.c (VM & Accounting)
-    participant Net as FreeBSD Socket / TCP / AF_UNIX Stack
+    box rgba(0,114,178,0.2) Program
+        participant App as Userspace
+    end
+    box rgba(86,180,233,0.2) kqring.ko
+        participant Sock as kqring_send_zc_iov()
+        participant ZC as kqring_zc.c (VM & Accounting)
+    end
+    box rgba(0,158,115,0.2) FreeBSD
+        participant Net as FreeBSD Socket / TCP / AF_UNIX Stack
+    end
 
     App->>Sock: Submit SEND_ZC / SENDMSG_ZC (>= PAGE_SIZE)
     alt IORING_RECVSEND_FIXED_BUF
@@ -423,6 +495,12 @@ classDiagram
     kqring_zc_notif "1" --> "1..*" kqring_zc_buf : in-flight ref(s)
     mbuf_EXT_SFBUF "1..*" --> "1" kqring_zc_notif : zc->refs
     kqring_zc_buf "1..*" --> "1" kqring_pin_acct : per-UID charge
+
+    style kqring_pin_acct fill:#e69f00,stroke:#b37b00,color:#111111
+    style kqring_zc_buf fill:#e69f00,stroke:#b37b00,color:#111111
+    style kqring_rsrc fill:#e69f00,stroke:#b37b00,color:#111111
+    style kqring_zc_notif fill:#cc79a7,stroke:#a35684,color:#111111
+    style mbuf_EXT_SFBUF fill:#009e73,stroke:#007a59,color:#111111
 ```
 
 - **Decoupled page lifetime:** `RLIMIT_MEMLOCK` and `vm_user_wire_count` charges live on `kqring_zc_buf`, not on the ring slot. Unregistering a buffer or closing the ring while zero-copy mbufs are still unread in a peer socket or awaiting TCP ACK keeps the pages held and charged until the last `EXT_SFBUF` mbuf is freed.
@@ -460,9 +538,15 @@ A positioned `READ` or `WRITE` on a disk device doesn't need a worker. `kqring_f
 
 ```mermaid
 sequenceDiagram
-    participant App as Program
-    participant File as kqring_file.c
-    participant Geom as GEOM / driver
+    box rgba(0,114,178,0.2) Program
+        participant App as Program
+    end
+    box rgba(86,180,233,0.2) kqring.ko
+        participant File as kqring_file.c
+    end
+    box rgba(0,158,115,0.2) FreeBSD
+        participant Geom as GEOM / driver
+    end
     App->>File: kqring_enter(2): 32 READs
     loop each request
         File->>File: hold user pages
@@ -481,10 +565,16 @@ Several `READ`s waiting on one pipe each have a worker. A worker that read first
 
 ```mermaid
 sequenceDiagram
-    participant A as Worker A
-    participant B as Worker B
-    participant P as Pipe
-    participant T as taskwork_ops
+    box rgba(213,94,0,0.2) Workers
+        participant A as Worker A
+        participant B as Worker B
+    end
+    box rgba(0,158,115,0.2) Data
+        participant P as Pipe
+    end
+    box rgba(204,121,167,0.2) Ring
+        participant T as taskwork_ops
+    end
     Note over A,B: both woken by a write
     A->>A: takes ctx->pipe_sx
     B-->>B: waits for ctx->pipe_sx
@@ -514,6 +604,11 @@ flowchart TD
 
     L1 --> L4
     L2 --> L3 --> L4 --> L5 --> L6
+
+    classDef worker fill:#d55e00,stroke:#a84a00,color:#111111
+    classDef plain fill:#cbd5e1,stroke:#64748b,color:#111111
+    class L1,L4,L5,L6 plain
+    class L2,L3 worker
 ```
 
 | Lock | Type | Protects | Ordering Rules |
@@ -570,6 +665,15 @@ flowchart LR
     K --> CQ[("CQE")]
     B -- "udata as user_data" --> CQ
     Run --> CQ
+
+    classDef core fill:#56b4e9,stroke:#2b83b8,color:#111111
+    classDef ops fill:#009e73,stroke:#007a59,color:#111111
+    classDef queue fill:#cc79a7,stroke:#a35684,color:#111111
+    classDef plain fill:#cbd5e1,stroke:#64748b,color:#111111
+    class R,V,Q plain
+    class T,K,B core
+    class Run ops
+    class CQ queue
 ```
 
 ### 10a. Event-Driven Chains (`kqring_trig.c`)
@@ -591,6 +695,13 @@ stateDiagram-v2
     Armed --> Ended: cancel
     Running --> Ended: error, end of file, CQ full, cancel
     Ended --> [*]: final CQE
+
+    classDef core fill:#56b4e9,stroke:#2b83b8,color:#111111
+    classDef ops fill:#009e73,stroke:#007a59,color:#111111
+    classDef plain fill:#cbd5e1,stroke:#64748b,color:#111111
+    class Armed ops
+    class Running core
+    class Ended plain
 ```
 
 ### 10b. Kevent Requests (`kqring_kpoll.c`)
@@ -614,6 +725,9 @@ flowchart LR
     C --> D["Stress"]
     D --> E["Stock kernel:<br/>suite"]
     E --> F["Commit"]
+
+    classDef ops fill:#009e73,stroke:#007a59,color:#111111
+    class A,B,C,D,E,F ops
 ```
 
 | Tool | What it catches |

@@ -29,16 +29,20 @@ Code written against `<linux/io_uring.h>` builds against [`<sys/kqring.h>`](incl
 sequenceDiagram
     participant P as Program
     participant K as Kernel
-    Note over P,K: kqueue: N sockets have a message each
-    P->>K: kevent()
-    K-->>P: N descriptors are ready
-    loop once per message
-        P->>K: recv()
-        K-->>P: data
+    rect rgba(230,159,0,0.2)
+        Note over P,K: kqueue: N sockets have a message each
+        P->>K: kevent()
+        K-->>P: N descriptors are ready
+        loop once per message
+            P->>K: recv()
+            K-->>P: data
+        end
     end
-    Note over P,K: kqring: the same N messages
-    P->>K: kqring_enter()
-    K-->>P: N completions in the shared ring, data already in buffers
+    rect rgba(0,158,115,0.2)
+        Note over P,K: kqring: the same N messages
+        P->>K: kqring_enter()
+        K-->>P: N completions in the shared ring, data already in buffers
+    end
 ```
 
 That is N + 1 system calls against one, which is why the gap is widest for busy servers.
@@ -69,6 +73,19 @@ flowchart LR
     Bio --> CQ
     Worker --> CQ
     CQ -- "reads results" --> App
+
+    classDef app fill:#0072b2,stroke:#005a8c,color:#ffffff
+    classDef core fill:#56b4e9,stroke:#2b83b8,color:#111111
+    classDef ops fill:#009e73,stroke:#007a59,color:#111111
+    classDef worker fill:#d55e00,stroke:#a84a00,color:#111111
+    classDef queue fill:#cc79a7,stroke:#a35684,color:#111111
+    classDef plain fill:#cbd5e1,stroke:#64748b,color:#111111
+    class App app
+    class SQ,CQ queue
+    class Issue plain
+    class Inline core
+    class Upcall,Bio ops
+    class Worker worker
 ```
 
 Requests that can finish immediately do, on the calling thread. Everything that has to wait is parked without blocking the program, and all results are posted by one thread, so the completion queue needs no lock against the program. [ARCHITECTURE.MD](ARCHITECTURE.MD) has the details.
