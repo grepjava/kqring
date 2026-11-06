@@ -2,10 +2,6 @@
 
 Known limits are in [BENCHMARK.MD](BENCHMARK.MD#known-gaps) and [Differences from Linux](README.md#differences-from-linux). This is the work that could close some of them; [ROADMAP.MD](ROADMAP.MD) puts it in order.
 
-## Correctness
-
-- **Post a poll on another ring before the enter that fired it returns, every time.** The gap is an event the poller has taken from the kqueue and not yet recorded.
-
 ## Performance
 
 - **Per-file ordering in the worker pool**, as io-wq hashes buffered writes per inode, so that writes to different files run in parallel and the issuer doesn't wait. Buffered writes are about 9% behind aio on a ZFS file.

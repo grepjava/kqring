@@ -8072,6 +8072,223 @@ test_poll_same_thread(void)
 	    "enter returns; self-poll doesn't loop\n");
 }
 
+/* A ring without DEFER_TASKRUN, enabled, with no buffer ring. */
+static void
+poll_ring_init(struct test_ring *r)
+{
+	ring_setup_shared = true;
+	ring_setup(r);
+	ring_setup_shared = false;
+	assert(kqring_register(r->fd, IORING_REGISTER_ENABLE_RINGS, NULL,
+	    0) == 0);
+}
+
+static void
+poll_ring_arm(struct test_ring *r, int fd, uint64_t user_data)
+{
+	struct io_uring_sqe *sqe;
+
+	sqe = ring_prep(r, IORING_OP_POLL_ADD, fd, user_data);
+	sqe->poll32_events = POLLIN;
+	ring_push_sqe(r);
+	ring_submit(r);
+}
+
+/* More polling rings than kqring_kpoll_run() holds at once: CQEs missing. */
+static int
+poll_before_return_rings(void)
+{
+	struct test_ring t[20], t2;
+	unsigned ready[nitems(t)];
+	int late = 0;
+
+	ring_init(&t2);
+	for (int i = 0; i < (int)nitems(t); i++) {
+		poll_ring_init(&t[i]);
+		poll_ring_arm(&t[i], t2.fd, 77300 + (uint64_t)i);
+		assert(ring_cq_ready(&t[i]) == 0);
+	}
+	(void)ring_prep(&t2, IORING_OP_NOP, -1, 77399);
+	ring_push_sqe(&t2);
+	ring_submit(&t2);
+	/* All at once: waiting for one gives the rest time to catch up. */
+	for (int i = 0; i < (int)nitems(t); i++)
+		ready[i] = ring_cq_ready(&t[i]);
+	for (int i = 0; i < (int)nitems(t); i++) {
+		if (ready[i] == 0) {
+			late++;
+			assert(ring_wait(&t[i], 1, 2000) == 0);
+		}
+		assert(ring_pop_cqe(&t[i]).user_data ==
+		    77300 + (uint64_t)i);
+		close(t[i].fd);
+	}
+	expect_cqe(&t2, 77399, 0);
+	close(t2.fd);
+	return (late);
+}
+
+/* More events on one ring than a scan takes at once: CQEs missing. */
+static int
+poll_before_return_events(void)
+{
+	enum { NPIPES = 100 };
+	struct test_ring t, t2;
+	struct io_uring_sqe *sqe;
+	int p[NPIPES][2], late;
+
+	assert(SQ_ENTRIES >= NPIPES);
+	poll_ring_init(&t);
+	ring_init(&t2);
+	poll_ring_arm(&t, t2.fd, 77400);
+	for (int i = 0; i < NPIPES; i++) {
+		assert(pipe(p[i]) == 0);
+		poll_ring_arm(&t, p[i][0], 77401 + (uint64_t)i);
+	}
+	assert(ring_cq_ready(&t) == 0);
+	for (int i = 0; i < NPIPES; i++) {
+		sqe = ring_prep(&t2, IORING_OP_WRITE, p[i][1], 0);
+		sqe->addr = (uint64_t)(uintptr_t)"x";
+		sqe->len = 1;
+		sqe->off = (uint64_t)-1;
+		ring_push_sqe(&t2);
+	}
+	ring_submit(&t2);
+	late = NPIPES + 1 - (int)ring_cq_ready(&t);
+	assert(ring_wait(&t, NPIPES + 1, 2000) == 0);
+	ring_drain_cqes(&t);
+	ring_drain_cqes(&t2);
+	for (int i = 0; i < NPIPES; i++) {
+		close(p[i][0]);
+		close(p[i][1]);
+	}
+	close(t.fd);
+	close(t2.fd);
+	return (late);
+}
+
+static _Atomic int poll_race_stop;
+
+static void *
+poll_race_spin(void *arg __unused)
+{
+	while (atomic_load_explicit(&poll_race_stop,
+	    memory_order_relaxed) == 0)
+		;
+	return (NULL);
+}
+
+/*
+ * The enter racing the ring's poller for the event, with nspin threads
+ * keeping the CPUs busy so that the poller can lose its CPU while it holds
+ * one.  How many rounds the CQE wasn't there when the enter returned.
+ */
+static int
+poll_before_return_race(int rounds, int nspin)
+{
+	pthread_t spin[16];
+	struct test_ring t, t2;
+	int late = 0;
+
+	assert(nspin <= (int)nitems(spin));
+	atomic_store(&poll_race_stop, 0);
+	for (int i = 0; i < nspin; i++)
+		assert(pthread_create(&spin[i], NULL, poll_race_spin,
+		    NULL) == 0);
+	poll_ring_init(&t);
+	ring_init(&t2);
+	for (int i = 0; i < rounds; i++) {
+		poll_ring_arm(&t, t2.fd, 77600);
+		(void)ring_prep(&t2, IORING_OP_NOP, -1, 77601);
+		ring_push_sqe(&t2);
+		ring_submit(&t2);
+		if (ring_cq_ready(&t) == 0) {
+			late++;
+			assert(ring_wait(&t, 1, 2000) == 0);
+		}
+		assert(ring_pop_cqe(&t).user_data == 77600);
+		expect_cqe(&t2, 77601, 0);
+	}
+	atomic_store(&poll_race_stop, 1);
+	for (int i = 0; i < nspin; i++)
+		assert(pthread_join(spin[i], NULL) == 0);
+	close(t.fd);
+	close(t2.fd);
+	return (late);
+}
+
+/* A write(2) firing a poll, with the enter and the poller both after it. */
+static uint64_t
+poll_write_ns(int rounds)
+{
+	struct test_ring t;
+	uint64_t t0;
+	int p[2];
+	char ch;
+
+	poll_ring_init(&t);
+	assert(pipe(p) == 0);
+	t0 = now_ns();
+	for (int i = 0; i < rounds; i++) {
+		poll_ring_arm(&t, p[0], 77700);
+		assert(write(p[1], "x", 1) == 1);
+		assert(ring_wait(&t, 1, 2000) == 0);
+		assert(ring_pop_cqe(&t).user_data == 77700);
+		assert(read(p[0], &ch, 1) == 1);
+	}
+	t0 = (now_ns() - t0) / (uint64_t)rounds;
+	close(t.fd);
+	close(p[0]);
+	close(p[1]);
+	return (t0);
+}
+
+/*
+ * kern.kqring.kp_test_gap_us, which debug kernels have: false if this
+ * kernel hasn't.
+ */
+static bool
+poll_test_gap(unsigned us)
+{
+	char cmd[80];
+
+	if (sysctlbyname("kern.kqring.kp_test_gap_us", NULL, NULL, NULL,
+	    0) != 0 && errno == ENOENT)
+		return (false);
+	snprintf(cmd, sizeof(cmd), "%ssysctl -q kern.kqring.kp_test_gap_us=%u"
+	    " >/dev/null", geteuid() == 0 ? "" : "sudo -n ", us);
+	assert(system(cmd) == 0);
+	return (true);
+}
+
+/*
+ * The CQE of a poll on another ring is there when the enter that fired it
+ * returns: however many rings poll, however many events fire, and when the
+ * ring's poller has the event already.  The race is about one round in
+ * tens of thousands, so debug kernels hold the poller in the gap to make
+ * it every round.
+ */
+static void
+test_poll_before_return(void)
+{
+	bool gap;
+
+	assert(poll_before_return_rings() == 0);
+	assert(poll_before_return_events() == 0);
+	assert(poll_before_return_race(20000, 0) == 0);
+	assert(poll_before_return_race(20000, 4) == 0);
+	gap = poll_test_gap(2000);
+	if (gap) {
+		assert(poll_before_return_rings() == 0);
+		assert(poll_before_return_events() == 0);
+		assert(poll_before_return_race(200, 0) == 0);
+		assert(poll_test_gap(0));
+	}
+	printf("[PASS] Poll on another ring: CQE posted before the enter "
+	    "returns, every time%s\n",
+	    gap ? " (poller held in the gap)" : "");
+}
+
 /*
  * NODROP backpressure: once many CQEs wait in the kernel, enters submit
  * nothing and fail with EBUSY, and a multishot request whose CQE would
@@ -11677,6 +11894,28 @@ main(int argc, char **argv)
 		printf("[OK]: %d failure(s)\n", failures);
 		return (failures != 0);
 	}
+	/* "pollrace [rounds [threads [gap_us]]]": count, for before-and-after runs. */
+	if (argc >= 2 && strcmp(argv[1], "pollrace") == 0) {
+		int rounds = argc > 2 ? atoi(argv[2]) : 200000;
+		int nspin = argc > 3 ? atoi(argv[3]) : 4;
+
+		if (argc > 4)
+			printf("gap: %s\n", poll_test_gap((unsigned)atoi(argv[4])) ?
+			    "set" : "not in this kernel");
+		printf("rings: %d late\n", poll_before_return_rings());
+		printf("events: %d late\n", poll_before_return_events());
+		uint64_t t0 = now_ns();
+		int late = poll_before_return_race(rounds, nspin);
+
+		printf("race: %d late of %d, %d spinning, %ju ns each\n",
+		    late, rounds, nspin,
+		    (uintmax_t)((now_ns() - t0) / (uint64_t)rounds));
+		printf("write: %ju ns each\n",
+		    (uintmax_t)poll_write_ns(rounds));
+		if (argc > 4)
+			(void)poll_test_gap(0);
+		return (0);
+	}
 	if (run_tests) {
 		test_probe(&r);
 		test_multishot_and_eof(&r);
@@ -11758,6 +11997,7 @@ main(int argc, char **argv)
 		test_no_mmap();
 		test_resize_rings();
 		test_poll_same_thread();
+		test_poll_before_return();
 		test_cq_backpressure();
 		test_sync_cancel_worker();
 		test_tag_failed_register();

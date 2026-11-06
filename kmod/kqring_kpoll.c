@@ -10,13 +10,20 @@
  *
  * Each such request is a knote (EVFILT_READ and/or EVFILT_WRITE on its
  * descriptor) on a kqueue the ring owns but that has no descriptor of its
- * own, and one kthread per ring waits in kevent(2) on it.  As io_uring's
+ * own, and one kthread per ring sleeps on it.  As io_uring's
  * poll wait queue entries do, a knote catches every wakeup of the file
  * (counted as it happens, so a write and then a read before the poller
  * looks still counts: see kqring_kp_filt_event()), any number of requests
  * cost no threads, and a multishot request gets a CQE per wakeup.  The
  * poller only records events and queues the request as taskwork;
  * kqring_kpoll_deliver() posts the CQEs.
+ *
+ * Enters take events too, so that a poll's CQE is there when the enter that
+ * fired it returns (kqring_kpoll_run()).  An event taken from the kqueue and
+ * not yet recorded is in neither place, so taking and recording are one step
+ * under ctx->kp_sx (kqring_kp_take()), and the poller sleeps without taking
+ * anything (kqring_kp_wait()): an enter that finds the kqueue empty has
+ * waited for whatever the poller took.
  *
  * A request on a fixed file (no descriptor to register), one whose file
  * has no kqfilter, or a second one on the same descriptor and filter (a
@@ -35,6 +42,26 @@
 static u_int kqring_kp_nrings;
 /* How often the poller looks at ctx->closing while nothing happens. */
 #define	KQRING_KP_IDLE_NS	(50 * 1000 * 1000)
+/*
+ * Batches of events one look takes.  An event that stays ready (LEVEL) is
+ * queued again as it is taken, so looking until the kqueue is empty might
+ * not end; what is left is the poller's.
+ */
+#define	KQRING_KP_BATCHES	64
+
+#ifdef KQRING_TEST_HOOKS
+/*
+ * Holds the poller this long between taking events and recording them, and
+ * an enter half as long before it looks, so that the enter arrives while
+ * the poller has them, every time (test_poll_before_return()).
+ */
+static u_int kqring_kp_test_gap_us;
+SYSCTL_UINT(_kern_kqring, OID_AUTO, kp_test_gap_us, CTLFLAG_RW,
+    &kqring_kp_test_gap_us, 0, "Test only: widen the poller's gap");
+#define	KQRING_KP_TEST_GAP(div)	DELAY(kqring_kp_test_gap_us / (div))
+#else
+#define	KQRING_KP_TEST_GAP(div)	do { } while (0)
+#endif
 
 struct kqring_kp_io {
 	struct kevent	*kev;
@@ -401,14 +428,69 @@ kqring_kp_event(struct kqring_ctx *ctx, const struct kevent *kev)
 	mtx_unlock(&ctx->mtx);
 }
 
+/*
+ * Take the events waiting on the ring's kqueue (fp) and record them, as one
+ * step: see the comment at the top.  No ring lock held.
+ */
+static void
+kqring_kp_take(struct kqring_ctx *ctx, struct file *fp, struct thread *td)
+{
+	struct kevent kev[KQRING_KP_NEVENTS];
+	struct kqring_kp_io io;
+	struct kevent_copyops ops = {
+		.arg = &io,
+		.k_copyin = kqring_kp_copyin,
+		.k_copyout = kqring_kp_copyout,
+		.kevent_size = sizeof(struct kevent),
+	};
+	struct timespec zero = { 0, 0 };
+	register_t saved[2] = { td->td_retval[0], td->td_retval[1] };
+
+	sx_xlock(&ctx->kp_sx);
+	for (int b = 0; b < KQRING_KP_BATCHES; b++) {
+		io.kev = kev;
+		io.n = 0;
+		io.max = nitems(kev);
+		(void)kern_kevent_fp(td, fp, 0, nitems(kev), &ops, &zero);
+		td->td_retval[0] = saved[0];
+		td->td_retval[1] = saved[1];
+		if (io.n > 0 && td == ctx->kp_td)
+			KQRING_KP_TEST_GAP(1);
+		for (int i = 0; i < io.n; i++)
+			kqring_kp_event(ctx, &kev[i]);
+		if (io.n < (int)nitems(kev))
+			break;
+	}
+	sx_xunlock(&ctx->kp_sx);
+}
+
+/*
+ * Sleep until the kqueue has events, as kqueue_scan() does, but leave them
+ * there.  True if it has them.  Interruptible: stop and exit requests end
+ * it, and the poller then suspends or exits.
+ */
+static bool
+kqring_kp_wait(struct kqueue *kq)
+{
+	bool ready;
+
+	mtx_lock(&kq->kq_lock);
+	if (kq->kq_count == 0) {
+		kq->kq_state |= KQ_SLEEP;
+		(void)msleep_sbt(kq, &kq->kq_lock, PSOCK | PCATCH, "kqkpwt",
+		    nstosbt(KQRING_KP_IDLE_NS), 0, 0);
+	}
+	ready = kq->kq_count != 0;
+	mtx_unlock(&kq->kq_lock);
+	return (ready);
+}
+
 static void
 kqring_kp_thread(void *arg)
 {
 	struct kqring_ctx *ctx = arg;
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
-	struct kevent kev[KQRING_KP_NEVENTS];
-	struct timespec idle = { 0, KQRING_KP_IDLE_NS };
 
 	PROC_LOCK(p);
 	SIGFILLSET(td->td_sigmask);
@@ -416,27 +498,15 @@ kqring_kp_thread(void *arg)
 	PROC_UNLOCK(p);
 
 	for (;;) {
-		struct kqring_kp_io io = { .kev = kev, .max = nitems(kev) };
-		struct kevent_copyops ops = {
-			.arg = &io,
-			.k_copyin = kqring_kp_copyin,
-			.k_copyout = kqring_kp_copyout,
-			.kevent_size = sizeof(struct kevent),
-		};
 		struct file *fp;
 
 		if (kqring_kthread_check_suspend(ctx))
 			break;
 		if ((fp = kqring_kp_getfp(ctx)) == NULL)
 			break;
-		/*
-		 * Sleeps interruptibly: stop and exit requests end it, and
-		 * the loop then suspends or exits above.
-		 */
-		(void)kern_kevent_fp(td, fp, 0, nitems(kev), &ops, &idle);
+		if (kqring_kp_wait(fp->f_data))
+			kqring_kp_take(ctx, fp, td);
 		fdrop(fp, td);
-		for (int i = 0; i < io.n; i++)
-			kqring_kp_event(ctx, &kev[i]);
 	}
 
 	/*
@@ -1164,32 +1234,18 @@ last:
 }
 
 /*
- * The events waiting on ctx's kqueue, taken now (without waiting) as the
- * poller would take them.
+ * The events on ctx's kqueue, taken now, as the poller would take them,
+ * and any it has taken and not yet recorded waited for.
  */
 static void
 kqring_kp_scan(struct kqring_ctx *ctx, struct thread *td)
 {
-	struct kevent kev[KQRING_KP_NEVENTS];
-	struct kqring_kp_io io = { .kev = kev, .max = nitems(kev) };
-	struct kevent_copyops ops = {
-		.arg = &io,
-		.k_copyin = kqring_kp_copyin,
-		.k_copyout = kqring_kp_copyout,
-		.kevent_size = sizeof(struct kevent),
-	};
-	struct timespec zero = { 0, 0 };
-	register_t saved[2] = { td->td_retval[0], td->td_retval[1] };
 	struct file *fp;
 
 	if ((fp = kqring_kp_getfp(ctx)) == NULL)
 		return;
-	(void)kern_kevent_fp(td, fp, 0, nitems(kev), &ops, &zero);
-	td->td_retval[0] = saved[0];
-	td->td_retval[1] = saved[1];
+	kqring_kp_take(ctx, fp, td);
 	fdrop(fp, td);
-	for (int i = 0; i < io.n; i++)
-		kqring_kp_event(ctx, &kev[i]);
 }
 
 /*
@@ -1220,14 +1276,20 @@ kqring_kpoll_kicked(struct kqring_ctx *ctx)
 void
 kqring_kpoll_run(struct thread *td)
 {
-	struct kqring_ctx *rings[8], *ctx;
-	int n = 0;
+	struct kqring_ctx *few[8], **rings = few, *ctx;
+	u_int max, n = 0;
 
-	if (atomic_load_int(&kqring_kp_nrings) == 0)
+	if ((max = atomic_load_int(&kqring_kp_nrings)) == 0)
 		return;
+	KQRING_KP_TEST_GAP(2);
+	/* Rings of other processes count too, so this is rarely needed. */
+	if (max > nitems(few))
+		rings = malloc(max * sizeof(*rings), M_KQRING, M_WAITOK);
+	else
+		max = nitems(few);
 	mtx_lock(&kqring_proc_mtx);
 	LIST_FOREACH(ctx, &kqring_ctx_list, proc_link) {
-		if (n == nitems(rings))
+		if (n == max)
 			break;
 		if (ctx->owner_proc == td->td_proc && ctx->kp_running &&
 		    !ctx->closing) {
@@ -1237,11 +1299,17 @@ kqring_kpoll_run(struct thread *td)
 	}
 	mtx_unlock(&kqring_proc_mtx);
 
-	for (int i = 0; i < n; i++) {
+	for (u_int i = 0; i < n; i++) {
 		ctx = rings[i];
 		kqring_kp_scan(ctx, td);
+		/*
+		 * Wait for sq_sx: its holder may be the ring's kthread, part
+		 * way through the taskwork that posts this CQE.  Interrupted,
+		 * that kthread or the next enter posts it.
+		 */
 		if (ctx->taskrun_only && (ctx->shared ||
-		    kqring_is_owner(ctx, td)) && sx_try_xlock(&ctx->sq_sx)) {
+		    kqring_is_owner(ctx, td)) &&
+		    sx_xlock_sig(&ctx->sq_sx) == 0) {
 			if (!ctx->closing) {
 				kqring_run_taskwork(ctx);
 				kqring_flush_overflow(ctx);
@@ -1255,6 +1323,8 @@ kqring_kpoll_run(struct thread *td)
 		}
 		kqring_ctx_rele(ctx);
 	}
+	if (rings != few)
+		free(rings, M_KQRING);
 }
 
 /*

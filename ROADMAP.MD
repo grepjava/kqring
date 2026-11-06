@@ -8,7 +8,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 
 | Phase | Work | Status |
 |---|---|---|
-| 1 | Ordering and poll timing | FIFO order done; poll timing open |
+| 1 | Ordering and poll timing | Done |
 | 2 | Make compatibility measurable | Not started |
 | 3 | Wait semantics | Not started |
 | 4 | Per-file write ordering | Not started |
@@ -32,7 +32,7 @@ The probe also can't speak for every variant of an operation. `SYNC_FILE_RANGE` 
 ## Phase 1: Ordering and poll timing
 
 - **Done:** reads of a named FIFO complete in the order of the data, as reads of a pipe do (`3a5f36c`).
-- **Open:** a poll on another ring can complete just after the enter that fired it. The gap is an event the poller has taken from the kqueue and not yet recorded. `test_poll_same_thread` can see it on slow kernels.
+- **Done:** a poll on another ring completes before the enter that fired it returns, however many rings poll and however many events fire. The poller no longer holds events an enter can't see, and `test_poll_before_return` forces the old race on debug kernels.
 
 Acceptance: a deterministic regression test, repeated debug-kernel runs, and no lost wakeups, hangs or teardown regressions.
 

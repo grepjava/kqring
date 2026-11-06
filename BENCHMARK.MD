@@ -319,7 +319,6 @@ The direct bio path scales until the 4 cores run out, while aio falls back. Thro
 ## Known gaps
 
 - **A pipe read that has to wait goes through a worker thread**, as does a write to a full pipe. Waiting for data with `POLL_ADD` first avoids the worker.
-- **A poll on another ring can complete just after the enter that fired it.** The CQE normally comes before the enter returns, but when the ring's poller has just taken the event from its kqueue and not yet recorded it, the enter finds nothing to post, and the CQE follows moments later. It is never lost. It has only been seen on a slow kernel, a KASAN one, where it failed `test_poll_same_thread`.
 - **Buffered writes to a file wait for their worker.** That keeps writes to one file in order, as io-wq's per-inode hashing does, but the issuer waits too, where io-wq's hashing wouldn't make it. So do `O_DIRECT` writes that use the file position, `O_APPEND` or per-write flags such as `RWF_DSYNC`.
 - **Page-cache misses, and filesystems without the page-cache read path, go through a worker.** This covers file reads that need the disk, ZFS, `O_DIRECT` on files, and reads using the file position (`off` = −1). Only disk devices themselves get the direct bio path: FreeBSD filesystems have no asynchronous read or write entry point. It also covers reads into a buffer that isn't mapped yet.
 - **Past 4 jobs on cached data, `psync` beats the worker path.** Workers top out near 530,000 IOPS on this machine, because each request is handed to another thread.

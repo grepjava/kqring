@@ -561,6 +561,11 @@ struct kqring_zc_notif {
 
 extern struct mtx kqring_zc_mtx;
 SYSCTL_DECL(_kern_kqring);
+
+/* Debug kernels get the knobs that force a race for the tests. */
+#ifdef INVARIANTS
+#define	KQRING_TEST_HOOKS
+#endif
 extern u_int kqring_zc_local_min_len;
 
 struct kqring_rsrc {
@@ -753,10 +758,12 @@ struct kqring_ctx {
 
 	/*
 	 * Non-socket POLL_ADD (kqring_kpoll.c): a kqueue with no descriptor,
-	 * and a kthread blocked in kevent(2) on it.
+	 * and a kthread sleeping on it.  kp_sx makes taking its events and
+	 * recording them one step (kqring_kp_take()); taken before ctx->mtx.
 	 */
 	struct file		*kp_fp;
 	struct thread		*kp_td;
+	struct sx		kp_sx;
 	/* Pollers of the ring or its eventfd were woken (a hint, any lock). */
 	bool			woke_pollers;
 	/* A CQE was dropped (KQRING_MAX_OVERFLOW); the issuer reports it. */
