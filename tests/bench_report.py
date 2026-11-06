@@ -2,13 +2,20 @@
 # SPDX-License-Identifier: BSD-2-Clause
 """Turn kqring_bench runs into median tables and SVG charts.
 
-usage: bench_report.py OUTDIR RUN.out [RUN.out ...]
+usage: bench_report.py OUTDIR FILE [FILE ...]
 
-Each RUN.out holds the "ROW <group> <variant> <ns/op>" lines of one
-kqring_bench run.  Prints a median table (with the run-to-run spread) and
-writes the charts used by BENCHMARK.MD and README.md into OUTDIR.  No
-dependencies beyond the standard library.
+Prints median tables (with the run-to-run spread) and writes the charts used
+by README.md, BENCHMARK.MD and ARCHITECTURE.MD into OUTDIR.  No dependencies
+beyond the standard library.  Files are told apart by name:
+
+  ufs.*          kqring_bench file, on UFS: its groups get the prefix "ufs_"
+  mt.*           kqring_mt_bench
+  diskbench.*    kqring_diskbench
+  *.csv          fio results and liburing's: section,series,x,value
+  anything else  kqring_bench: "ROW <group> <variant> <ns/op>" lines
 """
+import csv
+import glob
 import math
 import os
 import statistics
@@ -17,15 +24,52 @@ from html import escape
 
 # --- data -------------------------------------------------------------------
 
+def summarise(runs):
+    return {k: (statistics.median(v), (max(v) - min(v)) / statistics.median(v), len(v))
+            for k, v in runs.items()}
+
+
 def load(paths):
+    runs = {}
+    for p in paths:
+        prefix = "ufs_" if os.path.basename(p).startswith("ufs.") else ""
+        for line in open(p, encoding="utf-8"):
+            f = line.split()
+            if len(f) == 4 and f[0] == "ROW":
+                runs.setdefault((prefix + f[1], f[2]), []).append(float(f[3]))
+    return summarise(runs)
+
+
+def load_mt(paths):
+    """ROW <workload> <variant> <threads> <ops/s> <ns>: millions of ops/s."""
     runs = {}
     for p in paths:
         for line in open(p, encoding="utf-8"):
             f = line.split()
-            if len(f) == 4 and f[0] == "ROW":
-                runs.setdefault((f[1], f[2]), []).append(float(f[3]))
-    return {k: (statistics.median(v), (max(v) - min(v)) / statistics.median(v), len(v))
-            for k, v in runs.items()}
+            if len(f) == 6 and f[0] == "ROW":
+                runs.setdefault((f[1], f[2], int(f[3])), []).append(float(f[4]) / 1e6)
+    return summarise(runs)
+
+
+def load_disk(paths):
+    """ROW diskbench <label> <dir> <iops> <MiB/s> <p50> <p99> <p99.9>."""
+    iops, p99 = {}, {}
+    for p in paths:
+        for line in open(p, encoding="utf-8"):
+            f = line.split()
+            if len(f) == 9 and f[:2] == ["ROW", "diskbench"]:
+                iops.setdefault((f[2], f[3]), []).append(float(f[4]))
+                p99.setdefault((f[2], f[3]), []).append(float(f[7]))
+    return summarise(iops), summarise(p99)
+
+
+def load_csv(paths):
+    rows = {}
+    for p in paths:
+        for r in csv.DictReader(open(p, encoding="utf-8")):
+            rows.setdefault(r["section"], []).append(
+                (r["series"], r["x"], float(r["value"])))
+    return rows
 
 
 # --- palette (validated with the dataviz validator, light and dark) ----------
@@ -99,6 +143,12 @@ def nice_max(v):
 def fmt_num(v, unit):
     if unit == "GB/s":
         return f"{v:.2f}"
+    if unit == "M ops/s":
+        return f"{v:.1f}"
+    if unit == "% CPU":
+        return f"{v:.0f}%"
+    if unit == "k IOPS":
+        return f"{v:,.0f}k"
     if v >= 10000:
         return f"{v / 1000:.1f}k"
     return f"{v:,.0f}"
@@ -112,7 +162,14 @@ def grouped(path, title, subtitle, groups, series, unit, data, width=760):
     thick, gap, ggap = 14, 2, 18
     label_w = max(len(g[0]) for g in groups) * FONT_W + 24
     top = 78
-    legend_h = 22
+    places, lx, ly = [], 20, 0
+    for lab, _, _ in series if len(series) > 1 else []:
+        w = 15 + len(lab) * FONT_W + 18
+        if lx + w > width - 20:
+            lx, ly = 20, ly + 18
+        places.append((lx, ly))
+        lx += w
+    legend_h = 22 + ly if places else 0
     plot_x = label_w
     plot_w = width - plot_x - 70
     rows = [(g, [s for s in series if data(g[1], s[1]) is not None]) for g in groups]
@@ -121,11 +178,9 @@ def grouped(path, title, subtitle, groups, series, unit, data, width=760):
     out = svg_open(width, height, title)
     out.append(f'<text x="20" y="28" class="title">{escape(title)}</text>')
     out.append(f'<text x="20" y="48" class="sub">{escape(subtitle)}</text>')
-    lx = 20
-    for lab, _, col in series:
-        out.append(f'<rect x="{lx}" y="{top - 14}" width="10" height="10" rx="2" fill="{col}"/>')
-        out.append(f'<text x="{lx + 15}" y="{top - 5}" class="lab">{escape(lab)}</text>')
-        lx += 15 + len(lab) * FONT_W + 18
+    for (lab, _, col), (lx, ly) in zip(series, places):
+        out.append(f'<rect x="{lx}" y="{top - 14 + ly}" width="10" height="10" rx="2" fill="{col}"/>')
+        out.append(f'<text x="{lx + 15}" y="{top - 5 + ly}" class="lab">{escape(lab)}</text>')
     y = top + legend_h
     plot_top = y - 6
     for i in range(0, 6):
@@ -196,16 +251,116 @@ def speedup(path, title, subtitle, items, width=760):
     open(path, "w", encoding="utf-8", newline="\n").write("\n".join(out) + "\n")
 
 
+# --- lines: one measure against a small ordered x axis ------------------------
+
+def lines(path, title, subtitle, xs, series, unit, xname, width=760, height=380):
+    """xs: x labels; series: [(label, css color, [value or None per x])].
+    Every line is named at its right end as well as in the legend."""
+    top, right, bottom, left = 96, 190, 48, 56
+    plot_w, plot_h = width - left - right, height - top - bottom
+    vmax = nice_max(max(v for _, _, vs in series for v in vs if v is not None))
+
+    def xof(i):
+        return left + plot_w * i / (len(xs) - 1)
+
+    def yof(v):
+        return top + plot_h * (1 - v / vmax)
+
+    out = svg_open(width, height, title)
+    out.append(f'<text x="20" y="28" class="title">{escape(title)}</text>')
+    out.append(f'<text x="20" y="48" class="sub">{escape(subtitle)}</text>')
+    lx = 20
+    for lab, col, _ in series:
+        out.append(f'<rect x="{lx}" y="{top - 30}" width="10" height="10" rx="2" fill="{col}"/>')
+        out.append(f'<text x="{lx + 15}" y="{top - 21}" class="lab">{escape(lab)}</text>')
+        lx += 15 + len(lab) * FONT_W + 18
+    for i in range(0, 6):
+        v = vmax * i / 5
+        out.append(f'<line x1="{left}" y1="{yof(v):.1f}" x2="{left + plot_w}" y2="{yof(v):.1f}" '
+                   f'class="{"axis" if i == 0 else "grid"}"/>')
+        out.append(f'<text x="{left - 8}" y="{yof(v) + 4:.1f}" class="tick" '
+                   f'text-anchor="end">{fmt_num(v, unit)}</text>')
+    for i, x in enumerate(xs):
+        out.append(f'<text x="{xof(i):.1f}" y="{height - 22}" class="tick" '
+                   f'text-anchor="middle">{escape(str(x))}</text>')
+    out.append(f'<text x="{left + plot_w / 2:.1f}" y="{height - 6}" class="tick" '
+               f'text-anchor="middle">{escape(xname)}</text>')
+    ends = []
+    for lab, col, vs in series:
+        pts = [(xof(i), yof(v)) for i, v in enumerate(vs) if v is not None]
+        d = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+        out.append(f'<polyline points="{d}" fill="none" stroke="{col}" stroke-width="2" '
+                   f'stroke-linejoin="round" stroke-linecap="round"/>')
+        for (x, y), v in zip(pts, [v for v in vs if v is not None]):
+            out.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="{col}" '
+                       f'stroke="var(--surface)" stroke-width="2">'
+                       f'<title>{escape(lab)}: {fmt_num(v, unit)} {escape(unit)}</title></circle>')
+        last = [v for v in vs if v is not None][-1]
+        ends.append([pts[-1][0], pts[-1][1], lab, last])
+    # End labels, pushed apart where lines finish close together.
+    ends.sort(key=lambda e: e[1])
+    ly = []
+    for e in ends:
+        y = e[1] + 4
+        if ly and y < ly[-1] + 15:
+            y = ly[-1] + 15
+        ly.append(y)
+    for e, y in zip(ends, ly):
+        out.append(f'<text x="{e[0] + 10:.1f}" y="{y:.1f}" class="val">'
+                   f'{escape(e[2])} {fmt_num(e[3], unit)}</text>')
+    out.append(f'<text x="{width - 20}" y="{top - 21}" class="tick" text-anchor="end">{escape(unit)}</text>')
+    out.append("</svg>")
+    open(path, "w", encoding="utf-8", newline="\n").write("\n".join(out) + "\n")
+
+
+# --- one whole, split into a few parts ----------------------------------------
+
+def parts(path, title, subtitle, items, width=760):
+    """items: [(label, value, css color)], drawn as one bar and named below."""
+    bar_y, bar_h, x0 = 66, 26, 20
+    plot_w = width - 2 * x0
+    total = sum(i[1] for i in items)
+    height = bar_y + bar_h + 30 + 20 * len(items) + 8
+    out = svg_open(width, height, title)
+    out.append(f'<text x="20" y="28" class="title">{escape(title)}</text>')
+    out.append(f'<text x="20" y="48" class="sub">{escape(subtitle)}</text>')
+    x = x0
+    for lab, v, col in items:
+        w = plot_w * v / total
+        out.append(f'<rect x="{x:.1f}" y="{bar_y}" width="{max(w - 2, 1):.1f}" height="{bar_h}" '
+                   f'rx="4" fill="{col}"><title>{escape(lab)}: {v:g}</title></rect>')
+        x += w
+    y = bar_y + bar_h + 26
+    for lab, v, col in items:
+        out.append(f'<rect x="{x0}" y="{y - 10}" width="10" height="10" rx="2" fill="{col}"/>')
+        out.append(f'<text x="{x0 + 16}" y="{y}" class="lab">{v:g}  {escape(lab)}</text>')
+        y += 20
+    out.append("</svg>")
+    open(path, "w", encoding="utf-8", newline="\n").write("\n".join(out) + "\n")
+
+
 # --- main ---------------------------------------------------------------------
 
 def main():
     outdir, paths = sys.argv[1], sys.argv[2:]
-    m = load(paths)
+    base = [os.path.basename(p) for p in paths]
+    mt_paths = [p for p, b in zip(paths, base) if b.startswith("mt.")]
+    disk_paths = [p for p, b in zip(paths, base) if b.startswith("diskbench.")]
+    csv_paths = [p for p in paths if p.endswith(".csv")]
+    m = load([p for p in paths if p not in mt_paths + disk_paths + csv_paths])
+    mt = load_mt(mt_paths)
+    disk_iops, disk_p99 = load_disk(disk_paths)
+    data = load_csv(csv_paths)
     os.makedirs(outdir, exist_ok=True)
 
     print(f"{'group':<22} {'variant':<22} {'median':>10} {'spread':>7} runs")
     for (g, v), (med, spread, n) in sorted(m.items()):
         print(f"{g:<22} {v:<22} {med:>10.1f} {spread * 100:>6.1f}% {n}")
+    for (g, v, t), (med, spread, n) in sorted(mt.items()):
+        print(f"mt {g:<19} {v:<22} {t:>2} {med:>8.2f} M/s {spread * 100:>5.1f}% {n}")
+    for (g, d), (med, spread, n) in sorted(disk_iops.items()):
+        p99 = disk_p99[(g, d)][0]
+        print(f"disk {g:<20} {d:<6} {med:>10.0f} IOPS {spread * 100:>5.1f}% p99 {p99:>8.1f} us {n}")
 
     def ns(g, v):
         return m[(g, v)][0] if (g, v) in m else None
@@ -226,12 +381,15 @@ def main():
                 ("TCP accept (multishot ACCEPT)", ns("accept", "kqueue"), ns("accept", "kqring_multishot")),
                 ("1 µs timer (TIMEOUT)", ns("timer_1us", "kqueue"), ns("timer_1us", "kqring_timeout")),
                 ("Empty kevent vs 32 NOPs per enter", ns("floor", "kqueue_empty_kevent"), ns("floor", "kqring_nop_batch32")),
+                ("Empty kevent vs one NOP per enter", ns("floor", "kqueue_empty_kevent"), ns("floor", "kqring_nop")),
                 ("AF_UNIX 256 KiB send, SEND_ZC vs write", ns("send_unix_256k", "plain_write"), ns("send_unix_256k", "kqring_send_zc_fixed")),
                 ("TCP 64 KiB send, SEND_ZC vs write", ns("send_tcp_64k", "plain_write"), ns("send_tcp_64k", "kqring_send_zc_fixed")),
                 ("AF_UNIX 16 KiB send, SEND_ZC vs write", ns("send_unix_16k", "plain_write"), ns("send_unix_16k", "kqring_send_zc_fixed")),
                 ("AF_UNIX 64 B, RECV armed before data", ns("pingpong_unix_64", "kqueue"), ns("pingpong_unix_64", "kqring_recv_armed")),
-                ("File 4 KiB, 32 READs per enter vs pread", ns("file_4k", "pread"), ns("file_4k", "kqring_read_batch32")),
-                ("File 4 KiB READ vs pread", ns("file_4k", "pread"), ns("file_4k", "kqring_read")),
+                ("Disk 4 KiB read, 32 per enter vs pread", ns("disk_read_4k", "pread"), ns("disk_read_4k", "kqring_read_batch32")),
+                ("Disk 4 KiB write, 32 per enter vs pwrite", ns("disk_write_4k", "pwrite"), ns("disk_write_4k", "kqring_write_batch32")),
+                ("UFS file 4 KiB, 32 READs per enter vs pread", ns("ufs_file_4k", "pread"), ns("ufs_file_4k", "kqring_read_batch32")),
+                ("UFS file 4 KiB READ vs pread", ns("ufs_file_4k", "pread"), ns("ufs_file_4k", "kqring_read")),
                 ("Pipe 64 B READ, O_NONBLOCK", ns("pipe", "kqueue"), ns("pipe", "kqring_read_nonblock")),
                 ("Pipe 64 B READ, blocking pipe", ns("pipe", "kqueue"), ns("pipe", "kqring_read")),
             ])
@@ -278,19 +436,106 @@ def main():
     roles = {
         "pipe": {"plain": "plain_read", "kqueue": "kqueue", "inline": "kqring_read_nonblock",
                  "blocking": "kqring_read"},
-        "file_4k": {"plain": "pread", "inline": "kqring_read", "batch": "kqring_read_batch32"},
+        "ufs_file_4k": {"plain": "pread", "inline": "kqring_read", "batch": "kqring_read_batch32"},
         "floor": {"kqueue": "kqueue_empty_kevent", "inline": "kqring_nop",
                   "worker": "kqring_nop_async"},
     }
     grouped(os.path.join(outdir, "worker.svg"),
             "Pipes and files: inline vs worker thread",
             "ns per operation, lower is better; NOP via a worker shows a worker round trip",
-            [("Pipe READ, 64 B", "pipe"), ("File READ, 4 KiB", "file_4k"), ("Empty op (NOP)", "floor")],
+            [("Pipe READ, 64 B", "pipe"), ("UFS file READ, 4 KiB", "ufs_file_4k"), ("Empty op (NOP)", "floor")],
             [("read(2) / pread(2)", "plain", P), ("kqueue", "kqueue", K),
              ("kqring, inline", "inline", S1), ("kqring, blocking pipe, inline", "blocking", S4),
              ("kqring, via worker", "worker", S2),
              ("kqring, inline, 32 per enter", "batch", S3)],
             "ns", lambda g, r: ns(g, roles[g][r]) if r in roles[g] else None)
+
+    grouped(os.path.join(outdir, "echo.svg"),
+            "Echo server: CPU the server spends on each message",
+            "ns of server CPU per message, lower is better; a client thread sends and waits",
+            [("AF_UNIX 64 B", "echo_unix_64"), ("AF_UNIX 4 KiB", "echo_unix_4096"), ("TCP 64 B", "echo_tcp_64")],
+            [("kqueue: kevent + read + write", "kqueue_server_cpu", K),
+             ("kqring, io_uring style", "kqring_recv_send_server_cpu", S1),
+             ("kqring trigger, no CQE per message", "kqring_trigger_server_cpu", S2)],
+            "ns", ns)
+
+    if mt:
+        def rate(w, v):
+            return [mt[(w, v, t)][0] if (w, v, t) in mt else None for t in (1, 2, 4, 8)]
+
+        lines(os.path.join(outdir, "threads.svg"),
+              "One ring per thread: ping-pong against kqueue",
+              "AF_UNIX 64 B, each thread on its own CPU; 8 threads share 4 cores",
+              [1, 2, 4, 8],
+              [("kqueue", K, rate("pingpong_unix_64", "kqueue")),
+               ("kqring RECV", S1, rate("pingpong_unix_64", "kqring_recv_onebuf"))],
+              "M ops/s", "threads")
+
+    if data:
+        def col(section, series):
+            return [v for s_, _, v in data[section] if s_ == series]
+
+        def xs(section):
+            seen = []
+            for _, x, _ in data[section]:
+                if x not in seen:
+                    seen.append(x)
+            return seen
+
+        lines(os.path.join(outdir, "fio_scale.svg"),
+              "fio, 4 KiB random reads from md(4) disks, a ring and a disk per thread",
+              "Thousands of IOPS, higher is better; 32 in flight per job",
+              xs("md"),
+              [("aio", K, col("md", "aio")), ("kqring", S1, col("md", "kqring"))],
+              "k IOPS", "jobs")
+        lines(os.path.join(outdir, "fio_cached.svg"),
+              "fio, 4 KiB random reads of a ZFS file in the ARC, by jobs",
+              "Thousands of IOPS, higher is better; psync is a thread per job, others 16 in flight",
+              xs("cached"),
+              [("aio", K, col("cached", "aio")), ("kqring", S1, col("cached", "kqring")),
+               ("psync", P, col("cached", "psync"))],
+              "k IOPS", "jobs")
+        cpu = {(s_, x): v for s_, x, v in data["cpu"]}
+        grouped(os.path.join(outdir, "fio_cpu.svg"),
+                "fio on a SATA SSD: CPU for the same work, 32 in flight",
+                "Percent of one CPU, lower is better; IOPS within 5% of each other",
+                [(x, x) for x in xs("cpu")],
+                [("aio", "aio", K), ("kqring", "kqring", S1)],
+                "% CPU", lambda g, v: cpu.get((v, g)))
+        lib = {x: v for _, x, v in data["liburing"]}
+        parts(os.path.join(outdir, "liburing.svg"),
+              f"liburing's own tests on kqring: {lib['Passed']:g} of {sum(lib.values()):g} pass",
+              "liburing 2.9, RLIMIT_MEMLOCK raised; every failure is explained in liburing/README.md",
+              [("passed", lib["Passed"], S1),
+               ("skipped: the test found a feature missing and said so", lib["Skipped"], P),
+               ("failed: not kqring's (Linux-only assumptions in the test)", lib["Not kqring's"], S3),
+               ("failed: differences in kqring", lib["Differences"], K)])
+
+    costs = [("NOP, 32 per enter", ns("floor", "kqring_nop_batch32")),
+             ("NOP, one per enter", ns("floor", "kqring_nop")),
+             ("Pipe READ, inline", ns("pipe", "kqring_read")),
+             ("RECV, reused buffer", ns("pingpong_unix_64", "kqring_recv_onebuf")),
+             ("NOP through a worker", ns("floor", "kqring_nop_async")),
+             ("UFS READ, inline", ns("ufs_file_4k", "kqring_read")),
+             ("RECV armed, then woken by an upcall", ns("pingpong_unix_64", "kqring_recv_armed")),
+             ("Disk READ, bio to md(4)", ns("disk_read_4k", "kqring_read"))]
+    grouped(os.path.join(outdir, "paths.svg"),
+            "What one request costs on each path",
+            "ns per operation, lower is better; socket and pipe rows include the write that feeds them",
+            [(lab, lab) for lab, _ in costs],
+            [("ns", "ns", S1)],
+            "ns", lambda g, v: dict(costs)[g])
+
+    # Lines of code per source file, from the tree this script is in.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sizes = sorted(((sum(1 for _ in open(f, encoding="utf-8")), os.path.basename(f))
+                    for f in glob.glob(os.path.join(root, "kmod", "*.[ch]"))), reverse=True)
+    grouped(os.path.join(outdir, "modules.svg"),
+            f"kqring.ko by source file: {sum(n for n, _ in sizes):,} lines",
+            "Lines per file, including comments",
+            [(name, name) for _, name in sizes],
+            [("lines", "lines", S1)],
+            "lines", lambda g, v: dict((b, a) for a, b in sizes)[g])
 
 
 if __name__ == "__main__":

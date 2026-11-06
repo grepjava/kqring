@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="viz" width="760" height="210" viewBox="0 0 760 210" role="img" aria-label="liburing&#x27;s own tests on kqring: 144 of 168 pass">
+<title>liburing&#x27;s own tests on kqring: 144 of 168 pass</title>
+
+<style>
+  .viz { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+         --grid:#e1e0d9; --axis:#c3c2b7; --plain:#a8a69e; --kqueue:#eb6834;
+         --s1:#2a78d6; --s2:#1baf7a; --s3:#eda100; --s4:#e87ba4;
+         --faster:#2a78d6; --slower:#e34948; }
+  @media (prefers-color-scheme: dark) {
+    .viz { --surface:#1a1a19; --ink:#f0efec; --ink2:#c3c2b7; --muted:#898781;
+           --grid:#2c2c2a; --axis:#383835; --plain:#6f6d67; --kqueue:#d95926;
+           --s1:#3987e5; --s2:#199e70; --s3:#c98500; --s4:#d55181;
+           --faster:#3987e5; --slower:#e66767; }
+  }
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--ink); }
+  .title { font-size: 15px; font-weight: 600; }
+  .sub { font-size: 12px; fill: var(--ink2); }
+  .lab { font-size: 12px; fill: var(--ink2); }
+  .val { font-size: 11px; fill: var(--ink2); font-variant-numeric: tabular-nums; }
+  .tick { font-size: 11px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+  .grid { stroke: var(--grid); stroke-width: 1; }
+  .axis { stroke: var(--axis); stroke-width: 1; }
+</style>
+
+<rect width="760" height="210" rx="8" fill="var(--surface)"/>
+<text x="20" y="28" class="title">liburing&#x27;s own tests on kqring: 144 of 168 pass</text>
+<text x="20" y="48" class="sub">liburing 2.9, RLIMIT_MEMLOCK raised; every failure is explained in liburing/README.md</text>
+<rect x="20.0" y="66" width="615.1" height="26" rx="4" fill="var(--s1)"><title>passed: 144</title></rect>
+<rect x="637.1" y="66" width="28.0" height="26" rx="4" fill="var(--plain)"><title>skipped: the test found a feature missing and said so: 7</title></rect>
+<rect x="667.1" y="66" width="58.0" height="26" rx="4" fill="var(--s3)"><title>failed: not kqring&#x27;s (Linux-only assumptions in the test): 14</title></rect>
+<rect x="727.1" y="66" width="10.9" height="26" rx="4" fill="var(--kqueue)"><title>failed: differences in kqring: 3</title></rect>
+<rect x="20" y="108" width="10" height="10" rx="2" fill="var(--s1)"/>
+<text x="36" y="118" class="lab">144  passed</text>
+<rect x="20" y="128" width="10" height="10" rx="2" fill="var(--plain)"/>
+<text x="36" y="138" class="lab">7  skipped: the test found a feature missing and said so</text>
+<rect x="20" y="148" width="10" height="10" rx="2" fill="var(--s3)"/>
+<text x="36" y="158" class="lab">14  failed: not kqring&#x27;s (Linux-only assumptions in the test)</text>
+<rect x="20" y="168" width="10" height="10" rx="2" fill="var(--kqueue)"/>
+<text x="36" y="178" class="lab">3  failed: differences in kqring</text>
+</svg>

@@ -1,6 +1,6 @@
 # Spec: event-driven chains
 
-**Status:** phase 1 implemented (`kmod/kqring_trig.c`, tests in `kqring_test trig`). Phase 2 (`LEN_FROM_PREV`, `STOP_ON_ZERO`, `BUF_FROM_PREV`) is implemented, with the echo benchmark. Phase 3, kevent sources (`KQRING_TRIG_SRC_KEVENT`), is implemented.
+**Status:** implemented in `kmod/kqring_trig.c`, with tests in `kqring_test trig`.
 
 In io_uring, linked requests run once: the next request in a chain starts when the one before it completes. An *event-driven chain* runs its linked requests each time an event fires. "Whenever this socket is readable, receive into a provided buffer and write what arrived to this file" becomes one submission. After that, the kernel runs the chain on every event with no round trip to user space, until the program cancels it.
 
@@ -154,27 +154,17 @@ A liburing-style helper, `kqring_queue_init_ext()`, hides the opt-in.
 - **Cancellation and teardown** walk the trigger's running chains (`CANCEL_RUNNING`) through the existing cancel code. The trigger holds a reference until its last chain is done, so a chain never refers to a trigger that has been freed.
 - **Limits:** templates count against the ring's argument budget; each run's requests count against the ring's request limit, as if submitted; and a per-ring cap on armed triggers (`kern.kqring.max_triggers`, default 1024) applies.
 
-## Phases
+## How it was built
 
 1. **Opt-in and escape opcode; readiness triggers, `SERIAL` and `CONCURRENT` modes, `CQE_EACH`, `STOP_ON_ERROR`, cancellation.** Tests in `kqring_test`: the escape opcode rejected without opt-in, echo server loop, EOF, cancel while running, fd closed, CQ overflow, bad templates, unregister of a fixed file used by a template. Fuzzer: opted-in rings with random trigger setups and templates.
 2. **Step flags.** Done: `LEN_FROM_PREV` and `STOP_ON_ZERO` (tests: a `RECV` → `SEND` echo with no CQE per message, an event-driven file copy that stops at end of file, and bad step flags). `BUF_FROM_PREV` (tests: eight connections sharing four provided buffers, with a buffer ring and a `PROVIDE_BUFFERS` list, for 400 echoes; and its edge cases).
 3. **Kevent triggers.** Done: `source = KQRING_TRIG_SRC_KEVENT` with `kev` pointing to a `struct kevent`, as a `KQRING_EXT_KEVENT` request takes it (`sqe->fd` -1, `poll32_events` 0). A `SERIAL` trigger waits with a one-shot kevent request, a `CONCURRENT` one with a multishot one. `CQE_EACH` firings carry the kevent request's `res` (the `NOTE_*` that fired, or a signal's count). Tests: "when this file is written, read it" (20 writes, a `READ` each), a child's exit running a request once and ending the trigger, a signal-driven `CONCURRENT` trigger with `CQE_EACH`, and bad arguments.
 
-**Benchmark** (`kqring_bench echo`): a server thread echoes each message to a client that sends one and waits for it. Three servers are compared: kqueue (`kevent(2)`, `read(2)`, `write(2)`), io_uring style (each `RECV` CQE makes user space submit the `SEND` and the next `RECV`), and a trigger (`RECV` → `SEND` with `LEN_FROM_PREV`, no CQE or system call per message). It reports the round trip and the server thread's CPU time per message.
+**Benchmark:** see [Echo server](../BENCHMARK.MD#echo-server-an-event-driven-chain-against-kqueue).
 
-Medians of 3 runs on an Intel Core i5-8250U, FreeBSD 15.1 `GENERIC` (round trip / server CPU, in µs):
+## kqring's extensions
 
-| Messages | kqueue | io_uring style | Trigger |
-|---|---|---|---|
-| AF_UNIX, 64 B | 5.70 / 3.09 | 6.06 / 3.02 | 5.46 / 2.62 |
-| AF_UNIX, 4 KiB | 6.89 / 3.63 | 7.17 / 3.55 | 6.62 / 3.17 |
-| TCP, 64 B | 11.96 / 4.35 | 12.36 / 4.37 | 11.90 / 4.01 |
-
-The trigger uses 8–15% less server CPU per message than kqueue and is the fastest round trip in each case. One message at a time, most of each round trip is waking the other thread, which no server can avoid, so the gains are modest. The trigger's advantage grows with the work it saves per message: many connections, or chains of more than two steps.
-
-## Roadmap for kqring's extensions
-
-Event-driven chains are the first of three extensions, all behind the same opt-in and escape opcode. Each is a sub-opcode, and none duplicates an operation kqring already has.
+Event-driven chains are one of three extensions, all behind the same opt-in and escape opcode. Each is a sub-opcode, and none duplicates an operation kqring already has.
 
 1. **Event-driven chains** (`KQRING_EXT_TRIGGER`, this spec): phases 1 and 2 above.
 2. **Kevent operation** (`KQRING_EXT_KEVENT`, **implemented** for `VNODE`, `SIGNAL` and `PROC`; `include/sys/kqring.h` has the interface). One-shot or multishot (`KQRING_KEV_MULTISHOT` in `sqe->rw_flags`), with a CQE per event. `sqe->addr` points to a `struct kevent` with the ident, filter and fflags. With a 32-byte CQE (`CQE32`), `big_cqe[0]` holds the kevent's `data` and `big_cqe[1]` the fflags that fired. Events that fire before a CQE is posted merge into it.

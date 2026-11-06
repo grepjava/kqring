@@ -4,21 +4,181 @@
   <img src="docs/kqring-hero.jpg" alt="BSD daemon as Sméagol with the Ring of Power" width="100%">
 </p>
 
-`kqring` brings Linux's [`io_uring`](https://kernel.dk/io_uring.pdf) asynchronous I/O interface to FreeBSD, as a loadable kernel module (`kqring.ko`) for FreeBSD 15.1 (amd64).
+`kqring` brings Linux's [`io_uring`](https://kernel.dk/io_uring.pdf) asynchronous I/O interface to FreeBSD, as a loadable kernel module (`kqring.ko`) for FreeBSD 15.1 (amd64). Programs written for io_uring build against it with three system call wrappers changed, [liburing](liburing/) and [fio](fio/) run on it, and it adds operations of its own that io_uring doesn't have.
 
-It uses the io_uring ABI as-is, with the same structure layouts and `IORING_*` constants:
+> **Experimental preview, for test systems only.** kqring is an out-of-tree kernel module, and a bug in it can crash the machine. It has **not** had an independent security audit. See [Should you use it?](#should-you-use-it)
+
+## What kqring is
+
+A program and the kernel share two ring buffers in memory. The program writes requests into one, the **submission queue**, and reads results from the other, the **completion queue**. One system call can submit hundreds of requests and collect hundreds of results, and some programs need no system call at all.
+
+kqring uses the io_uring ABI as it is, with the same structure layouts and `IORING_*` constants:
 - submission and completion queues shared with the kernel through `mmap(2)`;
 - `struct io_uring_sqe`, `struct io_uring_cqe` and `struct io_uring_params`;
 - provided-buffer rings.
 
-Code written against `<linux/io_uring.h>` builds against [`<sys/kqring.h>`](include/sys/kqring.h) instead, and needs only its three syscall wrappers replaced.
+Code written against `<linux/io_uring.h>` builds against [`<sys/kqring.h>`](include/sys/kqring.h) instead.
 
-**Status.** kqring implements most of io_uring:
+## Why kqring exists
+
+**io_uring has no FreeBSD equivalent, and software is being written for it.** Storage engines, network servers and runtimes on Linux use io_uring directly or through liburing. On FreeBSD they need a second I/O backend, or they fall back to something slower. The goal of kqring is io_uring for FreeBSD in general: for any io_uring user, not for one application.
+
+**FreeBSD's own interfaces each do part of the job.** `kqueue(2)` is excellent at saying that a descriptor is *ready*, but the program still makes a system call for each read or write. `aio(4)` does asynchronous I/O, but with its own calling convention and a completion per request. A ring does both in one interface: it says an operation is *finished*, and many operations share one system call.
+
+```mermaid
+sequenceDiagram
+    participant P as Program
+    participant K as Kernel
+    Note over P,K: kqueue: N sockets have a message each
+    P->>K: kevent()
+    K-->>P: N descriptors are ready
+    loop once per message
+        P->>K: recv()
+        K-->>P: data
+    end
+    Note over P,K: kqring: the same N messages
+    P->>K: kqring_enter()
+    K-->>P: N completions in the shared ring, data already in buffers
+```
+
+That is N + 1 system calls against one, which is why the gap is widest for busy servers.
+
+| | `kqueue(2)` | `aio(4)` | kqring |
+|---|---|---|---|
+| Tells the program | a descriptor is ready | a request finished | a request finished |
+| Does the I/O | no, the program calls `read` / `write` | yes | yes |
+| Requests per system call | | many, with `lio_listio(2)` | many |
+| Results per system call | many events | one with `aio_waitcomplete(2)`, or many through a kqueue | many, or none if polling the ring |
+| Sockets, files, disks, timers, pipes in one queue | notification only | sockets, files and disks | yes |
+| Chains of dependent requests | no | no | yes, linked requests |
+| Zero-copy send | no | no | yes, `SEND_ZC` |
+| Code written for Linux io_uring | no | no | yes |
+
+## How it works
+
+```mermaid
+flowchart LR
+    App["Program"] -- "writes requests" --> SQ[("Submission<br/>queue")]
+    SQ -- "kqring_enter(2),<br/>or SQPOLL thread" --> Issue{"Can it finish<br/>without waiting?"}
+    Issue -- "yes" --> Inline["Runs at once on the<br/>calling thread"]
+    Issue -- "socket not ready" --> Upcall["Waits on a<br/>socket upcall"]
+    Issue -- "disk device" --> Bio["Goes straight to<br/>the driver as a bio"]
+    Issue -- "would block" --> Worker["Runs on a worker<br/>thread in the process"]
+    Inline --> CQ[("Completion<br/>queue")]
+    Upcall --> CQ
+    Bio --> CQ
+    Worker --> CQ
+    CQ -- "reads results" --> App
+```
+
+Requests that can finish immediately do, on the calling thread. Everything that has to wait is parked without blocking the program, and all results are posted by one thread, so the completion queue needs no lock against the program. [ARCHITECTURE.MD](ARCHITECTURE.MD) has the details.
+
+## What works today
+
+kqring implements most of io_uring:
 - about 60 opcodes, multishot operations, linked requests, timeouts and cancellation;
 - fixed files, registered and provided buffers;
 - zero-copy send, `SQPOLL` and in-process worker threads.
 
-It has its own functional test suite and benchmarks, and has been reviewed against the classes of bugs behind Linux io_uring's CVEs. [liburing](liburing/) 2.9 builds against it, and most of liburing's own test suite passes (see [`liburing/README.md`](liburing/README.md)). It has **not** had an independent security audit, and it is an out-of-tree kernel module: a bug in it can crash the machine.
+It also has [extensions](#kqring-extensions) of its own: event-driven chains, requests for any kqueue event, and a bridge that delivers an existing kqueue's events as completions.
+
+![liburing's own tests on kqring](docs/bench/liburing.svg)
+
+The 14 failures that aren't kqring's come from Linux-only assumptions in the tests, and the 3 others are deliberate differences. [`liburing/README.md`](liburing/README.md) explains each one.
+
+| How it's tested | Result on `v0.3.0` |
+|---|---|
+| kqring's own suite, stock and debug kernels | 120 tests pass |
+| Fuzzer, whole interface, 30 minutes on a debug kernel | clean, no leaks |
+| Stress test, 10 minutes on a debug kernel | clean, no leaks |
+| KASAN kernel with `kqring.ko` instrumented: suite, stress and 7 full fuzz runs | no memory errors reported in kqring |
+| liburing 2.9's test suite | 144 of 168 pass, every failure explained |
+| `kqring_diskbench -V`, every read checked against what was written | passed on an md(4) disk and a ZFS file |
+
+It has also been reviewed against the classes of bugs behind Linux io_uring's CVEs.
+
+---
+
+## Performance against kqueue
+
+![kqring vs kqueue: speed-up per operation](docs/bench/summary.svg)
+
+Compared with `kqueue(2)`, or the plain system call where kqueue has no role, on a 4-core i5-8250U running FreeBSD 15.1. Medians of 5 runs of `v0.3.0`, in ns per operation, lower is better.
+
+| Workload | Baseline | kqring | Result |
+|---|---:|---:|---|
+| Fan-in, 16 sockets, 64 B | 831 (kqueue) | 676 (multishot `RECV`) | **19% faster** |
+| Fan-in, 1,024 sockets, 64 B | 870 (kqueue) | 709 (batched `RECV`) | **18% faster** |
+| AF_UNIX ping-pong, 64 B | 1,117 (kqueue) | 881 (`RECV`, reused buffer) | **21% faster** |
+| AF_UNIX ping-pong, 64 B | 1,117 (kqueue) | 939 (multishot `RECV`) | **16% faster** |
+| AF_UNIX ping-pong, 64 B | 1,117 (kqueue) | 1,393 (`RECV` armed first) | 25% slower |
+| TCP ping-pong, 64 B | 5,948 (kqueue) | 5,891 (multishot `RECV`) | level |
+| TCP `ACCEPT` | 16,283 (kqueue) | 16,113 (multishot) | level |
+| TCP `ACCEPT` | 16,283 (kqueue) | 14,320 (multishot, 50 µs busy-poll) | **12% faster** |
+| Pipe read, 64 B, data ready | 1,026 (kqueue) | 848 (`READ`) | **17% faster** |
+| 1 µs timer | 9,412 (`EVFILT_TIMER`) | 4,898 (`TIMEOUT`) | **1.9× faster** |
+| Empty call | 288 (`kevent`) | 336 (`NOP`, one per enter) | 16% slower |
+| Empty call | 288 (`kevent`) | 69 (`NOP`, 32 per enter) | **4.2× faster** |
+| AF_UNIX send, 256 KiB | 25,746 (`write`) | 11,069 (`SEND_ZC`, registered) | **2.3× faster** |
+| TCP send, 256 KiB | 56,215 (`write`) | 41,974 (`SEND_ZC`, registered) | **25% faster** |
+| TCP send, 16 KiB | 7,433 (`write`) | 7,685 (`SEND`) | 3% slower |
+| 4 KiB disk read | 5,280 (`pread`) | 1,837 (`READ`, 32 per enter) | **2.9× faster** |
+| 4 KiB disk read | 5,280 (`pread`) | 5,842 (`READ`, one per enter) | 11% slower |
+| 4 KiB UFS cached read | 1,189 (`pread`) | 1,028 (`READ`, 32 per enter) | **13% faster** |
+| 4 KiB UFS cached read | 1,189 (`pread`) | 1,328 (`READ`, one per enter) | 12% slower |
+
+<p align="center">
+  <img src="docs/bench/fanin.svg" alt="Fan-in across N sockets" width="49%">
+  <img src="docs/bench/pingpong.svg" alt="Single-connection ping-pong" width="49%">
+</p>
+<p align="center">
+  <img src="docs/bench/send_unix.svg" alt="Bulk send over AF_UNIX" width="49%">
+  <img src="docs/bench/echo.svg" alt="Server CPU per message in an echo server" width="49%">
+</p>
+<p align="center">
+  <img src="docs/bench/worker.svg" alt="Pipes and files: inline vs worker" width="49%">
+  <img src="docs/bench/threads.svg" alt="Ping-pong with one ring per thread" width="49%">
+</p>
+
+These are mostly single-threaded loopback measurements of what each mechanism costs. [`BENCHMARK.MD`](BENCHMARK.MD) has the method, every result and the known gaps, and the raw runs are in [`docs/bench/data/`](docs/bench/data/).
+
+### Where kqring is faster
+
+1. **Servers with many active connections:** 18%–19% faster. One enter collects every ready message.
+2. **Steady receive:** multishot `RECV`, or `RECV` into a reused buffer, needs no separate wake-up before the read.
+3. **Bulk sends from 32–64 KiB up:** `SEND_ZC` from a registered buffer avoids copying user memory into the kernel.
+4. **Disks with requests in flight:** batched requests reach the driver together, which one thread calling `pread(2)` can't do.
+5. **Anything you can batch:** 32 `NOP`s per enter cost 69 ns each, against 288 ns for an empty `kevent(2)`.
+6. **Event-driven chains:** a [trigger](#kqring-extensions) echo server spends less CPU per message than kqueue, because it never returns to user space between messages.
+
+### Where kqueue or direct system calls are better
+
+1. **One-shot `RECV` armed before the data arrives:** 25% slower at 64 B. It takes a second enter and sets up a socket upcall each time. Use multishot.
+2. **One operation at a time:** a single request per enter costs more than the plain call, as the `NOP` and `READ` rows show. The ring pays off with several requests in flight.
+3. **Cached reads on ZFS:** ZFS has no page-cache read path, so reads go through a worker, and `pread(2)` is faster. On UFS, batched reads win.
+4. **Many threads reading cached data:** from 4 threads, `pread(2)` passes kqring's worker path, because a thread reading the cache itself needs no hand-off.
+5. **`sendfile(2)` with kernel TLS:** for serving files to the network, keep `sendfile(2)`. It moves file pages to the NIC without passing through user space.
+
+## Storage performance
+
+With [fio](fio/README.md)'s own `io_uring` engine, on a SATA SSD and on `md(4)` disks. kqring reaches what the SSD can do, 98,876 IOPS at 32 in flight, with less than half of `aio(4)`'s CPU.
+
+![CPU per engine on a SATA SSD](docs/bench/fio_cpu.svg)
+
+<p align="center">
+  <img src="docs/bench/fio_scale.svg" alt="fio on md(4) disks by jobs" width="49%">
+  <img src="docs/bench/fio_cached.svg" alt="fio on a cached ZFS file by jobs" width="49%">
+</p>
+
+On a ZFS file at 32 in flight, kqring is 4–5% behind `aio(4)` in IOPS and has a longer latency tail, at less than half the CPU. See [`BENCHMARK.MD`](BENCHMARK.MD#fio-on-a-real-ssd).
+
+## Should you use it?
+
+**Try it** if you're porting or testing software written for io_uring on FreeBSD, measuring whether a ring helps your workload, or want to work on kqring itself.
+
+**Don't use it in production yet.** It's an experimental preview, it runs in the kernel, and it hasn't been audited. It is built and tested on FreeBSD 15.1 amd64 with the `GENERIC` kernel only.
+
+Some things differ from Linux; see [Differences from Linux](#differences-from-linux) and [Known gaps](BENCHMARK.MD#known-gaps).
 
 ---
 
@@ -79,68 +239,6 @@ Programs that use liburing build against the port in [`liburing/`](liburing/), w
 
 ---
 
-## Performance
-
-![kqring vs kqueue: speed-up per operation](docs/bench/summary.svg)
-
-Compared with `kqueue(2)`, or the plain system call where kqueue has no role, on a 4-core i5-8250U running FreeBSD 15.1 (medians across runs):
-
-### Side-by-side comparison (`ns/op`, lower is better)
-
-| Workload | `kqueue` (or syscall baseline) | `kqring` (best idiom) | `kqring` (other variants) | Delta (`ns`) | Result |
-|---|---:|---:|---|---:|---:|
-| **Empty syscall floor** | `296.4 ns` (`kevent`) | **`62.6 ns`** (`NOP` × 32) | `326.0 ns` (`NOP` × 1)<br>`1,048.8 ns` (`NOP` `IOSQE_ASYNC`) | `−233.8 ns`<br>`+29.6 ns` | **4.7× faster** batched<br>10% slower unbatched |
-| **Fan-in: 16 sockets (64 B)** | `823.4 ns` | **`647.7 ns`** (multishot) | `666.0 ns` (batched 1-shot) | `−175.7 ns` | **21% faster (1.27×)** |
-| **Fan-in: 256 sockets (64 B)** | `854.7 ns` | **`672.3 ns`** (multishot) | `686.4 ns` (batched 1-shot) | `−182.4 ns` | **21% faster (1.27×)** |
-| **Fan-in: 1,024 sockets (64 B)** | `864.9 ns` | **`705.2 ns`** (batched 1-shot)<br>**`710.0 ns`** (multishot) | — | `−159.7 ns` | **18% faster (1.23×)** |
-| **AF_UNIX ping-pong (64 B)** | `1,117.5 ns` | **`868.7 ns`** (reused buf)<br>**`915.2 ns`** (multishot) | `953.8 ns` (provided buf)<br>`1,377.6 ns` (pre-armed 1-shot) | `−248.8 ns`<br>`−202.3 ns` | **22% faster** (reused)<br>**18% faster** (multishot)<br>23% slower (pre-armed 1-shot) |
-| **AF_UNIX ping-pong (1 KiB)** | `1,156.3 ns` | **`908.4 ns`** (reused buf)<br>**`1,021.9 ns`** (multishot) | `1,060.0 ns` (provided buf)<br>`1,516.3 ns` (pre-armed 1-shot) | `−247.9 ns`<br>`−134.4 ns` | **21% faster** (reused)<br>**12% faster** (multishot)<br>31% slower (pre-armed 1-shot) |
-| **AF_UNIX ping-pong (4 KiB)** | `1,269.5 ns` | **`1,019.0 ns`** (reused buf)<br>**`1,213.9 ns`** (multishot) | `1,242.4 ns` (provided buf)<br>`1,701.6 ns` (pre-armed 1-shot) | `−250.5 ns`<br>`−55.6 ns` | **20% faster** (reused)<br>**4% faster** (multishot)<br>34% slower (pre-armed 1-shot) |
-| **TCP loopback ping-pong (64 B)** | `5,904.1 ns` | **`5,824.1 ns`** (multishot) | `6,006.7 ns` (reused buf)<br>`6,089.4 ns` (provided buf)<br>`6,493.6 ns` (pre-armed 1-shot) | `−80.0 ns` | **1.4% faster** (multishot)<br>10% slower (pre-armed 1-shot) |
-| **Pipe read (64 B, data ready)** | `1,024.4 ns` | **`831.7 ns`** (`O_NONBLOCK`)<br>**`839.6 ns`** (blocking) | — | `−192.7 ns` | **19% faster (1.23×)** |
-| **TCP loopback `ACCEPT`** | `19,280.7 ns` | **`17,686.4 ns`** (multishot + 50 µs busy-poll)<br>**`19,257.0 ns`** (multishot) | — | `−1,594.3 ns`<br>`−23.7 ns` | **8% faster** (busy-poll)<br>**On par** (multishot) |
-| **1 µs one-shot timer** | `10,185.4 ns` (`EVFILT_TIMER`) | **`4,903.5 ns`** (`TIMEOUT`) | — | `−5,281.9 ns` | **52% faster (2.08×)** |
-| **AF_UNIX bulk send (16 KiB)** | `1,726.5 ns` (`write`) | `1,917.7 ns` (`SEND`) | `1,921.1 ns` (`SEND_ZC` reg)<br>`2,048.2 ns` (`SEND_ZC` unreg) | `+191.2 ns` | 11% slower |
-| **AF_UNIX bulk send (32 KiB)** | `2,931.0 ns` (`write`) | **`2,744.0 ns`** (`SEND_ZC` reg) | `3,146.5 ns` (`SEND`)<br>`3,157.7 ns` (`SEND_ZC` unreg) | `−187.0 ns` | **6% faster** |
-| **AF_UNIX bulk send (64 KiB)** | `5,509.1 ns` (`write`) | **`4,372.4 ns`** (`SEND_ZC` reg) | `5,114.9 ns` (`SEND_ZC` unreg)<br>`5,736.2 ns` (`SEND`) | `−1,136.7 ns` | **21% faster (1.26×)** |
-| **AF_UNIX bulk send (256 KiB)** | `25,896.1 ns` (`write`) | **`16,037.6 ns`** (`SEND_ZC` reg) | `18,585.2 ns` (`SEND_ZC` unreg)<br>`26,227.0 ns` (`SEND`) | `−9,858.5 ns` | **38% faster (1.61×)** |
-| **TCP loopback send (16 KiB)** | `7,531.0 ns` (`write`) | **`7,438.8 ns`** (`SEND_ZC` reg) | `7,747.8 ns` (`SEND_ZC` unreg)<br>`7,774.2 ns` (`SEND`) | `−92.2 ns` | **1.2% faster** |
-| **TCP loopback send (32 KiB)** | `8,539.5 ns` (`write`) | **`8,517.7 ns`** (`SEND`) | `8,771.3 ns` (`SEND_ZC` reg)<br>`8,967.8 ns` (`SEND_ZC` unreg) | `−21.8 ns` | **On par** |
-| **TCP loopback send (64 KiB)** | `15,068.4 ns` (`write`) | **`12,668.7 ns`** (`SEND_ZC` reg) | `13,527.5 ns` (`SEND_ZC` unreg)<br>`15,387.8 ns` (`SEND`) | `−2,399.7 ns` | **16% faster (1.19×)** |
-| **TCP loopback send (256 KiB)** | `56,709.8 ns` (`write`) | **`41,369.0 ns`** (`SEND_ZC` reg) | `43,282.6 ns` (`SEND_ZC` unreg)<br>`55,911.7 ns` (`SEND`) | `−15,340.8 ns` | **27% faster (1.37×)** |
-| **4 KiB cached file read (UFS)** | `1,217.2 ns` (`pread`) | **`1,041.4 ns`** (`READ` × 32) | `1,366.2 ns` (`READ` × 1, fixed)<br>`1,385.9 ns` (`READ` × 1) | `−175.8 ns` | **14% faster** batched<br>12–14% slower unbatched |
-| **4 KiB cached file read (ZFS ARC)** | `1,657.1 ns` (`pread`) | `2,150.8 ns` (`READ` × 32) | `2,343.1 ns` (`READ` × 1, fixed)<br>`2,431.7 ns` (`READ` × 1) | `+493.7 ns` | 30% slower batched<br>41–47% slower unbatched |
-| **4 KiB raw `md(4)` disk read** | `4,371.0 ns` (`pread`) | **`975.0 ns`** (`READ` × 32, direct bio) | `4,908.0 ns` (`READ` × 1, direct bio) | `−3,396.0 ns` | **78% faster (4.5×)** batched |
-| **4 KiB raw `md(4)` disk write** | `5,504.0 ns` (`pwrite`) | **`2,301.0 ns`** (`WRITE` × 32, direct bio) | `6,124.0 ns` (`WRITE` × 1, direct bio) | `−3,203.0 ns` | **58% faster (2.4×)** batched |
-
-<p align="center">
-  <img src="docs/bench/fanin.svg" alt="Fan-in across N sockets" width="49%">
-  <img src="docs/bench/pingpong.svg" alt="Single-connection ping-pong" width="49%">
-</p>
-<p align="center">
-  <img src="docs/bench/send_unix.svg" alt="Bulk send over AF_UNIX" width="49%">
-  <img src="docs/bench/worker.svg" alt="Pipes and files: inline vs worker" width="49%">
-</p>
-
-Except for multi-threaded scaling (12.5 M single-`NOP` enters/s on 8 threads vs 3.1 M on 1 thread), these are single-threaded loopback measurements. See [`BENCHMARK.MD`](BENCHMARK.MD) for the method, every result, and the known gaps.
-
-### When `kqring` is faster vs. when `kqueue` (or direct syscalls) is faster
-
-#### Where `kqring` is faster
-1. **High-concurrency servers, proxies, and message brokers (`16–1,024+` active sockets):** **18–21% faster (`648–705 ns` vs `823–865 ns`)**. With `IORING_RECV_MULTISHOT` + provided buffer rings (`PBUF_RING`), one `kqring_enter(2)` reaps incoming payloads from all ready connections and submits outbound writes, replacing `1 kevent + N recv + N send` syscalls.
-2. **Steady-state socket receive (`RECV` into a reused buffer or multishot `RECV`):** **4–22% faster (`869–1,214 ns` vs `1,118–1,270 ns` on AF_UNIX, `5,824 ns` vs `5,904 ns` on TCP)** because data Transfer + event notification happen in one step without a separate `kevent(2)` wakeup before `recv(2)`.
-3. **Bulk socket transmit (`≥ 32 KiB` on AF_UNIX, `≥ 64 KiB` on TCP):** **16–38% faster (`16.0 µs` vs `25.9 µs` on AF_UNIX 256 KiB; `41.4 µs` vs `56.7 µs` on TCP 256 KiB)** using `IORING_OP_SEND_ZC` with registered buffers (`M_EXTPG` multi-page zero-copy mbufs avoid copying user memory into kernel mbuf clusters).
-4. **Raw block / NVMe devices (`/dev/nda*`, `/dev/ada*`, `/dev/md*`):** **4.5× faster (`975 ns` vs `4,371 ns` read, `2,301 ns` vs `5,504 ns` write)** when batching 32 4 KiB requests per enter directly to the GEOM driver as unmapped `bio`s.
-5. **Batched operations, ready pipes, and short timers:** **4.7× faster** per-op syscall floor when batching (`62.6 ns` vs `296.4 ns`), **52% faster** 1 µs timers (`4,904 ns` vs `10,185 ns`), **18–19% faster** ready pipe reads (`832–840 ns` vs `1,024 ns`), **14% faster** batched cached file reads on UFS (`1,041 ns` vs `1,217 ns`), and **8% faster** TCP `ACCEPT` with `IORING_REGISTER_NAPI` busy-polling (`17.7 µs` vs `19.3 µs`).
-
-#### Where `kqueue` (or direct syscalls) is faster
-1. **Pre-arming one-shot `RECV`s on idle sockets (1 enter per op):** **10–34% slower than `kqueue` (`1,378 ns` vs `1,118 ns` at 64 B AF_UNIX; `6,494 ns` vs `5,904 ns` on TCP)**. Submitting a one-shot `RECV` before data arrives and waiting in a second enter pays two `kqring_enter(2)` calls plus socket-upcall install/remove per message. **Fix:** use `IORING_RECV_MULTISHOT` (which arms the upcall once and turns this into an **18% win**) or wait for readiness first.
-2. **Unbatched small (`< 32 KiB`) socket sends:** **11% slower than `write(2)` at 16 KiB on AF_UNIX (`1,918 ns` vs `1,727 ns`)**. When a socket send buffer already has room, a single unbatched `write(2)` avoids the ~190 ns SQE/CQE ring overhead, and below 32 KiB `memcpy` in L1/L2 cache is cheaper than zero-copy page pinning + `IORING_CQE_F_NOTIF` delivery. **Fix:** batch multiple `SEND` SQEs per enter or use `SEND_ZC` only at `≥ 32–64 KiB`.
-3. **Cached regular-file reads on ZFS (or unbatched 1-at-a-time file reads):** **30–47% slower than `pread(2)` on ZFS (`2,151–2,432 ns` vs `1,657 ns`)** and **12–14% slower unbatched on UFS (`1,366–1,386 ns` vs `1,217 ns`)**. ZFS caches data in the ARC rather than FreeBSD's `VOP_READ_PGCACHE`, so file reads on ZFS hand off to a worker thread (~1.05 µs hand-off overhead). **Fix:** use `pread(2)` for synchronous warm-ARC ZFS reads, or batch `READ`s on UFS/raw block devices.
-4. **Kernel TLS (`KTLS` + `sendfile(2)`) static media / CDN serving:** **Keep `sendfile(2)` + `kqueue`** for the file-to-NIC media path. FreeBSD's `sendfile(2)` + in-kernel TLS (`KTLS`) transfers and encrypts file pages directly from the filesystem cache to the NIC without touching userspace buffers. `kqring` can still run alongside it for control-plane RPCs, multishot `ACCEPT`, and timers (or be polled from an existing `kqueue` loop via its ring descriptor).
-
----
-
 ## Supported operations
 
 **How requests run.**
@@ -190,7 +288,7 @@ kqring adds operations io_uring doesn't have. A ring is plain io_uring until the
 - **Kevent requests** (`KQRING_EXT_KEVENT`): wait for a kqueue event io_uring has no request for, one-shot or multishot with a CQE per event. `EVFILT_VNODE` reports a file or directory being written, extended, renamed, deleted or changed (Linux needs inotify), `EVFILT_SIGNAL` a signal's deliveries (Linux needs signalfd), `EVFILT_READ` / `EVFILT_WRITE` how much can be read or written (as `FIONREAD` would tell after a `POLL_ADD`), and `EVFILT_PROC` any process's exit, fork or exec, with the exit status in a 32-byte CQE (`WAITID` only waits for children). The same events can drive a trigger (`KQRING_TRIG_SRC_KEVENT`): "whenever this file is written, read it" is one submission.
 - **Step flags** pass one request's result to the next within a run: `KQRING_STEP_LEN_FROM_PREV` sets a step's length to the bytes the step before it moved, `KQRING_STEP_STOP_ON_ZERO` ends the trigger when the step before it reads end of file, and `KQRING_STEP_BUF_FROM_PREV` hands a step the provided buffer the step before it filled, giving the buffer back to its group afterwards. A `RECV` → `SEND` pair with both makes an echo server that posts no CQE and needs no system call per message; a `READ` → `WRITE` pair copies a file.
 
-See [docs/event-chains-spec.md](docs/event-chains-spec.md) for the interface, the echo benchmark and the plan: passing a provided buffer to the next step, then kevent sources (file changes, signals, process events) and attaching an existing kqueue.
+See [docs/event-chains-spec.md](docs/event-chains-spec.md) for the interface.
 
 ---
 
@@ -295,7 +393,7 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
   - [`kqring_register.c`](kmod/kqring_register.c) — `io_uring_register` operations.
   - [`kqring_zc.c`](kmod/kqring_zc.c) — zero-copy send: page holding, `RLIMIT_MEMLOCK` accounting and mbuf construction.
   - [`kqring_trig.c`](kmod/kqring_trig.c) — kqring's extensions: the opt-in, and event-driven chains (triggers, their polls and runs).
-- [`tests/kqring_test.c`](tests/kqring_test.c) — functional test suite: 87 test groups covering every supported opcode, registration, setup flags and the lifetime rules above.
+- [`tests/kqring_test.c`](tests/kqring_test.c) — functional test suite: 120 tests covering every supported opcode, registration, setup flags and the lifetime rules above.
 - [`tests/kqring_bench.c`](tests/kqring_bench.c) — benchmarks against `kqueue(2)` and plain system calls; [`tests/bench_report.py`](tests/bench_report.py) turns runs into the tables and charts in [`BENCHMARK.MD`](BENCHMARK.MD).
 - [`tests/kqring_diskbench.c`](tests/kqring_diskbench.c) — storage workloads (queue depth, jobs, random or sequential, read/write mix) on a disk or file through kqring, `aio(4)` or `pread(2)` threads, with IOPS, latency percentiles and a `-V` mode that checks every read.
 - [`tests/kqring_stress.c`](tests/kqring_stress.c) — randomized multi-threaded stress test for races the functional suite can't time.
@@ -305,7 +403,7 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
 
 - [`ARCHITECTURE.MD`](ARCHITECTURE.MD) — how kqring works inside: shared memory layout, execution model, request lifecycle, zero-copy, workers and locking.
 - [`BENCHMARK.MD`](BENCHMARK.MD) — performance against `kqueue(2)` and plain system calls, with method and known gaps.
-- [`TODO.MD`](TODO.MD) — zero-copy roadmap and measured follow-ups.
+- [`TODO.MD`](TODO.MD) — what's open.
 - [`CHANGELOG.md`](CHANGELOG.md) — releases and their known limits.
 
 ## License

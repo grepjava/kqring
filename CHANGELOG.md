@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Documentation
+
+- `README.md` now explains what kqring is and why it exists, and `ARCHITECTURE.MD` covers kernel threads, where a request goes, disk I/O, read ordering, the extensions and testing, and no longer describes names the code has dropped. Its description of the ring header was wrong: all the indices share one 64-byte cache line.
+- Every table in `BENCHMARK.MD` is re-measured on `v0.3.0`, with the raw runs in `docs/bench/data/`, and the charts are redrawn. md(4) disks are now filled first. Reads of unwritten blocks are far cheaper, so 32 reads per enter are about 2.9× `pread(2)`, not 4.5×.
+
 ## 0.3.0 — 2026-11-06
 
 Still an **experimental preview**, for test systems only: the same caveats as 0.1.0 apply. This release adds kqring's first extensions beyond io_uring (event-driven chains, kevent requests and the kqueue bridge), runs fio's `io_uring` engine, and fixes what fio on a real SSD and on several rings exposed. The ABI only gains additions; rebuild the module and reload it.

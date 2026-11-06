@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="viz" width="760" height="278" viewBox="0 0 760 278" role="img" aria-label="fio on a SATA SSD: CPU for the same work, 32 in flight">
+<title>fio on a SATA SSD: CPU for the same work, 32 in flight</title>
+
+<style>
+  .viz { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+         --grid:#e1e0d9; --axis:#c3c2b7; --plain:#a8a69e; --kqueue:#eb6834;
+         --s1:#2a78d6; --s2:#1baf7a; --s3:#eda100; --s4:#e87ba4;
+         --faster:#2a78d6; --slower:#e34948; }
+  @media (prefers-color-scheme: dark) {
+    .viz { --surface:#1a1a19; --ink:#f0efec; --ink2:#c3c2b7; --muted:#898781;
+           --grid:#2c2c2a; --axis:#383835; --plain:#6f6d67; --kqueue:#d95926;
+           --s1:#3987e5; --s2:#199e70; --s3:#c98500; --s4:#d55181;
+           --faster:#3987e5; --slower:#e66767; }
+  }
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--ink); }
+  .title { font-size: 15px; font-weight: 600; }
+  .sub { font-size: 12px; fill: var(--ink2); }
+  .lab { font-size: 12px; fill: var(--ink2); }
+  .val { font-size: 11px; fill: var(--ink2); font-variant-numeric: tabular-nums; }
+  .tick { font-size: 11px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+  .grid { stroke: var(--grid); stroke-width: 1; }
+  .axis { stroke: var(--axis); stroke-width: 1; }
+</style>
+
+<rect width="760" height="278" rx="8" fill="var(--surface)"/>
+<text x="20" y="28" class="title">fio on a SATA SSD: CPU for the same work, 32 in flight</text>
+<text x="20" y="48" class="sub">Percent of one CPU, lower is better; IOPS within 5% of each other</text>
+<rect x="20" y="64" width="10" height="10" rx="2" fill="var(--kqueue)"/>
+<text x="35" y="73" class="lab">aio</text>
+<rect x="71.0" y="64" width="10" height="10" rx="2" fill="var(--s1)"/>
+<text x="86.0" y="73" class="lab">kqring</text>
+<line x1="114.0" y1="94" x2="114.0" y2="248" class="grid"/>
+<text x="114.0" y="264" class="tick" text-anchor="middle">0%</text>
+<line x1="229.2" y1="94" x2="229.2" y2="248" class="grid"/>
+<text x="229.2" y="264" class="tick" text-anchor="middle">20%</text>
+<line x1="344.4" y1="94" x2="344.4" y2="248" class="grid"/>
+<text x="344.4" y="264" class="tick" text-anchor="middle">40%</text>
+<line x1="459.6" y1="94" x2="459.6" y2="248" class="grid"/>
+<text x="459.6" y="264" class="tick" text-anchor="middle">60%</text>
+<line x1="574.8" y1="94" x2="574.8" y2="248" class="grid"/>
+<text x="574.8" y="264" class="tick" text-anchor="middle">80%</text>
+<line x1="690.0" y1="94" x2="690.0" y2="248" class="grid"/>
+<text x="690.0" y="264" class="tick" text-anchor="middle">100%</text>
+<text x="740" y="264" class="tick" text-anchor="end">% CPU</text>
+<text x="104.0" y="119.0" class="lab" text-anchor="end">Raw disk reads</text>
+<path d="M114.0,100.0 H668.7 Q672.7,100.0 672.7,104.0 V110.0 Q672.7,114.0 668.7,114.0 H114.0 Z" fill="var(--kqueue)"><title>Raw disk reads — aio: 97% % CPU</title></path>
+<text x="677.7" y="111" class="val">97%</text>
+<path d="M114.0,116.0 H369.2 Q373.2,116.0 373.2,120.0 V126.0 Q373.2,130.0 369.2,130.0 H114.0 Z" fill="var(--s1)"><title>Raw disk reads — kqring: 45% % CPU</title></path>
+<text x="378.2" y="127" class="val">45%</text>
+<text x="104.0" y="167.0" class="lab" text-anchor="end">ZFS file reads</text>
+<path d="M114.0,148.0 H524.7 Q528.7,148.0 528.7,152.0 V158.0 Q528.7,162.0 524.7,162.0 H114.0 Z" fill="var(--kqueue)"><title>ZFS file reads — aio: 72% % CPU</title></path>
+<text x="533.7" y="159" class="val">72%</text>
+<path d="M114.0,164.0 H300.1 Q304.1,164.0 304.1,168.0 V174.0 Q304.1,178.0 300.1,178.0 H114.0 Z" fill="var(--s1)"><title>ZFS file reads — kqring: 33% % CPU</title></path>
+<text x="309.1" y="175" class="val">33%</text>
+<text x="104.0" y="215.0" class="lab" text-anchor="end">ZFS file writes</text>
+<path d="M114.0,196.0 H282.8 Q286.8,196.0 286.8,200.0 V206.0 Q286.8,210.0 282.8,210.0 H114.0 Z" fill="var(--kqueue)"><title>ZFS file writes — aio: 30% % CPU</title></path>
+<text x="291.8" y="207" class="val">30%</text>
+<path d="M114.0,212.0 H190.6 Q194.6,212.0 194.6,216.0 V222.0 Q194.6,226.0 190.6,226.0 H114.0 Z" fill="var(--s1)"><title>ZFS file writes — kqring: 14% % CPU</title></path>
+<text x="199.6" y="223" class="val">14%</text>
+<line x1="114.0" y1="94" x2="114.0" y2="248" class="axis"/>
+</svg>

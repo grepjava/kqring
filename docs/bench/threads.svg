@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="viz" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="One ring per thread: ping-pong against kqueue">
+<title>One ring per thread: ping-pong against kqueue</title>
+
+<style>
+  .viz { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+         --grid:#e1e0d9; --axis:#c3c2b7; --plain:#a8a69e; --kqueue:#eb6834;
+         --s1:#2a78d6; --s2:#1baf7a; --s3:#eda100; --s4:#e87ba4;
+         --faster:#2a78d6; --slower:#e34948; }
+  @media (prefers-color-scheme: dark) {
+    .viz { --surface:#1a1a19; --ink:#f0efec; --ink2:#c3c2b7; --muted:#898781;
+           --grid:#2c2c2a; --axis:#383835; --plain:#6f6d67; --kqueue:#d95926;
+           --s1:#3987e5; --s2:#199e70; --s3:#c98500; --s4:#d55181;
+           --faster:#3987e5; --slower:#e66767; }
+  }
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--ink); }
+  .title { font-size: 15px; font-weight: 600; }
+  .sub { font-size: 12px; fill: var(--ink2); }
+  .lab { font-size: 12px; fill: var(--ink2); }
+  .val { font-size: 11px; fill: var(--ink2); font-variant-numeric: tabular-nums; }
+  .tick { font-size: 11px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+  .grid { stroke: var(--grid); stroke-width: 1; }
+  .axis { stroke: var(--axis); stroke-width: 1; }
+</style>
+
+<rect width="760" height="380" rx="8" fill="var(--surface)"/>
+<text x="20" y="28" class="title">One ring per thread: ping-pong against kqueue</text>
+<text x="20" y="48" class="sub">AF_UNIX 64 B, each thread on its own CPU; 8 threads share 4 cores</text>
+<rect x="20" y="66" width="10" height="10" rx="2" fill="var(--kqueue)"/>
+<text x="35" y="75" class="lab">kqueue</text>
+<rect x="89.0" y="66" width="10" height="10" rx="2" fill="var(--s1)"/>
+<text x="104.0" y="75" class="lab">kqring RECV</text>
+<line x1="56" y1="332.0" x2="570" y2="332.0" class="axis"/>
+<text x="48" y="336.0" class="tick" text-anchor="end">0.0</text>
+<line x1="56" y1="284.8" x2="570" y2="284.8" class="grid"/>
+<text x="48" y="288.8" class="tick" text-anchor="end">1.0</text>
+<line x1="56" y1="237.6" x2="570" y2="237.6" class="grid"/>
+<text x="48" y="241.6" class="tick" text-anchor="end">2.0</text>
+<line x1="56" y1="190.4" x2="570" y2="190.4" class="grid"/>
+<text x="48" y="194.4" class="tick" text-anchor="end">3.0</text>
+<line x1="56" y1="143.2" x2="570" y2="143.2" class="grid"/>
+<text x="48" y="147.2" class="tick" text-anchor="end">4.0</text>
+<line x1="56" y1="96.0" x2="570" y2="96.0" class="grid"/>
+<text x="48" y="100.0" class="tick" text-anchor="end">5.0</text>
+<text x="56.0" y="358" class="tick" text-anchor="middle">1</text>
+<text x="227.3" y="358" class="tick" text-anchor="middle">2</text>
+<text x="398.7" y="358" class="tick" text-anchor="middle">4</text>
+<text x="570.0" y="358" class="tick" text-anchor="middle">8</text>
+<text x="313.0" y="374" class="tick" text-anchor="middle">threads</text>
+<polyline points="56.0,291.3 227.3,266.0 398.7,213.0 570.0,146.5" fill="none" stroke="var(--kqueue)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="56.0" cy="291.3" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>kqueue: 0.9 M ops/s</title></circle>
+<circle cx="227.3" cy="266.0" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>kqueue: 1.4 M ops/s</title></circle>
+<circle cx="398.7" cy="213.0" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>kqueue: 2.5 M ops/s</title></circle>
+<circle cx="570.0" cy="146.5" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>kqueue: 3.9 M ops/s</title></circle>
+<polyline points="56.0,280.3 227.3,254.6 398.7,201.5 570.0,122.0" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="56.0" cy="280.3" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring RECV: 1.1 M ops/s</title></circle>
+<circle cx="227.3" cy="254.6" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring RECV: 1.6 M ops/s</title></circle>
+<circle cx="398.7" cy="201.5" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring RECV: 2.8 M ops/s</title></circle>
+<circle cx="570.0" cy="122.0" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring RECV: 4.4 M ops/s</title></circle>
+<text x="580.0" y="126.0" class="val">kqring RECV 4.4</text>
+<text x="580.0" y="150.5" class="val">kqueue 3.9</text>
+<text x="740" y="75" class="tick" text-anchor="end">M ops/s</text>
+</svg>

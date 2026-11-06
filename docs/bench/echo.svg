@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="viz" width="760" height="326" viewBox="0 0 760 326" role="img" aria-label="Echo server: CPU the server spends on each message">
+<title>Echo server: CPU the server spends on each message</title>
+
+<style>
+  .viz { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+         --grid:#e1e0d9; --axis:#c3c2b7; --plain:#a8a69e; --kqueue:#eb6834;
+         --s1:#2a78d6; --s2:#1baf7a; --s3:#eda100; --s4:#e87ba4;
+         --faster:#2a78d6; --slower:#e34948; }
+  @media (prefers-color-scheme: dark) {
+    .viz { --surface:#1a1a19; --ink:#f0efec; --ink2:#c3c2b7; --muted:#898781;
+           --grid:#2c2c2a; --axis:#383835; --plain:#6f6d67; --kqueue:#d95926;
+           --s1:#3987e5; --s2:#199e70; --s3:#c98500; --s4:#d55181;
+           --faster:#3987e5; --slower:#e66767; }
+  }
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--ink); }
+  .title { font-size: 15px; font-weight: 600; }
+  .sub { font-size: 12px; fill: var(--ink2); }
+  .lab { font-size: 12px; fill: var(--ink2); }
+  .val { font-size: 11px; fill: var(--ink2); font-variant-numeric: tabular-nums; }
+  .tick { font-size: 11px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+  .grid { stroke: var(--grid); stroke-width: 1; }
+  .axis { stroke: var(--axis); stroke-width: 1; }
+</style>
+
+<rect width="760" height="326" rx="8" fill="var(--surface)"/>
+<text x="20" y="28" class="title">Echo server: CPU the server spends on each message</text>
+<text x="20" y="48" class="sub">ns of server CPU per message, lower is better; a client thread sends and waits</text>
+<rect x="20" y="64" width="10" height="10" rx="2" fill="var(--kqueue)"/>
+<text x="35" y="73" class="lab">kqueue: kevent + read + write</text>
+<rect x="227.0" y="64" width="10" height="10" rx="2" fill="var(--s1)"/>
+<text x="242.0" y="73" class="lab">kqring, io_uring style</text>
+<rect x="392.0" y="64" width="10" height="10" rx="2" fill="var(--s2)"/>
+<text x="407.0" y="73" class="lab">kqring trigger, no CQE per message</text>
+<line x1="102.0" y1="94" x2="102.0" y2="296" class="grid"/>
+<text x="102.0" y="312" class="tick" text-anchor="middle">0</text>
+<line x1="219.6" y1="94" x2="219.6" y2="296" class="grid"/>
+<text x="219.6" y="312" class="tick" text-anchor="middle">1,000</text>
+<line x1="337.2" y1="94" x2="337.2" y2="296" class="grid"/>
+<text x="337.2" y="312" class="tick" text-anchor="middle">2,000</text>
+<line x1="454.8" y1="94" x2="454.8" y2="296" class="grid"/>
+<text x="454.8" y="312" class="tick" text-anchor="middle">3,000</text>
+<line x1="572.4" y1="94" x2="572.4" y2="296" class="grid"/>
+<text x="572.4" y="312" class="tick" text-anchor="middle">4,000</text>
+<line x1="690.0" y1="94" x2="690.0" y2="296" class="grid"/>
+<text x="690.0" y="312" class="tick" text-anchor="middle">5,000</text>
+<text x="740" y="312" class="tick" text-anchor="end">ns</text>
+<text x="92.0" y="127.0" class="lab" text-anchor="end">AF_UNIX 64 B</text>
+<path d="M102.0,100.0 H463.9 Q467.9,100.0 467.9,104.0 V110.0 Q467.9,114.0 463.9,114.0 H102.0 Z" fill="var(--kqueue)"><title>AF_UNIX 64 B — kqueue: kevent + read + write: 3,112 ns</title></path>
+<text x="472.9" y="111" class="val">3,112</text>
+<path d="M102.0,116.0 H450.6 Q454.6,116.0 454.6,120.0 V126.0 Q454.6,130.0 450.6,130.0 H102.0 Z" fill="var(--s1)"><title>AF_UNIX 64 B — kqring, io_uring style: 2,998 ns</title></path>
+<text x="459.6" y="127" class="val">2,998</text>
+<path d="M102.0,132.0 H408.2 Q412.2,132.0 412.2,136.0 V142.0 Q412.2,146.0 408.2,146.0 H102.0 Z" fill="var(--s2)"><title>AF_UNIX 64 B — kqring trigger, no CQE per message: 2,638 ns</title></path>
+<text x="417.2" y="143" class="val">2,638</text>
+<text x="92.0" y="191.0" class="lab" text-anchor="end">AF_UNIX 4 KiB</text>
+<path d="M102.0,164.0 H525.6 Q529.6,164.0 529.6,168.0 V174.0 Q529.6,178.0 525.6,178.0 H102.0 Z" fill="var(--kqueue)"><title>AF_UNIX 4 KiB — kqueue: kevent + read + write: 3,636 ns</title></path>
+<text x="534.6" y="175" class="val">3,636</text>
+<path d="M102.0,180.0 H518.3 Q522.3,180.0 522.3,184.0 V190.0 Q522.3,194.0 518.3,194.0 H102.0 Z" fill="var(--s1)"><title>AF_UNIX 4 KiB — kqring, io_uring style: 3,574 ns</title></path>
+<text x="527.3" y="191" class="val">3,574</text>
+<path d="M102.0,196.0 H476.1 Q480.1,196.0 480.1,200.0 V206.0 Q480.1,210.0 476.1,210.0 H102.0 Z" fill="var(--s2)"><title>AF_UNIX 4 KiB — kqring trigger, no CQE per message: 3,215 ns</title></path>
+<text x="485.1" y="207" class="val">3,215</text>
+<text x="92.0" y="255.0" class="lab" text-anchor="end">TCP 64 B</text>
+<path d="M102.0,228.0 H601.8 Q605.8,228.0 605.8,232.0 V238.0 Q605.8,242.0 601.8,242.0 H102.0 Z" fill="var(--kqueue)"><title>TCP 64 B — kqueue: kevent + read + write: 4,284 ns</title></path>
+<text x="610.8" y="239" class="val">4,284</text>
+<path d="M102.0,244.0 H595.9 Q599.9,244.0 599.9,248.0 V254.0 Q599.9,258.0 595.9,258.0 H102.0 Z" fill="var(--s1)"><title>TCP 64 B — kqring, io_uring style: 4,234 ns</title></path>
+<text x="604.9" y="255" class="val">4,234</text>
+<path d="M102.0,260.0 H556.6 Q560.6,260.0 560.6,264.0 V270.0 Q560.6,274.0 556.6,274.0 H102.0 Z" fill="var(--s2)"><title>TCP 64 B — kqring trigger, no CQE per message: 3,900 ns</title></path>
+<text x="565.6" y="271" class="val">3,900</text>
+<line x1="102.0" y1="94" x2="102.0" y2="296" class="axis"/>
+</svg>
