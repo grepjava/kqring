@@ -105,7 +105,7 @@ The 14 failures that aren't kqring's come from Linux-only assumptions in the tes
 
 | How it's tested | Result on `v0.3.0` |
 |---|---|
-| kqring's own suite, stock and debug kernels | 120 tests pass |
+| kqring's own suite, stock and debug kernels | 126 tests pass |
 | Fuzzer, whole interface, 30 minutes on a debug kernel | clean, no leaks |
 | Stress test, 10 minutes on a debug kernel | clean, no leaks |
 | KASAN kernel with `kqring.ko` instrumented: suite, stress and 7 full fuzz runs | no memory errors reported in kqring |
@@ -195,7 +195,7 @@ On a ZFS file at 32 in flight, kqring is 4–5% behind `aio(4)` in IOPS and has 
 
 **Don't use it in production yet.** It's an experimental preview, it runs in the kernel, and it hasn't been audited. It is built and tested on FreeBSD 15.1 amd64 with the `GENERIC` kernel only.
 
-Some things differ from Linux; see [Differences from Linux](#differences-from-linux) and [Known gaps](BENCHMARK.MD#known-gaps).
+Some things differ from Linux; see [Differences from Linux](#differences-from-linux), [Known gaps](BENCHMARK.MD#known-gaps) and the [compatibility matrix](COMPATIBILITY.MD).
 
 ---
 
@@ -413,7 +413,7 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
   - [`kqring_register.c`](kmod/kqring_register.c) — `io_uring_register` operations.
   - [`kqring_zc.c`](kmod/kqring_zc.c) — zero-copy send: page holding, `RLIMIT_MEMLOCK` accounting and mbuf construction.
   - [`kqring_trig.c`](kmod/kqring_trig.c) — kqring's extensions: the opt-in, and event-driven chains (triggers, their polls and runs).
-- [`tests/kqring_test.c`](tests/kqring_test.c) — functional test suite: 120 tests covering every supported opcode, registration, setup flags and the lifetime rules above.
+- [`tests/kqring_test.c`](tests/kqring_test.c) — functional test suite: 126 tests covering every supported opcode, registration, setup flags and the lifetime rules above.
 - [`tests/kqring_bench.c`](tests/kqring_bench.c) — benchmarks against `kqueue(2)` and plain system calls; [`tests/bench_report.py`](tests/bench_report.py) turns runs into the tables and charts in [`BENCHMARK.MD`](BENCHMARK.MD).
 - [`tests/kqring_diskbench.c`](tests/kqring_diskbench.c) — storage workloads (queue depth, jobs, random or sequential, read/write mix) on a disk or file through kqring, `aio(4)` or `pread(2)` threads, with IOPS, latency percentiles and a `-V` mode that checks every read.
 - [`tests/kqring_stress.c`](tests/kqring_stress.c) — randomized multi-threaded stress test for races the functional suite can't time.
@@ -423,6 +423,7 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
 
 - [`ARCHITECTURE.MD`](ARCHITECTURE.MD) — how kqring works inside: shared memory layout, execution model, request lifecycle, zero-copy, workers and locking.
 - [`BENCHMARK.MD`](BENCHMARK.MD) — performance against `kqueue(2)` and plain system calls, with method and known gaps.
+- [`COMPATIBILITY.MD`](COMPATIBILITY.MD) — every io_uring capability against Linux 6.18, with its contract, source and tests.
 - [`ROADMAP.MD`](ROADMAP.MD) — the phased plan towards compatibility with Linux.
 - [`TODO.MD`](TODO.MD) — what's open.
 - [`CHANGELOG.md`](CHANGELOG.md) — releases and their known limits.

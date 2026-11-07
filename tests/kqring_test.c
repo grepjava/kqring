@@ -550,13 +550,19 @@ test_setup_errors(void)
 	    "failed copyout\n");
 }
 
-/* Submit one prepared SQE and return its CQE's res. */
+/*
+ * Submit one prepared SQE and return its CQE's res. It may come after the
+ * enter: a read that misses the page cache goes to a worker. Tests of what
+ * completes inline check ring_cq_ready() themselves.
+ */
 static int32_t
 submit_one(struct test_ring *r)
 {
 	uint64_t ud = r->sqes[(r->sq_tail - 1) & r->sq_mask].user_data;
 
 	ring_submit(r);
+	if (ring_cq_ready(r) == 0)
+		(void)ring_wait(r, 1, 10000);
 	if (ring_cq_ready(r) != 1) {
 		fprintf(stderr, "submit_one: %u CQEs for user_data %llu\n",
 		    ring_cq_ready(r), (unsigned long long)ud);
@@ -9442,6 +9448,337 @@ test_phase5_security_audit(void)
 	    "exit, execve(2) ring teardown, forged sq_tail bound, owner check\n");
 }
 
+/*
+ * What COMPATIBILITY.MD lists that nothing else here covers: vectored fixed
+ * writes, level-triggered polls, ACCEPT_POLL_FIRST, the CQ ring's own
+ * mapping offset, and how an SQE that fails its checks ends a batch.
+ */
+static void
+test_compat_gaps(void)
+{
+	long page = sysconf(_SC_PAGESIZE);
+	struct io_uring_params p;
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	struct test_ring t, n;
+	bool ended = false, removed = false;
+	char dir[64], path[96], rb[16];
+	int fd, lfd, c1, pfd[2];
+	uint16_t port;
+
+	ring_init(&t);
+
+	/* WRITEV_FIXED: every iovec must be inside the buffer. */
+	char *m = mmap(NULL, (size_t)page * 2, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(m != MAP_FAILED);
+	struct iovec iov = { m, (size_t)page };
+	assert(reg(&t, IORING_REGISTER_BUFFERS, &iov, 1) == 0);
+	make_tmpdir(dir, sizeof(dir));
+	snprintf(path, sizeof(path), "%s/w", dir);
+	fd = open(path, O_RDWR | O_CREAT, 0600);
+	assert(fd >= 0);
+	memcpy(m, "fixed-", 6);
+	memcpy(m + 100, "vector", 6);
+	struct iovec wv[2] = { { m, 6 }, { m + 100, 6 } };
+	sqe = ring_prep(&t, IORING_OP_WRITEV_FIXED, fd, 78001);
+	sqe->addr = (uint64_t)(uintptr_t)wv;
+	sqe->len = 2;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 12);
+	assert(pread(fd, rb, 12, 0) == 12 &&
+	    memcmp(rb, "fixed-vector", 12) == 0);
+	wv[1].iov_base = m + page;
+	sqe = ring_prep(&t, IORING_OP_WRITEV_FIXED, fd, 78002);
+	sqe->addr = (uint64_t)(uintptr_t)wv;
+	sqe->len = 2;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EFAULT);
+
+	/* A level-triggered poll reports what is already readable. */
+	assert(pipe(pfd) == 0);
+	assert(write(pfd[1], "a", 1) == 1);
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, pfd[0], 78003);
+	sqe->poll32_events = POLLIN;
+	sqe->len = IORING_POLL_ADD_LEVEL;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 78003 && (c.res & POLLIN) != 0);
+
+	/* The same, multishot, until POLL_REMOVE ends it. */
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, pfd[0], 78004);
+	sqe->poll32_events = POLLIN;
+	sqe->len = IORING_POLL_ADD_LEVEL | IORING_POLL_ADD_MULTI;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 78004 && (c.res & POLLIN) != 0 &&
+	    (c.flags & IORING_CQE_F_MORE) != 0);
+	sqe = ring_prep(&t, IORING_OP_POLL_REMOVE, -1, 78005);
+	sqe->addr = 78004;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	while (!ended || !removed) {
+		assert(ring_wait(&t, 1, 2000) == 0);
+		c = ring_pop_cqe(&t);
+		if (c.user_data == 78005) {
+			assert(c.res == 0);
+			removed = true;
+		} else if ((c.flags & IORING_CQE_F_MORE) == 0) {
+			assert(c.user_data == 78004 && c.res == -ECANCELED);
+			ended = true;
+		}
+	}
+
+	/* ACCEPT_POLL_FIRST: armed with nothing queued, and with something. */
+	lfd = tcp_listener(&port);
+	sqe = ring_prep(&t, IORING_OP_ACCEPT, lfd, 78006);
+	sqe->ioprio = IORING_ACCEPT_POLL_FIRST;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+	c1 = tcp_connect(port);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 78006 && c.res >= 0);
+	close(c.res);
+	close(c1);
+	c1 = tcp_connect(port);
+	wait_readable(lfd);
+	sqe = ring_prep(&t, IORING_OP_ACCEPT, lfd, 78007);
+	sqe->ioprio = IORING_ACCEPT_POLL_FIRST;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 78007 && c.res >= 0);
+	close(c.res);
+	close(c1);
+	close(lfd);
+
+	/* IORING_OFF_CQ_RING maps the same memory as IORING_OFF_SQ_RING. */
+	char *cq = mmap(NULL, t.ring_map_len, PROT_READ | PROT_WRITE,
+	    MAP_SHARED, t.fd, IORING_OFF_CQ_RING);
+	assert(cq != MAP_FAILED);
+	ring_prep(&t, IORING_OP_NOP, -1, 78008);
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	assert(*(_Atomic unsigned *)(cq + ((char *)t.cq_ktail -
+	    (char *)t.ring_map)) == atomic_load(t.cq_ktail));
+	munmap(cq, t.ring_map_len);
+
+	/* With SUBMIT_ALL, an SQE that fails its checks ends nothing. */
+	ring_prep(&t, IORING_OP_NOP, -1, 78009);
+	ring_push_sqe(&t);
+	ring_prep(&t, IORING_OP_LAST, -1, 78010);
+	ring_push_sqe(&t);
+	ring_prep(&t, IORING_OP_NOP, -1, 78011);
+	ring_push_sqe(&t);
+	assert(kqring_enter(t.fd, 3, 0, 0, NULL, 0) == 3);
+	assert(ring_wait(&t, 3, 2000) == 0);
+	expect_cqe(&t, 78009, 0);
+	expect_cqe(&t, 78010, -EINVAL);
+	expect_cqe(&t, 78011, 0);
+
+	/* Without it, that SQE is the last, and is counted. */
+	memset(&p, 0, sizeof(p));
+	memset(&n, 0, sizeof(n));
+	n.fd = (int)kqring_setup(8, &p);
+	assert(n.fd >= 0);
+	ring_map(&n, &p);
+	ring_prep(&n, IORING_OP_NOP, -1, 78012);
+	ring_push_sqe(&n);
+	ring_prep(&n, IORING_OP_LAST, -1, 78013);
+	ring_push_sqe(&n);
+	ring_prep(&n, IORING_OP_NOP, -1, 78014);
+	ring_push_sqe(&n);
+	assert(kqring_enter(n.fd, 3, 0, 0, NULL, 0) == 2);
+	assert(ring_pending(&n) == 1);
+	assert(kqring_enter(n.fd, 0, 2, IORING_ENTER_GETEVENTS, NULL, 0) == 0);
+	assert(ring_pending(&n) == 1);
+	expect_cqe(&n, 78012, 0);
+	expect_cqe(&n, 78013, -EINVAL);
+	assert(kqring_enter(n.fd, 1, 0, 0, NULL, 0) == 1);
+	assert(ring_wait(&n, 1, 2000) == 0);
+	expect_cqe(&n, 78014, 0);
+
+	close(n.fd);
+	close(pfd[0]);
+	close(pfd[1]);
+	close(fd);
+	close(t.fd);
+	munmap(m, (size_t)page * 2);
+	unlink(path);
+	rmdir(dir);
+	printf("[PASS] Compatibility gaps: WRITEV_FIXED, level poll, "
+	    "ACCEPT_POLL_FIRST, OFF_CQ_RING, SUBMIT_ALL\n");
+}
+
+/*
+ * The rest of COMPATIBILITY.MD: what is refused, ignored or kept. The
+ * refused values are Linux 6.18's, which <sys/kqring.h> leaves out; when one
+ * is implemented, this test is where it stops being refused.
+ */
+static void
+test_compat_contracts(void)
+{
+	static const uint32_t bad_setup[] = {
+		1U << 17,	/* IORING_SETUP_HYBRID_IOPOLL */
+		1U << 18,	/* IORING_SETUP_CQE_MIXED */
+	};
+	static const uint32_t bad_enter[] = {
+		1U << 5,	/* IORING_ENTER_ABS_TIMER */
+		1U << 6,	/* IORING_ENTER_EXT_ARG_REG */
+		1U << 7,	/* IORING_ENTER_NO_IOWAIT */
+	};
+	static const uint32_t bad_reg[] = {
+		32,		/* IORING_REGISTER_ZCRX_IFQ */
+		34,		/* IORING_REGISTER_MEM_REGION */
+		35,		/* IORING_REGISTER_QUERY */
+	};
+	static const uint32_t bad_nop[] = {
+		1U << 1,	/* IORING_NOP_FILE */
+		1U << 2,	/* IORING_NOP_FIXED_FILE */
+		1U << 3,	/* IORING_NOP_FIXED_BUFFER */
+		1U << 4,	/* IORING_NOP_TW */
+		1U << 5,	/* IORING_NOP_CQE32 */
+	};
+	struct io_uring_params p;
+	struct io_uring_sqe *sqe;
+	struct msghdr mh;
+	struct stat sb;
+	struct test_ring t;
+	cap_rights_t rights;
+	char dir[64], path[96], buf[4096];
+	int fd, nfd, sv[2], p1[2], p2[2];
+
+	ring_init(&t);
+
+	for (size_t i = 0; i < nitems(bad_setup); i++) {
+		memset(&p, 0, sizeof(p));
+		p.flags = bad_setup[i];
+		assert(kqring_setup(8, &p) == -1 && errno == EINVAL);
+	}
+	for (size_t i = 0; i < nitems(bad_enter); i++)
+		assert(kqring_enter(t.fd, 0, 0, bad_enter[i], NULL, 0) == -1 &&
+		    errno == EINVAL);
+	for (size_t i = 0; i < nitems(bad_reg); i++)
+		assert(reg(&t, bad_reg[i], NULL, 0) == -EOPNOTSUPP);
+	for (size_t i = 0; i < nitems(bad_nop); i++) {
+		sqe = ring_prep(&t, IORING_OP_NOP, -1, 78101);
+		sqe->nop_flags = bad_nop[i];
+		ring_push_sqe(&t);
+		assert(submit_one(&t) == -EINVAL);
+	}
+
+	/* IORING_SEND_VECTORIZED, SOCKET_URING_OP_TX_TIMESTAMP. */
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	sqe = ring_prep(&t, IORING_OP_SEND, sv[0], 78102);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 1;
+	sqe->ioprio = 1U << 5;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+	sqe = ring_prep(&t, IORING_OP_URING_CMD, sv[0], 78103);
+	sqe->cmd_op = 4;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EOPNOTSUPP);
+
+	/* A send to a closed peer fails, and raises no SIGPIPE. */
+	assert(signal(SIGPIPE, SIG_DFL) != SIG_ERR);
+	close(sv[1]);
+	sqe = ring_prep(&t, IORING_OP_SEND, sv[0], 78104);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 1;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EPIPE);
+	struct iovec iov = { buf, 1 };
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	sqe = ring_prep(&t, IORING_OP_SENDMSG, sv[0], 78105);
+	sqe->addr = (uint64_t)(uintptr_t)&mh;
+	sqe->len = 1;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EPIPE);
+	close(sv[0]);
+
+	/* The splice hints are accepted, and change nothing. */
+	assert(pipe(p1) == 0 && pipe(p2) == 0);
+	assert(write(p1[1], "abcd", 4) == 4);
+	sqe = ring_prep(&t, IORING_OP_SPLICE, p2[1], 78106);
+	sqe->splice_fd_in = p1[0];
+	sqe->splice_off_in = (uint64_t)-1;
+	sqe->off = (uint64_t)-1;
+	sqe->len = 4;
+	sqe->splice_flags = SPLICE_F_MOVE | SPLICE_F_MORE | SPLICE_F_GIFT;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 4);
+	assert(read(p2[0], buf, 4) == 4 && memcmp(buf, "abcd", 4) == 0);
+	close(p1[0]);
+	close(p1[1]);
+	close(p2[0]);
+	close(p2[1]);
+
+	/* FALLOCATE punches a hole, and keeps the size. */
+	make_tmpdir(dir, sizeof(dir));
+	snprintf(path, sizeof(path), "%s/h", dir);
+	fd = open(path, O_RDWR | O_CREAT, 0600);
+	assert(fd >= 0);
+	memset(buf, 'x', sizeof(buf));
+	assert(write(fd, buf, sizeof(buf)) == (ssize_t)sizeof(buf));
+	assert(write(fd, buf, sizeof(buf)) == (ssize_t)sizeof(buf));
+	sqe = ring_prep(&t, IORING_OP_FALLOCATE, fd, 78107);
+	sqe->off = 0;
+	sqe->addr = sizeof(buf);
+	sqe->len = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 0);
+	assert(fstat(fd, &sb) == 0 && sb.st_size == 2 * (off_t)sizeof(buf));
+	assert(pread(fd, buf, 1, 0) == 1 && buf[0] == 0);
+	assert(pread(fd, buf, 1, (off_t)sizeof(buf)) == 1 && buf[0] == 'x');
+
+	/* A fixed slot keeps its descriptor's rights, and gives them back. */
+	cap_rights_init(&rights, CAP_READ, CAP_SEEK);
+	assert(cap_rights_limit(fd, &rights) == 0);
+	assert(reg(&t, IORING_REGISTER_FILES, &fd, 1) == 0);
+	sqe = ring_prep(&t, IORING_OP_READ, 0, 78108);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 1;
+	sqe->off = sizeof(buf);
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 1 && buf[0] == 'x');
+	sqe = ring_prep(&t, IORING_OP_WRITE, 0, 78109);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 1;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -ENOTCAPABLE);
+	sqe = ring_prep(&t, IORING_OP_WRITE, fd, 78110);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 1;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -ENOTCAPABLE);
+	sqe = ring_prep(&t, IORING_OP_FIXED_FD_INSTALL, 0, 78111);
+	sqe->flags = IOSQE_FIXED_FILE;
+	ring_push_sqe(&t);
+	nfd = submit_one(&t);
+	assert(nfd >= 0);
+	assert(write(nfd, buf, 1) == -1 && errno == ENOTCAPABLE);
+
+	close(nfd);
+	close(fd);
+	close(t.fd);
+	unlink(path);
+	rmdir(dir);
+	printf("[PASS] Compatibility contracts: refused flags, no SIGPIPE, "
+	    "splice hints, punched holes, rights of fixed files\n");
+}
+
 /* Child of test_stop_during_close(): open and close rings, forever. */
 static void *
 stop_close_thread(void *arg)
@@ -12105,6 +12442,8 @@ main(int argc, char **argv)
 		test_poll_same_thread();
 		test_poll_before_return();
 		test_taskrun_on_wakeup();
+		test_compat_gaps();
+		test_compat_contracts();
 		test_cq_backpressure();
 		test_sync_cancel_worker();
 		test_tag_failed_register();

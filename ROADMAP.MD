@@ -9,7 +9,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | Phase | Work | Status |
 |---|---|---|
 | 1 | Ordering and poll timing | Done |
-| 2 | Make compatibility measurable | liburing tests done; matrix and differential runs open |
+| 2 | Make compatibility measurable | liburing tests and matrix done; differential runs open |
 | 3 | Wait semantics | Not started |
 | 4 | Per-file write ordering | Not started |
 | 5 | Worker path scalability | Not started |
@@ -48,6 +48,8 @@ This comes before new features, so that what follows is measured against somethi
 Acceptance: every liburing 2.9 test is passing, skipped, failing with a documented reason, or listed as not portable with a reason.
 
 ### Versioned compatibility matrix
+
+**Done.** [`COMPATIBILITY.MD`](COMPATIBILITY.MD) lists all 205 capabilities against Linux 6.18 and liburing 2.9, and [`tests/compat_check.py`](tests/compat_check.py) fails if it stops matching the source. It found nothing wrong in the module, and its [validation gaps](COMPATIBILITY.MD#validation-gaps) list what is still unchecked.
 
 Document every supported opcode, setup flag, enter flag, registration and important subflag against a stated Linux kernel and liburing baseline. Classify each as equivalent, partial, unsupported or intentionally different, and record platform and filesystem dependencies separately from limits of the module.
 
