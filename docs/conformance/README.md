@@ -6,7 +6,7 @@ Raw output of [`tests/kqring_diff.c`](../../tests/kqring_diff.c) on Linux and on
 python3 tests/diff_compare.py docs/conformance/linux.out docs/conformance/kqring.out
 ```
 
-Each file repeated exactly over three runs. Of 19 cases, 15 match and 4 differ on purpose, with the reasons in [`tests/diff_expected.txt`](../../tests/diff_expected.txt).
+Each file repeated exactly over three runs. Of 21 cases, 16 match and 5 differ on purpose, with the reasons in [`tests/diff_expected.txt`](../../tests/diff_expected.txt).
 
 | | Linux | kqring |
 |---|---|---|
@@ -16,4 +16,4 @@ Each file repeated exactly over three runs. Of 19 cases, 15 match and 4 differ o
 | File system | ext4 | ZFS |
 | `RLIMIT_MEMLOCK` | 8 MiB | 64 KiB |
 
-kqring's baseline is Linux 6.18, but this Linux has 7.3. Every behaviour that was in dispute was also read in the v6.18 source, with one exception: `SINGLE_ISSUER`'s `io_allowed_run_tw()`, whose body wasn't checked there, so the wait rule for `DEFER_TASKRUN` rests on the 7.3 run.
+Linux 7.3 is kqring's baseline, so these results compare it with the version it's measured against.

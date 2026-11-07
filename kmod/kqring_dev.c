@@ -997,6 +997,15 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	if ((p.flags & IORING_SETUP_SQ_AFF) != 0 &&
 	    (p.flags & IORING_SETUP_SQPOLL) == 0)
 		return (EINVAL);
+	/* As io_uring: these say how an owner is told, which SQPOLL doesn't. */
+	if ((p.flags & IORING_SETUP_SQPOLL) != 0 &&
+	    (p.flags & (IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG |
+	    IORING_SETUP_DEFER_TASKRUN)) != 0)
+		return (EINVAL);
+	if ((p.flags & IORING_SETUP_TASKRUN_FLAG) != 0 &&
+	    (p.flags & (IORING_SETUP_COOP_TASKRUN |
+	    IORING_SETUP_DEFER_TASKRUN)) == 0)
+		return (EINVAL);
 	/* A ring with no descriptor has nothing to mmap through. */
 	if ((p.flags & IORING_SETUP_REGISTERED_FD_ONLY) != 0 &&
 	    (p.flags & IORING_SETUP_NO_MMAP) == 0)

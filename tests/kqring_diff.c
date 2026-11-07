@@ -354,6 +354,145 @@ c_nop(void)
 	ring_free(&r);
 }
 
+/* Which flags setup takes alone and in pairs. */
+static void
+c_setup_flags(void)
+{
+	static const struct {
+		const char *name;
+		uint32_t flag;
+	} fl[] = {
+		{ "IOPOLL", IORING_SETUP_IOPOLL },
+		{ "SQPOLL", IORING_SETUP_SQPOLL },
+		{ "SQ_AFF", IORING_SETUP_SQ_AFF },
+		{ "CQSIZE", IORING_SETUP_CQSIZE },
+		{ "CLAMP", IORING_SETUP_CLAMP },
+		{ "R_DISABLED", IORING_SETUP_R_DISABLED },
+		{ "SUBMIT_ALL", IORING_SETUP_SUBMIT_ALL },
+		{ "COOP_TASKRUN", IORING_SETUP_COOP_TASKRUN },
+		{ "TASKRUN_FLAG", IORING_SETUP_TASKRUN_FLAG },
+		{ "SQE128", IORING_SETUP_SQE128 },
+		{ "CQE32", IORING_SETUP_CQE32 },
+		{ "SINGLE_ISSUER", IORING_SETUP_SINGLE_ISSUER },
+		{ "DEFER_TASKRUN", IORING_SETUP_DEFER_TASKRUN },
+		{ "NO_SQARRAY", IORING_SETUP_NO_SQARRAY },
+	};
+	static const struct {
+		const char *name;
+		uint32_t flags;
+	} more[] = {
+		{ "defer+sqpoll", IORING_SETUP_SINGLE_ISSUER |
+		    IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SQPOLL },
+		{ "defer+coop", IORING_SETUP_SINGLE_ISSUER |
+		    IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_COOP_TASKRUN },
+		{ "defer+flag", IORING_SETUP_SINGLE_ISSUER |
+		    IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_TASKRUN_FLAG },
+		{ "defer+iopoll", IORING_SETUP_SINGLE_ISSUER |
+		    IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_IOPOLL },
+	};
+	size_t n = sizeof(fl) / sizeof(fl[0]);
+	char step[64];
+
+	for (size_t i = 0; i < n; i++) {
+		for (size_t j = i; j < n; j++) {
+			struct io_uring_params p;
+			int fd;
+
+			memset(&p, 0, sizeof(p));
+			p.flags = fl[i].flag | fl[j].flag;
+			p.cq_entries = 16;
+			fd = ring_sys_setup(4, &p);
+			snprintf(step, sizeof(step), "%s+%s", fl[i].name,
+			    fl[j].name);
+			say_rc(step, fd < 0 ? -1 : 0);
+			if (fd >= 0)
+				close(fd);
+		}
+	}
+	for (size_t i = 0; i < sizeof(more) / sizeof(more[0]); i++) {
+		struct io_uring_params p;
+		int fd;
+
+		memset(&p, 0, sizeof(p));
+		p.flags = more[i].flags;
+		fd = ring_sys_setup(4, &p);
+		say_rc(more[i].name, fd < 0 ? -1 : 0);
+		if (fd >= 0)
+			close(fd);
+	}
+}
+
+/* What Linux 7.3 has past IORING_OP_PIPE, which kqring refuses. */
+static void
+c_newer(void)
+{
+	struct io_uring_params p;
+	struct ring r;
+	struct io_uring_sqe *s;
+	uint64_t reg[8];
+	void *m;
+	int fd, sv[2];
+
+	memset(&p, 0, sizeof(p));
+	p.flags = 1U << 19;	/* IORING_SETUP_SQE_MIXED */
+	fd = ring_sys_setup(4, &p);
+	say_rc("sqe_mixed", fd < 0 ? -1 : 0);
+	if (fd >= 0)
+		close(fd);
+	memset(&p, 0, sizeof(p));
+	p.flags = (1U << 20) | IORING_SETUP_NO_SQARRAY;	/* SQ_REWIND */
+	fd = ring_sys_setup(4, &p);
+	say_rc("sq_rewind", fd < 0 ? -1 : 0);
+	if (fd >= 0)
+		close(fd);
+
+	ring_init(&r, 8, NULL);
+	prep(&r, 63, -1, 1);	/* IORING_OP_NOP128 */
+	(void)submit(&r);
+	await(&r, 1, 2000);
+	dump(&r, "nop128");
+	prep(&r, 64, -1, 2);	/* IORING_OP_URING_CMD128 */
+	(void)submit(&r);
+	await(&r, 1, 2000);
+	dump(&r, "uring_cmd128");
+
+	s = prep(&r, IORING_OP_TIMEOUT, -1, 3);
+	s->addr = 1000000;
+	s->len = 1;
+	s->timeout_flags = 1U << 7;	/* IORING_TIMEOUT_IMMEDIATE_ARG */
+	(void)submit(&r);
+	await(&r, 1, 2000);
+	dump(&r, "timeout_immediate");
+
+	CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	s = prep(&r, IORING_OP_URING_CMD, sv[0], 4);
+	s->cmd_op = 5;		/* SOCKET_URING_OP_GETSOCKNAME */
+	(void)submit(&r);
+	await(&r, 1, 2000);
+	dump(&r, "getsockname");
+	close(sv[0]);
+	close(sv[1]);
+
+	say_rc("register_zcrx_ctrl", ring_sys_register(r.fd, 36, NULL, 0));
+	say_rc("register_bpf_filter", ring_sys_register(r.fd, 37, NULL, 0));
+	say_rc("task_restrictions", ring_sys_register(-1,
+	    IORING_REGISTER_RESTRICTIONS, NULL, 0));
+
+	/* struct io_uring_buf_reg's min_left, once reserved. */
+	m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
+	    -1, 0);
+	CHECK(m != MAP_FAILED);
+	memset(reg, 0, sizeof(reg));
+	reg[0] = (uint64_t)(uintptr_t)m;
+	((uint32_t *)reg)[2] = 8;
+	((uint16_t *)reg)[6] = 1;
+	((uint32_t *)reg)[4] = 2;
+	say_rc("pbuf_min_left", ring_sys_register(r.fd,
+	    IORING_REGISTER_PBUF_RING, reg, 1));
+	munmap(m, 4096);
+	ring_free(&r);
+}
+
 static void
 c_bad_sqe(void)
 {
@@ -1378,6 +1517,8 @@ static const struct {
 	void		(*fn)(void);
 } cases[] = {
 	{ "nop", c_nop },
+	{ "setup_flags", c_setup_flags },
+	{ "newer", c_newer },
 	{ "bad_sqe", c_bad_sqe },
 	{ "batch_stop", c_batch_stop },
 	{ "links", c_links },

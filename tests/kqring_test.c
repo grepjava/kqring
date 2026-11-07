@@ -97,6 +97,8 @@ ring_setup(struct test_ring *r)
 	if (!ring_setup_shared)
 		p.flags |= IORING_SETUP_SINGLE_ISSUER |
 		    IORING_SETUP_DEFER_TASKRUN;
+	else
+		p.flags |= IORING_SETUP_COOP_TASKRUN;
 	p.cq_entries = CQ_ENTRIES;
 
 	memset(r, 0, sizeof(*r));
@@ -9090,16 +9092,16 @@ test_sqpoll_and_iopoll(void)
 
 	/* 1. SQ_AFF validation: invalid CPU rejected with EINVAL. */
 	memset(&p, 0, sizeof(p));
-	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
-	    IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF;
+	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_SQPOLL |
+	    IORING_SETUP_SQ_AFF;
 	p.sq_thread_cpu = 9999;
 	assert(kqring_setup(8, &p) == -1 && errno == EINVAL);
 
 	/* 2. SQPOLL + SQ_AFF (CPU 0) with 30 ms idle timeout. */
 	memset(&sr, 0, sizeof(sr));
 	memset(&p, 0, sizeof(p));
-	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
-	    IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF;
+	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_SQPOLL |
+	    IORING_SETUP_SQ_AFF;
 	p.sq_thread_cpu = 0;
 	p.sq_thread_idle = 30;
 	sr.fd = (int)kqring_setup(16, &p);
@@ -9851,7 +9853,7 @@ test_compat_gaps(void)
 
 /*
  * The rest of COMPATIBILITY.MD: what is refused, ignored or kept. The
- * refused values are Linux 6.18's, which <sys/kqring.h> leaves out; when one
+ * refused values are Linux 7.3's, which <sys/kqring.h> leaves out; when one
  * is implemented, this test is where it stops being refused.
  */
 static void
@@ -9860,6 +9862,14 @@ test_compat_contracts(void)
 	static const uint32_t bad_setup[] = {
 		1U << 17,	/* IORING_SETUP_HYBRID_IOPOLL */
 		1U << 18,	/* IORING_SETUP_CQE_MIXED */
+		1U << 19,	/* IORING_SETUP_SQE_MIXED */
+		1U << 20,	/* IORING_SETUP_SQ_REWIND */
+		IORING_SETUP_TASKRUN_FLAG,
+		IORING_SETUP_SQPOLL | IORING_SETUP_COOP_TASKRUN,
+		IORING_SETUP_SQPOLL | IORING_SETUP_COOP_TASKRUN |
+		    IORING_SETUP_TASKRUN_FLAG,
+		IORING_SETUP_SQPOLL | IORING_SETUP_SINGLE_ISSUER |
+		    IORING_SETUP_DEFER_TASKRUN,
 	};
 	static const uint32_t bad_enter[] = {
 		1U << 5,	/* IORING_ENTER_ABS_TIMER */
@@ -9870,6 +9880,8 @@ test_compat_contracts(void)
 		32,		/* IORING_REGISTER_ZCRX_IFQ */
 		34,		/* IORING_REGISTER_MEM_REGION */
 		35,		/* IORING_REGISTER_QUERY */
+		36,		/* IORING_REGISTER_ZCRX_CTRL */
+		37,		/* IORING_REGISTER_BPF_FILTER */
 	};
 	static const uint32_t bad_nop[] = {
 		1U << 1,	/* IORING_NOP_FILE */
@@ -9918,6 +9930,42 @@ test_compat_contracts(void)
 	sqe->cmd_op = 4;
 	ring_push_sqe(&t);
 	assert(submit_one(&t) == -EOPNOTSUPP);
+	sqe = ring_prep(&t, IORING_OP_URING_CMD, sv[0], 78113);
+	sqe->cmd_op = 5;	/* SOCKET_URING_OP_GETSOCKNAME */
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EOPNOTSUPP);
+
+	/* Linux 7.3's opcodes, and IORING_TIMEOUT_IMMEDIATE_ARG. */
+	(void)ring_prep(&t, 63, -1, 78114);	/* IORING_OP_NOP128 */
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+	(void)ring_prep(&t, 64, -1, 78115);	/* IORING_OP_URING_CMD128 */
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+	sqe = ring_prep(&t, IORING_OP_TIMEOUT, -1, 78116);
+	sqe->addr = 1000000;
+	sqe->len = 1;
+	sqe->timeout_flags = 1U << 7;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EINVAL);
+
+	/* Registration without a ring, and the field that was reserved. */
+	assert(kqring_register(-1, IORING_REGISTER_RESTRICTIONS, NULL, 0) ==
+	    -1 && errno == EBADF);
+	{
+		struct io_uring_buf_reg br;
+		void *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANON, -1, 0);
+
+		assert(m != MAP_FAILED);
+		memset(&br, 0, sizeof(br));
+		br.ring_addr = (uint64_t)(uintptr_t)m;
+		br.ring_entries = 8;
+		br.bgid = 9;
+		((uint32_t *)&br)[4] = 2;	/* min_left */
+		assert(reg(&t, IORING_REGISTER_PBUF_RING, &br, 1) == -EINVAL);
+		munmap(m, 4096);
+	}
 
 	/* A send to a closed peer fails, and raises no SIGPIPE. */
 	assert(signal(SIGPIPE, SIG_DFL) != SIG_ERR);

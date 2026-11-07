@@ -423,7 +423,7 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
 
 - [`ARCHITECTURE.MD`](ARCHITECTURE.MD) — how kqring works inside: shared memory layout, execution model, request lifecycle, zero-copy, workers and locking.
 - [`BENCHMARK.MD`](BENCHMARK.MD) — performance against `kqueue(2)` and plain system calls, with method and known gaps.
-- [`COMPATIBILITY.MD`](COMPATIBILITY.MD) — every io_uring capability against Linux 6.18, with its contract, source and tests.
+- [`COMPATIBILITY.MD`](COMPATIBILITY.MD) — every io_uring capability against Linux 7.3, with its contract, source and tests.
 - [`ROADMAP.MD`](ROADMAP.MD) — the phased plan towards compatibility with Linux.
 - [`TODO.MD`](TODO.MD) — what's open.
 - [`CHANGELOG.md`](CHANGELOG.md) — releases and their known limits.

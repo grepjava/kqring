@@ -49,7 +49,7 @@ Acceptance: every liburing 2.9 test is passing, skipped, failing with a document
 
 ### Versioned compatibility matrix
 
-**Done.** [`COMPATIBILITY.MD`](COMPATIBILITY.MD) lists all 205 capabilities against Linux 6.18 and liburing 2.9, and [`tests/compat_check.py`](tests/compat_check.py) fails if it stops matching the source. Its [validation gaps](COMPATIBILITY.MD#validation-gaps) list what is still unchecked.
+**Done.** [`COMPATIBILITY.MD`](COMPATIBILITY.MD) lists all 215 capabilities against Linux 7.3 and liburing 2.9, and [`tests/compat_check.py`](tests/compat_check.py) fails if it stops matching the source. Its [validation gaps](COMPATIBILITY.MD#validation-gaps) list what is still unchecked.
 
 Document every supported opcode, setup flag, enter flag, registration and important subflag against a stated Linux kernel and liburing baseline. Classify each as equivalent, partial, unsupported or intentionally different, and record platform and filesystem dependencies separately from limits of the module.
 
@@ -67,7 +67,7 @@ Acceptance: every advertised capability has a documented contract, a source refe
 
 ### Differential conformance
 
-**Done.** [`tests/kqring_diff.c`](tests/kqring_diff.c) has 19 cases that build and run on both systems, and [`tests/diff_compare.py`](tests/diff_compare.py) compares their output. On Linux 7.3 and kqring, 15 match and 4 differ on purpose, with the reasons in [`tests/diff_expected.txt`](tests/diff_expected.txt). The raw results and what they ran on are in [`docs/conformance/`](docs/conformance/README.md). The runs found `execve(2)` hanging on a ring with a kernel thread, and five differences that are now fixed: short transfers in links, `CANCEL_ALL` with nothing to cancel, `IORING_POLL_ADD_LEVEL`, a refused `FILES_UPDATE`, and another thread's enter on a `SINGLE_ISSUER` ring. Linux 6.18 itself hasn't been run, as the machine has 7.3; disputed behaviour was read in its source.
+**Done.** [`tests/kqring_diff.c`](tests/kqring_diff.c) has 21 cases that build and run on both systems, and [`tests/diff_compare.py`](tests/diff_compare.py) compares their output. On Linux 7.3 and kqring, 16 match and 5 differ on purpose, with the reasons in [`tests/diff_expected.txt`](tests/diff_expected.txt). The raw results and what they ran on are in [`docs/conformance/`](docs/conformance/README.md). The runs found `execve(2)` hanging on a ring with a kernel thread, and six differences that are now fixed: short transfers in links, `CANCEL_ALL` with nothing to cancel, `IORING_POLL_ADD_LEVEL`, a refused `FILES_UPDATE`, another thread's enter on a `SINGLE_ISSUER` ring, and which setup flags go together.
 
 Run matched cases on Linux io_uring and on kqring, normalizing native constants and errors while keeping meaningful differences. Exercise cancellation, links, timeouts, buffer lifetime, CQ overflow, resource updates, fork and exec, fixed descriptors and several submitter threads. The test machine also boots Linux, so both sides can run on the same hardware.
 

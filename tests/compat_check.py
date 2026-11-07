@@ -23,9 +23,11 @@ STATUSES = ('Equivalent', 'Partial', 'Different', 'Unsupported')
 # Every symbol of these kinds needs a row.
 REQUIRED = re.compile(
     r'^(IORING_OP_|IORING_SETUP_|IORING_ENTER_|IOSQE_(?!.*_BIT$)|'
-    r'IORING_REGISTER_|IORING_UNREGISTER_|IORING_FEAT_)')
+    r'IORING_REGISTER_|IORING_UNREGISTER_|IORING_FEAT_|IORING_TIMEOUT_|'
+    r'SOCKET_URING_OP_)')
 NOT_CAPABILITIES = {'IORING_OP_LAST', 'IORING_REGISTER_LAST',
-                    'IORING_REGISTER_FILES_SKIP'}
+                    'IORING_REGISTER_FILES_SKIP', 'IORING_TIMEOUT_CLOCK_MASK',
+                    'IORING_TIMEOUT_UPDATE_MASK'}
 
 
 def read(path):

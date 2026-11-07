@@ -17,11 +17,12 @@
 - `IORING_POLL_ADD_LEVEL` is now refused with `EINVAL`, as on Linux, which has the flag in its UAPI but doesn't accept it.
 - A refused `FILES_UPDATE` now leaves its slot empty, as on Linux, rather than keeping the old file.
 - With `IORING_SETUP_SINGLE_ISSUER`, another thread's enter that submits nothing now succeeds, as on Linux, rather than failing with `EEXIST`. A wait by another thread still fails unless the CQ can already satisfy it, or always on a `DEFER_TASKRUN` ring.
+- `IORING_SETUP_TASKRUN_FLAG` now needs `COOP_TASKRUN` or `DEFER_TASKRUN`, and `SQPOLL` refuses all three, with `EINVAL`, as on Linux. Programs that set them another way will now fail at setup.
 - `READ_MULTISHOT` of a file that can't be polled now completes with `EBADF`, where Linux has `EBADFD`, rather than `EOPNOTSUPP`, with or without `IOSQE_ASYNC`.
 
 ### Testing
 
-- Linux 7.3 and kqring now match in 15 of the 19 cases of `tests/kqring_diff.c`, and the other 4 differ on purpose. The results are in `docs/conformance/`.
+- Linux 7.3 and kqring now match in 16 of the 21 cases of `tests/kqring_diff.c`, and the other 5 differ on purpose. The results are in `docs/conformance/`.
 - `tests/kqring_diff.c` runs the same cases on Linux and on kqring, and `tests/diff_compare.py` fails on a difference that isn't listed with its reason.
 - `tests/kqring_test.c` now covers `WRITEV_FIXED`, level-triggered polls, `ACCEPT_POLL_FIRST`, `IORING_OFF_CQ_RING`, how a failed SQE ends a batch, the flags kqring refuses, `SIGPIPE`, hole punching and the Capsicum rights of fixed files.
 - `tests/kqring_fuzz.c` now really exercises futexes, whose wake masks all failed validation before, and resizes rings with requests in flight.
@@ -29,7 +30,7 @@
 
 ### Documentation
 
-- `COMPATIBILITY.MD` lists every io_uring capability against Linux 6.18 and liburing 2.9, with its contract, source and tests, and `tests/compat_check.py` checks it against the source.
+- `COMPATIBILITY.MD` lists every io_uring capability against Linux 7.3 and liburing 2.9, with its contract, source and tests, and `tests/compat_check.py` checks it against the source.
 - `README.md` now explains what kqring is and why it exists, and `ARCHITECTURE.MD` covers kernel threads, where a request goes, disk I/O, read ordering, the extensions and testing, and no longer describes names the code has dropped. Its description of the ring header was wrong: all the indices share one 64-byte cache line.
 - Every table in `BENCHMARK.MD` is re-measured on `v0.3.0`, with the raw runs in `docs/bench/data/`, and the charts are redrawn. md(4) disks are now filled first. Reads of unwritten blocks are far cheaper, so 32 reads per enter are about 2.9× `pread(2)`, not 4.5×. `tests/bench_doc.py` writes the document from those runs.
 

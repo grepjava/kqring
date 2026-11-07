@@ -2,7 +2,7 @@
 
 This file lists every io_uring capability against one baseline, says how kqring behaves, and points at the code and the test behind that claim. [`tests/compat_check.py`](tests/compat_check.py) checks it against the source, so a capability can't be added or removed without this file changing too.
 
-**Baseline:** the UAPI header of Linux 6.18 (`include/uapi/linux/io_uring.h`) and liburing 2.9. kqring's opcode numbers match that header. kqring 0.3.0 on FreeBSD 15.1-RELEASE, amd64.
+**Baseline:** Linux 7.3, whose UAPI header (`linux/io_uring.h`, from `linux-libc-dev` 7.3.0-9.9 on Ubuntu 26.10) lists the capabilities and whose running kernel is what [`tests/kqring_diff.c`](tests/kqring_diff.c) compares against, and liburing 2.9. kqring's opcode numbers match that header up to `IORING_OP_PIPE`, and what Linux has after it is refused. kqring 0.3.0 on FreeBSD 15.1-RELEASE, amd64.
 
 This matrix records what kqring is designed to do and what its tests check. [Differential conformance](ROADMAP.MD#differential-conformance) compares the behaviour that matters most with a running Linux kernel, case by case; rows outside those cases rest on kqring's own tests and on liburing's.
 
@@ -92,6 +92,8 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_OP_READV_FIXED` | Different | As `READ_FIXED`. Every iovec must be inside the buffer. | `kqring_exec_file_rw` | `test_registered_buffers` |
 | `IORING_OP_WRITEV_FIXED` | Different | As `READV_FIXED`. | `kqring_exec_file_rw` | `test_compat_gaps` |
 | `IORING_OP_PIPE` | Partial | A direct pipe briefly has descriptors in the process. | `kqring_exec_pipe` | `test_direct_descriptors`, `fuzz` |
+| `IORING_OP_NOP128` | Unsupported | `-EINVAL`, even with 128-byte SQEs. | `kqring_req_prep` | `test_compat_contracts` |
+| `IORING_OP_URING_CMD128` | Unsupported | `-EINVAL`, even with 128-byte SQEs. | `kqring_req_prep` | `test_compat_contracts` |
 
 ## Setup flags
 
@@ -116,6 +118,8 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_SETUP_NO_SQARRAY` | Equivalent | | `kqring_ioc_setup` | `test_no_mmap`, `fuzz` |
 | `IORING_SETUP_HYBRID_IOPOLL` | Unsupported | `EINVAL`. | `kqring_ioc_setup` | `test_compat_contracts` |
 | `IORING_SETUP_CQE_MIXED` | Unsupported | `EINVAL`. | `kqring_ioc_setup` | `test_compat_contracts` |
+| `IORING_SETUP_SQE_MIXED` | Unsupported | `EINVAL`. | `kqring_ioc_setup` | `test_compat_contracts` |
+| `IORING_SETUP_SQ_REWIND` | Unsupported | `EINVAL`. | `kqring_ioc_setup` | `test_compat_contracts` |
 
 ## Enter flags
 
@@ -183,6 +187,10 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_REGISTER_ZCRX_IFQ` | Unsupported | `EOPNOTSUPP`. **Platform:** needs driver support FreeBSD lacks. | `kqring_register_op` | `test_compat_contracts` |
 | `IORING_REGISTER_MEM_REGION` | Unsupported | `EOPNOTSUPP`. Phase 3. | `kqring_register_op` | `test_compat_contracts`, `liburing/reg-wait` |
 | `IORING_REGISTER_QUERY` | Unsupported | `EOPNOTSUPP`. | `kqring_register_op` | `test_compat_contracts` |
+| `IORING_REGISTER_ZCRX_CTRL` | Unsupported | `EOPNOTSUPP`. **Platform:** needs driver support FreeBSD lacks. | `kqring_register_op` | `test_compat_contracts` |
+| `IORING_REGISTER_BPF_FILTER` | Unsupported | `EOPNOTSUPP`. | `kqring_register_op` | `test_compat_contracts` |
+| `io_uring_task_restriction` | Unsupported | Restrictions apply to one ring, so registering without a ring fails with `EBADF`. | `kqring_ioc_register` | `test_compat_contracts` |
+| `io_uring_buf_reg.min_left` | Unsupported | `EINVAL`: kqring still treats the field as reserved. | `kqring_register_op` | `test_compat_contracts` |
 
 ## Features
 
@@ -223,6 +231,7 @@ These are the `IORING_FEAT_*` bits setup returns.
 | `IORING_LINK_TIMEOUT_UPDATE` | Equivalent | | `kqring_timeout_remove` | `test_link_timeout`, `liburing/link-timeout` |
 | `IORING_TIMEOUT_ETIME_SUCCESS` | Equivalent | | `kqring_timeout_prep` | `test_timeouts` |
 | `IORING_TIMEOUT_MULTISHOT` | Equivalent | | `kqring_timeout_fire` | `test_timeouts`, `liburing/timeout` |
+| `IORING_TIMEOUT_IMMEDIATE_ARG` | Unsupported | `-EINVAL`. | `kqring_timeout_prep` | `test_compat_contracts` |
 | `IORING_POLL_ADD_MULTI` | Equivalent | On the ring's own eventfd it ends after the first CQE. | `kqring_kpoll_arm` | `test_nonsock_poll`, `liburing/poll-mshot-update` |
 | `IORING_POLL_ADD_LEVEL` | Equivalent | In the UAPI, but refused with `EINVAL`, as on Linux. | `kqring_req_prep` | `test_compat_gaps` |
 | `IORING_POLL_UPDATE_EVENTS` | Equivalent | | `kqring_poll_remove` | `liburing/poll-mshot-update` |
@@ -264,6 +273,7 @@ These are the `IORING_FEAT_*` bits setup returns.
 | `SOCKET_URING_OP_GETSOCKOPT` | Equivalent | | `kqring_exec_uring_cmd` | `test_uring_cmd`, `liburing/socket-getsetsock-cmd` |
 | `SOCKET_URING_OP_SETSOCKOPT` | Equivalent | | `kqring_exec_uring_cmd` | `test_uring_cmd`, `liburing/socket-getsetsock-cmd` |
 | `SOCKET_URING_OP_TX_TIMESTAMP` | Unsupported | `-EOPNOTSUPP`. | `kqring_exec_uring_cmd` | `test_compat_contracts` |
+| `SOCKET_URING_OP_GETSOCKNAME` | Unsupported | `-EOPNOTSUPP`. | `kqring_exec_uring_cmd` | `test_compat_contracts` |
 | `IO_URING_NAPI_REGISTER_OP` | Partial | See `IORING_REGISTER_NAPI`. | `kqring_register_napi` | `test_napi_busy_poll` |
 | `IO_URING_NAPI_STATIC_ADD_ID` | Unsupported | `EOPNOTSUPP`, as is `IO_URING_NAPI_STATIC_DEL_ID`. | `kqring_register_napi` | `test_napi_busy_poll` |
 
@@ -302,4 +312,4 @@ Everything marked `gap` above, plus limits of the tests themselves:
 - **Features not advertised.** `IORING_FEAT_NO_IOWAIT` and `IORING_FEAT_RW_ATTR` are simply not set.
 - **`liburing/pipe-reuse` and `liburing/splice`** stop early, so the subtests after their first failure haven't run.
 
-`Equivalent` means no difference is known. Only the behaviour in [`tests/kqring_diff.c`](tests/kqring_diff.c) has been compared with a running Linux kernel, and that kernel was 7.3 rather than the 6.18 baseline. Some rows also rest on a test that covers more than the row names.
+`Equivalent` means no difference is known. Only the behaviour in [`tests/kqring_diff.c`](tests/kqring_diff.c) has been compared with a running Linux kernel. Some rows also rest on a test that covers more than the row names.
