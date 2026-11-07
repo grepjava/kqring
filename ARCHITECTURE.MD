@@ -155,7 +155,7 @@ flowchart LR
    - **Shared rings (no `SINGLE_ISSUER`):** any thread of the owner process (`ctx->shared`), one at a time under `sx_xlock(&ctx->sq_sx)`.
    - **No `DEFER_TASKRUN` (`ctx->taskrun_only`):** a `kqtask` kernel thread in the owner process also runs taskwork as it is queued, so completions appear without an enter, as Linux's task_work does; it takes `sq_sx` like an enter and wakes waiters after each batch.
    - **`IORING_SETUP_SQPOLL` mode:** Either the in-process `kqsqp` thread (`kqring_sqpoll_thread`) or an entering thread, mutually serialized by `sx_xlock(&ctx->sq_sx)`.
-   - Threads of another process (a forked child) cannot enter or register (`EEXIST`): workers resolve descriptors in the owner's table, so the ring stays bound to one process.
+   - Threads of another process (a forked child) cannot submit, wait or register (`EEXIST`): workers resolve descriptors in the owner's table, so the ring stays bound to one process.
 
 ```mermaid
 flowchart LR
@@ -400,7 +400,7 @@ sequenceDiagram
 Pipes, FIFOs, eventfds, ttys, kqueues, ring descriptors and devices with a `d_kqfilter` have no upcall slot, so a `POLL_ADD` on them becomes kqueue knotes:
 
 - **One kqueue per ring, with no descriptor.** On the first such poll, `kern_kqueue()` creates a kqueue on the owner's descriptor table; kqring takes a file reference (`ctx->kp_fp`) and closes the descriptor at once. One `kqpoll` kernel thread per ring sleeps on it (waking every 50 ms to notice suspension and teardown). It sleeps on the kqueue directly (`kqring_kp_wait()`), as `kqueue_scan()` does, rather than inside `kern_kevent_fp()`, so that it holds no event while it sleeps.
-- **Each request is one or two knotes** (`EVFILT_READ` and/or `EVFILT_WRITE` on `sqe->fd`), with `udata` = a per-ring request id. A single-shot poll uses `EV_ONESHOT`; a multishot one `EV_CLEAR` (or neither for `IORING_POLL_ADD_LEVEL`). The knote catches every wakeup of the file, so any number of polls cost no threads.
+- **Each request is one or two knotes** (`EVFILT_READ` and/or `EVFILT_WRITE` on `sqe->fd`), with `udata` = a per-ring request id. A single-shot poll uses `EV_ONESHOT`; a multishot one `EV_CLEAR`. The knote catches every wakeup of the file, so any number of polls cost no threads.
 - **Delivery is taskwork.** The poller only records the events (`op->kp_revents`, `op->kp_nev`) under `ctx->mtx` and queues the request; `kqring_kpoll_deliver()` posts one CQE per event for a multishot poll, ending it instead when the CQ would overflow.
 - **Lookups are hashed:** armed polls by descriptor (`ctx->kp_ops[]`, for events and the one-knote-per-descriptor-and-filter check) and every armed `POLL_ADD` by `user_data` (`ctx->poll_hash[]`, for `POLL_REMOVE`).
 - **Fallbacks:** a poll on a fixed file (no descriptor to register), on a file without a kqfilter, or a second one on the same descriptor and filter waits on a worker (`kqring_wq_poll_wait()`).

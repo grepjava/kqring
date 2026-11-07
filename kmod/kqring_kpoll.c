@@ -707,7 +707,6 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	uint32_t events = sqe->poll32_events ? sqe->poll32_events :
 	    sqe->poll_events;
 	bool multi = (sqe->len & IORING_POLL_ADD_MULTI) != 0;
-	bool level = (sqe->len & IORING_POLL_ADD_LEVEL) != 0;
 	struct kevent kev[2];
 	struct kqring_op *o;
 	uint8_t filters = 0;
@@ -752,10 +751,10 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 
 	/*
 	 * A single-shot poll fires once; a multishot one on each wakeup
-	 * (EV_CLEAR) or, LEVEL, while the file stays ready.
+	 * (EV_CLEAR).
 	 */
 	n = kqring_kp_kevents(op, kev, EV_ADD | (!multi ? EV_ONESHOT : 0) |
-	    (!level ? EV_CLEAR : 0));
+	    EV_CLEAR);
 	error = kqring_kp_change(ctx, kev, n);
 	if (error == 0) {
 		/*

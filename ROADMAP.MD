@@ -9,7 +9,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | Phase | Work | Status |
 |---|---|---|
 | 1 | Ordering and poll timing | Done |
-| 2 | Make compatibility measurable | liburing tests and matrix done; differential runs started |
+| 2 | Make compatibility measurable | Done |
 | 3 | Wait semantics | Not started |
 | 4 | Per-file write ordering | Not started |
 | 5 | Worker path scalability | Not started |
@@ -67,7 +67,7 @@ Acceptance: every advertised capability has a documented contract, a source refe
 
 ### Differential conformance
 
-**Started.** [`tests/kqring_diff.c`](tests/kqring_diff.c) has 18 cases that build and run on both systems, and [`tests/diff_compare.py`](tests/diff_compare.py) compares their output. They have only run on kqring so far, where they already found `execve(2)` hanging on a ring with a kernel thread.
+**Done.** [`tests/kqring_diff.c`](tests/kqring_diff.c) has 19 cases that build and run on both systems, and [`tests/diff_compare.py`](tests/diff_compare.py) compares their output. On Linux 7.3 and kqring, 15 match and 4 differ on purpose, with the reasons in [`tests/diff_expected.txt`](tests/diff_expected.txt). The raw results and what they ran on are in [`docs/conformance/`](docs/conformance/README.md). The runs found `execve(2)` hanging on a ring with a kernel thread, and five differences that are now fixed: short transfers in links, `CANCEL_ALL` with nothing to cancel, `IORING_POLL_ADD_LEVEL`, a refused `FILES_UPDATE`, and another thread's enter on a `SINGLE_ISSUER` ring. Linux 6.18 itself hasn't been run, as the machine has 7.3; disputed behaviour was read in its source.
 
 Run matched cases on Linux io_uring and on kqring, normalizing native constants and errors while keeping meaningful differences. Exercise cancellation, links, timeouts, buffer lifetime, CQ overflow, resource updates, fork and exec, fixed descriptors and several submitter threads. The test machine also boots Linux, so both sides can run on the same hardware.
 

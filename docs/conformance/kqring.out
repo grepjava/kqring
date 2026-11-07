@@ -1,0 +1,138 @@
+# system FreeBSD 15.1-RELEASE amd64
+# memlock 65536
+# compiler FreeBSD Clang 19.1.7 (https://github.com/llvm/llvm-project.git llvmorg-19.1.7-0-gcd708029e0b2)
+nop/enter 1
+nop/cqe ud=1 res=0 flags=-
+bad_sqe/opcode ud=1 res=-EINVAL flags=-
+bad_sqe/flags ud=2 res=-EINVAL flags=-
+bad_sqe/badfd ud=3 res=-EBADF flags=-
+bad_sqe/no_fixed_table ud=4 res=-EBADF flags=-
+batch_stop/enter 2
+batch_stop/left 1
+batch_stop/cqe ud=1 res=0 flags=-
+batch_stop/cqe ud=2 res=-EINVAL flags=-
+links/ok ud=1 res=0 flags=-
+links/ok ud=2 res=0 flags=-
+links/ok ud=3 res=0 flags=-
+links/failed ud=4 res=-EBADF flags=-
+links/failed ud=5 res=-ECANCELED flags=-
+links/failed ud=6 res=-ECANCELED flags=-
+links/hardlink ud=7 res=-EBADF flags=-
+links/hardlink ud=8 res=0 flags=-
+links/short_read ud=9 res=4 flags=-
+links/short_read ud=10 res=-ECANCELED flags=-
+links/short_read_pipe ud=20 res=3 flags=-
+links/short_read_pipe ud=21 res=-ECANCELED flags=-
+links/short_recv ud=22 res=3 flags=-
+links/short_recv ud=23 res=0 flags=-
+links/short_waitall ud=24 res=3 flags=-
+links/short_waitall ud=25 res=-ECANCELED flags=-
+links/short_skip ud=26 res=4 flags=-
+links/short_hardlink ud=28 res=4 flags=-
+links/short_hardlink ud=29 res=0 flags=-
+links/short_splice ud=30 res=3 flags=-
+links/short_splice ud=31 res=-ECANCELED flags=-
+links/open_chain ud=11 res=0 flags=-
+links/skip ud=13 res=0 flags=-
+drain/cqe ud=1 res=-ETIME flags=-
+drain/cqe ud=2 res=0 flags=-
+drain/cqe ud=3 res=0 flags=-
+timeouts/expire ud=1 res=-ETIME flags=-
+timeouts/count ud=3 res=0 flags=-
+timeouts/count ud=4 res=0 flags=-
+timeouts/count ud=2 res=0 flags=-
+timeouts/remove ud=6 res=0 flags=-
+timeouts/remove ud=5 res=-ECANCELED flags=-
+timeouts/remove_missing ud=7 res=-ENOENT flags=-
+timeouts/update ud=9 res=0 flags=-
+timeouts/update ud=8 res=-ETIME flags=-
+link_timeout/fires ud=2 res=-ETIME flags=-
+link_timeout/fires ud=1 res=-ECANCELED flags=-
+link_timeout/beaten ud=3 res=1 flags=-
+link_timeout/beaten ud=4 res=-ECANCELED flags=-
+cancel/poll ud=1 res=-ECANCELED flags=-
+cancel/poll ud=2 res=0 flags=-
+cancel/missing ud=3 res=-ENOENT flags=-
+cancel/blocked_read ud=5 res=0 flags=-
+cancel/blocked_read ud=4 res=-ECANCELED flags=-
+cancel/any_one ud=6 res=-ECANCELED flags=-
+cancel/any_one ud=7 res=-ECANCELED flags=-
+cancel/any_one ud=8 res=-ECANCELED flags=-
+cancel/any_one ud=9 res=3 flags=-
+cancel/any_all ud=10 res=0 flags=-
+poll/ready ud=1 res=OUT flags=-
+poll/armed none
+poll/multi ud=2 res=IN flags=M
+poll/multi ud=2 res=IN flags=M
+poll/multi ud=2 res=IN flags=M
+poll/removed ud=2 res=-ECANCELED flags=-
+poll/removed ud=3 res=0 flags=-
+poll/level ud=4 res=-EINVAL flags=-
+poll/level_multi_many 0
+poll_hup/hup ud=7 res=INHUP flags=-
+poll_hup/native_in 1
+poll_hup/native_hup 1
+provided_buffers/provide ud=1 res=0 flags=-
+provided_buffers/first ud=2 res=3 flags=B
+provided_buffers/eof ud=3 res=0 flags=-
+provided_buffers/left ud=4 res=1 flags=-
+provided_buffers/empty ud=5 res=-ENOBUFS flags=-
+buffer_lifetime/remapped ud=1 res=6 flags=-
+buffer_lifetime/remapped_data after!
+buffer_lifetime/unmapped ud=2 res=-EFAULT flags=-
+buffer_lifetime/too_long ud=3 res=-EFAULT flags=-
+cq_overflow/enter 8
+cq_overflow/enter 8
+cq_overflow/enter 8
+cq_overflow/cq_ready 8
+cq_overflow/sq_flag 1
+cq_overflow/reaped 24
+cq_overflow/in_order 1
+cq_overflow/sq_flag_after 0
+fixed_files/register 0
+fixed_files/empty_slot ud=1 res=-EBADF flags=-
+fixed_files/bad_slot ud=2 res=-EBADF flags=-
+fixed_files/update 1
+fixed_files/read ud=3 res=4 flags=-
+fixed_files/data aaaa
+fixed_files/replace 1
+fixed_files/tag ud=100 res=0 flags=-
+fixed_files/read2 ud=4 res=4 flags=-
+fixed_files/data2 bbbb
+fixed_files/self -EBADF
+fixed_files/after_self ud=20 res=-EBADF flags=-
+fixed_files/refill 1
+fixed_files/install ud=5 res=fd flags=-
+fixed_files/cloexec 1
+fixed_files/close_slot ud=6 res=0 flags=-
+fixed_files/closed_slot ud=7 res=-EBADF flags=-
+fixed_files/unregister 0
+fixed_files/unregister_again -ENXIO
+sockets/armed none
+sockets/woken ud=1 res=5 flags=-
+sockets/dontwait ud=2 res=-EAGAIN flags=-
+sockets/eof ud=3 res=0 flags=-
+sockets/closed_peer ud=4 res=-EPIPE flags=-
+sockets/not_a_socket ud=5 res=-ENOTSOCK flags=-
+fork/child_enter -EEXIST
+fork/parent_cq none
+fork/parent_after ud=2 res=0 flags=-
+exec/enter_after -EBADF
+exec/status 0
+threads/enter_errors 0
+threads/enter_errors 0
+threads/enter_errors 0
+threads/enter_errors 0
+threads/cqes 800
+threads/sum 1279600
+threads/single_issuer 0
+threads/single_issuer_submit -EEXIST
+threads/single_issuer_getevents 0
+threads/defer_enter 0
+threads/defer_getevents -EEXIST
+eventfd/register 0
+eventfd/again -EBUSY
+eventfd/cqe ud=1 res=0 flags=-
+eventfd/signalled 1
+eventfd/unregister 0
+# end

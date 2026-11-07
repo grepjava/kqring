@@ -264,8 +264,10 @@ kqring_xfer_end(struct kqring_op *op, int error, size_t n)
 	if (n == 0 && error == EWOULDBLOCK)
 		return (EAGAIN);
 	if (n == 0 && error != 0) {
-		if (op->done_io != 0)
+		if (op->done_io != 0) {
+			op->short_io = true;
 			return (kqring_done(op, kqring_xfer_res(op->done_io), 0));
+		}
 		return (kqring_done(op, -error, 0));
 	}
 	return (-1);
@@ -284,6 +286,20 @@ kqring_waitall(struct kqring_op *op, size_t n, size_t want, size_t *total)
 		return (EAGAIN);
 	*total = op->done_io;
 	return (0);
+}
+
+/*
+ * Whether a transfer of n bytes of `want` fails its link, as in io_uring:
+ * for READ / WRITE on a socket any short one does, for the socket opcodes
+ * only with MSG_WAITALL, which also refuses a truncated message.
+ */
+static void
+kqring_sock_short(struct kqring_op *op, size_t n, size_t want, bool trunc)
+{
+	if (op->sock_rw)
+		op->short_io = n < want;
+	else if ((op->sqe.msg_flags & MSG_WAITALL) != 0)
+		op->short_io = n < want || trunc;
 }
 
 static size_t
@@ -479,10 +495,13 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	} else if (kqring_so_rcv_pending(so, false)) {
 		cqe_flags |= IORING_CQE_F_SOCK_NONEMPTY;
 	}
-	if (waitall && kqring_waitall(op, n, sqe->len, &n) == EAGAIN) {
+	want += op->done_io;
+	if (waitall && kqring_waitall(op, n, (size_t)want, &n) == EAGAIN) {
 		kqring_put_sock(op, fp, EAGAIN);
 		return (EAGAIN);
 	}
+	kqring_sock_short(op, n, (size_t)want,
+	    (flags & (MSG_TRUNC | MSG_CTRUNC)) != 0);
 	kqring_put_sock(op, fp, multishot ? EAGAIN : 0);
 	return (kqring_done(op, kqring_xfer_res(n), cqe_flags));
 }
@@ -985,10 +1004,12 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 		if (bg_lock)
 			sx_xunlock(&ctx->bg_sx);
 	}
-	if (waitall && kqring_waitall(op, n, sqe->len, &n) == EAGAIN) {
+	want += op->done_io;
+	if (waitall && kqring_waitall(op, n, (size_t)want, &n) == EAGAIN) {
 		kqring_put_sock(op, fp, EAGAIN);
 		return (EAGAIN);
 	}
+	kqring_sock_short(op, n, (size_t)want, false);
 	kqring_put_sock(op, fp, 0);
 	return (kqring_done(op, kqring_xfer_res(n), cqe_flags));
 }
@@ -1284,11 +1305,14 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 	}
 	if (kqring_so_rcv_pending(so, false))
 		cqe_flags |= IORING_CQE_F_SOCK_NONEMPTY;
-	if (waitall && kqring_waitall(op, n, want + op->done_io, &n) ==
-	    EAGAIN) {
+	want += op->done_io;
+	if (waitall && kqring_waitall(op, n, want, &n) == EAGAIN) {
 		kqring_put_sock(op, fp, EAGAIN);
 		return (EAGAIN);
 	}
+	/* With a control buffer only a truncation counts, as in io_uring. */
+	kqring_sock_short(op, n, ma->msg.msg_controllen != 0 ? 0 : want,
+	    (oflags & (MSG_TRUNC | MSG_CTRUNC)) != 0);
 	kqring_put_sock(op, fp, 0);
 	return (kqring_done(op, kqring_xfer_res(n), cqe_flags));
 }
@@ -1396,11 +1420,12 @@ kqring_exec_sendmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 	/* The control data went with the first part, as in io_uring. */
 	if (n > 0)
 		ma->msg.msg_controllen = 0;
-	if (waitall && kqring_waitall(op, n, want + op->done_io, &n) ==
-	    EAGAIN) {
+	want += op->done_io;
+	if (waitall && kqring_waitall(op, n, want, &n) == EAGAIN) {
 		kqring_put_sock(op, fp, EAGAIN);
 		return (EAGAIN);
 	}
+	kqring_sock_short(op, n, want, false);
 	kqring_put_sock(op, fp, 0);
 	return (kqring_done(op, kqring_xfer_res(n), 0));
 }
@@ -1790,7 +1815,6 @@ kqring_wq_poll_wait(struct kqring_ctx *ctx, struct kqring_op *op)
 	cap_rights_t rights;
 	bool is_poll = sqe->opcode == IORING_OP_POLL_ADD;
 	bool multi = is_poll && (sqe->len & IORING_POLL_ADD_MULTI) != 0;
-	bool level = is_poll && (sqe->len & IORING_POLL_ADD_LEVEL) != 0;
 	bool no_selq;
 	int error, events, revents;
 
@@ -1824,11 +1848,8 @@ kqring_wq_poll_wait(struct kqring_ctx *ctx, struct kqring_op *op)
 				kqring_wq_mark_blocking(ctx, op);
 				break;
 			}
-			if (!level) {
-				kqring_selfd_alloc(stp);
-				(void)fo_poll(fp, POLLINIGNEOF, td->td_ucred,
-				    td);
-			}
+			kqring_selfd_alloc(stp);
+			(void)fo_poll(fp, POLLINIGNEOF, td->td_ucred, td);
 			no_selq = STAILQ_EMPTY(&stp->st_selq);
 			fdrop(fp, td);
 			mtx_lock(&ctx->mtx);
@@ -1840,13 +1861,10 @@ kqring_wq_poll_wait(struct kqring_ctx *ctx, struct kqring_op *op)
 			}
 			mtx_unlock(&ctx->mtx);
 			kqring_wq_mark_blocking(ctx, op);
-			if (level || no_selq) {
+			if (no_selq) {
 				kqring_seltd_clear(stp);
-				if (!kqring_wq_wait_taskwork(ctx, op, "kqwqlv"))
-					break;
-				if (no_selq && !level)
-					break;
-				continue;
+				(void)kqring_wq_wait_taskwork(ctx, op, "kqwqlv");
+				break;
 			}
 		} else {
 			no_selq = STAILQ_EMPTY(&stp->st_selq);

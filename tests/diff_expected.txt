@@ -1,1 +1,5 @@
 # Cases that differ from Linux on purpose: name, then why, with a reference.
+buffer_lifetime kqring copies through the user mapping at each I/O, where Linux pins the pages at registration (COMPATIBILITY.MD, IORING_OP_READ_FIXED).
+exec kqring tears a ring down when its owner execs, so the descriptor doesn't survive (COMPATIBILITY.MD, Boundaries).
+fork A ring belongs to one process: a forked child can't submit to it (COMPATIBILITY.MD, Boundaries).
+poll_hup The poll result follows the file: a pipe closed by its writer gives POLLIN|POLLHUP from poll(2) on FreeBSD and POLLHUP on Linux. native_in shows it (Platform).

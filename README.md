@@ -250,7 +250,7 @@ Programs that use liburing build against the port in [`liburing/`](liburing/), w
 
 ### Requirements
 
-- **Rings belong to one process.** Without `IORING_SETUP_SINGLE_ISSUER`, any thread of the process that created the ring may submit, wait and register; with it, only the creating thread may (`EEXIST` otherwise), as on Linux. Another process, such as a forked child, cannot use the ring except to wake an `SQPOLL` thread (see [Differences from Linux](#differences-from-linux)).
+- **Rings belong to one process.** Without `IORING_SETUP_SINGLE_ISSUER`, any thread of the process that created the ring may submit, wait and register; with it, only the creating thread may (`EEXIST` otherwise). Another thread's enter that submits nothing is allowed, as on Linux, but it can't wait for completions that haven't been posted yet. Another process, such as a forked child, cannot use the ring except to wake an `SQPOLL` thread (see [Differences from Linux](#differences-from-linux)).
 - **`IORING_SETUP_DEFER_TASKRUN` is the fastest mode.** It requires `SINGLE_ISSUER`, as on Linux, and completions are posted when the owner enters the ring. Without it, a kernel thread in the process posts completions as they happen, which costs a thread switch per batch.
 - **Raise `RLIMIT_MEMLOCK` to register buffers.** Registered buffers' pages are held for zero-copy send and charged to the user's locked-memory limit, which FreeBSD sets to only 64 KiB by default (Linux uses 8 MiB). Set `memorylocked` in `login.conf(5)`, or use `ulimit -l`.
 
@@ -281,7 +281,7 @@ Programs that use liburing build against the port in [`liburing/`](liburing/), w
 - **Fixed files and buffers:** `FILES_UPDATE` (including `IORING_FILE_INDEX_ALLOC`), `FIXED_FD_INSTALL`, `PROVIDE_BUFFERS`, `REMOVE_BUFFERS`.
   - `OPENAT`, `OPENAT2`, `ACCEPT` (including multishot), `SOCKET` and `PIPE` can create direct descriptors (`file_index`), and `CLOSE` can close them.
 - **Synchronisation:** `FUTEX_WAIT`, `FUTEX_WAITV`, `FUTEX_WAKE`, `WAITID`, `MSG_RING` (`IORING_MSG_DATA` and `IORING_MSG_SEND_FD`, including 32-byte `big_cqe` payload transfer on `SQE128` + `CQE32` rings).
-- **Control:** `NOP`, `POLL_ADD` (including multishot and `IORING_POLL_ADD_LEVEL` on sockets, pipes, eventfds, and files; on anything but a socket it is a knote on a kqueue the ring owns, served by one kernel thread per ring), `POLL_REMOVE`, `TIMEOUT`, `TIMEOUT_REMOVE`, `LINK_TIMEOUT`, `ASYNC_CANCEL` (including `IORING_ASYNC_CANCEL_FD_FIXED`).
+- **Control:** `NOP`, `POLL_ADD` (including multishot on sockets, pipes, eventfds, and files; on anything but a socket it is a knote on a kqueue the ring owns, served by one kernel thread per ring), `POLL_REMOVE`, `TIMEOUT`, `TIMEOUT_REMOVE`, `LINK_TIMEOUT`, `ASYNC_CANCEL` (including `IORING_ASYNC_CANCEL_FD_FIXED`).
 - **Setup flags:**
   - `IORING_SETUP_SINGLE_ISSUER`, `IORING_SETUP_DEFER_TASKRUN`, `IORING_SETUP_CQSIZE`, `IORING_SETUP_CLAMP`, `IORING_SETUP_R_DISABLED`, `IORING_SETUP_SUBMIT_ALL`, `IORING_SETUP_COOP_TASKRUN`, `IORING_SETUP_TASKRUN_FLAG`, `IORING_SETUP_SQE128`, `IORING_SETUP_CQE32`, `IORING_SETUP_ATTACH_WQ`, `IORING_SETUP_SQPOLL`, `IORING_SETUP_SQ_AFF`, `IORING_SETUP_IOPOLL`, `IORING_SETUP_NO_MMAP` (rings in the caller's memory, which `fork(2)` then shares rather than copies), `IORING_SETUP_NO_SQARRAY` and `IORING_SETUP_REGISTERED_FD_ONLY`.
 - **SQE flags:** `IOSQE_FIXED_FILE`, `IOSQE_IO_LINK`, `IOSQE_IO_HARDLINK`, `IOSQE_IO_DRAIN`, `IOSQE_ASYNC`, `IOSQE_CQE_SKIP_SUCCESS` and `IOSQE_BUFFER_SELECT` (any group), plus `sqe->personality`.
@@ -312,7 +312,7 @@ See [docs/event-chains-spec.md](docs/event-chains-spec.md) for the interface.
 ## Differences from Linux
 
 **Threading and signals**
-- **One process per ring.** Workers look files up in the owner's descriptor table and run with its credentials, so a forked child that inherits a ring can't submit to it, wait on it or register with it (`EEXIST`); on Linux it can. It can still wake an `SQPOLL` thread with `IORING_ENTER_SQ_WAKEUP`. With `SINGLE_ISSUER`, only the owner thread may enter or register, as on Linux. Before `IORING_REGISTER_ENABLE_RINGS`, one thread at a time may register. `PROBE` and `SEND_MSG_RING` work from any thread.
+- **One process per ring.** Workers look files up in the owner's descriptor table and run with its credentials, so a forked child that inherits a ring can't submit to it, wait on it or register with it (`EEXIST`); on Linux it can. It can still wake an `SQPOLL` thread with `IORING_ENTER_SQ_WAKEUP`. With `SINGLE_ISSUER`, only the owner thread may submit or register, as on Linux, and a wait by another thread fails with `EEXIST` unless the CQ can already satisfy it, where Linux waits. Before `IORING_REGISTER_ENABLE_RINGS`, one thread at a time may register. `PROBE` and `SEND_MSG_RING` work from any thread.
 - **Ring descriptors can't be passed over UNIX sockets.** `sendmsg(2)` with `SCM_RIGHTS` fails with `EOPNOTSUPP` (Linux 6.7 and later refuse with `EINVAL`), so a ring can't end up in flight on a socket held in its own fixed-file table. A child still inherits a ring across `fork(2)`.
 - **No signal masks.** `kqring_enter()` rejects a signal mask, both the plain form and `struct io_uring_getevents_arg.sigmask` with `IORING_ENTER_EXT_ARG`, with `EINVAL`. Timeouts and `min_wait_usec` (`IORING_FEAT_MIN_TIMEOUT`) through `IORING_ENTER_EXT_ARG` work.
 - **`SIGPIPE`** is never raised.
@@ -413,7 +413,7 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
   - [`kqring_register.c`](kmod/kqring_register.c) — `io_uring_register` operations.
   - [`kqring_zc.c`](kmod/kqring_zc.c) — zero-copy send: page holding, `RLIMIT_MEMLOCK` accounting and mbuf construction.
   - [`kqring_trig.c`](kmod/kqring_trig.c) — kqring's extensions: the opt-in, and event-driven chains (triggers, their polls and runs).
-- [`tests/kqring_test.c`](tests/kqring_test.c) — functional test suite: 127 tests covering every supported opcode, registration, setup flags and the lifetime rules above.
+- [`tests/kqring_test.c`](tests/kqring_test.c) — functional test suite: 130 tests covering every supported opcode, registration, setup flags and the lifetime rules above.
 - [`tests/kqring_bench.c`](tests/kqring_bench.c) — benchmarks against `kqueue(2)` and plain system calls; [`tests/bench_report.py`](tests/bench_report.py) turns runs into the tables and charts in [`BENCHMARK.MD`](BENCHMARK.MD).
 - [`tests/kqring_diskbench.c`](tests/kqring_diskbench.c) — storage workloads (queue depth, jobs, random or sequential, read/write mix) on a disk or file through kqring, `aio(4)` or `pread(2)` threads, with IOPS, latency percentiles and a `-V` mode that checks every read.
 - [`tests/kqring_stress.c`](tests/kqring_stress.c) — randomized multi-threaded stress test for races the functional suite can't time.

@@ -4,7 +4,7 @@ This file lists every io_uring capability against one baseline, says how kqring 
 
 **Baseline:** the UAPI header of Linux 6.18 (`include/uapi/linux/io_uring.h`) and liburing 2.9. kqring's opcode numbers match that header. kqring 0.3.0 on FreeBSD 15.1-RELEASE, amd64.
 
-This matrix records what kqring is designed to do and what its tests check. Most of it hasn't been compared with a running Linux kernel yet. That is the job of [differential conformance](ROADMAP.MD#differential-conformance), which is still open.
+This matrix records what kqring is designed to do and what its tests check. [Differential conformance](ROADMAP.MD#differential-conformance) compares the behaviour that matters most with a running Linux kernel, case by case; rows outside those cases rest on kqring's own tests and on liburing's.
 
 ## How to read it
 
@@ -51,12 +51,12 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_OP_CLOSE` | Equivalent | | `kqring_exec_close` | `test_socket_ops`, `test_direct_descriptors`, `liburing/open-close`, `fuzz` |
 | `IORING_OP_FILES_UPDATE` | Equivalent | | `kqring_files_update` | `test_fixed_files`, `liburing/file-update`, `fuzz` |
 | `IORING_OP_STATX` | Partial | Fills `struct statx` from `stat(2)`, so it holds what `stat(2)` knows. | `kqring_exec_statx` | `test_path_ops`, `liburing/statx`, `fuzz` |
-| `IORING_OP_READ` | Equivalent | | `kqring_exec_file_rw`, `kqring_exec_recv` | `test_file_rw`, `test_inline_file_pipe`, `test_pipe_read_order`, `test_fifo_read`, `liburing/read-write`, `fuzz` |
+| `IORING_OP_READ` | Equivalent | | `kqring_exec_file_rw`, `kqring_exec_recv` | `test_file_rw`, `test_short_links`, `test_inline_file_pipe`, `test_pipe_read_order`, `test_fifo_read`, `liburing/read-write`, `fuzz` |
 | `IORING_OP_WRITE` | Equivalent | | `kqring_exec_file_rw`, `kqring_exec_send` | `test_file_rw`, `test_file_write_order`, `liburing/read-write`, `fuzz` |
 | `IORING_OP_FADVISE` | Equivalent | | `kqring_exec_fadvise` | `test_path_ops`, `test_fixed_file_ops`, `liburing/fadvise` |
 | `IORING_OP_MADVISE` | Equivalent | | `kqring_exec_sync` | `test_path_ops`, `liburing/madvise`, `fuzz` |
 | `IORING_OP_SEND` | Equivalent | Takes provided buffers, bundles and a destination address. `SIGPIPE` is never raised. | `kqring_exec_send` | `test_send_armed`, `liburing/send_recv`, `liburing/recvsend_bundle`, `fuzz` |
-| `IORING_OP_RECV` | Equivalent | A read at end of file consumes no provided buffer. | `kqring_exec_recv` | `test_multishot_and_eof`, `test_waitall`, `liburing/send_recv`, `liburing/recv-multishot`, `fuzz` |
+| `IORING_OP_RECV` | Equivalent | A read at end of file consumes no provided buffer. | `kqring_exec_recv` | `test_multishot_and_eof`, `test_waitall`, `test_short_links`, `liburing/send_recv`, `liburing/recv-multishot`, `fuzz` |
 | `IORING_OP_OPENAT2` | Equivalent | | `kqring_exec_openat` | `test_path_ops`, `liburing/openat2`, `fuzz` |
 | `IORING_OP_EPOLL_CTL` | Unsupported | `-EOPNOTSUPP`. **Platform:** FreeBSD has no epoll. | `kqring_req_prep` | `test_phase2_validation`, `liburing/poll-v-poll` |
 | `IORING_OP_SPLICE` | Partial | One side must be a pipe. **Platform:** large pipe writes block until read, which stops `liburing/splice` early. | `kqring_exec_splice` | `test_splice_and_tee`, `liburing/splice`, `fuzz` |
@@ -109,7 +109,7 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_SETUP_TASKRUN_FLAG` | Equivalent | | `kqring_kp_kick` | `test_taskrun_on_wakeup`, `fuzz` |
 | `IORING_SETUP_SQE128` | Equivalent | | `kqring_ioc_setup` | `test_sqe128_cqe32_attach_wq`, `fuzz` |
 | `IORING_SETUP_CQE32` | Equivalent | | `kqring_ioc_setup` | `test_sqe128_cqe32_attach_wq`, `fuzz` |
-| `IORING_SETUP_SINGLE_ISSUER` | Equivalent | | `kqring_is_owner` | `test_single_issuer`, `liburing/single-issuer`, `fuzz` |
+| `IORING_SETUP_SINGLE_ISSUER` | Partial | Another thread's wait fails with `EEXIST` unless the CQ can already satisfy it, where Linux waits: the ring's state is the owner's, without locks. | `kqring_is_owner` | `test_single_issuer`, `test_single_issuer_wait`, `liburing/single-issuer`, `fuzz` |
 | `IORING_SETUP_DEFER_TASKRUN` | Equivalent | | `kqring_ioc_setup` | `test_setup_errors`, `liburing/defer-taskrun`, `fuzz` |
 | `IORING_SETUP_NO_MMAP` | Equivalent | `fork(2)` shares these rings rather than copying them. | `kqring_ioc_setup` | `test_no_mmap`, `liburing/no-mmap-inval`, `fuzz` |
 | `IORING_SETUP_REGISTERED_FD_ONLY` | Equivalent | | `kqring_ioc_setup` | `test_no_mmap`, `liburing/reg-fd-only`, `fuzz` |
@@ -136,7 +136,7 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 |---|---|---|---|---|
 | `IOSQE_FIXED_FILE` | Equivalent | A slot keeps the Capsicum rights its descriptor had. | `kqring_op_fget` | `test_fixed_files`, `test_compat_contracts`, `liburing/file-register`, `fuzz` |
 | `IOSQE_IO_DRAIN` | Equivalent | | `kqring_submit_sqes` | `test_drain`, `liburing/link_drain`, `fuzz` |
-| `IOSQE_IO_LINK` | Equivalent | | `kqring_submit_sqes` | `test_links`, `liburing/link`, `fuzz` |
+| `IOSQE_IO_LINK` | Equivalent | A short read or write breaks the link, and so does `SPLICE`, `TEE` or a socket opcode with `MSG_WAITALL`. | `kqring_submit_sqes` | `test_links`, `test_short_links`, `liburing/link`, `fuzz` |
 | `IOSQE_IO_HARDLINK` | Equivalent | | `kqring_submit_sqes` | `test_links`, `liburing/link`, `fuzz` |
 | `IOSQE_ASYNC` | Equivalent | | `kqring_req_issue` | `test_sqe_validation`, `liburing/read-write`, `fuzz` |
 | `IOSQE_BUFFER_SELECT` | Partial | Blocking worker I/O reserves the group's head buffer; other selections get `-ENOBUFS` meanwhile. | `kqring_buf_select` | `test_buffer_groups`, `test_worker_buffer_reservation`, `liburing/buf-ring`, `fuzz` |
@@ -160,7 +160,7 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_REGISTER_RESTRICTIONS` | Equivalent | | `kqring_restrictions_register` | `test_restrictions`, `liburing/register-restrictions` |
 | `IORING_REGISTER_ENABLE_RINGS` | Equivalent | | `kqring_register_op` | `test_restrictions`, `liburing/register-restrictions`, `fuzz` |
 | `IORING_REGISTER_FILES2` | Equivalent | | `kqring_files_register` | `test_rsrc_tags`, `liburing/rsrc_tags` |
-| `IORING_REGISTER_FILES_UPDATE2` | Equivalent | | `kqring_files_update` | `test_rsrc_tags`, `liburing/rsrc_tags` |
+| `IORING_REGISTER_FILES_UPDATE2` | Equivalent | A refused descriptor leaves its slot empty. | `kqring_files_update` | `test_rsrc_tags`, `test_files_update_refused`, `liburing/rsrc_tags` |
 | `IORING_REGISTER_BUFFERS2` | Equivalent | | `kqring_bufs_register` | `test_tag_failed_register`, `liburing/rsrc_tags` |
 | `IORING_REGISTER_BUFFERS_UPDATE` | Equivalent | | `kqring_bufs_update` | `test_rsrc_tags`, `liburing/rsrc_tags` |
 | `IORING_REGISTER_IOWQ_AFF` | Equivalent | | `kqring_iowq_aff` | `test_iowq_register` |
@@ -224,7 +224,7 @@ These are the `IORING_FEAT_*` bits setup returns.
 | `IORING_TIMEOUT_ETIME_SUCCESS` | Equivalent | | `kqring_timeout_prep` | `test_timeouts` |
 | `IORING_TIMEOUT_MULTISHOT` | Equivalent | | `kqring_timeout_fire` | `test_timeouts`, `liburing/timeout` |
 | `IORING_POLL_ADD_MULTI` | Equivalent | On the ring's own eventfd it ends after the first CQE. | `kqring_kpoll_arm` | `test_nonsock_poll`, `liburing/poll-mshot-update` |
-| `IORING_POLL_ADD_LEVEL` | Partial | Reports readiness that already exists. Repeat behaviour hasn't been compared with Linux. | `kqring_kpoll_arm` | `test_compat_gaps` |
+| `IORING_POLL_ADD_LEVEL` | Equivalent | In the UAPI, but refused with `EINVAL`, as on Linux. | `kqring_req_prep` | `test_compat_gaps` |
 | `IORING_POLL_UPDATE_EVENTS` | Equivalent | | `kqring_poll_remove` | `liburing/poll-mshot-update` |
 | `IORING_POLL_UPDATE_USER_DATA` | Equivalent | | `kqring_poll_remove` | `test_poll_remove`, `liburing/poll-mshot-update` |
 | `IORING_ASYNC_CANCEL_ALL` | Equivalent | | `kqring_cancel` | `test_cancel_flags`, `liburing/poll-cancel-all` |
@@ -302,4 +302,4 @@ Everything marked `gap` above, plus limits of the tests themselves:
 - **Features not advertised.** `IORING_FEAT_NO_IOWAIT` and `IORING_FEAT_RW_ATTR` are simply not set.
 - **`liburing/pipe-reuse` and `liburing/splice`** stop early, so the subtests after their first failure haven't run.
 
-`Equivalent` means no difference is known, not that one was looked for on a running Linux kernel. Some rows also rest on a test that covers more than the row names.
+`Equivalent` means no difference is known. Only the behaviour in [`tests/kqring_diff.c`](tests/kqring_diff.c) has been compared with a running Linux kernel, and that kernel was 7.3 rather than the 6.18 baseline. Some rows also rest on a test that covers more than the row names.

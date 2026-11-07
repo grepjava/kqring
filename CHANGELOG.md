@@ -12,10 +12,16 @@
 - `IORING_REGISTER_RESTRICTIONS` now accepts an empty set, which denies everything, as on Linux. It used to fail with `EINVAL`.
 - `IORING_SQ_TASKRUN` is now set by whatever fires a poll, on a ring with `IORING_SETUP_TASKRUN_FLAG`, and an enter that doesn't wait now posts that poll's CQE. A program that peeked at the CQ straight after firing a poll could find nothing and no sign that it should enter, until the ring's poller had looked.
 - `execve(2)` by a ring's owner no longer hangs. A ring with a completions, `SQPOLL` or poller thread left the process stuck until killed, because exec parks those threads and teardown waited for them. Teardown now finishes after the exec.
+- A short read or write now breaks its link, as on Linux, and shows its CQE despite `IOSQE_CQE_SKIP_SUCCESS`. So does a short `SPLICE` or `TEE`, or a socket opcode with `MSG_WAITALL`. The link used to go on.
+- `ASYNC_CANCEL` with `IORING_ASYNC_CANCEL_ALL` or `IORING_ASYNC_CANCEL_ANY` now returns 0 when nothing matches, as on Linux, rather than `ENOENT`.
+- `IORING_POLL_ADD_LEVEL` is now refused with `EINVAL`, as on Linux, which has the flag in its UAPI but doesn't accept it.
+- A refused `FILES_UPDATE` now leaves its slot empty, as on Linux, rather than keeping the old file.
+- With `IORING_SETUP_SINGLE_ISSUER`, another thread's enter that submits nothing now succeeds, as on Linux, rather than failing with `EEXIST`. A wait by another thread still fails unless the CQ can already satisfy it, or always on a `DEFER_TASKRUN` ring.
 - `READ_MULTISHOT` of a file that can't be polled now completes with `EBADF`, where Linux has `EBADFD`, rather than `EOPNOTSUPP`, with or without `IOSQE_ASYNC`.
 
 ### Testing
 
+- Linux 7.3 and kqring now match in 15 of the 19 cases of `tests/kqring_diff.c`, and the other 4 differ on purpose. The results are in `docs/conformance/`.
 - `tests/kqring_diff.c` runs the same cases on Linux and on kqring, and `tests/diff_compare.py` fails on a difference that isn't listed with its reason.
 - `tests/kqring_test.c` now covers `WRITEV_FIXED`, level-triggered polls, `ACCEPT_POLL_FIRST`, `IORING_OFF_CQ_RING`, how a failed SQE ends a batch, the flags kqring refuses, `SIGPIPE`, hole punching and the Capsicum rights of fixed files.
 - `tests/kqring_fuzz.c` now really exercises futexes, whose wake masks all failed validation before, and resizes rings with requests in flight.

@@ -83,6 +83,8 @@ now_ns(void)
 static bool ring_setup_shared;
 
 static void ring_map(struct test_ring *r, const struct io_uring_params *pp);
+static struct io_uring_cqe expect_cqe(struct test_ring *r, uint64_t ud,
+    int32_t res);
 
 /* Set up and map a ring, still disabled (IORING_SETUP_R_DISABLED). */
 static void
@@ -463,6 +465,30 @@ enter_from_other_thread(void *arg)
 }
 
 static void *
+submit_from_other_thread(void *arg)
+{
+	struct test_ring *r = arg;
+	long rc = kqring_enter(r->fd, 1, 0, 0, NULL, 0);
+	return ((void *)(intptr_t)(rc < 0 ? errno : 0));
+}
+
+static void *
+getevents_from_other_thread(void *arg)
+{
+	struct test_ring *r = arg;
+	long rc = kqring_enter(r->fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0);
+	return ((void *)(intptr_t)(rc < 0 ? errno : 0));
+}
+
+static void *
+wait_from_other_thread(void *arg)
+{
+	struct test_ring *r = arg;
+	long rc = kqring_enter(r->fd, 0, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+	return ((void *)(intptr_t)(rc < 0 ? errno : 0));
+}
+
+static void *
 unregister_from_other_thread(void *arg)
 {
 	struct test_ring *r = arg;
@@ -475,15 +501,65 @@ test_single_issuer(struct test_ring *r)
 {
 	pthread_t t;
 	void *res;
+	/* An enter that asks nothing of the ring is allowed, as in io_uring. */
 	assert(pthread_create(&t, NULL, enter_from_other_thread, r) == 0);
+	assert(pthread_join(t, &res) == 0);
+	assert((intptr_t)res == 0);
+	assert(pthread_create(&t, NULL, submit_from_other_thread, r) == 0);
+	assert(pthread_join(t, &res) == 0);
+	assert((intptr_t)res == EEXIST);
+	/* This ring is DEFER_TASKRUN: only the owner runs its completions. */
+	assert(pthread_create(&t, NULL, getevents_from_other_thread, r) == 0);
 	assert(pthread_join(t, &res) == 0);
 	assert((intptr_t)res == EEXIST);
 	assert(pthread_create(&t, NULL, unregister_from_other_thread, r) == 0);
 	assert(pthread_join(t, &res) == 0);
 	assert((intptr_t)res == EEXIST);
-	printf("[PASS] SINGLE_ISSUER: enter/unregister from another thread "
-	    "-> EEXIST\n");
+	printf("[PASS] SINGLE_ISSUER: submit/unregister from another thread "
+	    "-> EEXIST, an idle enter -> 0\n");
 }
+
+/*
+ * SINGLE_ISSUER without DEFER_TASKRUN: another thread's wait sees the CQ as
+ * it stands.  Linux would wait; here the owner's state can't be run from
+ * another thread, so a wait the CQ can't satisfy fails rather than hang.
+ */
+static void
+test_single_issuer_wait(void)
+{
+	struct io_uring_params p;
+	struct test_ring t;
+	pthread_t th;
+	void *res;
+
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_SINGLE_ISSUER;
+	memset(&t, 0, sizeof(t));
+	t.fd = (int)kqring_setup(SQ_ENTRIES, &p);
+	assert(t.fd >= 0);
+	ring_map(&t, &p);
+
+	assert(pthread_create(&th, NULL, getevents_from_other_thread, &t) == 0);
+	assert(pthread_join(th, &res) == 0);
+	assert((intptr_t)res == 0);
+	assert(pthread_create(&th, NULL, wait_from_other_thread, &t) == 0);
+	assert(pthread_join(th, &res) == 0);
+	assert((intptr_t)res == EEXIST);
+
+	(void)ring_prep(&t, IORING_OP_NOP, -1, 79001);
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	assert(pthread_create(&th, NULL, wait_from_other_thread, &t) == 0);
+	assert(pthread_join(th, &res) == 0);
+	assert((intptr_t)res == 0);
+	expect_cqe(&t, 79001, 0);
+	munmap(t.ring_map, t.ring_map_len);
+	munmap(t.sqes, t.sqes_len);
+	close(t.fd);
+	printf("[PASS] SINGLE_ISSUER: another thread's wait sees the CQ\n");
+}
+
 
 static void
 test_setup_errors(void)
@@ -1927,7 +2003,7 @@ test_cancel_flags(struct test_ring *r)
 	ring_submit(r);
 	expect_cqe(r, 27021, -ECANCELED);
 	expect_cqe(r, 27031, 1);
-	expect_cqe(r, 27032, -ENOENT);
+	expect_cqe(r, 27032, 0);	/* ALL / ANY count: nothing is 0. */
 	expect_cqe(r, 27033, -EINVAL);
 
 	close(a[0]);
@@ -9450,9 +9526,185 @@ test_phase5_security_audit(void)
 
 /*
  * What COMPATIBILITY.MD lists that nothing else here covers: vectored fixed
- * writes, level-triggered polls, ACCEPT_POLL_FIRST, the CQ ring's own
+ * writes, refused level-triggered polls, ACCEPT_POLL_FIRST, the CQ ring's own
  * mapping offset, and how an SQE that fails its checks ends a batch.
  */
+static void
+short_link(struct test_ring *t, uint64_t ud, int32_t res, int32_t next)
+{
+	ring_push_sqe(t);
+	(void)ring_prep(t, IORING_OP_NOP, -1, ud + 1);
+	ring_push_sqe(t);
+	ring_submit(t);
+	assert(ring_wait(t, 2, 2000) == 0);
+	expect_cqe(t, ud, res);
+	expect_cqe(t, ud + 1, next);
+}
+
+static struct io_uring_sqe *
+short_sqe(struct test_ring *t, uint8_t opcode, int fd, uint64_t ud, void *buf,
+    unsigned len)
+{
+	struct io_uring_sqe *sqe = ring_prep(t, opcode, fd, ud);
+
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = len;
+	sqe->flags = IOSQE_IO_LINK;
+	return (sqe);
+}
+
+/*
+ * A transfer that moves less than was asked fails its link, though its CQE
+ * reports the bytes, as in io_uring: READ and WRITE and their kin on
+ * anything, SPLICE and TEE, and the socket opcodes only with MSG_WAITALL.
+ */
+static void
+test_short_links(void)
+{
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	char dir[64], path[96], buf[16];
+	struct iovec iov[2] = { { buf, 8 }, { buf + 8, 8 } };
+	int fd, p[2], q[2];
+
+	ring_init(&t);
+	make_tmpdir(dir, sizeof(dir));
+	snprintf(path, sizeof(path), "%s/s", dir);
+	fd = open(path, O_RDWR | O_CREAT, 0600);
+	assert(fd >= 0 && write(fd, "abcd", 4) == 4);
+
+	(void)short_sqe(&t, IORING_OP_READ, fd, 79101, buf, sizeof(buf));
+	short_link(&t, 79101, 4, -ECANCELED);
+	(void)short_sqe(&t, IORING_OP_READ, fd, 79103, buf, 4);
+	short_link(&t, 79103, 4, 0);
+	(void)short_sqe(&t, IORING_OP_READ, fd, 79105, buf, 0);
+	short_link(&t, 79105, 0, 0);
+	sqe = short_sqe(&t, IORING_OP_READV, fd, 79107, iov, 2);
+	short_link(&t, 79107, 4, -ECANCELED);
+
+	/* End of file is short too; a hard link goes on regardless. */
+	sqe = short_sqe(&t, IORING_OP_READ, fd, 79109, buf, 4);
+	sqe->off = 4;
+	short_link(&t, 79109, 0, -ECANCELED);
+	sqe = short_sqe(&t, IORING_OP_READ, fd, 79111, buf, sizeof(buf));
+	sqe->flags = IOSQE_IO_HARDLINK;
+	short_link(&t, 79111, 4, 0);
+
+	/* The failure shows, and takes the chain's CQEs with it. */
+	sqe = short_sqe(&t, IORING_OP_READ, fd, 79113, buf, sizeof(buf));
+	sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;
+	ring_push_sqe(&t);
+	(void)ring_prep(&t, IORING_OP_NOP, -1, 79114);
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 79113, 4);
+	usleep(20000);
+	(void)kqring_enter(t.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0);
+	assert(ring_cq_ready(&t) == 0);
+
+	assert(pipe(p) == 0);
+	assert(write(p[1], "abc", 3) == 3);
+	(void)short_sqe(&t, IORING_OP_READ, p[0], 79115, buf, sizeof(buf));
+	short_link(&t, 79115, 3, -ECANCELED);
+	assert(pipe(q) == 0);
+	assert(write(p[1], "abc", 3) == 3);
+	sqe = short_sqe(&t, IORING_OP_SPLICE, q[1], 79117, NULL, sizeof(buf));
+	sqe->addr = 0;
+	sqe->splice_fd_in = p[0];
+	sqe->splice_off_in = (uint64_t)-1;
+	sqe->off = (uint64_t)-1;
+	short_link(&t, 79117, 3, -ECANCELED);
+	close(p[0]);
+	close(p[1]);
+	close(q[0]);
+	close(q[1]);
+
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, p) == 0);
+	assert(write(p[1], "abc", 3) == 3);
+	(void)short_sqe(&t, IORING_OP_READ, p[0], 79119, buf, sizeof(buf));
+	short_link(&t, 79119, 3, -ECANCELED);
+	assert(write(p[1], "abc", 3) == 3);
+	(void)short_sqe(&t, IORING_OP_RECV, p[0], 79121, buf, sizeof(buf));
+	short_link(&t, 79121, 3, 0);
+	assert(write(p[1], "abc", 3) == 3);
+	shutdown(p[1], SHUT_WR);
+	sqe = short_sqe(&t, IORING_OP_RECV, p[0], 79123, buf, sizeof(buf));
+	sqe->msg_flags = MSG_WAITALL;
+	short_link(&t, 79123, 3, -ECANCELED);
+	close(p[0]);
+	close(p[1]);
+
+	close(fd);
+	unlink(path);
+	rmdir(dir);
+	munmap(t.ring_map, t.ring_map_len);
+	munmap(t.sqes, t.sqes_len);
+	close(t.fd);
+	printf("[PASS] A short transfer breaks its link\n");
+}
+
+/* A refused FILES_UPDATE leaves the slot empty, as in io_uring. */
+static void
+test_files_update_refused(void)
+{
+	struct io_uring_rsrc_register rr;
+	struct io_uring_rsrc_update2 up;
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	char buf[4];
+	int fds[1], p[2];
+	uint64_t tags[1] = { 0x7d01 };
+
+	ring_init(&t);
+	assert(pipe(p) == 0);
+	assert(write(p[1], "abc", 3) == 3);
+	fds[0] = p[0];
+	memset(&rr, 0, sizeof(rr));
+	rr.nr = 1;
+	rr.data = (uint64_t)(uintptr_t)fds;
+	rr.tags = (uint64_t)(uintptr_t)tags;
+	assert(reg(&t, IORING_REGISTER_FILES2, &rr, sizeof(rr)) == 0);
+
+	fds[0] = t.fd;
+	tags[0] = 0;
+	memset(&up, 0, sizeof(up));
+	up.data = (uint64_t)(uintptr_t)fds;
+	up.tags = (uint64_t)(uintptr_t)tags;
+	up.nr = 1;
+	assert(reg(&t, IORING_REGISTER_FILES_UPDATE2, &up, sizeof(up)) ==
+	    -EBADF);
+	assert(kqring_enter(t.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) == 0);
+	expect_cqe(&t, 0x7d01, 0);	/* The old file went. */
+
+	sqe = ring_prep(&t, IORING_OP_READ, 0, 79201);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 1;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EBADF);
+
+	/* The same with a descriptor that doesn't exist, and a good one. */
+	fds[0] = p[0];
+	assert(reg(&t, IORING_REGISTER_FILES_UPDATE2, &up, sizeof(up)) == 1);
+	fds[0] = 1000000;
+	assert(reg(&t, IORING_REGISTER_FILES_UPDATE2, &up, sizeof(up)) ==
+	    -EBADF);
+	sqe = ring_prep(&t, IORING_OP_READ, 0, 79202);
+	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = 1;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == -EBADF);
+
+	close(p[0]);
+	close(p[1]);
+	munmap(t.ring_map, t.ring_map_len);
+	munmap(t.sqes, t.sqes_len);
+	close(t.fd);
+	printf("[PASS] A refused FILES_UPDATE empties its slot\n");
+}
+
 static void
 test_compat_gaps(void)
 {
@@ -9461,7 +9713,6 @@ test_compat_gaps(void)
 	struct io_uring_sqe *sqe;
 	struct io_uring_cqe c;
 	struct test_ring t, n;
-	bool ended = false, removed = false;
 	char dir[64], path[96], rb[16];
 	int fd, lfd, c1, pfd[2];
 	uint16_t port;
@@ -9495,43 +9746,24 @@ test_compat_gaps(void)
 	ring_push_sqe(&t);
 	assert(submit_one(&t) == -EFAULT);
 
-	/* A level-triggered poll reports what is already readable. */
+	/* IORING_POLL_ADD_LEVEL is in the UAPI, but io_uring refuses it. */
 	assert(pipe(pfd) == 0);
 	assert(write(pfd[1], "a", 1) == 1);
 	sqe = ring_prep(&t, IORING_OP_POLL_ADD, pfd[0], 78003);
 	sqe->poll32_events = POLLIN;
 	sqe->len = IORING_POLL_ADD_LEVEL;
 	ring_push_sqe(&t);
-	ring_submit(&t);
-	assert(ring_wait(&t, 1, 2000) == 0);
-	c = ring_pop_cqe(&t);
-	assert(c.user_data == 78003 && (c.res & POLLIN) != 0);
-
-	/* The same, multishot, until POLL_REMOVE ends it. */
+	assert(submit_one(&t) == -EINVAL);
 	sqe = ring_prep(&t, IORING_OP_POLL_ADD, pfd[0], 78004);
 	sqe->poll32_events = POLLIN;
 	sqe->len = IORING_POLL_ADD_LEVEL | IORING_POLL_ADD_MULTI;
 	ring_push_sqe(&t);
-	ring_submit(&t);
-	assert(ring_wait(&t, 1, 2000) == 0);
-	c = ring_pop_cqe(&t);
-	assert(c.user_data == 78004 && (c.res & POLLIN) != 0 &&
-	    (c.flags & IORING_CQE_F_MORE) != 0);
+	assert(submit_one(&t) == -EINVAL);
 	sqe = ring_prep(&t, IORING_OP_POLL_REMOVE, -1, 78005);
 	sqe->addr = 78004;
+	sqe->len = IORING_POLL_UPDATE_EVENTS | IORING_POLL_ADD_LEVEL;
 	ring_push_sqe(&t);
-	ring_submit(&t);
-	while (!ended || !removed) {
-		assert(ring_wait(&t, 1, 2000) == 0);
-		c = ring_pop_cqe(&t);
-		if (c.user_data == 78005) {
-			assert(c.res == 0);
-			removed = true;
-		} else if ((c.flags & IORING_CQE_F_MORE) == 0) {
-			assert(c.user_data == 78004 && c.res == -ECANCELED);
-			ended = true;
-		}
-	}
+	assert(submit_one(&t) == -EINVAL);
 
 	/* ACCEPT_POLL_FIRST: armed with nothing queued, and with something. */
 	lfd = tcp_listener(&port);
@@ -12554,6 +12786,9 @@ main(int argc, char **argv)
 		test_poll_before_return();
 		test_taskrun_on_wakeup();
 		test_compat_gaps();
+		test_short_links();
+		test_files_update_refused();
+		test_single_issuer_wait();
 		test_compat_contracts();
 		test_exec_kthreads();
 		test_cq_backpressure();

@@ -266,6 +266,40 @@ dump(struct ring *r, const char *step)
 	atomic_store_explicit(r->cq_head, h, memory_order_release);
 }
 
+static int
+cqe_cmp(const void *a, const void *b)
+{
+	uint64_t x = ((const struct io_uring_cqe *)a)->user_data;
+	uint64_t y = ((const struct io_uring_cqe *)b)->user_data;
+
+	return (x < y ? -1 : x > y);
+}
+
+/* dump(), for CQEs whose order neither system promises. */
+static void
+dump_sorted(struct ring *r, const char *step)
+{
+	struct io_uring_cqe cq[16];
+	unsigned h = atomic_load_explicit(r->cq_head, memory_order_relaxed);
+	unsigned t = atomic_load_explicit(r->cq_tail, memory_order_acquire);
+	unsigned n = 0;
+	char res[32], fl[8];
+
+	CHECK(t - h <= 16);
+	for (; h != t; h++)
+		cq[n++] = r->cqes[h & r->cq_mask];
+	atomic_store_explicit(r->cq_head, h, memory_order_release);
+	qsort(cq, n, sizeof(cq[0]), cqe_cmp);
+	if (n == 0)
+		printf("%s/%s none\n", current, step);
+	for (unsigned i = 0; i < n; i++) {
+		print_res(cq[i].user_data, cq[i].res, res, sizeof(res));
+		flags_str(cq[i].flags, fl, sizeof(fl));
+		printf("%s/%s ud=%llu res=%s flags=%s\n", current, step,
+		    (unsigned long long)cq[i].user_data, res, fl);
+	}
+}
+
 static void
 say(const char *step, const char *fmt, int v)
 {
@@ -373,6 +407,7 @@ c_links(void)
 	struct io_uring_sqe *s;
 	char buf[16];
 	int fd = scratch_file("abcd", 4);
+	int p[2];
 
 	ring_init(&r, 16, NULL);
 
@@ -412,6 +447,88 @@ c_links(void)
 	(void)submit(&r);
 	await(&r, 2, 2000);
 	dump(&r, "short_read");
+
+	/* The same from a pipe, and from a socket, where only MSG_WAITALL asks
+	 * for the whole length. */
+	CHECK(pipe(p) == 0);
+	CHECK(write(p[1], "abc", 3) == 3);
+	s = prep(&r, IORING_OP_READ, p[0], 20);
+	s->flags = IOSQE_IO_LINK;
+	s->addr = (uint64_t)(uintptr_t)buf;
+	s->len = sizeof(buf);
+	prep(&r, IORING_OP_NOP, -1, 21);
+	(void)submit(&r);
+	await(&r, 2, 2000);
+	dump(&r, "short_read_pipe");
+	close(p[0]);
+	close(p[1]);
+
+	CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, p) == 0);
+	CHECK(write(p[1], "abc", 3) == 3);
+	s = prep(&r, IORING_OP_RECV, p[0], 22);
+	s->flags = IOSQE_IO_LINK;
+	s->addr = (uint64_t)(uintptr_t)buf;
+	s->len = sizeof(buf);
+	prep(&r, IORING_OP_NOP, -1, 23);
+	(void)submit(&r);
+	await(&r, 2, 2000);
+	dump(&r, "short_recv");
+
+	/* MSG_WAITALL that the peer's end of file leaves short. */
+	CHECK(write(p[1], "abc", 3) == 3);
+	shutdown(p[1], SHUT_WR);
+	s = prep(&r, IORING_OP_RECV, p[0], 24);
+	s->flags = IOSQE_IO_LINK;
+	s->addr = (uint64_t)(uintptr_t)buf;
+	s->len = sizeof(buf);
+	s->msg_flags = MSG_WAITALL;
+	prep(&r, IORING_OP_NOP, -1, 25);
+	(void)submit(&r);
+	await(&r, 2, 2000);
+	dump(&r, "short_waitall");
+	close(p[0]);
+	close(p[1]);
+
+	/* A failed request's CQE isn't skipped, nor are the ones after it. */
+	s = prep(&r, IORING_OP_READ, fd, 26);
+	s->flags = IOSQE_IO_LINK | IOSQE_CQE_SKIP_SUCCESS;
+	s->addr = (uint64_t)(uintptr_t)buf;
+	s->len = sizeof(buf);
+	prep(&r, IORING_OP_NOP, -1, 27);
+	(void)submit(&r);
+	await(&r, 2, 200);
+	dump(&r, "short_skip");
+
+	s = prep(&r, IORING_OP_READ, fd, 28);
+	s->flags = IOSQE_IO_HARDLINK;
+	s->addr = (uint64_t)(uintptr_t)buf;
+	s->len = sizeof(buf);
+	prep(&r, IORING_OP_NOP, -1, 29);
+	(void)submit(&r);
+	await(&r, 2, 2000);
+	dump(&r, "short_hardlink");
+
+	{
+		int q[2];
+
+		CHECK(pipe(p) == 0);
+		CHECK(pipe(q) == 0);
+		CHECK(write(p[1], "abc", 3) == 3);
+		s = prep(&r, IORING_OP_SPLICE, q[1], 30);
+		s->flags = IOSQE_IO_LINK;
+		s->splice_fd_in = p[0];
+		s->splice_off_in = (uint64_t)-1;
+		s->off = (uint64_t)-1;
+		s->len = sizeof(buf);
+		prep(&r, IORING_OP_NOP, -1, 31);
+		(void)submit(&r);
+		await(&r, 2, 2000);
+		dump(&r, "short_splice");
+		close(p[0]);
+		close(p[1]);
+		close(q[0]);
+		close(q[1]);
+	}
 
 	/* A chain the batch leaves unfinished ends with the batch. */
 	s = prep(&r, IORING_OP_NOP, -1, 11);
@@ -562,7 +679,7 @@ c_cancel(void)
 	s->addr = 1;
 	(void)submit(&r);
 	await(&r, 2, 2000);
-	dump(&r, "poll");
+	dump_sorted(&r, "poll");
 
 	s = prep(&r, IORING_OP_ASYNC_CANCEL, -1, 3);
 	s->addr = 12345;
@@ -591,12 +708,12 @@ c_cancel(void)
 	s = prep(&r, IORING_OP_ASYNC_CANCEL, -1, 9);
 	s->cancel_flags = IORING_ASYNC_CANCEL_ANY;
 	(void)submit(&r);
-	await(&r, 2, 2000);
-	dump(&r, "any_one");
+	await(&r, 4, 2000);
+	dump_sorted(&r, "any_one");
 	s = prep(&r, IORING_OP_ASYNC_CANCEL, -1, 10);
 	s->cancel_flags = IORING_ASYNC_CANCEL_ANY | IORING_ASYNC_CANCEL_ALL;
 	(void)submit(&r);
-	await(&r, 3, 2000);
+	await(&r, 1, 2000);
 	dump(&r, "any_all");
 
 	res_poll_mask = 0;
@@ -610,7 +727,6 @@ c_poll(void)
 {
 	struct ring r;
 	struct io_uring_sqe *s;
-	char ch;
 	int p[2];
 
 	CHECK(pipe(p) == 0);
@@ -638,7 +754,7 @@ c_poll(void)
 	s->addr = 2;
 	(void)submit(&r);
 	await(&r, 2, 2000);
-	dump(&r, "removed");
+	dump_sorted(&r, "removed");
 
 	/* Three bytes are still in the pipe. How often does this fire? */
 	s = prep(&r, IORING_OP_POLL_ADD, p[0], 4);
@@ -664,19 +780,37 @@ c_poll(void)
 	atomic_store_explicit(r.cq_head, atomic_load(r.cq_tail),
 	    memory_order_release);
 
-	/* The peer's close ends a poll. */
-	CHECK(read(p[0], &ch, 1) == 1);
-	CHECK(read(p[0], &ch, 1) == 1);
-	CHECK(read(p[0], &ch, 1) == 1);
-	res_poll_mask |= 1ULL << 7;
+	res_poll_mask = 0;
+	close(p[0]);
+	close(p[1]);
+	ring_free(&r);
+}
+
+/* The peer's close ends a poll, with what poll(2) would say. */
+static void
+c_poll_hup(void)
+{
+	struct ring r;
+	struct io_uring_sqe *s;
+	struct pollfd pf;
+	int p[2];
+
+	CHECK(pipe(p) == 0);
+	ring_init(&r, 16, NULL);
+	res_poll_mask = 1ULL << 7;
 	s = prep(&r, IORING_OP_POLL_ADD, p[0], 7);
 	s->poll32_events = POLLIN;
 	(void)submit(&r);
 	close(p[1]);
 	await(&r, 1, 2000);
 	dump(&r, "hup");
-
 	res_poll_mask = 0;
+	pf.fd = p[0];
+	pf.events = POLLIN;
+	pf.revents = 0;
+	CHECK(poll(&pf, 1, 0) == 1);
+	say("native_in", "%d", (pf.revents & POLLIN) != 0);
+	say("native_hup", "%d", (pf.revents & POLLHUP) != 0);
 	close(p[0]);
 	ring_free(&r);
 }
@@ -906,6 +1040,19 @@ c_fixed_files(void)
 	say_rc("self", ring_sys_register(r.fd, IORING_REGISTER_FILES_UPDATE2,
 	    &up, sizeof(up)));
 
+	/* What the refused update left in the slot. */
+	s = prep(&r, IORING_OP_READ, 0, 20);
+	s->flags = IOSQE_FIXED_FILE;
+	s->addr = (uint64_t)(uintptr_t)buf;
+	s->len = 4;
+	(void)submit(&r);
+	await(&r, 1, 2000);
+	dump(&r, "after_self");
+
+	fds[0] = b;
+	say_rc("refill", ring_sys_register(r.fd, IORING_REGISTER_FILES_UPDATE2,
+	    &up, sizeof(up)));
+
 	/* Direct descriptors. */
 	s = prep(&r, IORING_OP_FIXED_FD_INSTALL, 0, 5);
 	s->flags = IOSQE_FIXED_FILE;
@@ -1115,6 +1262,26 @@ other_thread_enter(void *arg)
 	return ((void *)(intptr_t)(rc < 0 ? errno : 0));
 }
 
+static void *
+other_thread_submit(void *arg)
+{
+	struct ring *r = arg;
+	int rc;
+
+	prep(r, IORING_OP_NOP, -1, 1);
+	rc = ring_sys_enter(r->fd, 1, 0, 0, NULL, 0);
+	return ((void *)(intptr_t)(rc < 0 ? errno : 0));
+}
+
+static void *
+other_thread_getevents(void *arg)
+{
+	struct ring *r = arg;
+	int rc = ring_sys_enter(r->fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0);
+
+	return ((void *)(intptr_t)(rc < 0 ? errno : 0));
+}
+
 /* Several submitters on one ring, then what SINGLE_ISSUER refuses. */
 static void
 c_threads(void)
@@ -1158,6 +1325,27 @@ c_threads(void)
 	CHECK(pthread_join(th[0], &res) == 0);
 	errno = (int)(intptr_t)res;
 	say_rc("single_issuer", errno != 0 ? -1 : 0);
+	CHECK(pthread_create(&th[0], NULL, other_thread_submit, &r) == 0);
+	CHECK(pthread_join(th[0], &res) == 0);
+	errno = (int)(intptr_t)res;
+	say_rc("single_issuer_submit", errno != 0 ? -1 : 0);
+	CHECK(pthread_create(&th[0], NULL, other_thread_getevents, &r) == 0);
+	CHECK(pthread_join(th[0], &res) == 0);
+	errno = (int)(intptr_t)res;
+	say_rc("single_issuer_getevents", errno != 0 ? -1 : 0);
+	ring_free(&r);
+
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+	ring_init(&r, 8, &p);
+	CHECK(pthread_create(&th[0], NULL, other_thread_enter, &r) == 0);
+	CHECK(pthread_join(th[0], &res) == 0);
+	errno = (int)(intptr_t)res;
+	say_rc("defer_enter", errno != 0 ? -1 : 0);
+	CHECK(pthread_create(&th[0], NULL, other_thread_getevents, &r) == 0);
+	CHECK(pthread_join(th[0], &res) == 0);
+	errno = (int)(intptr_t)res;
+	say_rc("defer_getevents", errno != 0 ? -1 : 0);
 	ring_free(&r);
 }
 
@@ -1198,6 +1386,7 @@ static const struct {
 	{ "link_timeout", c_link_timeout },
 	{ "cancel", c_cancel },
 	{ "poll", c_poll },
+	{ "poll_hup", c_poll_hup },
 	{ "provided_buffers", c_provided_buffers },
 	{ "buffer_lifetime", c_buffer_lifetime },
 	{ "cq_overflow", c_cq_overflow },

@@ -719,9 +719,11 @@ kqring_cancel(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
 	/* Triggers between events, with no poll armed to be found above. */
 	if (ctx->ntriggers > 0 && (n == 0 || all))
 		n += kqring_trig_cancel(ctx, sqe, cfp, all);
-	if (n == 0)
-		return (running ? -EALREADY : -ENOENT);
-	return (all ? n : 0);
+	if (n == 0 && running)
+		return (-EALREADY);
+	if (all)
+		return (n);	/* Nothing found is 0 here, as in io_uring. */
+	return (n != 0 ? 0 : -ENOENT);
 }
 
 /*
@@ -819,8 +821,7 @@ kqring_poll_remove(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
 	/* Update: re-issue the same request with the new parameters. */
 	if ((pflags & IORING_POLL_UPDATE_EVENTS) != 0) {
 		op->sqe.poll32_events = sqe->poll32_events;
-		op->sqe.len = pflags & (IORING_POLL_ADD_MULTI |
-		    IORING_POLL_ADD_LEVEL);
+		op->sqe.len = pflags & IORING_POLL_ADD_MULTI;
 	}
 	if ((pflags & IORING_POLL_UPDATE_USER_DATA) != 0)
 		op->sqe.user_data = sqe->off;

@@ -1596,8 +1596,8 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 	case IORING_OP_POLL_ADD:
 		if (sqe->buf_index != 0 || sqe->off != 0 || sqe->addr != 0)
 			return (EINVAL);
-		if ((sqe->len & ~(IORING_POLL_ADD_MULTI |
-		    IORING_POLL_ADD_LEVEL)) != 0)
+		/* IORING_POLL_ADD_LEVEL is in the UAPI, but io_uring refuses it. */
+		if ((sqe->len & ~IORING_POLL_ADD_MULTI) != 0)
 			return (EINVAL);
 		multishot = (sqe->len & IORING_POLL_ADD_MULTI) != 0;
 		break;
@@ -1624,8 +1624,7 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		if (sqe->buf_index != 0 || sqe->splice_fd_in != 0)
 			return (EINVAL);
 		if ((sqe->len & ~(IORING_POLL_UPDATE_EVENTS |
-		    IORING_POLL_UPDATE_USER_DATA | IORING_POLL_ADD_MULTI |
-		    IORING_POLL_ADD_LEVEL)) != 0 ||
+		    IORING_POLL_UPDATE_USER_DATA | IORING_POLL_ADD_MULTI)) != 0 ||
 		    ((sqe->len & (IORING_POLL_UPDATE_EVENTS |
 		    IORING_POLL_UPDATE_USER_DATA)) == 0 && sqe->len != 0))
 			return (EINVAL);
@@ -1957,7 +1956,7 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
     uint32_t cflags)
 {
 	struct kqring_op *next, *lt;
-	bool failed, zc;
+	bool failed, short_xfer, zc;
 
 	/*
 	 * Cancellation never waits for a running worker or frees its state.
@@ -1985,6 +1984,16 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 	    (op->sqe.opcode == IORING_OP_TIMEOUT ||
 	    op->sqe.opcode == IORING_OP_LINK_TIMEOUT) &&
 	    (op->sqe.timeout_flags & IORING_TIMEOUT_ETIME_SUCCESS) != 0);
+	/*
+	 * A transfer that moved less than was asked fails too, as in io_uring,
+	 * though its CQE reports the bytes: the link breaks, and
+	 * IOSQE_CQE_SKIP_SUCCESS doesn't hide it.  A trigger's run isn't a
+	 * link: each step takes what the last one moved.
+	 */
+	short_xfer = op->trun == NULL && res >= 0 && (op->short_io ||
+	    ((op->sqe.opcode == IORING_OP_SPLICE ||
+	    op->sqe.opcode == IORING_OP_TEE) && (uint32_t)res != op->sqe.len));
+	failed = failed || short_xfer;
 	if (__predict_false(op->trun != NULL) && failed)
 		kqring_trun_failed(op->trun, res);
 	/* A buffer passed to the next step never goes to user space. */
@@ -2007,7 +2016,8 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 	 * IOSQE_CQE_SKIP_SUCCESS skips a success, and a LINK_TIMEOUT that
 	 * fired (-ETIME), which io_uring does not count as failing.
 	 */
-	if ((op->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) == 0 || (res < 0 &&
+	if ((op->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) == 0 || short_xfer ||
+	    (res < 0 &&
 	    !(op->sqe.opcode == IORING_OP_LINK_TIMEOUT && res == -ETIME))) {
 		if (op->sqe.opcode == IORING_OP_TIMEOUT)
 			kqring_post_cqe_uncounted(ctx, op->sqe.user_data, res,

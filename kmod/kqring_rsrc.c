@@ -462,34 +462,34 @@ fail:
 
 /*
  * Set fixed slot `slot` to descriptor fd's file, with its Capsicum rights,
- * or empty it (fd -1).  A tag only goes with a file.
+ * or empty it (fd -1).  A tag only goes with a file.  The slot is emptied
+ * before fd is looked at, so a refused fd leaves it empty, as in io_uring.
  */
 static int
 kqring_files_set(struct kqring_ctx *ctx, uint32_t slot, int fd,
     uint64_t tag)
 {
 	struct thread *td = curthread;
-	struct kqring_rsrc *old, *r = NULL;
+	struct kqring_rsrc *old;
 	struct filecaps caps;
 	struct file *fp;
 
-	if (fd == -1) {
-		if (tag != 0)
-			return (EINVAL);
-	} else {
-		if (fget_cap(td, fd, &cap_no_rights, NULL, &fp, &caps) != 0)
-			return (EBADF);
-		if (kqring_fp_is_ring(fp)) {
-			filecaps_free(&caps);
-			fdrop(fp, td);
-			return (EBADF);
-		}
-		r = kqring_rsrc_file(fp, &caps, tag);
-	}
+	if (fd == -1 && tag != 0)
+		return (EINVAL);
 	old = ctx->files[slot];
-	ctx->files[slot] = r;
+	ctx->files[slot] = NULL;
 	if (old != NULL)
 		kqring_rsrc_put(ctx, old);
+	if (fd == -1)
+		return (0);
+	if (fget_cap(td, fd, &cap_no_rights, NULL, &fp, &caps) != 0)
+		return (EBADF);
+	if (kqring_fp_is_ring(fp)) {
+		filecaps_free(&caps);
+		fdrop(fp, td);
+		return (EBADF);
+	}
+	ctx->files[slot] = kqring_rsrc_file(fp, &caps, tag);
 	return (0);
 }
 

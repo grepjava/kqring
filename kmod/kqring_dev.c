@@ -1312,14 +1312,6 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 
 	if (!ctx->setup_done || !ctx->enabled || ctx->closing)
 		return (EBADF);
-	/*
-	 * SINGLE_ISSUER: only the owner submits.  With SQPOLL the kthread is
-	 * the issuer, so any thread or process may wake it and wait, as in
-	 * io_uring.
-	 */
-	if (!sqpoll && !kqring_is_owner(ctx, td))
-		return (EEXIST);
-
 	/* SQ_WAKEUP/SQ_WAIT need SQPOLL. */
 	if ((ea->flags & ~KQRING_ENTER_FLAGS) != 0)
 		return (EINVAL);
@@ -1332,6 +1324,24 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 
 	wait = (ea->flags & IORING_ENTER_GETEVENTS) != 0 &&
 	    (ea->min_complete != 0 || iopoll);
+	/*
+	 * SINGLE_ISSUER: only the owner submits, or waits on a DEFER_TASKRUN
+	 * ring.  With SQPOLL the kthread is the issuer, so any thread or
+	 * process may wake it and wait, as in io_uring.  Anyone else's enter
+	 * is allowed, but the ring's state is the owner's, without locks:
+	 * it sees the CQ as it stands, and a wait the CQ can't satisfy yet
+	 * fails, as no one might run the completions it needs.
+	 */
+	if (!sqpoll && !kqring_is_owner(ctx, td)) {
+		if (ea->to_submit > 0 ||
+		    ((ea->flags & IORING_ENTER_GETEVENTS) != 0 &&
+		    (ctx->flags & IORING_SETUP_DEFER_TASKRUN) != 0) ||
+		    (wait && (iopoll || atomic_load_acq_32(&shm->cq_tail) -
+		    atomic_load_acq_32(&shm->cq_head) < ea->min_complete)))
+			return (EEXIST);
+		ea->SUBMITTED_out = 0;
+		return (0);
+	}
 	/* Waiting for events is when kevent(2) would look at a kqueue. */
 	if ((ea->flags & IORING_ENTER_GETEVENTS) != 0)
 		kqring_kq_rescan(ctx);

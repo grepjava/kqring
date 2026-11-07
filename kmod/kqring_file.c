@@ -207,6 +207,7 @@ kqring_bio_done(struct bio *bp)
 	mtx_lock(&ctx->mtx);
 	op->res = error != 0 ? kqring_errno(error) :
 	    kqring_xfer_res(atomic_load_long(&op->bio_bytes));
+	op->short_io = atomic_load_long(&op->bio_bytes) < op->bio_len;
 	op->cflags = 0;
 	op->bio_done = true;
 	ctx->bio_held -= op->bio_len;
@@ -513,6 +514,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (error == 0)
 		fp->f_nextoff[UIO_READ] = auio.uio_offset;
 	fdrop(fp, td);
+	op->short_io = done < (size_t)want;
 	if (error != 0 && done == 0)
 		kqring_done(op, kqring_errno(error), 0);
 	else
@@ -759,8 +761,10 @@ read_busy:
 	}
 	if (is_write) {
 		done += op->done_io;
+		want += op->done_io;
 		op->done_io = 0;
 	}
+	op->short_io = done < (size_t)want;
 	/* RWF_DSYNC / RWF_SYNC: as an O_DSYNC / O_SYNC write. */
 	if (is_write && error == 0 && vnode &&
 	    (sqe->rw_flags & (KQRING_RWF_DSYNC | KQRING_RWF_SYNC)) != 0) {

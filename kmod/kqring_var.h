@@ -381,6 +381,7 @@ struct kqring_op {
 	void			*args;
 	size_t			args_len;
 	size_t			done_io;	/* MSG_WAITALL: bytes so far */
+	bool			short_io;	/* moved less than was asked */
 	bool			sock_rw;	/* READ/WRITE(V) on a socket */
 	bool			connecting;	/* CONNECT: soconnect() issued */
 	bool			futex_woken;	/* FUTEX_WAKE hit; res in ->res */

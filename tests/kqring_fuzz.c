@@ -1290,6 +1290,8 @@ sqe_struct(struct fz *f, struct io_uring_sqe *s)
 		    POLLOUT : (uint32_t)rn(f, 0x200);
 		if (chance(f, 40))
 			s->len = IORING_POLL_ADD_MULTI;
+		if (chance(f, 3))
+			s->len |= IORING_POLL_ADD_LEVEL;	/* EINVAL */
 		maybe_fixed(f, s);
 		break;
 	case 9:
@@ -1774,6 +1776,14 @@ do_chaos(struct fz *f)
 			struct io_uring_params p;
 
 			(void)kqring_enter(f->ring, 1, 0, 0, NULL, 0);
+			/*
+			 * Not the owner, with nothing to submit.  On an SQPOLL
+			 * ring anyone may wait, for as long as it takes.
+			 */
+			alarm(1);
+			(void)kqring_enter(f->ring, 0, (unsigned)rn(f, 2),
+			    chance(f, 50) ? IORING_ENTER_GETEVENTS : 0, NULL, 0);
+			alarm(0);
 			(void)kqring_register(f->ring, IORING_REGISTER_PROBE,
 			    f->arena, 0);
 			/* Sometimes a ring of its own, and an exec on it. */
