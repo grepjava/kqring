@@ -9779,6 +9779,112 @@ test_compat_contracts(void)
 	    "splice hints, punched holes, rights of fixed files\n");
 }
 
+static const char *test_argv0;
+
+enum {
+	EXEC_COMPLETIONS,	/* a ring with its completions thread */
+	EXEC_POLLER,		/* DEFER_TASKRUN: only the poller thread */
+	EXEC_SQPOLL,
+	EXEC_WAITER,		/* and another thread blocked in an enter */
+	EXEC_CLOEXEC,		/* the exec also closes the ring */
+	EXEC_KINDS
+};
+
+static void *
+exec_waiter(void *arg)
+{
+	struct test_ring *r = arg;
+
+	(void)kqring_enter(r->fd, 0, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+	return (NULL);
+}
+
+/* Make a ring of this kind with a poll armed, and exec. Never returns. */
+static void
+exec_with_ring(int kind)
+{
+	long page = sysconf(_SC_PAGESIZE);
+	struct io_uring_params p;
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	pthread_t th;
+	char arg[16];
+	int pfd[2];
+
+	assert(pipe(pfd) == 0);
+	if (kind == EXEC_SQPOLL) {
+		memset(&p, 0, sizeof(p));
+		memset(&t, 0, sizeof(t));
+		p.flags = IORING_SETUP_SQPOLL;
+		t.fd = (int)kqring_setup(8, &p);
+		assert(t.fd >= 0);
+		ring_map(&t, &p);
+	} else {
+		ring_setup_shared = kind != EXEC_POLLER;
+		ring_init(&t);
+		ring_setup_shared = false;
+		/* Pages the deferred teardown releases after the exec. */
+		struct iovec iov = { mmap(NULL, (size_t)page,
+		    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0),
+		    (size_t)page };
+		assert(iov.iov_base != MAP_FAILED);
+		assert(reg(&t, IORING_REGISTER_BUFFERS, &iov, 1) == 0);
+	}
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, pfd[0], 78201);
+	sqe->poll32_events = POLLIN;
+	ring_push_sqe(&t);
+	assert(kqring_enter(t.fd, 1, 0, kind == EXEC_SQPOLL ?
+	    IORING_ENTER_SQ_WAKEUP : 0, NULL, 0) == 1);
+	usleep(20000);
+	if (kind == EXEC_WAITER) {
+		assert(pthread_create(&th, NULL, exec_waiter, &t) == 0);
+		usleep(20000);
+	}
+	if (kind == EXEC_CLOEXEC) {
+		assert(fcntl(t.fd, F_SETFD, FD_CLOEXEC) == 0);
+		execl("/usr/bin/true", "true", (char *)NULL);
+	} else {
+		assert(fcntl(t.fd, F_SETFD, 0) == 0);
+		snprintf(arg, sizeof(arg), "%d", t.fd);
+		execl(test_argv0, test_argv0, "--exec-after", arg, (char *)NULL);
+	}
+	_exit(127);
+}
+
+/*
+ * execve(2) by a ring's owner. It parks the process's other threads until
+ * the new image is in place, so waiting for the ring's kernel threads in the
+ * exec hung. The new image finds the ring gone (--exec-after, in main()).
+ */
+static void
+test_exec_kthreads(void)
+{
+	for (int kind = 0; kind < EXEC_KINDS; kind++) {
+		for (int i = 0; i < 20; i++) {
+			int status = 0, waited = 0;
+			pid_t pid, rc;
+
+			fflush(stdout);
+			pid = fork();
+			assert(pid >= 0);
+			if (pid == 0)
+				exec_with_ring(kind);
+			while ((rc = waitpid(pid, &status, WNOHANG)) == 0 &&
+			    waited++ < 1000)
+				usleep(10000);
+			if (rc == 0) {
+				fprintf(stderr, "exec hung, kind %d\n", kind);
+				kill(pid, SIGKILL);
+				abort();
+			}
+			assert(rc == pid && WIFEXITED(status) &&
+			    WEXITSTATUS(status) == 0);
+		}
+	}
+	printf("[PASS] execve(2) by a ring's owner: completions thread, poller, "
+	    "SQPOLL, a blocked enter, close-on-exec\n");
+}
+
 /* Child of test_stop_during_close(): open and close rings, forever. */
 static void *
 stop_close_thread(void *arg)
@@ -12329,6 +12435,11 @@ main(int argc, char **argv)
 	bool run_bench = argc < 2 || strcmp(argv[1], "tests") != 0;
 	struct test_ring r;
 
+	/* The new image of test_exec_kthreads(). */
+	if (argc == 3 && strcmp(argv[1], "--exec-after") == 0)
+		return (kqring_enter(atoi(argv[2]), 0, 0, 0, NULL, 0) == -1 &&
+		    errno == EBADF ? 0 : 1);
+	test_argv0 = argv[0];
 	ring_init(&r);
 	/* "trig": only the event-driven chain tests. */
 	if (argc >= 2 && strcmp(argv[1], "trig") == 0) {
@@ -12444,6 +12555,7 @@ main(int argc, char **argv)
 		test_taskrun_on_wakeup();
 		test_compat_gaps();
 		test_compat_contracts();
+		test_exec_kthreads();
 		test_cq_backpressure();
 		test_sync_cancel_worker();
 		test_tag_failed_register();

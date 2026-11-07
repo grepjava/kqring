@@ -9,7 +9,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | Phase | Work | Status |
 |---|---|---|
 | 1 | Ordering and poll timing | Done |
-| 2 | Make compatibility measurable | liburing tests and matrix done; differential runs open |
+| 2 | Make compatibility measurable | liburing tests and matrix done; differential runs started |
 | 3 | Wait semantics | Not started |
 | 4 | Per-file write ordering | Not started |
 | 5 | Worker path scalability | Not started |
@@ -49,7 +49,7 @@ Acceptance: every liburing 2.9 test is passing, skipped, failing with a document
 
 ### Versioned compatibility matrix
 
-**Done.** [`COMPATIBILITY.MD`](COMPATIBILITY.MD) lists all 205 capabilities against Linux 6.18 and liburing 2.9, and [`tests/compat_check.py`](tests/compat_check.py) fails if it stops matching the source. It found nothing wrong in the module, and its [validation gaps](COMPATIBILITY.MD#validation-gaps) list what is still unchecked.
+**Done.** [`COMPATIBILITY.MD`](COMPATIBILITY.MD) lists all 205 capabilities against Linux 6.18 and liburing 2.9, and [`tests/compat_check.py`](tests/compat_check.py) fails if it stops matching the source. Its [validation gaps](COMPATIBILITY.MD#validation-gaps) list what is still unchecked.
 
 Document every supported opcode, setup flag, enter flag, registration and important subflag against a stated Linux kernel and liburing baseline. Classify each as equivalent, partial, unsupported or intentionally different, and record platform and filesystem dependencies separately from limits of the module.
 
@@ -66,6 +66,8 @@ Cover these boundaries explicitly:
 Acceptance: every advertised capability has a documented contract, a source reference, and a test or a recorded validation gap.
 
 ### Differential conformance
+
+**Started.** [`tests/kqring_diff.c`](tests/kqring_diff.c) has 18 cases that build and run on both systems, and [`tests/diff_compare.py`](tests/diff_compare.py) compares their output. They have only run on kqring so far, where they already found `execve(2)` hanging on a ring with a kernel thread.
 
 Run matched cases on Linux io_uring and on kqring, normalizing native constants and errors while keeping meaningful differences. Exercise cancellation, links, timeouts, buffer lifetime, CQ overflow, resource updates, fork and exec, fixed descriptors and several submitter threads. The test machine also boots Linux, so both sides can run on the same hardware.
 

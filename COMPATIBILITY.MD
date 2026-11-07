@@ -275,7 +275,7 @@ Behaviour that no single flag covers. Each row is a contract, and [Differences f
 |---|---|---|---|---|
 | One process per ring | Different | Only the owning process submits, waits or registers. A forked child gets `EEXIST`, except for `IORING_ENTER_SQ_WAKEUP`. | `kqring_is_owner` | `test_phase5_security_audit`, `liburing/across-fork` |
 | Rings inherited across `fork(2)` | Different | The child inherits the descriptor but can't use the ring. `NO_MMAP` ring memory is shared. | `kqring_is_owner` | `test_worker_process_lifecycle`, `test_no_mmap` |
-| Teardown across `execve(2)` | Different | Rings are torn down and in-flight requests are freed with no CQE. The descriptor then gives `EBADF`. Linux keeps the ring usable. | `kqring_proc_exec` | `test_phase5_security_audit` |
+| Teardown across `execve(2)` | Different | Rings are torn down and in-flight requests are freed with no CQE. The descriptor then gives `EBADF`. Linux keeps the ring usable. | `kqring_proc_exec` | `test_phase5_security_audit`, `test_exec_kthreads` |
 | Worker cancellation and CQE order | Different | The cancel's CQE can come first. Wait for the target's own CQE before freeing its buffers. | `kqring_cancel` | `test_worker_cancel_and_timeout`, `test_sync_cancel_worker` |
 | Timeout CQE order | Different | As cancellation, for `LINK_TIMEOUT`. | `kqring_ltimeout_arm` | `test_worker_cancel_and_timeout` |
 | Fixed buffers after unmapping | Different | `-EFAULT`, because I/O goes through the mapping. Linux's pinned pages stay valid. | `kqring_exec_file_rw` | `test_registered_buffers` |

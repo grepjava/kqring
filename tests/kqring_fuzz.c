@@ -1771,9 +1771,19 @@ do_chaos(struct fz *f)
 		pid_t pid = fork();
 
 		if (pid == 0) {
+			struct io_uring_params p;
+
 			(void)kqring_enter(f->ring, 1, 0, 0, NULL, 0);
 			(void)kqring_register(f->ring, IORING_REGISTER_PROBE,
 			    f->arena, 0);
+			/* Sometimes a ring of its own, and an exec on it. */
+			if (chance(f, 30)) {
+				memset(&p, 0, sizeof(p));
+				p.flags = chance(f, 50) ? IORING_SETUP_SQPOLL : 0;
+				if (kqring_setup(8, &p) >= 0)
+					execl("/usr/bin/true", "true",
+					    (char *)NULL);
+			}
 			_exit(0);
 		}
 		if (pid > 0)

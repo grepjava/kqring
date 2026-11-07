@@ -599,6 +599,22 @@ kqring_teardown_may_defer(void)
 }
 
 /*
+ * Whether curthread is in execve(2) with its process's other threads parked.
+ * thread_single(SINGLE_BOUNDARY) holds them until the new image is in place,
+ * after the process_exec handler, and only then does post_execve() make them
+ * exit.  A ring's kthreads can't get out until that thread moves on, and
+ * nothing interrupts it, so it mustn't wait for them.
+ */
+static bool
+kqring_teardown_in_exec(void)
+{
+	struct proc *p = curproc;
+
+	return ((p->p_flag & (P_STOPPED_SINGLE | P_SINGLE_EXIT)) ==
+	    P_STOPPED_SINGLE && p->p_singlethread == curthread);
+}
+
+/*
  * Sleep in teardown until woken or a second passes; callers loop on their
  * condition.  EINTR: defer the teardown (see above).
  */
@@ -611,6 +627,8 @@ kqring_teardown_sleep(void *chan, struct mtx *mtx, const char *wmesg)
 		(void)msleep(chan, mtx, 0, wmesg, hz);
 		return (0);
 	}
+	if (kqring_teardown_in_exec())
+		return (EINTR);
 	error = msleep(chan, mtx, PCATCH, wmesg, hz);
 	if (error != EINTR && error != ERESTART)
 		return (0);
@@ -629,6 +647,8 @@ kqring_teardown_sq_lock(struct kqring_ctx *ctx)
 			sx_xlock(&ctx->sq_sx);
 			return (0);
 		}
+		if (kqring_teardown_in_exec())
+			return (sx_try_xlock(&ctx->sq_sx) ? 0 : EINTR);
 		if (sx_xlock_sig(&ctx->sq_sx) == 0)
 			return (0);
 		if (kqring_teardown_may_defer())
