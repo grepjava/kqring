@@ -22,6 +22,9 @@
  * MSG_RING, futexes, splice; its file is O_DIRECT half the time), bursts of
  * reads of one pipe or FIFO, chained with links and link timeouts, with
  * data written to the other ends of the pipes and sockets they wait on.
+ * Enters wait with signal masks (never blocking the fuzzer's own signals),
+ * absolute deadlines and registered waits, in the caller's or the module's
+ * memory region, registered before the ring is enabled.
  * Half of those rings (and a few others) opt in to kqring's extensions,
  * sometimes with bad arguments, and get event-driven chains: triggers on
  * those pipes and sockets with random modes and 1-3 templates from the
@@ -35,6 +38,7 @@
  *    teardown (closing everything, reaping children) that takes 120 s;
  *  - a CQ ring that holds more entries than it has room for;
  *  - SIGBUS or SIGSEGV in the fuzzer, which says where and dies;
+ *  - its log descriptors no longer being its log, which would hide the rest;
  *  - kqring memory, user-wired pages or sockets nothing refers to still
  *    held once everything is closed.
  *
@@ -110,6 +114,8 @@ static _Atomic uint64_t	st_echo, st_echo_sent;
 static _Atomic uint64_t	st_direct, st_buffered;
 /* New rings closed under us before they could be mapped. */
 static _Atomic uint64_t	st_ring_gone;
+static _Atomic uint64_t	st_dyn_reserved;	/* refused, see dyn_add() */
+static struct stat	out_st, err_st;		/* OUT_FD, ERR_FD at start */
 /* Reads in pipe bursts submitted; those that got data. */
 static _Atomic uint64_t	st_piperd, st_piperd_data;
 /* Pipe slots opened as FIFOs. */
@@ -135,11 +141,17 @@ struct fz {
 	char		*sqmap, *cqmap;
 	size_t		sqmap_len, cqmap_len;
 	char		*sqes;
+	size_t		sqes_map_len;	/* if mapped, not NO_MMAP memory */
 	unsigned	sqe_size;
 	_Atomic unsigned *sq_khead, *sq_ktail, *cq_khead, *cq_ktail;
 	unsigned	*sq_array;
 	unsigned	sq_tail, sq_mask, cq_mask;
 	char		*user_mem[2];	/* NO_MMAP rings */
+	char		*rw_page;	/* 2 pages for a caller's region */
+	struct io_uring_reg_wait *rw;	/* the ring's wait region, or NULL */
+	size_t		rw_size;
+	void		*rw_kmap;	/* a module region's mapping */
+	size_t		rw_kmap_len;
 	uint64_t	ud;
 	/*
 	 * Structured mode: a ring set up from a known-good template, and
@@ -489,11 +501,25 @@ pool_close(struct fz *f)
 }
 
 static void
-dyn_add(struct fz *f, int fd)
+dyn_add(struct fz *f, int fd, unsigned op, int64_t res, uint64_t ud)
 {
 	/* stdio is the log; PIPE fds are read back from the arena. */
 	if (fd <= STDERR_FILENO)
 		return;
+	/*
+	 * The fuzzer's own numbers (OUT_FD, ERR_FD, MAP_FD + thread) are
+	 * never taken as a request's: a CQE taken for another request's,
+	 * whose user_data slot was reused, would have the fuzzer close its
+	 * log.  Others above them are real once the table has grown so far.
+	 */
+	if (fd == OUT_FD || fd == ERR_FD ||
+	    (fd >= MAP_FD && fd < MAP_FD + MAX_THREADS)) {
+		if (atomic_fetch_add(&st_dyn_reserved, 1) < 20)
+			dprintf(ERR_FD, "kqring_fuzz: thread %d: fd %d from "
+			    "op %u res %jd ud %ju not taken as a request's\n",
+			    f->id, fd, op, (intmax_t)res, (uintmax_t)ud);
+		return;
+	}
 	if (f->ndyn == NDYN) {
 		close(f->dyn[0]);
 		memmove(&f->dyn[0], &f->dyn[1], (NDYN - 1) * sizeof(int));
@@ -530,6 +556,9 @@ ring_unmap(struct fz *f)
 	if (f->cqmap != NULL && f->cqmap != f->sqmap)
 		munmap(f->cqmap, f->cqmap_len);
 	f->sqmap = f->cqmap = NULL;
+	if (f->sqes_map_len != 0)
+		munmap(f->sqes, f->sqes_map_len);
+	f->sqes_map_len = 0;
 	f->sqes = NULL;
 	f->sq_khead = f->sq_ktail = f->cq_khead = f->cq_ktail = NULL;
 	f->sq_array = NULL;
@@ -544,6 +573,11 @@ ring_close(struct fz *f)
 	atomic_store(&ring_fds[f->id], -1);
 	(void)CALL(f, "close(ring)", close(f->ring));
 	f->ring = -1;
+	if (f->rw_kmap != NULL) {
+		munmap(f->rw_kmap, f->rw_kmap_len);
+		f->rw_kmap = NULL;
+	}
+	f->rw = NULL;
 	for (int i = 0; i < 2; i++)
 		if (f->user_mem[i] != NULL) {
 			munmap(f->user_mem[i], (2 << 20) + PAGE_SIZE);
@@ -713,6 +747,7 @@ ring_open(struct fz *f)
 			f->sqes = NULL;
 			return;
 		}
+		f->sqes_map_len = (size_t)p->sq_entries * f->sqe_size;
 	}
 	f->sq_khead = (void *)(base + p->sq_off.head);
 	f->sq_ktail = (void *)(base + p->sq_off.tail);
@@ -1047,6 +1082,54 @@ sanitize(struct fz *f, struct io_uring_sqe *s)
  * table of the pool, buffers, a buffer ring, a personality), each of
  * which may fail (RLIMIT_MEMLOCK, a disabled ring) and is then not used.
  */
+/*
+ * A memory region for registered waits on a ring not yet enabled: the
+ * thread's pages or the module's, mapped; now and then a bad one.
+ */
+static void
+wait_region(struct fz *f)
+{
+	struct io_uring_region_desc rd;
+	struct io_uring_mem_region_reg mr;
+	bool user = chance(f, 50);
+
+	memset(&rd, 0, sizeof(rd));
+	memset(&mr, 0, sizeof(mr));
+	rd.size = (1 + rn(f, 2)) * PAGE_SIZE;
+	if (user) {
+		rd.flags = IORING_MEM_REGION_TYPE_USER;
+		rd.user_addr = (uint64_t)(uintptr_t)f->rw_page;
+	}
+	mr.region_uptr = (uint64_t)(uintptr_t)&rd;
+	mr.flags = IORING_MEM_REGION_REG_WAIT_ARG;
+	if (chance(f, 10)) {
+		switch (rn(f, 5)) {
+		case 0: rd.user_addr = gen_ptr(f); break;
+		case 1: rd.size = rnd(f); break;
+		case 2: rd.flags = (uint32_t)rnd(f); break;
+		case 3: mr.flags = rnd(f); break;
+		default: mr.region_uptr = gen_ptr(f); break;
+		}
+	}
+	if (CALL(f, "mem_region", kqring_register(f->ring,
+	    IORING_REGISTER_MEM_REGION, &mr, 1)) != 0 ||
+	    mr.flags != IORING_MEM_REGION_REG_WAIT_ARG)
+		return;
+	if (user) {
+		f->rw = (void *)f->rw_page;
+	} else {
+		void *m = mmap(NULL, rd.size, PROT_READ | PROT_WRITE,
+		    MAP_SHARED, f->ring, (off_t)rd.mmap_offset);
+
+		if (m == MAP_FAILED)
+			return;
+		f->rw_kmap = m;
+		f->rw_kmap_len = rd.size;
+		f->rw = m;
+	}
+	f->rw_size = rd.size;
+}
+
 static void
 ring_resources(struct fz *f)
 {
@@ -1059,6 +1142,8 @@ ring_resources(struct fz *f)
 	f->pbuf = false;
 	f->personality = 0;
 	f->nrecent = 0;
+	if ((f->p.flags & IORING_SETUP_R_DISABLED) != 0 && chance(f, 50))
+		wait_region(f);
 	if ((f->p.flags & IORING_SETUP_R_DISABLED) != 0 && chance(f, 90))
 		(void)CALL(f, "enable", kqring_register(f->ring,
 		    IORING_REGISTER_ENABLE_RINGS, NULL, 0));
@@ -1562,15 +1647,17 @@ reap(struct fz *f)
 		case IORING_OP_ACCEPT:
 		case IORING_OP_FIXED_FD_INSTALL:
 			if (c->res > 2)
-				dyn_add(f, c->res);
+				dyn_add(f, c->res, op, c->res, c->user_data);
 			break;
 		case IORING_OP_PIPE: {
 			uint64_t a = f->ops[c->user_data % NOPS].addr;
 
 			if (a >= (uint64_t)(uintptr_t)f->arena && a + 8 <=
 			    (uint64_t)(uintptr_t)f->arena + ARENA_SIZE) {
-				dyn_add(f, ((int *)(uintptr_t)a)[0]);
-				dyn_add(f, ((int *)(uintptr_t)a)[1]);
+				dyn_add(f, ((int *)(uintptr_t)a)[0], op, c->res,
+				    c->user_data);
+				dyn_add(f, ((int *)(uintptr_t)a)[1], op, c->res,
+				    c->user_data);
 			}
 			break;
 		}
@@ -1663,10 +1750,23 @@ do_submit(struct fz *f)
 				/*
 				 * A template runs again on every event: never
 				 * a CLOSE, whose descriptor number may be
-				 * reused.  Linked up to the last, mostly.
+				 * reused, or a request that makes one, whose
+				 * CQEs come back as the trigger's and would
+				 * fill the table (a socket that stays readable
+				 * made 100,000 in minutes).  Linked up to the
+				 * last, mostly.
 				 */
-				if (s->opcode == IORING_OP_CLOSE)
+				switch (s->opcode) {
+				case IORING_OP_CLOSE:
+				case IORING_OP_OPENAT:
+				case IORING_OP_OPENAT2:
+				case IORING_OP_SOCKET:
+				case IORING_OP_ACCEPT:
+				case IORING_OP_FIXED_FD_INSTALL:
+				case IORING_OP_PIPE:
 					s->opcode = IORING_OP_NOP;
+					break;
+				}
 				if (f->tmpl_echo)
 					sqe_echo(f, s, f->tmpl_left == 2);
 				if (--f->tmpl_left > 0)
@@ -1731,6 +1831,74 @@ do_submit(struct fz *f)
 			argsz = (size_t)rn(f, 64);
 			min = (unsigned)rn(f, 2);
 		}
+	}
+	/*
+	 * A signal mask: the thread's, with more blocked, never the
+	 * watchdog's SIGUSR1 or the faults it reports.
+	 */
+	sigset_t mask;
+	if (chance(f, 10)) {
+		uint64_t bits = rnd(f);
+
+		pthread_sigmask(SIG_SETMASK, NULL, &mask);
+		for (int s = 1; s < 64; s++)
+			if ((bits & (1ULL << s)) != 0)
+				sigaddset(&mask, s);
+		sigdelset(&mask, SIGUSR1);
+		sigdelset(&mask, SIGBUS);
+		sigdelset(&mask, SIGSEGV);
+		if ((flags & IORING_ENTER_EXT_ARG) != 0) {
+			ga.sigmask = (uint64_t)(uintptr_t)&mask;
+			ga.sigmask_sz = chance(f, 90) ? sizeof(mask) :
+			    (uint32_t)rn(f, 32);
+		} else if (arg == NULL) {
+			arg = &mask;
+			argsz = chance(f, 90) ? sizeof(mask) : (size_t)rn(f, 32);
+		}
+	}
+	/* A deadline: soon, or long past (the duration taken as a time). */
+	if (chance(f, 5)) {
+		flags |= IORING_ENTER_ABS_TIMER;
+		if (chance(f, 50)) {
+			struct timespec now;
+
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			ts.tv_sec = now.tv_sec;
+			ts.tv_nsec = now.tv_nsec;
+		}
+	}
+	/* A registered wait, by its offset in the region. */
+	if ((flags & IORING_ENTER_EXT_ARG) != 0 && f->rw != NULL &&
+	    chance(f, 40)) {
+		size_t nw = f->rw_size / sizeof(*f->rw);
+		uint64_t off = chance(f, 90) ? rn(f, nw) * sizeof(*f->rw) :
+		    rnd(f) % (f->rw_size + 128);
+		uint64_t at = (off % f->rw_size) & ~(uint64_t)7;
+		struct io_uring_reg_wait *w;
+
+		if (at > f->rw_size - sizeof(*w))
+			at = f->rw_size - sizeof(*w);
+		w = (void *)((char *)f->rw + at);
+
+		memset(w, 0, sizeof(*w));
+		w->ts.tv_nsec = (long long)rn(f, 2000000);
+		w->flags = chance(f, 97) ? IORING_REG_WAIT_TS :
+		    (uint32_t)rnd(f);
+		w->min_wait_usec = chance(f, 80) ? 0 : (uint32_t)rn(f, 500);
+		if (ga.sigmask != 0) {
+			w->sigmask = ga.sigmask;
+			w->sigmask_sz = ga.sigmask_sz;
+		}
+		if ((flags & IORING_ENTER_ABS_TIMER) != 0 && chance(f, 50)) {
+			struct timespec now;
+
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			w->ts.tv_sec = now.tv_sec;
+			w->ts.tv_nsec = now.tv_nsec;
+		}
+		flags |= IORING_ENTER_EXT_ARG_REG;
+		arg = (void *)(uintptr_t)off;
+		argsz = chance(f, 95) ? sizeof(*w) : (size_t)rn(f, 128);
 	}
 	if (chance(f, 3))
 		flags = (unsigned)rnd(f) & ~(unsigned)IORING_ENTER_REGISTERED_RING;
@@ -1903,6 +2071,10 @@ fz_main(void *arg)
 	f->pbuf_page = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
 	    MAP_PRIVATE | MAP_ANON, -1, 0);
 	if (f->pbuf_page == MAP_FAILED)
+		die("mmap: %s", strerror(errno));
+	f->rw_page = mmap(NULL, 2 * PAGE_SIZE, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	if (f->rw_page == MAP_FAILED)
 		die("mmap: %s", strerror(errno));
 
 	while (!atomic_load(&stop) && (max_iters == 0 || iters < max_iters)) {
@@ -2096,6 +2268,8 @@ main(int argc, char **argv)
 	printf("kqring_fuzz: seed %ju, %d threads, %d s, in %s\n",
 	    (uintmax_t)seed, nthreads, run_secs, scratch);
 	stdio_hide();
+	if (fstat(OUT_FD, &out_st) != 0 || fstat(ERR_FD, &err_st) != 0)
+		die("fstat: %s", strerror(errno));
 
 	for (int i = 0; i < nthreads; i++) {
 		fzs[i].id = i;
@@ -2138,6 +2312,20 @@ main(int argc, char **argv)
 		if (atomic_load(&nfinished) == nthreads)
 			break;
 		if (now - last > 10000000000ULL) {
+			struct stat o, e;
+
+			/* The log must still be the log: fail, not go quiet. */
+			if (fstat(OUT_FD, &o) != 0 || o.st_dev != out_st.st_dev ||
+			    o.st_ino != out_st.st_ino || fstat(ERR_FD, &e) != 0 ||
+			    e.st_dev != err_st.st_dev ||
+			    e.st_ino != err_st.st_ino) {
+				dprintf(ERR_FD, "kqring_fuzz: FAIL: descriptor "
+				    "%d or %d is no longer the log\n", OUT_FD,
+				    ERR_FD);
+				dprintf(STDERR_FILENO, "kqring_fuzz: FAIL: log "
+				    "descriptor replaced\n");
+				_exit(4);
+			}
 			dprintf(OUT_FD, "[%4ju s] rings %ju (setup failed %ju) "
 			    "sqes %ju "
 			    "enters %ju registers %ju cqes %ju chaos %ju "
@@ -2188,6 +2376,8 @@ main(int argc, char **argv)
 	    (uintmax_t)st_direct, (uintmax_t)st_buffered);
 	printf("kqring_fuzz: new rings closed before mapping %ju\n",
 	    (uintmax_t)st_ring_gone);
+	printf("kqring_fuzz: CQE descriptors in the fuzzer's range, refused "
+	    "%ju\n", (uintmax_t)st_dyn_reserved);
 	printf("kqring_fuzz: pipe burst reads %ju, with data %ju, FIFOs %ju\n",
 	    (uintmax_t)st_piperd, (uintmax_t)st_piperd_data,
 	    (uintmax_t)st_fifo);

@@ -308,3 +308,30 @@
  
  	ret = io_uring_queue_init(1, &ring, 0);
  	if (ret < 0)
+--- test/reg-wait.c
++++ test/reg-wait.c
+@@ -92,7 +92,7 @@
+ 	reg->ts.tv_sec = 1;
+ 	reg->ts.tv_nsec = 0;
+ 	reg->sigmask = 100;
+-	reg->sigmask_sz = 8;
++	reg->sigmask_sz = _NSIG / 8;
+ 
+ 	ret = io_uring_submit_and_wait_reg(ring, &cqe, 1, 0);
+ 	if (ret != -EFAULT) {
+--- test/iowait.c
++++ test/iowait.c
+@@ -70,6 +70,13 @@
+ 
+ 	ts.tv_sec = 1;
+ 	ts.tv_nsec = 0;
++	/* FreeBSD has no /proc/stat, and no iowait time to count. */
++	if (access("/proc/stat", R_OK) != 0) {
++		ret = io_uring_wait_cqe_timeout(ring, &cqe, &ts);
++		close(fds[0]);
++		close(fds[1]);
++		return ret == -ETIME ? T_EXIT_SKIP : T_EXIT_FAIL;
++	}
+ 	iowait_pre = get_iowait(cpu);
+ 	ret = io_uring_wait_cqe_timeout(ring, &cqe, &ts);
+ 	if (ret != -ETIME) {

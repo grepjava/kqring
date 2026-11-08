@@ -783,22 +783,16 @@ test_enter_validation(struct test_ring *r)
 	for (size_t i = 0; i < sizeof(bad_flags) / sizeof(bad_flags[0]); i++)
 		assert(kqring_enter(r->fd, 1, 0, bad_flags[i], NULL, 0) == -1 &&
 		    errno == EINVAL);
-	/* Without EXT_ARG, arg would be a sigmask. */
-	assert(kqring_enter(r->fd, 1, 1, IORING_ENTER_GETEVENTS, &ga,
+	/*
+	 * Without EXT_ARG, arg is a sigmask, whose size is checked when the
+	 * wait would sleep (test_enter_sigmask()).
+	 */
+	assert(kqring_enter(r->fd, 0, 1, IORING_ENTER_GETEVENTS, &ga,
 	    sizeof(ga)) == -1 && errno == EINVAL);
-	/* Wrong argsz, or a sigmask. */
+	/* Wrong argsz. */
 	assert(kqring_enter(r->fd, 1, 1,
 	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
 	    sizeof(ga) - 1) == -1 && errno == EINVAL);
-	sigset_t set;
-	sigemptyset(&set);
-	ga.sigmask = (uint64_t)(uintptr_t)&set;
-	ga.sigmask_sz = sizeof(set);
-	assert(kqring_enter(r->fd, 1, 1,
-	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
-	    sizeof(ga)) == -1 && errno == EINVAL);
-	ga.sigmask = 0;
-	ga.sigmask_sz = 0;
 	assert(ring_pending(r) == 1);
 	assert(ring_cq_ready(r) == 0);
 
@@ -8696,6 +8690,481 @@ test_sync_cancel_waiting(void)
 	printf("[PASS] SYNC_CANCEL ends a waiting read within any timeout\n");
 }
 
+static _Atomic int sigmask_hits;
+
+static void
+sigmask_handler(int sig __unused)
+{
+	atomic_fetch_add(&sigmask_hits, 1);
+}
+
+static void *
+sigmask_kill_later(void *arg)
+{
+	usleep(50000);
+	assert(pthread_kill(*(pthread_t *)arg, SIGUSR1) == 0);
+	return (NULL);
+}
+
+static bool
+sigmask_has(int sig)
+{
+	sigset_t cur;
+
+	assert(sigprocmask(SIG_SETMASK, NULL, &cur) == 0);
+	return (sigismember(&cur, sig) == 1);
+}
+
+/*
+ * io_uring_enter(2)'s signal mask, plain and in EXT_ARG: the thread waits
+ * with it, as with ppoll(2).  A signal it unblocks ends the wait (EINTR, or
+ * success if there are CQEs) and is handled under it; otherwise the old
+ * mask is back on return.  The size is checked only if the wait sleeps.
+ */
+static void
+test_enter_sigmask(void)
+{
+	struct __kernel_timespec ts = { .tv_nsec = 300000000 };
+	struct io_uring_getevents_arg ga = {
+		.ts = (uint64_t)(uintptr_t)&ts,
+	};
+	struct sigaction sa = { .sa_handler = sigmask_handler }, osa;
+	sigset_t none, usr1, old;
+	struct test_ring t;
+	pthread_t self = pthread_self(), killer;
+	uint64_t t0, ms;
+
+	ring_init(&t);
+	sigemptyset(&none);
+	sigemptyset(&usr1);
+	sigaddset(&usr1, SIGUSR1);
+	assert(sigaction(SIGUSR1, &sa, &osa) == 0);
+	assert(sigprocmask(SIG_BLOCK, &usr1, &old) == 0);
+
+	/* Plain: a pending signal the mask unblocks ends the wait at once. */
+	atomic_store(&sigmask_hits, 0);
+	assert(raise(SIGUSR1) == 0);
+	assert(atomic_load(&sigmask_hits) == 0);
+	assert(kqring_enter(t.fd, 0, 1, IORING_ENTER_GETEVENTS, &none,
+	    sizeof(none)) == -1 && errno == EINTR);
+	assert(atomic_load(&sigmask_hits) == 1);
+	assert(sigmask_has(SIGUSR1));
+
+	/* EXT_ARG, with a timeout it doesn't wait for. */
+	assert(raise(SIGUSR1) == 0);
+	ga.sigmask = (uint64_t)(uintptr_t)&none;
+	ga.sigmask_sz = sizeof(none);
+	t0 = now_ns();
+	assert(kqring_enter(t.fd, 0, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
+	    sizeof(ga)) == -1 && errno == EINTR);
+	assert(now_ns() - t0 < 200000000);
+	assert(atomic_load(&sigmask_hits) == 2);
+	assert(sigmask_has(SIGUSR1));
+
+	/* Interrupted with a CQE posted: success. */
+	(void)ring_prep(&t, IORING_OP_NOP, -1, 79300);
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(raise(SIGUSR1) == 0);
+	assert(kqring_enter(t.fd, 0, 2, IORING_ENTER_GETEVENTS, &none,
+	    sizeof(none)) == 0);
+	assert(atomic_load(&sigmask_hits) == 3);
+	assert(ring_pop_cqe(&t).user_data == 79300);
+
+	/* No sleep, no check: the CQ holds enough, so any size passes. */
+	(void)ring_prep(&t, IORING_OP_NOP, -1, 79301);
+	ring_push_sqe(&t);
+	assert(kqring_enter(t.fd, 1, 1, IORING_ENTER_GETEVENTS, &none,
+	    3) == 1);
+	assert(ring_pop_cqe(&t).user_data == 79301);
+	/* A sleep checks it, and the pointer. */
+	assert(kqring_enter(t.fd, 0, 1, IORING_ENTER_GETEVENTS, &none,
+	    3) == -1 && errno == EINVAL);
+	ga.sigmask_sz = sizeof(none) + 1;
+	assert(kqring_enter(t.fd, 0, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
+	    sizeof(ga)) == -1 && errno == EINVAL);
+	ga.sigmask = 8;
+	ga.sigmask_sz = sizeof(none);
+	assert(kqring_enter(t.fd, 0, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
+	    sizeof(ga)) == -1 && errno == EFAULT);
+	assert(atomic_load(&sigmask_hits) == 3);
+	assert(sigmask_has(SIGUSR1));
+
+	/*
+	 * A mask that blocks a signal the thread takes: it arrives during
+	 * the wait, which runs to its timeout, and is handled after it.
+	 */
+	assert(sigprocmask(SIG_UNBLOCK, &usr1, NULL) == 0);
+	assert(pthread_create(&killer, NULL, sigmask_kill_later, &self) == 0);
+	ga.sigmask = (uint64_t)(uintptr_t)&usr1;
+	t0 = now_ns();
+	assert(kqring_enter(t.fd, 0, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
+	    sizeof(ga)) == -1 && (errno == ETIME || errno == ETIMEDOUT));
+	ms = (now_ns() - t0) / 1000000;
+	assert(ms >= 250);
+	assert(pthread_join(killer, NULL) == 0);
+	assert(atomic_load(&sigmask_hits) == 4);
+	assert(!sigmask_has(SIGUSR1));
+
+	/* A wait that ends with a CQE restores the old mask. */
+	struct __kernel_timespec tts = { .tv_nsec = 20000000 };
+	struct io_uring_sqe *sqe = ring_prep(&t, IORING_OP_TIMEOUT, -1, 79302);
+	sqe->addr = (uint64_t)(uintptr_t)&tts;
+	sqe->len = 1;
+	ring_push_sqe(&t);
+	sigset_t all;
+	sigfillset(&all);
+	assert(kqring_enter(t.fd, 1, 1, IORING_ENTER_GETEVENTS, &all,
+	    sizeof(all)) == 1);
+	assert(ring_pop_cqe(&t).user_data == 79302);
+	assert(!sigmask_has(SIGUSR1) && !sigmask_has(SIGUSR2));
+
+	assert(sigprocmask(SIG_SETMASK, &old, NULL) == 0);
+	assert(sigaction(SIGUSR1, &osa, NULL) == 0);
+	close(t.fd);
+	printf("[PASS] io_uring_enter(2) waits with its signal mask (plain "
+	    "and EXT_ARG)\n");
+}
+
+static long
+abs_enter(int fd, unsigned min, unsigned flags, clockid_t clk, long add_ms,
+    uint64_t *ms)
+{
+	struct timespec now;
+	struct __kernel_timespec ts;
+	struct io_uring_getevents_arg ga = {
+		.ts = (uint64_t)(uintptr_t)&ts,
+	};
+	uint64_t t0;
+	long rc;
+
+	assert(clock_gettime(clk, &now) == 0);
+	ts.tv_sec = now.tv_sec + add_ms / 1000;
+	ts.tv_nsec = now.tv_nsec + (add_ms % 1000) * 1000000L;
+	if (add_ms < 0) {
+		ts.tv_sec = 0;
+		ts.tv_nsec = 0;
+	} else if (ts.tv_nsec >= 1000000000L) {
+		ts.tv_sec++;
+		ts.tv_nsec -= 1000000000L;
+	}
+	t0 = now_ns();
+	rc = kqring_enter(fd, 0, min, IORING_ENTER_GETEVENTS |
+	    IORING_ENTER_EXT_ARG | flags, &ga, sizeof(ga));
+	*ms = (now_ns() - t0) / 1000000;
+	return (rc);
+}
+
+/*
+ * IORING_ENTER_ABS_TIMER: the timeout is a time of the ring's clock
+ * (IORING_REGISTER_CLOCK), not a duration.  IORING_ENTER_NO_IOWAIT is
+ * accepted and advertised: FreeBSD has no iowait accounting to leave out.
+ */
+static void
+test_enter_abs_timer(void)
+{
+	struct io_uring_clock_register clk = { .clockid = CLOCK_BOOTTIME };
+	struct io_uring_params p;
+	struct test_ring t;
+	uint64_t ms;
+	int fd;
+
+	memset(&p, 0, sizeof(p));
+	fd = kqring_setup(4, &p);
+	assert(fd >= 0);
+	assert((p.features & IORING_FEAT_NO_IOWAIT) != 0);
+	close(fd);
+
+	ring_init(&t);
+	/* 100 ms from now on CLOCK_MONOTONIC, the default. */
+	assert(abs_enter(t.fd, 1, IORING_ENTER_ABS_TIMER, CLOCK_MONOTONIC,
+	    100, &ms) == -1 && errno == ETIME);
+	assert(ms >= 90 && ms < 1000);
+	/* A deadline passed (time 0) times out at once, as does 0 relative. */
+	assert(abs_enter(t.fd, 1, IORING_ENTER_ABS_TIMER, CLOCK_MONOTONIC,
+	    -1, &ms) == -1 && errno == ETIME);
+	assert(ms < 50);
+	assert(abs_enter(t.fd, 1, 0, CLOCK_MONOTONIC, -1, &ms) == -1 &&
+	    errno == ETIME);
+	assert(ms < 50);
+	/* A CQE before the deadline ends the wait with success. */
+	struct __kernel_timespec tts = { .tv_nsec = 20000000 };
+	struct io_uring_sqe *sqe = ring_prep(&t, IORING_OP_TIMEOUT, -1, 79400);
+	sqe->addr = (uint64_t)(uintptr_t)&tts;
+	sqe->len = 1;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(abs_enter(t.fd, 1, IORING_ENTER_ABS_TIMER |
+	    IORING_ENTER_NO_IOWAIT, CLOCK_MONOTONIC, 2000, &ms) == 0);
+	assert(ms < 1000);
+	assert(ring_pop_cqe(&t).user_data == 79400);
+	/* CLOCK_BOOTTIME, which FreeBSD makes CLOCK_MONOTONIC. */
+	assert(kqring_register(t.fd, IORING_REGISTER_CLOCK, &clk, 0) == 0);
+	assert(abs_enter(t.fd, 1, IORING_ENTER_ABS_TIMER, CLOCK_BOOTTIME,
+	    100, &ms) == -1 && errno == ETIME);
+	assert(ms >= 90 && ms < 1000);
+	/* NO_IOWAIT on its own, with nothing to wait for. */
+	assert(kqring_enter(t.fd, 0, 0, IORING_ENTER_GETEVENTS |
+	    IORING_ENTER_NO_IOWAIT, NULL, 0) == 0);
+	close(t.fd);
+	printf("[PASS] IORING_ENTER_ABS_TIMER deadlines on the ring's clock, "
+	    "NO_IOWAIT\n");
+}
+
+static int
+reg_region(int fd, uint64_t addr, uint64_t size, uint32_t rflags,
+    uint64_t flags, uint64_t *mmap_off)
+{
+	struct io_uring_region_desc rd = {
+		.user_addr = addr,
+		.size = size,
+		.flags = rflags,
+	};
+	struct io_uring_mem_region_reg mr = {
+		.region_uptr = (uint64_t)(uintptr_t)&rd,
+		.flags = flags,
+	};
+
+	if (kqring_register(fd, IORING_REGISTER_MEM_REGION, &mr, 1) < 0)
+		return (-errno);
+	if (mmap_off != NULL)
+		*mmap_off = rd.mmap_offset;
+	return (0);
+}
+
+static long
+reg_wait_enter(int fd, unsigned submit, unsigned min, uint64_t off,
+    unsigned flags)
+{
+	return (kqring_enter(fd, submit, min, IORING_ENTER_GETEVENTS |
+	    IORING_ENTER_EXT_ARG | IORING_ENTER_EXT_ARG_REG | flags,
+	    (void *)(uintptr_t)off, sizeof(struct io_uring_reg_wait)));
+}
+
+/* A registered wait's timeout: ms, or with ABS_TIMER ms from now. */
+static void
+reg_wait_set(struct io_uring_reg_wait *w, long ms, bool abs)
+{
+	struct timespec now = { 0, 0 };
+
+	memset(w, 0, sizeof(*w));
+	if (abs)
+		assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+	w->ts.tv_sec = now.tv_sec + ms / 1000;
+	w->ts.tv_nsec = now.tv_nsec + (ms % 1000) * 1000000L;
+	if (w->ts.tv_nsec >= 1000000000L) {
+		w->ts.tv_sec++;
+		w->ts.tv_nsec -= 1000000000L;
+	}
+	w->flags = IORING_REG_WAIT_TS;
+}
+
+static uint64_t
+reg_wait_ms(int fd, uint64_t off, unsigned flags, int expect)
+{
+	uint64_t t0 = now_ns();
+
+	if (expect == 0)
+		assert(reg_wait_enter(fd, 0, 1, off, flags) == 0);
+	else
+		assert(reg_wait_enter(fd, 0, 1, off, flags) == -1 &&
+		    errno == expect);
+	return ((now_ns() - t0) / 1000000);
+}
+
+/*
+ * IORING_REGISTER_MEM_REGION and registered waits (IORING_ENTER_EXT_ARG_REG),
+ * as Linux 7.3 checks them: the region, the caller's or the module's, comes
+ * before the ring is enabled; a wait is named by its offset in it, which
+ * must be aligned and inside; and it is read at each enter, after fork(2)
+ * too.
+ */
+static void
+test_reg_wait(void)
+{
+	long page = sysconf(_SC_PAGESIZE);
+	size_t size = 2 * (size_t)page;
+	size_t nw = size / sizeof(struct io_uring_reg_wait);
+	struct io_uring_region_desc rd = { .size = (uint64_t)page };
+	struct io_uring_mem_region_reg mr = {
+		.region_uptr = (uint64_t)(uintptr_t)&rd,
+		.flags = IORING_MEM_REGION_REG_WAIT_ARG,
+	};
+	struct io_uring_reg_wait *w, *kw;
+	struct sigaction sa = { .sa_handler = sigmask_handler }, osa;
+	struct test_ring t, k;
+	sigset_t none, usr1, old;
+	uint64_t moff, ms;
+	char *user, *ro;
+	pid_t pid;
+	int st;
+
+	user = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
+	    -1, 0);
+	ro = mmap(NULL, (size_t)page, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(user != MAP_FAILED && ro != MAP_FAILED);
+	w = (struct io_uring_reg_wait *)(void *)user;
+	ring_setup(&t);
+
+	/* The registration's checks, in Linux's order. */
+	assert(kqring_register(t.fd, IORING_REGISTER_MEM_REGION, &mr, 0) ==
+	    -1 && errno == EINVAL);
+	assert(kqring_register(t.fd, IORING_REGISTER_MEM_REGION, NULL, 1) ==
+	    -1 && errno == EINVAL);
+	mr.flags = 2;
+	assert(kqring_register(t.fd, IORING_REGISTER_MEM_REGION, &mr, 1) ==
+	    -1 && errno == EINVAL);
+	mr.flags = IORING_MEM_REGION_REG_WAIT_ARG;
+	mr.__resv[1] = 1;
+	assert(kqring_register(t.fd, IORING_REGISTER_MEM_REGION, &mr, 1) ==
+	    -1 && errno == EINVAL);
+	mr.__resv[1] = 0;
+	mr.region_uptr = 8;
+	assert(kqring_register(t.fd, IORING_REGISTER_MEM_REGION, &mr, 1) ==
+	    -1 && errno == EFAULT);
+	assert(reg_region(t.fd, (uintptr_t)user, size, 0,
+	    IORING_MEM_REGION_REG_WAIT_ARG, NULL) == -EFAULT);
+	assert(reg_region(t.fd, 0, size, IORING_MEM_REGION_TYPE_USER,
+	    IORING_MEM_REGION_REG_WAIT_ARG, NULL) == -EFAULT);
+	assert(reg_region(t.fd, (uintptr_t)user, size, 2,
+	    IORING_MEM_REGION_REG_WAIT_ARG, NULL) == -EINVAL);
+	assert(reg_region(t.fd, (uintptr_t)user, 0, IORING_MEM_REGION_TYPE_USER,
+	    IORING_MEM_REGION_REG_WAIT_ARG, NULL) == -EINVAL);
+	assert(reg_region(t.fd, (uintptr_t)user + 16, size,
+	    IORING_MEM_REGION_TYPE_USER, IORING_MEM_REGION_REG_WAIT_ARG,
+	    NULL) == -EINVAL);
+	assert(reg_region(t.fd, (uintptr_t)user, size + 16,
+	    IORING_MEM_REGION_TYPE_USER, IORING_MEM_REGION_REG_WAIT_ARG,
+	    NULL) == -EINVAL);
+	assert(reg_region(t.fd, (uintptr_t)ro, (uint64_t)page,
+	    IORING_MEM_REGION_TYPE_USER, IORING_MEM_REGION_REG_WAIT_ARG,
+	    NULL) == -EFAULT);
+	assert(reg_region(t.fd, 0x1000, (uint64_t)page,
+	    IORING_MEM_REGION_TYPE_USER, IORING_MEM_REGION_REG_WAIT_ARG,
+	    NULL) == -EFAULT);
+	/* One region per ring. */
+	assert(reg_region(t.fd, (uintptr_t)user, size,
+	    IORING_MEM_REGION_TYPE_USER, IORING_MEM_REGION_REG_WAIT_ARG,
+	    &moff) == 0);
+	assert(moff == 0);
+	assert(reg_region(t.fd, (uintptr_t)user, size,
+	    IORING_MEM_REGION_TYPE_USER, 0, NULL) == -EBUSY);
+	/* The caller's region isn't mapped through the ring. */
+	assert(mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_SHARED,
+	    t.fd, 0x20000000) == MAP_FAILED);
+	assert(kqring_register(t.fd, IORING_REGISTER_ENABLE_RINGS, NULL, 0) ==
+	    0);
+
+	/* Waits by offset: the first and last fit, past or unaligned don't. */
+	reg_wait_set(&w[0], 100, false);
+	ms = reg_wait_ms(t.fd, 0, 0, ETIME);
+	assert(ms >= 90 && ms < 1000);
+	reg_wait_set(&w[nw - 1], 1, false);
+	(void)reg_wait_ms(t.fd, (nw - 1) * sizeof(*w), 0, ETIME);
+	(void)reg_wait_ms(t.fd, nw * sizeof(*w), 0, EFAULT);
+	(void)reg_wait_ms(t.fd, size - sizeof(long), 0, EFAULT);
+	(void)reg_wait_ms(t.fd, 0 - sizeof(long), 0, EFAULT);
+	(void)reg_wait_ms(t.fd, 4, 0, EFAULT);
+	assert(kqring_enter(t.fd, 0, 1, IORING_ENTER_GETEVENTS |
+	    IORING_ENTER_EXT_ARG | IORING_ENTER_EXT_ARG_REG, NULL,
+	    sizeof(*w) - 1) == -1 && errno == EINVAL);
+	w[1] = w[0];
+	w[1].flags = 2;
+	(void)reg_wait_ms(t.fd, sizeof(*w), 0, EINVAL);
+	w[1].flags = IORING_REG_WAIT_TS;
+	w[1].ts.tv_nsec = 1000000000LL;
+	(void)reg_wait_ms(t.fd, sizeof(*w), 0, EINVAL);
+
+	/* Repeated waits, each read afresh. */
+	for (unsigned i = 0; i < 40; i++) {
+		reg_wait_set(&w[i % nw], 1, false);
+		(void)reg_wait_ms(t.fd, (i % nw) * sizeof(*w), 0, ETIME);
+	}
+	/* An absolute deadline, and min_wait_usec. */
+	reg_wait_set(&w[2], 80, true);
+	ms = reg_wait_ms(t.fd, 2 * sizeof(*w), IORING_ENTER_ABS_TIMER, ETIME);
+	assert(ms >= 60 && ms < 1000);
+	/* Without a timeout, a completion ends it. */
+	memset(&w[3], 0, sizeof(*w));
+	(void)ring_prep(&t, IORING_OP_NOP, -1, 79500);
+	ring_push_sqe(&t);
+	assert(reg_wait_enter(t.fd, 1, 1, 3 * sizeof(*w), 0) == 1);
+	assert(ring_pop_cqe(&t).user_data == 79500);
+
+	/* Its signal mask, which is checked as the plain one is. */
+	sigemptyset(&none);
+	sigemptyset(&usr1);
+	sigaddset(&usr1, SIGUSR1);
+	assert(sigaction(SIGUSR1, &sa, &osa) == 0);
+	assert(sigprocmask(SIG_BLOCK, &usr1, &old) == 0);
+	atomic_store(&sigmask_hits, 0);
+	reg_wait_set(&w[4], 1000, false);
+	w[4].sigmask = (uint64_t)(uintptr_t)&none;
+	w[4].sigmask_sz = 1;
+	(void)reg_wait_ms(t.fd, 4 * sizeof(*w), 0, EINVAL);
+	w[4].sigmask = 100;
+	w[4].sigmask_sz = sizeof(sigset_t);
+	(void)reg_wait_ms(t.fd, 4 * sizeof(*w), 0, EFAULT);
+	w[4].sigmask = (uint64_t)(uintptr_t)&none;
+	assert(raise(SIGUSR1) == 0);
+	ms = reg_wait_ms(t.fd, 4 * sizeof(*w), 0, EINTR);
+	assert(ms < 500 && atomic_load(&sigmask_hits) == 1);
+	assert(sigprocmask(SIG_SETMASK, &old, NULL) == 0);
+	assert(sigaction(SIGUSR1, &osa, NULL) == 0);
+
+	/*
+	 * After fork(2) the process writes its own copy of the held pages;
+	 * the wait must see what it wrote, not the 10 s held before.
+	 */
+	reg_wait_set(&w[5], 10000, false);
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0)
+		_exit(0);
+	assert(waitpid(pid, &st, 0) == pid && WIFEXITED(st));
+	reg_wait_set(&w[5], 30, false);
+	ms = reg_wait_ms(t.fd, 5 * sizeof(*w), 0, ETIME);
+	assert(ms < 5000);
+
+	/* The module's region, mapped at the offset it reports. */
+	ring_setup(&k);
+	assert(reg_region(k.fd, 0, (uint64_t)page, 0,
+	    IORING_MEM_REGION_REG_WAIT_ARG, &moff) == 0);
+	assert(moff == 0x20000000);
+	assert(mmap(NULL, 2 * (size_t)page, PROT_READ | PROT_WRITE,
+	    MAP_SHARED, k.fd, (off_t)moff) == MAP_FAILED);
+	kw = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_SHARED, k.fd,
+	    (off_t)moff);
+	assert(kw != MAP_FAILED);
+	assert(kqring_register(k.fd, IORING_REGISTER_ENABLE_RINGS, NULL, 0) ==
+	    0);
+	reg_wait_set(&kw[1], 50, false);
+	ms = reg_wait_ms(k.fd, sizeof(*kw), 0, ETIME);
+	assert(ms >= 40 && ms < 1000);
+	close(k.fd);
+	/* The mapping keeps the memory after the ring is gone. */
+	kw[1].min_wait_usec = 7;
+	assert(munmap(kw, (size_t)page) == 0);
+
+	/* A region on an enabled ring holds no waits. */
+	assert(reg_region(t.fd, 0, (uint64_t)page, 0, 0, NULL) == -EBUSY);
+	ring_init(&k);
+	assert(reg_region(k.fd, 0, (uint64_t)page, 0,
+	    IORING_MEM_REGION_REG_WAIT_ARG, NULL) == -EINVAL);
+	assert(reg_region(k.fd, 0, (uint64_t)page, 0, 0, &moff) == 0);
+	(void)reg_wait_ms(k.fd, 0, 0, EFAULT);
+	close(k.fd);
+
+	close(t.fd);
+	assert(munmap(user, size) == 0 && munmap(ro, (size_t)page) == 0);
+	printf("[PASS] IORING_REGISTER_MEM_REGION and registered waits "
+	    "(EXT_ARG_REG)\n");
+}
+
 /*
  * Reads on workers that select from one buffer group take its head buffer
  * in turn.  One that finds it held is woken when it is free, not a clock
@@ -10037,13 +10506,10 @@ test_compat_contracts(void)
 		    IORING_SETUP_DEFER_TASKRUN,
 	};
 	static const uint32_t bad_enter[] = {
-		1U << 5,	/* IORING_ENTER_ABS_TIMER */
-		1U << 6,	/* IORING_ENTER_EXT_ARG_REG */
-		1U << 7,	/* IORING_ENTER_NO_IOWAIT */
+		1U << 8,
 	};
 	static const uint32_t bad_reg[] = {
 		32,		/* IORING_REGISTER_ZCRX_IFQ */
-		34,		/* IORING_REGISTER_MEM_REGION */
 		35,		/* IORING_REGISTER_QUERY */
 		36,		/* IORING_REGISTER_ZCRX_CTRL */
 		37,		/* IORING_REGISTER_BPF_FILTER */
@@ -13042,6 +13508,9 @@ main(int argc, char **argv)
 		test_sync_cancel_worker();
 		test_sync_cancel_waiting();
 		test_bgroup_worker_reads();
+		test_enter_sigmask();
+		test_enter_abs_timer();
+		test_reg_wait();
 		test_tag_failed_register();
 		test_tag_release_no_drop();
 		test_sqe128_cqe32_attach_wq();

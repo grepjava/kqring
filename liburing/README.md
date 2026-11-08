@@ -35,9 +35,9 @@ liburing's test suite, run on FreeBSD 15.1 with `kqring.ko` from this tree (Nove
 |---|---|
 | In liburing 2.15 | 258 |
 | Built | 245 |
-| Passed | **209** |
+| Passed | **210** |
 | Skipped | 27 (the test found a feature missing and said so) |
-| Failed | 9, explained below |
+| Failed | 8, explained below |
 | Not built | 9 not portable, 2 BPF, 2 AddressSanitizer only, explained below |
 
 `fixed-buf-merge` and `read-write` register more buffer memory than FreeBSD's default `RLIMIT_MEMLOCK` (64 KiB; Linux uses 8 MiB), so they need it raised: `ulimit -l 65536` as root, or `memorylocked` in `login.conf(5)`.
@@ -61,12 +61,6 @@ These results aren't a compatibility percentage. Some of the tests are adapted, 
 | `across-fork` | A forked child submits to its parent's ring. kqring rings belong to one process: workers resolve descriptors in the owner's table, so allowing another process could let it reach files it can't see, for example from inside a Capsicum sandbox. The child gets `EEXIST`. |
 | `io_uring_register` | Registers a file-backed buffer and expects a refusal. Linux refuses because it pins the pages for as long as the buffer is registered. kqring goes through the mapping at each I/O, so it has no such problem, and accepts the buffer. |
 
-### Not implemented yet
-
-| Tests | Why they fail |
-|---|---|
-| `reg-wait` | Needs `IORING_REGISTER_MEM_REGION` and registered waits, which are [phase 3 of the roadmap](../ROADMAP.MD#phase-3-wait-semantics). |
-
 ### Skipped tests
 
 The 27 skips are tests that check for a feature and report its absence:
@@ -76,9 +70,8 @@ The 27 skips are tests that check for a feature and report its absence:
   - Mixed-size CQEs and SQEs, `IORING_SETUP_CQE_MIXED` and `IORING_SETUP_SQE_MIXED` (`cq-peek-batch-mixed`, `nop32`, `nop32-overflow`, `sqe-mixed-bad-wrap`, `sqe-mixed-boundary`, `sqe-mixed-nop`). `large-resize` resizes a `CQE32` ring first, which passes, and skips at its `CQE_MIXED` part.
   - `IORING_REGISTER_QUERY` (`ring-query`, and `zcrx`, which also needs zero-copy receive).
   - BPF filters on a ring (`cbpf_filter`) and task restrictions (`task-restrict`), refused with `EOPNOTSUPP`.
-  - `IORING_FEAT_NO_IOWAIT`, which kqring doesn't advertise (`iowait`).
 - **`epwait`** needs `IORING_OP_EPOLL_WAIT`, and FreeBSD has no epoll.
-- **Linux-only facilities:** fault injection (`fc2a85cb02ef`), fsnotify (`fsnotify`), ublk (`uring_cmd_ublk`), the kernel's io_uring mock files (`mock_file`), requested huge pages (`fixed-hugepage`), and `/proc` (`wq-aff`, `io-wq-unused-exit`, `resize-mmap-fail`).
+- **Linux-only facilities:** fault injection (`fc2a85cb02ef`), fsnotify (`fsnotify`), ublk (`uring_cmd_ublk`), the kernel's io_uring mock files (`mock_file`), requested huge pages (`fixed-hugepage`), and `/proc` (`wq-aff`, `io-wq-unused-exit`, `resize-mmap-fail`). `iowait` runs its waits with and without `IORING_ENTER_NO_IOWAIT`, then skips where it would read the time spent waiting for I/O from `/proc/stat`: FreeBSD doesn't count that time apart.
 - **`fallocate`** skips when the test directory is on ZFS, which doesn't support preallocation: the `FALLOCATE` completes with `EOPNOTSUPP`, which the test takes as unsupported.
 - **`napi-test`** needs root and a script that sets up Linux network namespaces.
 - **`ring-leak`** skips because a ring descriptor can't be sent with `SCM_RIGHTS`, as on Linux 6.7 and later. FreeBSD refuses with `EOPNOTSUPP` where Linux uses `EINVAL`, and `test-compat.h` maps one to the other for the tests.
@@ -115,6 +108,8 @@ The tests that are changed, or that test something else, are:
 | `io-cancel`, `timeout` | Leave out the subtests in which a forked child uses its parent's ring | See `across-fork` above. |
 | `poll-v-poll`, `epwait` | Take `EOPNOTSUPP` as epoll not being supported, as they do `EINVAL` | FreeBSD has no epoll. `poll-v-poll` polls a kqueue in place of an epoll descriptor. |
 | `cbpf_filter`, `task-restrict` | Take `EOPNOTSUPP` as the feature not being supported, as they do `EINVAL` | kqring refuses these registrations with `EOPNOTSUPP`, where a Linux kernel without them gives `EINVAL`. |
+| `reg-wait` | Gives a signal mask the size of FreeBSD's `sigset_t` (`_NSIG / 8`, 16 bytes) where it expects `EFAULT` from a bad pointer | Linux's is 8 bytes. With 8, kqring fails the size check first, with `EINVAL`. |
+| `iowait` | Skips where it would read `/proc/stat`, after its waits | FreeBSD has no `/proc/stat`, and doesn't count time waiting for I/O apart. Without the change it reads 0 and fails. |
 | `sendzc-bug` | Doesn't set `SO_ZEROCOPY` where the platform has no such option, as liburing's own helpers already don't | io_uring's zero-copy sends don't need it, and FreeBSD has no such option. |
 | `socket`, `send_recv`, `send_recvmsg`, `recv-msgall-stream` | A semaphore replaces a mutex used as a signal ([`mutex-signal.h`](freebsd/test-include/mutex-signal.h)) | The tests unlock a mutex from a thread that doesn't own it, which glibc allows and FreeBSD's libthr refuses. |
 | `232c93d07b74`, `accept-test` | Socket paths in `/tmp` | FreeBSD has no abstract AF_UNIX addresses. |

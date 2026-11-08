@@ -430,8 +430,9 @@ kqring_file_alloc_range(struct kqring_ctx *ctx,
 }
 
 /*
- * IORING_REGISTER_CLOCK: the clock of wait timeouts.  They are relative,
- * so either clock gives the same result except across a suspend.
+ * IORING_REGISTER_CLOCK: the clock of IORING_ENTER_ABS_TIMER deadlines.
+ * FreeBSD defines CLOCK_BOOTTIME as CLOCK_MONOTONIC, the uptime that waits
+ * are timed in, so there is one clock to choose.
  */
 static int
 kqring_register_clock(struct kqring_ctx *ctx,
@@ -450,6 +451,145 @@ kqring_register_clock(struct kqring_ctx *ctx,
 	if (cr.clockid != CLOCK_MONOTONIC && cr.clockid != CLOCK_BOOTTIME)
 		return (EINVAL);
 	ctx->clockid = cr.clockid;
+	return (0);
+}
+
+/*
+ * IORING_REGISTER_MEM_REGION, as io_register_mem_region() and
+ * io_create_region(): one region per ring, with the same checks in the
+ * same order.  The caller's pages are held for the ring's life, so memory
+ * that isn't mapped writable fails with EFAULT, as pinning does in Linux.
+ */
+static int
+kqring_register_mem_region(struct kqring_ctx *ctx,
+    const struct kqring_register_arg *ra, struct thread *td)
+{
+	struct io_uring_mem_region_reg reg;
+	struct io_uring_region_desc rd;
+	vm_object_t obj = NULL;
+	vm_page_t *pages = NULL;
+	vm_offset_t kva = 0;
+	size_t len = 0;
+	struct uidinfo *uip;
+	bool user;
+	int error;
+
+	if (ra->arg == NULL || ra->nr_args != 1)
+		return (EINVAL);
+	if (ctx->region_len != 0)
+		return (EBUSY);
+	if ((error = copyin(ra->arg, &reg, sizeof(reg))) != 0)
+		return (error);
+	error = copyin((const void *)(uintptr_t)reg.region_uptr, &rd,
+	    sizeof(rd));
+	if (error != 0)
+		return (error);
+	if (reg.__resv[0] != 0 || reg.__resv[1] != 0)
+		return (EINVAL);
+	if ((reg.flags & ~(uint64_t)IORING_MEM_REGION_REG_WAIT_ARG) != 0)
+		return (EINVAL);
+	/* Waiters don't lock the region, so it must come before any. */
+	if ((reg.flags & IORING_MEM_REGION_REG_WAIT_ARG) != 0 && ctx->enabled)
+		return (EINVAL);
+
+	for (int i = 0; i < 4; i++)
+		if (rd.__resv[i] != 0)
+			return (EINVAL);
+	if ((rd.flags & ~(uint32_t)IORING_MEM_REGION_TYPE_USER) != 0)
+		return (EINVAL);
+	user = (rd.flags & IORING_MEM_REGION_TYPE_USER) != 0;
+	/* user_addr is set if and only if the memory is the caller's. */
+	if (user != (rd.user_addr != 0))
+		return (EFAULT);
+	if (rd.size == 0 || rd.mmap_offset != 0 || rd.id != 0)
+		return (EINVAL);
+	if ((rd.size >> PAGE_SHIFT) > INT_MAX)
+		return (E2BIG);
+	if (((rd.user_addr | rd.size) & PAGE_MASK) != 0)
+		return (EINVAL);
+	if (rd.user_addr + rd.size < rd.user_addr)
+		return (EOVERFLOW);
+
+	error = kqring_mem_charge(td->td_ucred, rd.size, user, &uip);
+	if (error != 0)
+		return (error);
+	if (user)
+		error = kqring_pin_shm(td, rd.user_addr, rd.size, false, &kva,
+		    &len, &pages);
+	else
+		error = kqring_alloc_shm(rd.size, &obj, &kva, &len);
+	if (error != 0) {
+		kqring_mem_uncharge(uip, rd.size, user);
+		return (error);
+	}
+	if (!user)
+		rd.mmap_offset = KQRING_OFF_PARAM_REGION;
+	if ((error = copyout(&rd, (void *)(uintptr_t)reg.region_uptr,
+	    sizeof(rd))) != 0) {
+		kqring_mem_uncharge(uip, rd.size, user);
+		if (user)
+			kqring_unpin_shm(kva, len, pages);
+		else
+			kqring_free_shm(obj, kva, len);
+		return (error);
+	}
+
+	/* Under mtx, which mmap(2) of the region takes. */
+	mtx_lock(&ctx->mtx);
+	ctx->region_obj = obj;
+	ctx->region_pages = pages;
+	ctx->region_kva = kva;
+	ctx->region_uaddr = rd.user_addr;
+	ctx->region_cow_gen = atomic_load_int(&ctx->cow_gen);
+	ctx->region_uip = uip;
+	ctx->region_len = len;
+	if ((reg.flags & IORING_MEM_REGION_REG_WAIT_ARG) != 0)
+		ctx->cq_wait_size = rd.size;
+	mtx_unlock(&ctx->mtx);
+	return (0);
+}
+
+void
+kqring_region_free(struct kqring_ctx *ctx)
+{
+	if (ctx->region_len == 0)
+		return;
+	kqring_mem_uncharge(ctx->region_uip, ctx->region_len,
+	    ctx->region_pages != NULL);
+	if (ctx->region_pages != NULL)
+		kqring_unpin_shm(ctx->region_kva, ctx->region_len,
+		    ctx->region_pages);
+	else
+		kqring_free_shm(ctx->region_obj, ctx->region_kva,
+		    ctx->region_len);
+	ctx->region_obj = NULL;
+	ctx->region_pages = NULL;
+	ctx->region_len = 0;
+	ctx->cq_wait_size = 0;
+}
+
+/*
+ * The registered wait at offset off of the region, as io_get_ext_arg_reg():
+ * EFAULT unless it is aligned to a long and lies inside.  The caller's
+ * pages are read through their address after a fork(2), whose
+ * copy-on-write gives the process new pages for the ones held.
+ */
+int
+kqring_reg_wait_get(struct kqring_ctx *ctx, uint64_t off,
+    struct io_uring_reg_wait *w)
+{
+	uint64_t end;
+
+	if (off % sizeof(long) != 0)
+		return (EFAULT);
+	end = off + sizeof(*w);
+	if (end < off || end > ctx->cq_wait_size)
+		return (EFAULT);
+	if (ctx->region_pages != NULL &&
+	    ctx->region_cow_gen != atomic_load_int(&ctx->cow_gen))
+		return (copyin((const void *)(uintptr_t)(ctx->region_uaddr +
+		    off), w, sizeof(*w)));
+	memcpy(w, (const char *)ctx->region_kva + off, sizeof(*w));
 	return (0);
 }
 
@@ -866,6 +1006,9 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 		return (kqring_sync_cancel(ctx, ra, resp));
 	case IORING_REGISTER_CLOCK:
 		return (kqring_register_clock(ctx, ra));
+
+	case IORING_REGISTER_MEM_REGION:
+		return (kqring_register_mem_region(ctx, ra, td));
 
 	case IORING_REGISTER_IOWQ_AFF:
 		return (kqring_iowq_aff(ctx, ra, true));

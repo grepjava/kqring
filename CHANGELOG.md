@@ -4,6 +4,10 @@
 
 ### Added
 
+- Signal masks in `kqring_enter()`, plain and in `io_uring_getevents_arg`: as with `ppoll(2)`, the thread waits with the mask, and a signal it lets in ends the wait and is handled with the mask still in place. They were refused with `EINVAL`. The mask is a FreeBSD `sigset_t`, 16 bytes.
+- `IORING_ENTER_ABS_TIMER`: the wait's timeout is a time of the ring's clock, which `IORING_REGISTER_CLOCK` now chooses. On FreeBSD `CLOCK_BOOTTIME` is `CLOCK_MONOTONIC`, so the two give the same deadlines.
+- `IORING_REGISTER_MEM_REGION` and registered waits (`IORING_ENTER_EXT_ARG_REG`): a region of the program's memory or the module's, and waits named by their offset in it, read at each enter without a copy.
+- `IORING_ENTER_NO_IOWAIT` and `IORING_FEAT_NO_IOWAIT`. FreeBSD doesn't count time waiting for I/O apart, so the flag changes nothing.
 - `io_uring_buf_reg.min_left`, from Linux 7.3: on an `IOU_PBUF_RING_INC` ring, a buffer with less than that many bytes left is used up rather than kept for the next transfer. kqring refused it with `EINVAL` before.
 
 ### Fixed
@@ -29,13 +33,20 @@
 - `IORING_REGISTER_SYNC_CANCEL` with a short timeout no longer fails with `ETIME` when what it cancels is a read waiting for a pipe's data, or anything else whose worker is only waiting. Linux has such a request armed as a poll and cancels it at once; the worker kqring uses for it could take longer to stop than the timeout. liburing's `sync-cancel` failed on this, rarely.
 - A multishot poll on the ring's own registered eventfd now ends at the wakeup after its first CQE, close to Linux, which ends it at the next event after the ring's own signal. It used to fire on its own signal for ever.
 - `READ_MULTISHOT` of a file that can't be polled now completes with `EBADF`, where Linux has `EBADFD`, rather than `EOPNOTSUPP`, with or without `IOSQE_ASYNC`.
+- A wait that a signal ends now succeeds if there are CQEs to reap, as on Linux, rather than failing with `EINTR`.
 
 ### Testing
 
-- Linux 7.3 and kqring now match in 16 of the 21 cases of `tests/kqring_diff.c`, and the other 5 differ on purpose. The results are in `docs/conformance/`.
+- Linux 7.3 and kqring now match in 19 of the 25 cases of `tests/kqring_diff.c`, and the other 6 differ on purpose. The results are in `docs/conformance/`.
 - `tests/kqring_diff.c` runs the same cases on Linux and on kqring, and `tests/diff_compare.py` fails on a difference that isn't listed with its reason.
 - `tests/kqring_test.c` now covers `WRITEV_FIXED`, level-triggered polls, `ACCEPT_POLL_FIRST`, `IORING_OFF_CQ_RING`, how a failed SQE ends a batch, the flags kqring refuses, `SIGPIPE`, hole punching and the Capsicum rights of fixed files.
+- `tests/kqring_fuzz.c` now unmaps each ring's SQE array. It left them all mapped, a few thousand more every 10 s, and with tens of thousands each `fork(2)` and page fault slowed until a run could stop making progress.
+- `tests/kqring_fuzz.c` no longer puts requests that create descriptors in a trigger's chain. A chain runs again on every event, its CQEs come back as the trigger's, so the fuzzer never closed what they made, and a socket that stayed readable filled the descriptor table in minutes.
+- `tests/kqring_fuzz.c` no longer closes its own log. It closes the descriptors requests create, taken from their CQEs, and a CQE taken for another request's, whose `user_data` slot had been reused, could name its log; a run then went on silently. It now refuses the numbers of its own descriptors, says when, and fails if its log stops being its log.
 - `tests/kqring_fuzz.c` no longer reports an overrun CQ when another thread's new ring took a ring's descriptor number before it was mapped: it mapped that other ring, whose CQ is larger.
+- `tests/kqring_test.c` covers signal masks in both forms, absolute deadlines on either clock, and memory regions with registered waits: their checks, offsets, repeated waits, masks, and a region read after `fork(2)`.
+- `tests/kqring_diff.c` has cases for signal masks, absolute deadlines, registered waits, and the order in which an enter checks its wait argument and submits.
+- `tests/kqring_fuzz.c` now waits with signal masks, absolute deadlines and registered waits, in its own memory or the module's, sometimes with bad arguments.
 - `tests/kqring_fuzz.c` now also registers without a ring, uses incremental buffer rings with and without `min_left`, caps multishot `RECV` by `len` and `optlen`, polls the ring's own eventfd and cancels synchronously.
 - `tests/kqring_fuzz.c` now really exercises futexes, whose wake masks all failed validation before, and resizes rings with requests in flight.
 - liburing 2.9: 179 of 196 tests pass, up from 144 of 168. 28 of the 32 tests that weren't built now are, and the other 4 are listed as not portable. Tests that stopped on portability problems, or on an early failure, before they reached what they test now run, and `regbuf-merge` now really calls kqring: it used to pass by making unrelated FreeBSD system calls. Every adapted test is listed in [`liburing/README.md`](liburing/README.md#adapted-tests).

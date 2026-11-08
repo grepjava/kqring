@@ -1512,6 +1512,350 @@ c_eventfd(void)
 	ring_free(&r);
 }
 
+/* IORING_ENTER_ABS_TIMER on the default clock, and NO_IOWAIT. */
+static void
+c_abs_timer(void)
+{
+	struct __kernel_timespec ts;
+	struct io_uring_getevents_arg ga = { .ts = (uint64_t)(uintptr_t)&ts };
+	struct io_uring_params p;
+	struct timespec now, t1;
+	struct ring r;
+	long ms;
+
+	memset(&p, 0, sizeof(p));
+	ring_init(&r, 8, &p);
+	say("feat_no_iowait", "%d", (p.features & IORING_FEAT_NO_IOWAIT) != 0);
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	ts.tv_sec = now.tv_sec;
+	ts.tv_nsec = now.tv_nsec + 100000000L;
+	if (ts.tv_nsec >= 1000000000L) {
+		ts.tv_sec++;
+		ts.tv_nsec -= 1000000000L;
+	}
+	say_rc("abs_100ms", ring_sys_enter(r.fd, 0, 1, IORING_ENTER_GETEVENTS |
+	    IORING_ENTER_EXT_ARG | IORING_ENTER_ABS_TIMER, &ga, sizeof(ga)));
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	ms = (t1.tv_sec - now.tv_sec) * 1000 +
+	    (t1.tv_nsec - now.tv_nsec) / 1000000;
+	say("abs_100ms_waited", "%d", ms >= 90 && ms < 1000);
+
+	ts.tv_sec = 0;
+	ts.tv_nsec = 0;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	say_rc("abs_past", ring_sys_enter(r.fd, 0, 1, IORING_ENTER_GETEVENTS |
+	    IORING_ENTER_EXT_ARG | IORING_ENTER_ABS_TIMER, &ga, sizeof(ga)));
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	ms = (t1.tv_sec - now.tv_sec) * 1000 +
+	    (t1.tv_nsec - now.tv_nsec) / 1000000;
+	say("abs_past_at_once", "%d", ms < 50);
+
+	prep(&r, IORING_OP_NOP, -1, 1);
+	say_rc("no_iowait", ring_sys_enter(r.fd, 1, 1, IORING_ENTER_GETEVENTS |
+	    IORING_ENTER_NO_IOWAIT, NULL, 0));
+	dump(&r, "cqe");
+	ring_free(&r);
+}
+
+/*
+ * A bad wait argument with SQEs to submit: kqring refuses the enter before
+ * it submits; Linux submits, then drops the wait's error for the count.
+ */
+static void
+c_ext_arg_order(void)
+{
+	struct __kernel_timespec ts = { .tv_nsec = 1000000 };
+	struct io_uring_getevents_arg ga = { .ts = (uint64_t)(uintptr_t)&ts };
+	struct ring r;
+
+	ring_init(&r, 8, NULL);
+	prep(&r, IORING_OP_NOP, -1, 1);
+	say_rc("bad_argsz", ring_sys_enter(r.fd, 1, 1, IORING_ENTER_GETEVENTS |
+	    IORING_ENTER_EXT_ARG, &ga, sizeof(ga) - 1));
+	say("submitted", "%d", pending(&r) == 0);
+	(void)submit(&r);
+	await(&r, 1, 2000);
+	dump(&r, "cqe");
+	ring_free(&r);
+}
+
+/* The kernel's sigset_t: 8 bytes on Linux (_NSIG / 8), 16 on FreeBSD. */
+#if defined(__linux__)
+#define	KSIGSZ	8
+#else
+#define	KSIGSZ	sizeof(sigset_t)
+#endif
+
+static _Atomic int sig_hits;
+
+static void
+sig_count(int sig)
+{
+	(void)sig;
+	atomic_fetch_add(&sig_hits, 1);
+}
+
+static void *
+sig_kill_later(void *arg)
+{
+	pause_ms(50);
+	pthread_kill(*(pthread_t *)arg, SIGUSR1);
+	return (NULL);
+}
+
+static int
+sig_blocked(void)
+{
+	sigset_t cur;
+
+	CHECK(sigprocmask(SIG_SETMASK, NULL, &cur) == 0);
+	return (sigismember(&cur, SIGUSR1) == 1);
+}
+
+/* io_uring_enter(2)'s signal mask, plain and through EXT_ARG. */
+static void
+c_sigmask(void)
+{
+	struct __kernel_timespec ts = { .tv_nsec = 300000000 };
+	struct io_uring_getevents_arg ga = { .ts = (uint64_t)(uintptr_t)&ts };
+	struct sigaction sa, osa;
+	sigset_t none, usr1, all, old;
+	pthread_t me = pthread_self(), killer;
+	struct timespec t0, t1;
+	struct ring r;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = sig_count;
+	CHECK(sigaction(SIGUSR1, &sa, &osa) == 0);
+	sigemptyset(&none);
+	sigemptyset(&usr1);
+	sigaddset(&usr1, SIGUSR1);
+	sigfillset(&all);
+	CHECK(sigprocmask(SIG_BLOCK, &usr1, &old) == 0);
+	ring_init(&r, 8, NULL);
+
+	raise(SIGUSR1);
+	say_rc("plain_unblocks", ring_sys_enter(r.fd, 0, 1,
+	    IORING_ENTER_GETEVENTS, &none, KSIGSZ));
+	say("plain_hits", "%d", atomic_load(&sig_hits));
+	say("plain_blocked_after", "%d", sig_blocked());
+
+	raise(SIGUSR1);
+	ga.sigmask = (uint64_t)(uintptr_t)&none;
+	ga.sigmask_sz = KSIGSZ;
+	say_rc("ext_unblocks", ring_sys_enter(r.fd, 0, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga, sizeof(ga)));
+	say("ext_hits", "%d", atomic_load(&sig_hits));
+
+	prep(&r, IORING_OP_NOP, -1, 1);
+	(void)submit(&r);
+	raise(SIGUSR1);
+	say_rc("with_cqe", ring_sys_enter(r.fd, 0, 2, IORING_ENTER_GETEVENTS,
+	    &none, KSIGSZ));
+	say("with_cqe_hits", "%d", atomic_load(&sig_hits));
+	dump(&r, "cqe");
+
+	prep(&r, IORING_OP_NOP, -1, 2);
+	say_rc("bad_size_ready", ring_sys_enter(r.fd, 1, 1,
+	    IORING_ENTER_GETEVENTS, &none, 3));
+	dump(&r, "cqe");
+	say_rc("bad_size_wait", ring_sys_enter(r.fd, 0, 1,
+	    IORING_ENTER_GETEVENTS, &none, 3));
+	ga.sigmask_sz = KSIGSZ + 1;
+	say_rc("ext_bad_size", ring_sys_enter(r.fd, 0, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga, sizeof(ga)));
+	ga.sigmask = 8;
+	ga.sigmask_sz = KSIGSZ;
+	say_rc("ext_fault", ring_sys_enter(r.fd, 0, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga, sizeof(ga)));
+	say("bad_hits", "%d", atomic_load(&sig_hits));
+
+	CHECK(sigprocmask(SIG_UNBLOCK, &usr1, NULL) == 0);
+	CHECK(pthread_create(&killer, NULL, sig_kill_later, &me) == 0);
+	ga.sigmask = (uint64_t)(uintptr_t)&usr1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	say_rc("blocks", ring_sys_enter(r.fd, 0, 1,
+	    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga, sizeof(ga)));
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	CHECK(pthread_join(killer, NULL) == 0);
+	say("blocks_full_wait", "%d", (t1.tv_sec - t0.tv_sec) * 1000 +
+	    (t1.tv_nsec - t0.tv_nsec) / 1000000 >= 250);
+	say("blocks_hits", "%d", atomic_load(&sig_hits));
+	say("blocks_unblocked_after", "%d", !sig_blocked());
+
+	prep(&r, IORING_OP_NOP, -1, 3);
+	say_rc("all_ready", ring_sys_enter(r.fd, 1, 1, IORING_ENTER_GETEVENTS,
+	    &all, KSIGSZ));
+	dump(&r, "cqe");
+	say("all_unblocked_after", "%d", !sig_blocked());
+
+	CHECK(sigprocmask(SIG_SETMASK, &old, NULL) == 0);
+	CHECK(sigaction(SIGUSR1, &osa, NULL) == 0);
+	ring_free(&r);
+}
+
+static int
+dregion(int fd, void *addr, uint64_t size, uint32_t rflags, uint64_t flags,
+    uint64_t *moff)
+{
+	struct io_uring_region_desc rd;
+	struct io_uring_mem_region_reg mr;
+	int rc;
+
+	memset(&rd, 0, sizeof(rd));
+	memset(&mr, 0, sizeof(mr));
+	rd.user_addr = (uint64_t)(uintptr_t)addr;
+	rd.size = size;
+	rd.flags = rflags;
+	mr.region_uptr = (uint64_t)(uintptr_t)&rd;
+	mr.flags = flags;
+	rc = ring_sys_register(fd, IORING_REGISTER_MEM_REGION, &mr, 1);
+	if (rc == 0 && moff != NULL)
+		*moff = rd.mmap_offset;
+	return (rc);
+}
+
+static int
+dwait(int fd, unsigned submit, uint64_t off, long *ms)
+{
+	struct timespec t0, t1;
+	int rc;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	rc = ring_sys_enter(fd, submit, 1, IORING_ENTER_GETEVENTS |
+	    IORING_ENTER_EXT_ARG | IORING_ENTER_EXT_ARG_REG,
+	    (void *)(uintptr_t)off, sizeof(struct io_uring_reg_wait));
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	if (ms != NULL)
+		*ms = (t1.tv_sec - t0.tv_sec) * 1000 +
+		    (t1.tv_nsec - t0.tv_nsec) / 1000000;
+	return (rc);
+}
+
+static void
+dwait_ts(struct io_uring_reg_wait *w, long ms)
+{
+	memset(w, 0, sizeof(*w));
+	w->ts.tv_sec = ms / 1000;
+	w->ts.tv_nsec = (ms % 1000) * 1000000L;
+	w->flags = IORING_REG_WAIT_TS;
+}
+
+/* IORING_REGISTER_MEM_REGION and registered waits. */
+static void
+c_reg_wait(void)
+{
+	long page = sysconf(_SC_PAGESIZE), ms;
+	size_t size = 2 * (size_t)page;
+	size_t nw = size / sizeof(struct io_uring_reg_wait);
+	struct io_uring_params p;
+	struct io_uring_reg_wait *w, *kw;
+	struct ring r, k;
+	uint64_t moff = 1;
+	char *user, *ro;
+	pid_t pid;
+	int st;
+
+	user = mmap(NULL, size, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	ro = mmap(NULL, (size_t)page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS,
+	    -1, 0);
+	CHECK(user != MAP_FAILED && ro != MAP_FAILED);
+	w = (struct io_uring_reg_wait *)(void *)user;
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_R_DISABLED;
+	ring_init(&r, 8, &p);
+
+	say_rc("no_args", ring_sys_register(r.fd, IORING_REGISTER_MEM_REGION,
+	    NULL, 1));
+	say_rc("kernel_with_addr", dregion(r.fd, user, size, 0,
+	    IORING_MEM_REGION_REG_WAIT_ARG, NULL));
+	say_rc("user_no_addr", dregion(r.fd, NULL, size,
+	    IORING_MEM_REGION_TYPE_USER, IORING_MEM_REGION_REG_WAIT_ARG, NULL));
+	say_rc("size_0", dregion(r.fd, user, 0, IORING_MEM_REGION_TYPE_USER,
+	    IORING_MEM_REGION_REG_WAIT_ARG, NULL));
+	say_rc("misaligned", dregion(r.fd, user + 16, size,
+	    IORING_MEM_REGION_TYPE_USER, IORING_MEM_REGION_REG_WAIT_ARG, NULL));
+	say_rc("read_only", dregion(r.fd, ro, (uint64_t)page,
+	    IORING_MEM_REGION_TYPE_USER, IORING_MEM_REGION_REG_WAIT_ARG, NULL));
+	say_rc("bad_flags", dregion(r.fd, user, size,
+	    IORING_MEM_REGION_TYPE_USER, 2, NULL));
+	say_rc("user", dregion(r.fd, user, size, IORING_MEM_REGION_TYPE_USER,
+	    IORING_MEM_REGION_REG_WAIT_ARG, &moff));
+	say("user_mmap_offset", "%d", (int)moff);
+	say_rc("again", dregion(r.fd, user, size, IORING_MEM_REGION_TYPE_USER,
+	    0, NULL));
+	say_rc("enable", ring_sys_register(r.fd, IORING_REGISTER_ENABLE_RINGS,
+	    NULL, 0));
+
+	dwait_ts(&w[0], 100);
+	say_rc("wait_first", dwait(r.fd, 0, 0, &ms));
+	say("wait_first_100ms", "%d", ms >= 90 && ms < 1000);
+	dwait_ts(&w[nw - 1], 1);
+	say_rc("wait_last", dwait(r.fd, 0, (nw - 1) * sizeof(*w), NULL));
+	say_rc("wait_past_end", dwait(r.fd, 0, nw * sizeof(*w), NULL));
+	say_rc("wait_straddles", dwait(r.fd, 0, size - sizeof(long), NULL));
+	say_rc("wait_wraps", dwait(r.fd, 0, 0 - sizeof(long), NULL));
+	say_rc("wait_unaligned", dwait(r.fd, 0, 4, NULL));
+	say_rc("wait_argsz", ring_sys_enter(r.fd, 0, 1, IORING_ENTER_GETEVENTS |
+	    IORING_ENTER_EXT_ARG | IORING_ENTER_EXT_ARG_REG, NULL,
+	    sizeof(*w) - 1));
+	dwait_ts(&w[1], 1);
+	w[1].flags = 2;
+	say_rc("wait_bad_flags", dwait(r.fd, 0, sizeof(*w), NULL));
+	dwait_ts(&w[1], 1000);
+	w[1].sigmask = 100;
+	w[1].sigmask_sz = 1;
+	say_rc("wait_sigmask_size", dwait(r.fd, 0, sizeof(*w), NULL));
+	w[1].sigmask_sz = KSIGSZ;
+	say_rc("wait_sigmask_fault", dwait(r.fd, 0, sizeof(*w), NULL));
+	memset(&w[2], 0, sizeof(*w));
+	prep(&r, IORING_OP_NOP, -1, 1);
+	say_rc("wait_nop", dwait(r.fd, 1, 2 * sizeof(*w), NULL));
+	dump(&r, "cqe");
+
+	dwait_ts(&w[3], 10000);
+	pid = fork();
+	CHECK(pid >= 0);
+	if (pid == 0)
+		_exit(0);
+	CHECK(waitpid(pid, &st, 0) == pid);
+	dwait_ts(&w[3], 30);
+	say_rc("after_fork", dwait(r.fd, 0, 3 * sizeof(*w), &ms));
+	say("after_fork_reads_new", "%d", ms < 5000);
+
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_R_DISABLED;
+	ring_init(&k, 8, &p);
+	say_rc("kernel", dregion(k.fd, NULL, (uint64_t)page, 0,
+	    IORING_MEM_REGION_REG_WAIT_ARG, &moff));
+	say("kernel_mmap_offset", "%#x", (int)moff);
+	kw = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_SHARED, k.fd,
+	    (off_t)moff);
+	say("kernel_mapped", "%d", kw != MAP_FAILED);
+	say_rc("kernel_enable", ring_sys_register(k.fd,
+	    IORING_REGISTER_ENABLE_RINGS, NULL, 0));
+	if (kw != MAP_FAILED) {
+		dwait_ts(&kw[1], 20);
+		say_rc("kernel_wait", dwait(k.fd, 0, sizeof(*kw), NULL));
+		munmap(kw, (size_t)page);
+	}
+	ring_free(&k);
+
+	ring_init(&k, 8, NULL);
+	say_rc("enabled_wait_arg", dregion(k.fd, NULL, (uint64_t)page, 0,
+	    IORING_MEM_REGION_REG_WAIT_ARG, NULL));
+	say_rc("enabled_plain", dregion(k.fd, NULL, (uint64_t)page, 0, 0,
+	    NULL));
+	say_rc("enabled_wait", dwait(k.fd, 0, 0, NULL));
+	ring_free(&k);
+
+	ring_free(&r);
+	munmap(user, size);
+	munmap(ro, (size_t)page);
+}
+
 static const struct {
 	const char	*name;
 	void		(*fn)(void);
@@ -1537,6 +1881,10 @@ static const struct {
 	{ "exec", c_exec },
 	{ "threads", c_threads },
 	{ "eventfd", c_eventfd },
+	{ "sigmask", c_sigmask },
+	{ "abs_timer", c_abs_timer },
+	{ "reg_wait", c_reg_wait },
+	{ "ext_arg_order", c_ext_arg_order },
 };
 
 static void

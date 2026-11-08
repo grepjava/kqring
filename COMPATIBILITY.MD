@@ -128,11 +128,12 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_ENTER_GETEVENTS` | Equivalent | | `kqring_ioc_enter_body` | `test_enter_validation`, `liburing/submit-and-wait`, `fuzz` |
 | `IORING_ENTER_SQ_WAKEUP` | Equivalent | A forked child may use it. | `kqring_ioc_enter_body` | `test_enter_validation`, `test_sqpoll_and_iopoll`, `fuzz` |
 | `IORING_ENTER_SQ_WAIT` | Equivalent | | `kqring_ioc_enter_body` | `test_enter_validation`, `test_sqpoll_and_iopoll`, `liburing/sqwait`, `fuzz` |
-| `IORING_ENTER_EXT_ARG` | Partial | Timeouts and `min_wait_usec` work. A signal mask gives `EINVAL`; [phase 3](ROADMAP.MD#phase-3-wait-semantics) adds it. | `kqring_ioc_enter_body` | `test_enter_validation`, `test_min_wait`, `liburing/min-timeout`, `fuzz` |
+| `IORING_ENTER_EXT_ARG` | Different | Timeouts, `min_wait_usec` and signal masks work. The argument is checked before anything is submitted, so a bad one fails the enter; Linux submits first and returns the count. | `kqring_ioc_enter_body` | `test_enter_validation`, `test_min_wait`, `test_enter_sigmask`, `liburing/min-timeout`, `fuzz` |
 | `IORING_ENTER_REGISTERED_RING` | Equivalent | | `kqring_ioc_enter_body` | `test_enter_validation`, `test_registered_rings`, `liburing/reg-reg-ring`, `fuzz` |
-| `IORING_ENTER_ABS_TIMER` | Unsupported | `EINVAL`. Phase 3. | `kqring_ioc_enter_body` | `test_compat_contracts` |
-| `IORING_ENTER_EXT_ARG_REG` | Unsupported | `EINVAL`. Phase 3. | `kqring_ioc_enter_body` | `test_compat_contracts`, `liburing/reg-wait` |
-| `IORING_ENTER_NO_IOWAIT` | Unsupported | `EINVAL`. | `kqring_ioc_enter_body` | `test_compat_contracts` |
+| `IORING_ENTER_ABS_TIMER` | Equivalent | The timeout is a time of the ring's clock (`IORING_REGISTER_CLOCK`). | `kqring_enter_wait_sig` | `test_enter_abs_timer`, `test_reg_wait`, `liburing/wait-timeout`, `fuzz` |
+| `IORING_ENTER_EXT_ARG_REG` | Equivalent | The wait is the `io_uring_reg_wait` at the argument's offset in the ring's region, which must be aligned to a `long` and inside it (`EFAULT`). After `fork(2)` it is read through its address, so the process's own writes count. | `kqring_reg_wait_get` | `test_reg_wait`, `liburing/reg-wait`, `fuzz` |
+| `IORING_ENTER_NO_IOWAIT` | Equivalent | Accepted. **Platform:** FreeBSD doesn't count time waiting for I/O apart, so a wait never counts as such. | `kqring_ioc_enter_body` | `test_enter_abs_timer`, `liburing/iowait` |
+| Signal mask | Equivalent | Plain or in `io_uring_getevents_arg`, as `ppoll(2)`: the thread waits with it if the CQ can't satisfy the wait already, and its size is checked only then. A signal it lets in ends the wait with `EINTR`, or success if CQEs are posted, and is handled with the mask still in place. IOPOLL rings ignore it. **Platform:** the mask is a FreeBSD `sigset_t`, so its size is 16 (Linux's is 8). | `kqring_enter_wait_sig` | `test_enter_sigmask`, `test_reg_wait`, `liburing/reg-wait`, `fuzz` |
 
 ## SQE flags
 
@@ -179,13 +180,13 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_REGISTER_PBUF_STATUS` | Equivalent | | `kqring_pbuf_status` | `test_buffer_groups`, `liburing/ringbuf-status` |
 | `IORING_REGISTER_NAPI` | Partial | Sets only a busy-wait: a wait spins up to `busy_poll_to` µs. **Platform:** FreeBSD has no NAPI polling. | `kqring_register_napi` | `test_napi_busy_poll` |
 | `IORING_UNREGISTER_NAPI` | Partial | As `REGISTER_NAPI`. | `kqring_register_napi` | `test_napi_busy_poll` |
-| `IORING_REGISTER_CLOCK` | Partial | Recorded, with no effect, because timeouts are relative. Phase 3 gives it one. | `kqring_register_clock` | `test_fixed_file_ops` |
+| `IORING_REGISTER_CLOCK` | Equivalent | The clock of `IORING_ENTER_ABS_TIMER` deadlines. **Platform:** FreeBSD defines `CLOCK_BOOTTIME` as `CLOCK_MONOTONIC`, so there is one clock to choose. | `kqring_register_clock` | `test_fixed_file_ops`, `test_enter_abs_timer`, `liburing/wait-timeout` |
 | `IORING_REGISTER_CLONE_BUFFERS` | Partial | Both rings must have the same owner thread. | `kqring_bufs_clone` | `test_registered_buffers`, `test_registered_rings`, `liburing/regbuf-clone` |
 | `IORING_REGISTER_SEND_MSG_RING` | Equivalent | Works from any thread, or with no ring (descriptor -1). | `kqring_register_send_msg`, `kqring_register_blind` | `test_send_fd`, `test_compat_contracts`, `liburing/msg-ring` |
 | `IORING_REGISTER_RESIZE_RINGS` | Equivalent | On `DEFER_TASKRUN` rings, as on Linux. | `kqring_resize_rings` | `test_resize_rings`, `liburing/resize-rings`, `fuzz` |
 | `IORING_REGISTER_USE_REGISTERED_RING` | Equivalent | | `kqring_register_op` | `test_registered_rings`, `liburing/reg-reg-ring` |
 | `IORING_REGISTER_ZCRX_IFQ` | Unsupported | `EOPNOTSUPP`. **Platform:** needs driver support FreeBSD lacks. | `kqring_register_op` | `test_compat_contracts` |
-| `IORING_REGISTER_MEM_REGION` | Unsupported | `EOPNOTSUPP`. Phase 3. | `kqring_register_op` | `test_compat_contracts`, `liburing/reg-wait` |
+| `IORING_REGISTER_MEM_REGION` | Equivalent | One region per ring, the caller's pages (held, so they must be mapped writable) or the module's, mapped at the offset it returns. With `IORING_MEM_REGION_REG_WAIT_ARG` it holds registered waits, and needs a ring still disabled. The module's memory counts against `kern.kqring.user_ring_mem` (see Resource limits). | `kqring_register_mem_region` | `test_reg_wait`, `liburing/reg-wait`, `fuzz` |
 | `IORING_REGISTER_QUERY` | Unsupported | `EOPNOTSUPP`. | `kqring_register_op` | `test_compat_contracts` |
 | `IORING_REGISTER_ZCRX_CTRL` | Unsupported | `EOPNOTSUPP`. **Platform:** needs driver support FreeBSD lacks. | `kqring_register_op` | `test_compat_contracts` |
 | `IORING_REGISTER_BPF_FILTER` | Unsupported | `EOPNOTSUPP`. | `kqring_register_op` | `test_compat_contracts` |
@@ -206,7 +207,7 @@ These are the `IORING_FEAT_*` bits setup returns.
 | `IORING_FEAT_FAST_POLL` | Equivalent | | `kqring_op_attempt` | `test_send_armed`, `liburing/accept-link` |
 | `IORING_FEAT_POLL_32BITS` | Equivalent | | `kqring_req_prep` | `test_nonsock_poll` |
 | `IORING_FEAT_SQPOLL_NONFIXED` | Equivalent | | `kqring_sqpoll_thread` | `test_sqpoll_and_iopoll` |
-| `IORING_FEAT_EXT_ARG` | Partial | No signal mask; see `IORING_ENTER_EXT_ARG`. | `kqring_ioc_enter_body` | `test_enter_validation`, `liburing/timeout-new` |
+| `IORING_FEAT_EXT_ARG` | Equivalent | See `IORING_ENTER_EXT_ARG`. | `kqring_ioc_enter_body` | `test_enter_validation`, `test_enter_sigmask`, `liburing/timeout-new` |
 | `IORING_FEAT_NATIVE_WORKERS` | Equivalent | | `kqring_wq_enqueue` | `test_worker_process_lifecycle` |
 | `IORING_FEAT_RSRC_TAGS` | Equivalent | | `kqring_rsrc_put` | `test_rsrc_tags`, `liburing/rsrc_tags` |
 | `IORING_FEAT_CQE_SKIP` | Equivalent | | `kqring_req_complete` | `test_cqe_skip`, `liburing/skip-cqe` |
@@ -214,7 +215,7 @@ These are the `IORING_FEAT_*` bits setup returns.
 | `IORING_FEAT_REG_REG_RING` | Equivalent | | `kqring_register_op` | `test_registered_rings`, `liburing/reg-reg-ring` |
 | `IORING_FEAT_RECVSEND_BUNDLE` | Partial | Up to 32 buffers per CQE. | `kqring_exec_recv` | `liburing/recvsend_bundle`, `liburing/recvsend_bundle-inc` |
 | `IORING_FEAT_MIN_TIMEOUT` | Equivalent | | `kqring_ioc_enter_body` | `test_min_wait`, `liburing/min-timeout` |
-| `IORING_FEAT_NO_IOWAIT` | Unsupported | Not advertised. | `kqring_ioc_setup` | `gap` |
+| `IORING_FEAT_NO_IOWAIT` | Equivalent | See `IORING_ENTER_NO_IOWAIT`. | `kqring_ioc_setup` | `test_enter_abs_timer`, `liburing/iowait` |
 | `IORING_FEAT_RW_ATTR` | Unsupported | Not advertised. | `kqring_ioc_setup` | `gap` |
 
 ## Subflags
@@ -309,7 +310,8 @@ Everything marked `gap` above, plus limits of the tests themselves:
 
 - **A dropped completion.** Enters report one with `EOVERFLOW`, but the kernel keeps room for every completion still to come, so no test can make one happen.
 - **`vm.max_user_wired`.** Only `RLIMIT_MEMLOCK` is exercised.
-- **Features not advertised.** `IORING_FEAT_NO_IOWAIT` and `IORING_FEAT_RW_ATTR` are simply not set.
+- **Features not advertised.** `IORING_FEAT_RW_ATTR` is simply not set.
+- **Suspend.** No test suspends the machine, so how an `IORING_ENTER_ABS_TIMER` deadline or a wait's timeout behaves across a suspend is unchecked. `CLOCK_BOOTTIME` and `CLOCK_MONOTONIC` are the same clock on FreeBSD, so they can't differ there.
 - **`liburing/pipe-reuse` and `liburing/splice`** stop early, so the subtests after their first failure haven't run.
 
 `Equivalent` means no difference is known. Only the behaviour in [`tests/kqring_diff.c`](tests/kqring_diff.c) has been compared with a running Linux kernel. Some rows also rest on a test that covers more than the row names.

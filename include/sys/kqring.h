@@ -543,6 +543,9 @@ _Static_assert(sizeof(struct statx) == 256, "struct statx must be 256 bytes");
 #define IORING_ENTER_SQ_WAIT		(1U << 2)
 #define IORING_ENTER_EXT_ARG		(1U << 3)
 #define IORING_ENTER_REGISTERED_RING	(1U << 4)
+#define IORING_ENTER_ABS_TIMER		(1U << 5)
+#define IORING_ENTER_EXT_ARG_REG	(1U << 6)
+#define IORING_ENTER_NO_IOWAIT		(1U << 7)
 
 /*
  * Features reported in params->features
@@ -563,6 +566,8 @@ _Static_assert(sizeof(struct statx) == 256, "struct statx must be 256 bytes");
 #define IORING_FEAT_REG_REG_RING	(1U << 13)
 #define IORING_FEAT_RECVSEND_BUNDLE	(1U << 14)
 #define IORING_FEAT_MIN_TIMEOUT		(1U << 15)
+#define IORING_FEAT_RW_ATTR		(1U << 16)
+#define IORING_FEAT_NO_IOWAIT		(1U << 17)
 
 /*
  * io_uring_register() opcodes
@@ -601,6 +606,7 @@ enum {
 	IORING_REGISTER_CLONE_BUFFERS		= 30,
 	IORING_REGISTER_SEND_MSG_RING		= 31,
 	IORING_REGISTER_RESIZE_RINGS		= 33,
+	IORING_REGISTER_MEM_REGION		= 34,
 	IORING_REGISTER_LAST
 };
 
@@ -855,6 +861,56 @@ struct io_uring_getevents_arg {
 	__u32	sigmask_sz;
 	__u32	min_wait_usec;
 	__u64	ts;
+};
+
+/*
+ * IORING_REGISTER_MEM_REGION: memory shared with the kernel, either the
+ * caller's (IORING_MEM_REGION_TYPE_USER, at user_addr) or allocated by it
+ * and mapped at mmap_offset.  With IORING_MEM_REGION_REG_WAIT_ARG, which
+ * needs a ring still disabled (IORING_SETUP_R_DISABLED), it holds the
+ * io_uring_reg_wait arguments that IORING_ENTER_EXT_ARG_REG enters name by
+ * their offset.
+ */
+enum {
+	IORING_MEM_REGION_TYPE_USER		= 1,
+};
+
+struct io_uring_region_desc {
+	__u64	user_addr;
+	__u64	size;
+	__u32	flags;
+	__u32	id;
+	__u64	mmap_offset;
+	__u64	__resv[4];
+};
+
+enum {
+	IORING_MEM_REGION_REG_WAIT_ARG		= 1,
+};
+
+struct io_uring_mem_region_reg {
+	__u64	region_uptr;	/* struct io_uring_region_desc * */
+	__u64	flags;
+	__u64	__resv[2];
+};
+
+enum {
+	IORING_REG_WAIT_TS			= (1U << 0),
+};
+
+/*
+ * A registered wait: io_uring_enter(2)'s argument with
+ * IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG | IORING_ENTER_EXT_ARG_REG
+ * is its offset in the region.
+ */
+struct io_uring_reg_wait {
+	struct __kernel_timespec	ts;
+	__u32				min_wait_usec;
+	__u32				flags;
+	__u64				sigmask;
+	__u32				sigmask_sz;
+	__u32				pad[3];
+	__u64				pad2[2];
 };
 
 /*

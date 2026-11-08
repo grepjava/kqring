@@ -254,4 +254,69 @@ eventfd/again -EBUSY
 eventfd/cqe ud=1 res=0 flags=-
 eventfd/signalled 1
 eventfd/unregister 0
+sigmask/plain_unblocks -EINTR
+sigmask/plain_hits 1
+sigmask/plain_blocked_after 1
+sigmask/ext_unblocks -EINTR
+sigmask/ext_hits 2
+sigmask/with_cqe 0
+sigmask/with_cqe_hits 3
+sigmask/cqe ud=1 res=0 flags=-
+sigmask/bad_size_ready 1
+sigmask/cqe ud=2 res=0 flags=-
+sigmask/bad_size_wait -EINVAL
+sigmask/ext_bad_size -EINVAL
+sigmask/ext_fault -EFAULT
+sigmask/bad_hits 3
+sigmask/blocks -ETIME
+sigmask/blocks_full_wait 1
+sigmask/blocks_hits 4
+sigmask/blocks_unblocked_after 1
+sigmask/all_ready 1
+sigmask/cqe ud=3 res=0 flags=-
+sigmask/all_unblocked_after 1
+abs_timer/feat_no_iowait 0
+abs_timer/abs_100ms -ETIME
+abs_timer/abs_100ms_waited 1
+abs_timer/abs_past -ETIME
+abs_timer/abs_past_at_once 1
+abs_timer/no_iowait 1
+abs_timer/cqe ud=1 res=0 flags=-
+reg_wait/no_args -EINVAL
+reg_wait/kernel_with_addr -EFAULT
+reg_wait/user_no_addr -EFAULT
+reg_wait/size_0 -EINVAL
+reg_wait/misaligned -EINVAL
+reg_wait/read_only -EFAULT
+reg_wait/bad_flags -EINVAL
+reg_wait/user 0
+reg_wait/user_mmap_offset 0
+reg_wait/again -EBUSY
+reg_wait/enable 0
+reg_wait/wait_first -ETIME
+reg_wait/wait_first_100ms 1
+reg_wait/wait_last -ETIME
+reg_wait/wait_past_end -EFAULT
+reg_wait/wait_straddles -EFAULT
+reg_wait/wait_wraps -EFAULT
+reg_wait/wait_unaligned -EFAULT
+reg_wait/wait_argsz -EINVAL
+reg_wait/wait_bad_flags -EINVAL
+reg_wait/wait_sigmask_size -EINVAL
+reg_wait/wait_sigmask_fault -EFAULT
+reg_wait/wait_nop 1
+reg_wait/cqe ud=1 res=0 flags=-
+reg_wait/after_fork -ETIME
+reg_wait/after_fork_reads_new 1
+reg_wait/kernel 0
+reg_wait/kernel_mmap_offset 0x20000000
+reg_wait/kernel_mapped 1
+reg_wait/kernel_enable 0
+reg_wait/kernel_wait -ETIME
+reg_wait/enabled_wait_arg -EINVAL
+reg_wait/enabled_plain 0
+reg_wait/enabled_wait -EFAULT
+ext_arg_order/bad_argsz -EINVAL
+ext_arg_order/submitted 0
+ext_arg_order/cqe ud=1 res=0 flags=-
 # end

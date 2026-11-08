@@ -10,7 +10,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 |---|---|---|
 | 1 | Ordering and poll timing | Done |
 | 2 | Make compatibility measurable | Done |
-| 3 | Wait semantics | Not started |
+| 3 | Wait semantics | Done |
 | 4 | Per-file write ordering | Not started |
 | 5 | Worker path scalability | Not started |
 | 6 | Performance evidence | Not started |
@@ -22,13 +22,13 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 
 FreeBSD-native extensions add persistent event-driven chains, result and buffer forwarding between steps, native kevent requests and a kqueue bridge. These stay an opt-in interface alongside the Linux-compatible API.
 
-The liburing 2.15 port passes 209 of the 245 tests it builds, with `RLIMIT_MEMLOCK` raised. That isn't a compatibility percentage:
+The liburing 2.15 port passes 210 of the 245 tests it builds, with `RLIMIT_MEMLOCK` raised. That isn't a compatibility percentage:
 
 - 13 more tests can't be built here, each for a recorded reason.
-- The port carries portability shims and adapts some tests, 27 tests skip, and 8 of the 9 failures are intentional differences or the platform's.
+- The port carries portability shims and adapts some tests, 27 tests skip, and the 8 failures are intentional differences or the platform's.
 - A test stops at its first failure, so the subtests after it haven't run.
 
-The probe also can't speak for every variant of an operation. `SYNC_FILE_RANGE` syncs the whole file, `URING_CMD` supports four socket commands only, and `IORING_REGISTER_CLOCK` is recorded but has no effect.
+The probe also can't speak for every variant of an operation. `SYNC_FILE_RANGE` syncs the whole file, and `URING_CMD` supports four socket commands only.
 
 ## Phase 1: Ordering and poll timing
 
@@ -49,7 +49,7 @@ Acceptance: every liburing test is passing, skipped, failing with a documented r
 
 ### Versioned compatibility matrix
 
-**Done.** [`COMPATIBILITY.MD`](COMPATIBILITY.MD) lists all 215 capabilities against Linux 7.3 and liburing 2.15, and [`tests/compat_check.py`](tests/compat_check.py) fails if it stops matching the source. Its [validation gaps](COMPATIBILITY.MD#validation-gaps) list what is still unchecked.
+**Done.** [`COMPATIBILITY.MD`](COMPATIBILITY.MD) lists all 216 capabilities against Linux 7.3 and liburing 2.15, and [`tests/compat_check.py`](tests/compat_check.py) fails if it stops matching the source. Its [validation gaps](COMPATIBILITY.MD#validation-gaps) list what is still unchecked.
 
 Document every supported opcode, setup flag, enter flag, registration and important subflag against a stated Linux kernel and liburing baseline. Classify each as equivalent, partial, unsupported or intentionally different, and record platform and filesystem dependencies separately from limits of the module.
 
@@ -67,7 +67,7 @@ Acceptance: every advertised capability has a documented contract, a source refe
 
 ### Differential conformance
 
-**Done.** [`tests/kqring_diff.c`](tests/kqring_diff.c) has 21 cases that build and run on both systems, and [`tests/diff_compare.py`](tests/diff_compare.py) compares their output. On Linux 7.3 and kqring, 16 match and 5 differ on purpose, with the reasons in [`tests/diff_expected.txt`](tests/diff_expected.txt). The raw results and what they ran on are in [`docs/conformance/`](docs/conformance/README.md). The runs found `execve(2)` hanging on a ring with a kernel thread, and six differences that are now fixed: short transfers in links, `CANCEL_ALL` with nothing to cancel, `IORING_POLL_ADD_LEVEL`, a refused `FILES_UPDATE`, another thread's enter on a `SINGLE_ISSUER` ring, and which setup flags go together.
+**Done.** [`tests/kqring_diff.c`](tests/kqring_diff.c) has 25 cases that build and run on both systems, and [`tests/diff_compare.py`](tests/diff_compare.py) compares their output. On Linux 7.3 and kqring, 19 match and 6 differ on purpose, with the reasons in [`tests/diff_expected.txt`](tests/diff_expected.txt). The raw results and what they ran on are in [`docs/conformance/`](docs/conformance/README.md). The runs found `execve(2)` hanging on a ring with a kernel thread, and six differences that are now fixed: short transfers in links, `CANCEL_ALL` with nothing to cancel, `IORING_POLL_ADD_LEVEL`, a refused `FILES_UPDATE`, another thread's enter on a `SINGLE_ISSUER` ring, and which setup flags go together.
 
 Run matched cases on Linux io_uring and on kqring, normalizing native constants and errors while keeping meaningful differences. Exercise cancellation, links, timeouts, buffer lifetime, CQ overflow, resource updates, fork and exec, fixed descriptors and several submitter threads. The test machine also boots Linux, so both sides can run on the same hardware.
 
@@ -75,13 +75,17 @@ Acceptance: kernel versions, commits, build options, filesystem, resource limits
 
 ## Phase 3: Wait semantics
 
-This is the largest gap the review found in the existing liburing interface. Today `kqring_enter()` rejects a signal mask in both forms with `EINVAL`, timeouts are always relative, and `IORING_ENTER_ABS_TIMER`, `IORING_ENTER_EXT_ARG_REG` and `IORING_REGISTER_MEM_REGION` don't exist.
+This was the largest gap the review found in the existing liburing interface: `kqring_enter()` rejected a signal mask in both forms with `EINVAL`, timeouts were always relative, and `IORING_ENTER_ABS_TIMER`, `IORING_ENTER_EXT_ARG_REG` and `IORING_REGISTER_MEM_REGION` didn't exist.
 
-In order:
+1. **Done:** signal masks, in the plain form and through `IORING_ENTER_EXT_ARG`. As in Linux, the thread waits with the mask only if it will sleep, and the size is checked only then. A signal it lets in ends the wait and is handled with the mask still in place, and a wait a signal ends succeeds if there are CQEs. The mask is FreeBSD's `sigset_t`, 16 bytes where Linux's is 8.
+2. **Done:** absolute deadlines (`IORING_ENTER_ABS_TIMER`) on the clock `IORING_REGISTER_CLOCK` chooses. FreeBSD defines `CLOCK_BOOTTIME` as `CLOCK_MONOTONIC`, so the choice can't change a deadline here.
+3. **Done:** registered waits, in a region of the program's memory or the module's (`IORING_REGISTER_MEM_REGION`), with Linux's checks of the region and of each wait's offset. liburing's `reg-wait` passes, and `wait-timeout` now runs its absolute-deadline and clock parts.
 
-1. Signal masks, in the plain form and through `IORING_ENTER_EXT_ARG`.
-2. Absolute deadlines (`IORING_ENTER_ABS_TIMER`), and giving `IORING_REGISTER_CLOCK` an effect.
-3. Registered waits, which need `IORING_REGISTER_MEM_REGION`, and `io_uring_register_wait_reg()` with `reg-wait` built and running.
+`IORING_ENTER_NO_IOWAIT` came with them: it is accepted and advertised, and changes nothing, because FreeBSD doesn't count time waiting for I/O apart.
+
+`tests/kqring_test.c` covers interruption, timeout expiry, repeated registered waits, both clocks, invalid arguments, a region read after `fork(2)`, and the module's region outliving its ring. `tests/kqring_diff.c` compares signal masks, absolute deadlines and registered waits with Linux 7.3, and they match. One difference remains, and it is older than this phase: kqring checks a wait's argument before it submits anything, where Linux submits first, so a bad argument fails the whole enter. The matrix lists it under `IORING_ENTER_EXT_ARG`. The fuzzer waits with masks, deadlines and registered waits, and its leak check covers the regions' memory at teardown.
+
+Not covered: suspend. The test machine isn't suspended during runs, so no test shows how a deadline behaves across one. Both clocks are the same one on FreeBSD, so they can't differ there, but whether it counts the time suspended isn't checked. The matrix lists this as a validation gap.
 
 Acceptance: conformance tests for interruption, timeout expiry, repeated registered waits, clock choice, suspend behavior, invalid arguments and teardown. Whatever differs afterwards stays visible in the matrix.
 

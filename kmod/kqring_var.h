@@ -213,11 +213,15 @@ MALLOC_DECLARE(M_SELFD);
 	IORING_SETUP_NO_MMAP | IORING_SETUP_REGISTERED_FD_ONLY |	\
 	IORING_SETUP_NO_SQARRAY)
 
+/* mmap(2) offset of a module-allocated IORING_REGISTER_MEM_REGION. */
+#define	KQRING_OFF_PARAM_REGION	0x20000000ULL
+
 /* KQRING_IOC_ENTER flags implemented. */
 #define	KQRING_ENTER_FLAGS						\
 	(IORING_ENTER_GETEVENTS | IORING_ENTER_SQ_WAKEUP |		\
 	IORING_ENTER_SQ_WAIT | IORING_ENTER_EXT_ARG |			\
-	IORING_ENTER_REGISTERED_RING)
+	IORING_ENTER_REGISTERED_RING | IORING_ENTER_ABS_TIMER |		\
+	IORING_ENTER_EXT_ARG_REG | IORING_ENTER_NO_IOWAIT)
 
 #define	KQRING_MAX_REG_RINGS	16U
 #define	KQRING_PROC_HASH	64
@@ -852,6 +856,22 @@ struct kqring_ctx {
 	struct kqring_restrictions rst;
 	bool			restricted;	/* rst in force */
 	uint32_t		clockid;	/* IORING_REGISTER_CLOCK */
+	/*
+	 * IORING_REGISTER_MEM_REGION, set once (under sq_sx) and freed with
+	 * the ring: the caller's pages held (region_pages, read through
+	 * region_uaddr after a fork, as provided buffer rings are) or the
+	 * module's (region_obj, mapped at KQRING_OFF_PARAM_REGION).
+	 * cq_wait_size is its size if it holds registered waits, which
+	 * needs a ring still disabled, so no enter sees it change.
+	 */
+	vm_object_t		region_obj;
+	vm_page_t		*region_pages;
+	vm_offset_t		region_kva;
+	size_t			region_len;
+	uint64_t		region_uaddr;
+	uint32_t		region_cow_gen;
+	struct uidinfo		*region_uip;
+	size_t			cq_wait_size;
 	/* IORING_REGISTER_NAPI: busy-wait before sleeping (0: never) */
 	sbintime_t		busy_poll_sbt;
 	uint32_t		busy_poll_us;
@@ -1395,6 +1415,9 @@ int	kqring_reg_ring_fget(struct thread *td, uint32_t slot, bool is_enter,
 int	kqring_alloc_shm(size_t bytes, vm_object_t *obj_out,
 	    vm_offset_t *kva_out, size_t *alloc_len_out);
 void	kqring_free_shm(vm_object_t obj, vm_offset_t kva, size_t alloc_len);
+void	kqring_region_free(struct kqring_ctx *ctx);
+int	kqring_reg_wait_get(struct kqring_ctx *ctx, uint64_t off,
+	    struct io_uring_reg_wait *w);
 int	kqring_mem_charge(struct ucred *cred, size_t bytes, bool user_wired,
 	    struct uidinfo **uipp);
 void	kqring_mem_uncharge(struct uidinfo *uip, size_t bytes,

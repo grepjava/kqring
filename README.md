@@ -101,7 +101,7 @@ It also has [extensions](#kqring-extensions) of its own: event-driven chains, re
 
 ![liburing's own tests on kqring](docs/bench/liburing.svg)
 
-Of the 9 failures, 6 come from Linux-only assumptions in the tests, 2 are deliberate differences, and 1 needs registered waits, which aren't implemented yet. [`liburing/README.md`](liburing/README.md) explains each one.
+Of the 8 failures, 6 come from Linux-only assumptions in the tests and 2 are deliberate differences. [`liburing/README.md`](liburing/README.md) explains each one.
 
 | How it's tested | Result on `v0.3.0` |
 |---|---|
@@ -314,7 +314,8 @@ See [docs/event-chains-spec.md](docs/event-chains-spec.md) for the interface.
 **Threading and signals**
 - **One process per ring.** Workers look files up in the owner's descriptor table and run with its credentials, so a forked child that inherits a ring can't submit to it, wait on it or register with it (`EEXIST`); on Linux it can. It can still wake an `SQPOLL` thread with `IORING_ENTER_SQ_WAKEUP`. With `SINGLE_ISSUER`, only the owner thread may submit or register, as on Linux, and a wait by another thread fails with `EEXIST` unless the CQ can already satisfy it, where Linux waits. Before `IORING_REGISTER_ENABLE_RINGS`, one thread at a time may register. `PROBE` and `SEND_MSG_RING` work from any thread.
 - **Ring descriptors can't be passed over UNIX sockets.** `sendmsg(2)` with `SCM_RIGHTS` fails with `EOPNOTSUPP` (Linux 6.7 and later refuse with `EINVAL`), so a ring can't end up in flight on a socket held in its own fixed-file table. A child still inherits a ring across `fork(2)`.
-- **No signal masks.** `kqring_enter()` rejects a signal mask, both the plain form and `struct io_uring_getevents_arg.sigmask` with `IORING_ENTER_EXT_ARG`, with `EINVAL`. Timeouts and `min_wait_usec` (`IORING_FEAT_MIN_TIMEOUT`) through `IORING_ENTER_EXT_ARG` work.
+- **Signal masks are FreeBSD's `sigset_t`.** A wait's signal mask, plain, in `io_uring_getevents_arg` or in a registered wait, is 16 bytes where Linux's is 8, so its size must be `sizeof(sigset_t)`. liburing's `_NSIG / 8` gives that on FreeBSD.
+- **One clock.** FreeBSD defines `CLOCK_BOOTTIME` as `CLOCK_MONOTONIC`, so `IORING_REGISTER_CLOCK` takes either and `IORING_ENTER_ABS_TIMER` deadlines are times of that one clock.
 - **`SIGPIPE`** is never raised.
 
 **Values and formats**

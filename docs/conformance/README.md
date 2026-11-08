@@ -6,7 +6,7 @@ Raw output of [`tests/kqring_diff.c`](../../tests/kqring_diff.c) on Linux and on
 python3 tests/diff_compare.py docs/conformance/linux.out docs/conformance/kqring.out
 ```
 
-Each file repeated exactly over three runs. Of 21 cases, 16 match and 5 differ on purpose, with the reasons in [`tests/diff_expected.txt`](../../tests/diff_expected.txt).
+Each file repeated exactly over three runs. Of 25 cases, 19 match and 6 differ on purpose, with the reasons in [`tests/diff_expected.txt`](../../tests/diff_expected.txt).
 
 | | Linux | kqring |
 |---|---|---|

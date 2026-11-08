@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" class="viz" width="760" height="230" viewBox="0 0 760 230" role="img" aria-label="liburing&#x27;s own tests on kqring: 209 of 245 pass">
-<title>liburing&#x27;s own tests on kqring: 209 of 245 pass</title>
+<svg xmlns="http://www.w3.org/2000/svg" class="viz" width="760" height="210" viewBox="0 0 760 210" role="img" aria-label="liburing&#x27;s own tests on kqring: 210 of 245 pass">
+<title>liburing&#x27;s own tests on kqring: 210 of 245 pass</title>
 
 <style>
   .viz { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
@@ -22,22 +22,19 @@
   .axis { stroke: var(--axis); stroke-width: 1; }
 </style>
 
-<rect width="760" height="230" rx="8" fill="var(--surface)"/>
-<text x="20" y="28" class="title">liburing&#x27;s own tests on kqring: 209 of 245 pass</text>
+<rect width="760" height="210" rx="8" fill="var(--surface)"/>
+<text x="20" y="28" class="title">liburing&#x27;s own tests on kqring: 210 of 245 pass</text>
 <text x="20" y="48" class="sub">liburing 2.15, RLIMIT_MEMLOCK raised; every failure is explained in liburing/README.md</text>
-<rect x="20.0" y="66" width="612.2" height="26" rx="4" fill="var(--s1)"><title>passed: 209</title></rect>
-<rect x="634.2" y="66" width="77.3" height="26" rx="4" fill="var(--plain)"><title>skipped: the test found a feature missing and said so: 27</title></rect>
-<rect x="713.6" y="66" width="15.6" height="26" rx="4" fill="var(--s3)"><title>failed: not kqring&#x27;s (Linux-only assumptions in the test): 6</title></rect>
-<rect x="731.2" y="66" width="3.9" height="26" rx="4" fill="var(--kqueue)"><title>failed: differences in kqring: 2</title></rect>
-<rect x="737.1" y="66" width="1.0" height="26" rx="4" fill="var(--s4)"><title>failed: not implemented yet: 1</title></rect>
+<rect x="20.0" y="66" width="615.1" height="26" rx="4" fill="var(--s1)"><title>passed: 210</title></rect>
+<rect x="637.1" y="66" width="77.3" height="26" rx="4" fill="var(--plain)"><title>skipped: the test found a feature missing and said so: 27</title></rect>
+<rect x="716.5" y="66" width="15.6" height="26" rx="4" fill="var(--s3)"><title>failed: not kqring&#x27;s (Linux-only assumptions in the test): 6</title></rect>
+<rect x="734.1" y="66" width="3.9" height="26" rx="4" fill="var(--kqueue)"><title>failed: differences in kqring: 2</title></rect>
 <rect x="20" y="108" width="10" height="10" rx="2" fill="var(--s1)"/>
-<text x="36" y="118" class="lab">209  passed</text>
+<text x="36" y="118" class="lab">210  passed</text>
 <rect x="20" y="128" width="10" height="10" rx="2" fill="var(--plain)"/>
 <text x="36" y="138" class="lab">27  skipped: the test found a feature missing and said so</text>
 <rect x="20" y="148" width="10" height="10" rx="2" fill="var(--s3)"/>
 <text x="36" y="158" class="lab">6  failed: not kqring&#x27;s (Linux-only assumptions in the test)</text>
 <rect x="20" y="168" width="10" height="10" rx="2" fill="var(--kqueue)"/>
 <text x="36" y="178" class="lab">2  failed: differences in kqring</text>
-<rect x="20" y="188" width="10" height="10" rx="2" fill="var(--s4)"/>
-<text x="36" y="198" class="lab">1  failed: not implemented yet</text>
 </svg>

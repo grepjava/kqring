@@ -525,6 +525,7 @@ kqring_ctx_free_final(struct kqring_ctx *ctx)
 	kqring_kpoll_close(ctx);
 	kqring_files_free(ctx);
 	kqring_bufs_free(ctx);
+	kqring_region_free(ctx);
 	for (int i = 0; i < KQRING_BGROUP_HASH; i++) {
 		struct kqring_bgroup *bg;
 
@@ -1091,7 +1092,8 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	    IORING_FEAT_CQE_SKIP | IORING_FEAT_LINKED_FILE |
 	    IORING_FEAT_NATIVE_WORKERS | IORING_FEAT_CUR_PERSONALITY |
 	    IORING_FEAT_RSRC_TAGS | IORING_FEAT_REG_REG_RING |
-	    IORING_FEAT_RECVSEND_BUNDLE | IORING_FEAT_MIN_TIMEOUT;
+	    IORING_FEAT_RECVSEND_BUNDLE | IORING_FEAT_MIN_TIMEOUT |
+	    IORING_FEAT_NO_IOWAIT;
 
 	kqring_ring_offsets(p.flags, sq_entries, cq_entries, &l, &p);
 
@@ -1284,8 +1286,82 @@ kqring_enter_wait(struct kqring_ctx *ctx, uint32_t min_complete,
 	    kqring_wait_cqes(ctx, 1, has_timeout, sbt, lock));
 }
 
+/*
+ * The wait with io_uring_enter(2)'s signal mask, as io_cqring_wait() and
+ * ppoll(2) do it: if the CQ doesn't already hold min_complete CQEs, the
+ * thread waits with usig as its mask (whose size is checked only then, as
+ * in Linux).  A wait a signal ends leaves it for ast() to restore after the
+ * handler has run; any other ends here.  IOPOLL rings ignore the mask, as
+ * io_iopoll_check() does.
+ */
+static int
+kqring_enter_wait_sig(struct kqring_ctx *ctx, uint32_t min_complete,
+    bool has_timeout, sbintime_t sbt, sbintime_t min_sbt, bool lock,
+    const void *usig, size_t sigsz, bool abs)
+{
+	struct kqring_shm_header *shm = ctx->shm;
+	struct thread *td = curthread;
+	sigset_t set;
+	int error;
+
+	/*
+	 * IORING_ENTER_ABS_TIMER: sbt is a time of the ring's clock.  Both
+	 * clocks IORING_REGISTER_CLOCK takes are the uptime here (FreeBSD
+	 * defines CLOCK_BOOTTIME as CLOCK_MONOTONIC), so the wait is what is
+	 * left until then.
+	 */
+	if (has_timeout && abs)
+		sbt = kqring_until(sbt);
+	if (usig == NULL || (ctx->flags & IORING_SETUP_IOPOLL) != 0 ||
+	    atomic_load_acq_32(&shm->cq_tail) -
+	    atomic_load_acq_32(&shm->cq_head) >= min_complete ||
+	    !KQRING_STQ_EMPTY_HINT(&ctx->ocq)) {
+		error = kqring_enter_wait(ctx, min_complete, has_timeout, sbt,
+		    min_sbt, lock);
+	} else {
+		if (sigsz != sizeof(set))
+			return (EINVAL);
+		if ((error = copyin(usig, &set, sizeof(set))) != 0)
+			return (error);
+		error = kern_sigprocmask(td, SIG_SETMASK, &set,
+		    &td->td_oldsigmask, 0);
+		if (error != 0)
+			return (error);
+		td->td_pflags |= TDP_OLDMASK;
+		error = kqring_enter_wait(ctx, min_complete, has_timeout, sbt,
+		    min_sbt, lock);
+		if (error == EINTR) {
+			ast_sched(td, TDA_SIGSUSPEND);
+		} else {
+			td->td_pflags &= ~TDP_OLDMASK;
+			kern_sigprocmask(td, SIG_SETMASK, &td->td_oldsigmask,
+			    NULL, 0);
+		}
+	}
+	/* A wait a signal ends with CQEs posted succeeds, as in io_uring. */
+	if (error == EINTR && atomic_load_acq_32(&shm->cq_tail) !=
+	    atomic_load_acq_32(&shm->cq_head))
+		error = 0;
+	return (error);
+}
+
 static int kqring_ioc_enter_body(struct kqring_ctx *ctx,
     struct kqring_enter_arg *ea, struct thread *td);
+
+/*
+ * An enter's timeout as sbintime_t: a duration, at least 1 if nonzero, or
+ * with IORING_ENTER_ABS_TIMER a time (kqring_enter_wait_sig()).
+ */
+static sbintime_t
+kqring_wait_ts_sbt(const struct timespec *ts, uint32_t flags)
+{
+	sbintime_t sbt = kqring_ts_to_sbt(ts);
+
+	if (sbt == 0 && (ts->tv_sec > 0 || ts->tv_nsec > 0) &&
+	    (flags & IORING_ENTER_ABS_TIMER) == 0)
+		sbt = 1;
+	return (sbt);
+}
 
 /*
  * An enter, then, if it woke pollers of the ring, their completions on
@@ -1317,6 +1393,8 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	bool iopoll = (ctx->flags & IORING_SETUP_IOPOLL) != 0;
 	bool lock = kqring_enter_locks(ctx, td);
 	bool wait;
+	const void *usig = NULL;
+	size_t sigsz = 0;
 	int error = 0;
 
 	if (!ctx->setup_done || !ctx->enabled || ctx->closing)
@@ -1328,8 +1406,10 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	    IORING_ENTER_SQ_WAIT)) != 0)
 		return (EINVAL);
 	/* Without EXT_ARG, io_uring_enter(2)'s arg is a sigmask. */
-	if ((ea->flags & IORING_ENTER_EXT_ARG) == 0 && ea->arg != NULL)
-		return (EINVAL);
+	if ((ea->flags & IORING_ENTER_EXT_ARG) == 0) {
+		usig = ea->arg;
+		sigsz = ea->argsz;
+	}
 
 	wait = (ea->flags & IORING_ENTER_GETEVENTS) != 0 &&
 	    (ea->min_complete != 0 || iopoll);
@@ -1360,25 +1440,48 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	 * any SQE, so that a bad argument fails the call without losing
 	 * submissions.
 	 */
-	if ((ea->flags & IORING_ENTER_EXT_ARG) != 0 && ea->arg != NULL) {
+	if ((ea->flags & (IORING_ENTER_EXT_ARG | IORING_ENTER_EXT_ARG_REG)) ==
+	    (IORING_ENTER_EXT_ARG | IORING_ENTER_EXT_ARG_REG)) {
+		/* A registered wait: arg is its offset in the region. */
+		struct io_uring_reg_wait w;
+
+		if (iopoll || ea->argsz != sizeof(w))
+			return (EINVAL);
+		error = kqring_reg_wait_get(ctx, (uintptr_t)ea->arg, &w);
+		if (error != 0)
+			return (error);
+		if ((w.flags & ~(uint32_t)IORING_REG_WAIT_TS) != 0)
+			return (EINVAL);
+		usig = (const void *)(uintptr_t)w.sigmask;
+		sigsz = w.sigmask_sz;
+		min_sbt = (sbintime_t)w.min_wait_usec * SBT_1US;
+		if (wait && (w.flags & IORING_REG_WAIT_TS) != 0) {
+			struct timespec ts;
+
+			if (w.ts.tv_sec < 0 || w.ts.tv_nsec < 0 ||
+			    w.ts.tv_nsec >= 1000000000LL)
+				return (EINVAL);
+			ts.tv_sec = w.ts.tv_sec;
+			ts.tv_nsec = (long)w.ts.tv_nsec;
+			sbt = kqring_wait_ts_sbt(&ts, ea->flags);
+			has_timeout = true;
+		}
+	} else if ((ea->flags & IORING_ENTER_EXT_ARG) != 0 && ea->arg != NULL) {
 		struct io_uring_getevents_arg ext;
 		if (ea->argsz != sizeof(ext))
 			return (EINVAL);
 		error = copyin(ea->arg, &ext, sizeof(ext));
 		if (error != 0)
 			return (error);
-		/* Signal masks are not implemented: reject, not ignore. */
-		if (ext.sigmask != 0)
-			return (EINVAL);
+		usig = (const void *)(uintptr_t)ext.sigmask;
+		sigsz = ext.sigmask_sz;
 		min_sbt = (sbintime_t)ext.min_wait_usec * SBT_1US;
 		if (wait && ext.ts != 0) {
 			struct timespec ts;
 			error = kqring_copyin_ts(ext.ts, &ts);
 			if (error != 0)
 				return (error);
-			sbt = kqring_ts_to_sbt(&ts);
-			if (sbt == 0 && (ts.tv_sec > 0 || ts.tv_nsec > 0))
-				sbt = 1;
+			sbt = kqring_wait_ts_sbt(&ts, ea->flags);
 			has_timeout = true;
 		}
 	}
@@ -1422,8 +1525,9 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 		}
 		if (!wait || ea->min_complete == 0)
 			return (0);
-		return (kqring_enter_wait(ctx, ea->min_complete, has_timeout,
-		    sbt, min_sbt, false));
+		return (kqring_enter_wait_sig(ctx, ea->min_complete,
+		    has_timeout, sbt, min_sbt, false, usig, sigsz,
+		    (ea->flags & IORING_ENTER_ABS_TIMER) != 0));
 	}
 
 	/*
@@ -1486,8 +1590,9 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	 * then times out or is interrupted: an ioctl error would make
 	 * sys_ioctl() skip copying SUBMITTED_out back to userspace.
 	 */
-	error = kqring_enter_wait(ctx, ea->min_complete, has_timeout, sbt,
-	    min_sbt, lock);
+	error = kqring_enter_wait_sig(ctx, ea->min_complete, has_timeout, sbt,
+	    min_sbt, lock, usig, sigsz,
+	    (ea->flags & IORING_ENTER_ABS_TIMER) != 0);
 	kqring_evfd_flush(ctx);
 	if (error != 0 && submitted > 0)
 		error = 0;
@@ -2278,6 +2383,19 @@ kqring_mmap_object(struct kqring_ctx *ctx, vm_ooffset_t *offset,
 			/* The mapping's own reference outlives unregister. */
 			vm_object_reference(bg->ring_obj);
 			*object = bg->ring_obj;
+			*offset = 0;
+			error = 0;
+		}
+		mtx_unlock(&ctx->mtx);
+		return (error);
+	}
+	if ((*offset & IORING_OFF_MMAP_MASK) == KQRING_OFF_PARAM_REGION) {
+		/* A module-allocated region; the caller's isn't mapped. */
+		error = EINVAL;
+		mtx_lock(&ctx->mtx);
+		if (ctx->region_obj != NULL && size <= ctx->region_len) {
+			vm_object_reference(ctx->region_obj);
+			*object = ctx->region_obj;
 			*offset = 0;
 			error = 0;
 		}
