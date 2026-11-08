@@ -457,7 +457,7 @@ The direct bio path scales until the 4 cores run out, while aio falls back. Thro
 ## Known gaps
 
 - **A pipe read that has to wait goes through a worker thread**, as does a write to a full pipe. Waiting for data with `POLL_ADD` first avoids the worker.
-- **Buffered writes to a file wait for their worker.** That keeps writes to one file in order, as io-wq's per-inode hashing does, but the issuer waits too, where io-wq's hashing wouldn't make it. So do `O_DIRECT` writes that use the file position, `O_APPEND` or per-write flags such as `RWF_DSYNC`.
+- **Writes to one file run one at a time.** Since phase 4 they keep their order by a bucket of the file, as io-wq's per-inode hashing does, and the issuer no longer waits for them; see [docs/write-ordering.md](docs/write-ordering.md), which measured no change in throughput or CPU on this machine. The tables above predate it.
 - **Page-cache misses, and filesystems without the page-cache read path, go through a worker.** This covers file reads that need the disk, ZFS, `O_DIRECT` on files, and reads using the file position (`off` = −1). Only disk devices themselves get the direct bio path: FreeBSD filesystems have no asynchronous read or write entry point. It also covers reads into a buffer that isn't mapped yet.
 - **Past 4 jobs on cached data, `psync` beats the worker path.** Workers top out near 530,000 IOPS on this machine, because each request is handed to another thread.
 - **One operation per enter costs a little more than an empty `kevent`.** That's the `NOP` floor: parsing an SQE and posting a CQE. Batching removes it.

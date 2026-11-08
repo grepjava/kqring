@@ -518,8 +518,8 @@ kqring_timeout_fire(struct kqring_ctx *ctx, struct kqring_op *op)
 		mtx_lock(&ctx->mtx);
 		target->ltimeout = NULL;
 		op->ltarget = NULL;
-		if (target->bio) {
-			/* Disk I/O in flight cannot be cancelled. */
+		if (kqring_op_cancel_busy_locked(ctx, target)) {
+			/* Disk or file I/O in flight cannot be cancelled. */
 			mtx_unlock(&ctx->mtx);
 			kqring_req_complete(ctx, op, -EALREADY, 0);
 			return;
@@ -700,8 +700,8 @@ kqring_cancel(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
 		TAILQ_FOREACH(op, &ctx->active_ops, active_link) {
 			if (!kqring_cancel_match(op, sqe, cfp))
 				continue;
-			/* Disk I/O in flight cannot be cancelled. */
-			if (op->bio) {
+			/* Disk or file I/O in flight cannot be cancelled. */
+			if (kqring_op_cancel_busy_locked(ctx, op)) {
 				running = true;
 				continue;
 			}
@@ -759,8 +759,8 @@ kqring_cancel_wait(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe,
 		}
 		if (op == NULL) {
 			TAILQ_FOREACH(op, &ctx->active_ops, active_link) {
-				if (op->bio && kqring_cancel_match_req(op, sqe,
-				    cfp))
+				if (kqring_op_in_flight(op) &&
+				    kqring_cancel_match_req(op, sqe, cfp))
 					break;
 			}
 		}

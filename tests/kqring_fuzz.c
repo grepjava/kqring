@@ -39,6 +39,11 @@
  *  - a CQ ring that holds more entries than it has room for;
  *  - SIGBUS or SIGSEGV in the fuzzer, which says where and dies;
  *  - its log descriptors no longer being its log, which would hide the rest;
+ *  - writes to a file out of order: each thread appends bursts of numbered
+ *    records to a file of its own (not on IOPOLL rings, not behind a link,
+ *    not on rings whose SQ array it scrambles),
+ *    and once every ring is gone, a ring's records must be whole and in the
+ *    order it submitted them (cancelled ones may be missing);
  *  - kqring memory, user-wired pages or sockets nothing refers to still
  *    held once everything is closed.
  *
@@ -92,6 +97,7 @@
 #define NOPS		256		/* opcode and addr per user_data slot */
 #define OP_ECHO		0xfd		/* in ops[]: a step sending a passed buffer */
 #define OP_PIPERD	0xfc		/* in ops[]: a read of a pipe burst */
+#define OP_ORDW		0xfb		/* in ops[]: an ordered write, addr seq */
 #define HANG_NS		(30ULL * 1000000000ULL)
 #define KICK_NS		(2ULL * 1000000000ULL)
 #define REG_RINGS	16
@@ -170,6 +176,15 @@ struct fz {
 	bool		tmpl_echo;	/* they are a buffer-passing pair */
 	int		echo_fd;	/* on this socket */
 	unsigned	pipe_left;	/* reads of a burst still due */
+	int		ord_fd;		/* O_APPEND file of numbered records */
+	char		*ord_buf;	/* the records, each written once */
+	struct ord_meta	*ord_meta;	/* how each was submitted */
+	uint32_t	ord_seq;	/* next record */
+	uint32_t	ord_gen;	/* the current ring's number */
+	unsigned	ord_left;	/* writes of a burst still due */
+	bool		sq_chaos;	/* this ring's SQ array gets random slots */
+	uint32_t	ord_cqes;	/* CQEs of them reaped */
+	unsigned	batch_room;	/* do_submit()'s room, for ord reports */
 	int		pipe_fd;	/* on this pipe */
 };
 
@@ -204,6 +219,7 @@ now_ns(void)
  */
 #define OUT_FD		900
 #define MAP_FD		800		/* + thread: a ring while it's mapped */
+#define ORD_FD		700		/* + thread: its ordered-writes file */
 #define ERR_FD		901
 
 static void
@@ -507,13 +523,15 @@ dyn_add(struct fz *f, int fd, unsigned op, int64_t res, uint64_t ud)
 	if (fd <= STDERR_FILENO)
 		return;
 	/*
-	 * The fuzzer's own numbers (OUT_FD, ERR_FD, MAP_FD + thread) are
-	 * never taken as a request's: a CQE taken for another request's,
-	 * whose user_data slot was reused, would have the fuzzer close its
-	 * log.  Others above them are real once the table has grown so far.
+	 * The fuzzer's own numbers (OUT_FD, ERR_FD, MAP_FD and ORD_FD +
+	 * thread) are never taken as a request's: a CQE taken for another
+	 * request's, whose user_data slot was reused, would have the fuzzer
+	 * close its log, or write into the records of ordered writes.
+	 * Others above them are real once the table has grown so far.
 	 */
 	if (fd == OUT_FD || fd == ERR_FD ||
-	    (fd >= MAP_FD && fd < MAP_FD + MAX_THREADS)) {
+	    (fd >= MAP_FD && fd < MAP_FD + MAX_THREADS) ||
+	    (fd >= ORD_FD && fd < ORD_FD + MAX_THREADS)) {
 		if (atomic_fetch_add(&st_dyn_reserved, 1) < 20)
 			dprintf(ERR_FD, "kqring_fuzz: thread %d: fd %d from "
 			    "op %u res %jd ud %ju not taken as a request's\n",
@@ -763,6 +781,14 @@ ring_open(struct fz *f)
 	f->ext_op = 0;
 	f->tmpl_left = 0;
 	f->tmpl_echo = false;
+	f->ord_left = 0;
+	f->ord_gen++;
+	/*
+	 * Half the rings get a random SQ array entry now and then, which runs
+	 * whatever SQE is in that slot, again or early: no ordered writes on
+	 * them, whose order that would rightly break.
+	 */
+	f->sq_chaos = chance(f, 50);
 	if (chance(f, f->valid ? 50 : 10)) {
 		struct kqring_ext_setup es = { .version = KQRING_EXT_VERSION };
 
@@ -1260,6 +1286,88 @@ pool_fd(struct fz *f, int kind)
 }
 
 /*
+ * Ordered writes: records of 16 bytes, appended by bursts of WRITEs on
+ * workers to the thread's file, never in a chain (a linked write runs after
+ * the ones submitted after it, rightly).  Each record has its own place in
+ * ord_buf, so a write still running after its ring closed reads what it was
+ * given.  ord_check() reads the files back.
+ */
+#define ORD_MAX		65536
+#define ORD_MAGIC	0x4f524445U	/* "ORDE" */
+
+struct ord_rec {
+	uint32_t	magic;
+	uint32_t	id;
+	uint32_t	gen;
+	uint32_t	seq;
+};
+
+/* For a report of records out of order. */
+struct ord_meta {
+	uint64_t	ud;
+	uint32_t	sq_tail;	/* where in the SQ */
+	uint32_t	ring_flags;
+	uint8_t		flags;		/* the SQE's */
+	uint8_t		before;		/* the SQE's before it in the SQ */
+	uint8_t		first;		/* first of its do_submit() */
+	uint32_t	sq_head;	/* the kernel's, at prep */
+	uint32_t	sq_entries;	/* f->p's */
+	uint32_t	room;		/* do_submit()'s */
+	uint32_t	cqe_at;		/* its CQE was the thread's nth, or 0 */
+	int32_t		res;
+};
+
+static _Atomic uint64_t	st_ord;
+
+static bool
+sqe_ord_write(struct fz *f, struct io_uring_sqe *s, struct io_uring_sqe *prev)
+{
+	uint64_t ud = s->user_data;
+	struct ord_rec *r;
+
+	if (f->ord_fd < 0 || f->ord_seq >= ORD_MAX)
+		return (false);
+	r = (struct ord_rec *)(void *)f->ord_buf + f->ord_seq;
+	{
+		struct ord_meta *m = &f->ord_meta[f->ord_seq];
+		struct io_uring_sqe *b = (struct io_uring_sqe *)(void *)
+		    (f->sqes + (size_t)((f->sq_tail - 1) & f->sq_mask) *
+		    f->sqe_size);
+
+		m->ud = ud;
+		m->sq_tail = f->sq_tail;
+		m->sq_head = atomic_load(f->sq_khead);
+		m->sq_entries = f->p.sq_entries;
+		m->room = f->batch_room;
+		m->cqe_at = 0;
+		m->ring_flags = f->p.flags;
+		m->before = b->flags;
+		m->first = prev == NULL;
+	}
+	r->magic = ORD_MAGIC;
+	r->id = (uint32_t)f->id;
+	r->gen = f->ord_gen;
+	r->seq = f->ord_seq++;
+	if (prev != NULL)
+		prev->flags &= ~(IOSQE_IO_LINK | IOSQE_IO_HARDLINK);
+	memset(s, 0, f->sqe_size);
+	s->user_data = ud;
+	s->opcode = IORING_OP_WRITE;
+	s->fd = f->ord_fd;
+	/* At an offset too: O_APPEND appends it all the same. */
+	s->off = chance(f, 30) ? rn(f, 1 << 20) : (uint64_t)-1;
+	s->addr = (uint64_t)(uintptr_t)r;
+	s->len = sizeof(*r);
+	if (chance(f, 30))
+		s->flags = IOSQE_ASYNC;
+	f->ord_meta[r->seq].flags = s->flags;
+	f->ops[ud % NOPS].op = OP_ORDW;
+	f->ops[ud % NOPS].addr = r->seq;
+	atomic_fetch_add(&st_ord, 1);
+	return (true);
+}
+
+/*
  * One of a burst of reads of a pipe, in place of the request sqe_fill() put
  * in s: they wait on workers together and take turns at the data, which
  * random requests hardly ever do.
@@ -1628,6 +1736,14 @@ reap(struct fz *f)
 			atomic_fetch_add(&st_echo_sent, 1);
 		if (op == OP_PIPERD && c->res > 0)
 			atomic_fetch_add(&st_piperd_data, 1);
+		if (op == OP_ORDW) {
+			uint64_t q = f->ops[c->user_data % NOPS].addr;
+
+			if (q < ORD_MAX && f->ord_meta[q].ud == c->user_data) {
+				f->ord_meta[q].cqe_at = ++f->ord_cqes;
+				f->ord_meta[q].res = c->res;
+			}
+		}
 		if (f->ext_op != 0 && op == f->ext_op) {
 			if ((c->flags & IORING_CQE_F_MORE) != 0)
 				atomic_fetch_add(&st_trig_fire, 1);
@@ -1674,7 +1790,10 @@ do_submit(struct fz *f)
 	if (f->sqes != NULL && f->sq_ktail != NULL) {
 		room = f->p.sq_entries -
 		    (f->sq_tail - atomic_load(f->sq_khead));
-		n = (unsigned)MIN(room, 1 + rn(f, MIN(f->p.sq_entries, 16)));
+		/* One draw: MIN() would take a second, past the room. */
+		n = 1 + (unsigned)rn(f, MIN(f->p.sq_entries, 16));
+		n = MIN(room, n);
+		f->batch_room = room;
 		if (f->p.sq_entries == 0 || room > f->p.sq_entries)
 			n = 0;
 		struct io_uring_sqe *prev = NULL;
@@ -1685,7 +1804,8 @@ do_submit(struct fz *f)
 			    (size_t)idx * f->sqe_size);
 
 			if (f->sq_array != NULL)
-				f->sq_array[idx] = chance(f, 98) ? idx :
+				f->sq_array[idx] = !f->sq_chaos ||
+				    chance(f, 98) ? idx :
 				    (unsigned)rnd(f);
 			/* An event-driven chain: a trigger, then templates. */
 			if (f->ext_op != 0 && f->tmpl_left == 0 &&
@@ -1726,6 +1846,15 @@ do_submit(struct fz *f)
 			if (f->pipe_left > 0 && f->tmpl_left == 0) {
 				sqe_pipe_read(f, s);
 				f->pipe_left--;
+			} else if (f->valid && f->tmpl_left == 0 &&
+			    !f->sq_chaos &&
+			    (f->p.flags & IORING_SETUP_IOPOLL) == 0) {
+				if (f->ord_left == 0 && rn(f, 1000) < 3)
+					f->ord_left = 2 + (unsigned)rn(f, 7);
+				if (f->ord_left > 0) {
+					f->ord_left--;
+					(void)sqe_ord_write(f, s, prev);
+				}
 			}
 			/*
 			 * Chains: link to the next request, and sometimes
@@ -2076,6 +2205,32 @@ fz_main(void *arg)
 	    MAP_PRIVATE | MAP_ANON, -1, 0);
 	if (f->rw_page == MAP_FAILED)
 		die("mmap: %s", strerror(errno));
+	{
+		char path[32];
+		int fd;
+
+		/*
+		 * Out of reach, as the log is: at a small number, a CQE
+		 * misread as an open's would put it among the descriptors
+		 * that requests write to and close, and zeros from the arena
+		 * would land among the records.
+		 */
+		snprintf(path, sizeof(path), "ord%d", f->id);
+		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND |
+		    O_CLOEXEC, 0600);
+		if (fd < 0)
+			die("open %s: %s", path, strerror(errno));
+		f->ord_fd = fcntl(fd, F_DUPFD_CLOEXEC, ORD_FD + f->id);
+		if (f->ord_fd != ORD_FD + f->id)
+			die("ord%d at descriptor %d", f->id, f->ord_fd);
+		close(fd);
+		f->ord_buf = mmap(NULL, ORD_MAX * sizeof(struct ord_rec),
+		    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+		f->ord_meta = mmap(NULL, ORD_MAX * sizeof(struct ord_meta),
+		    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+		if (f->ord_buf == MAP_FAILED || f->ord_meta == MAP_FAILED)
+			die("mmap: %s", strerror(errno));
+	}
 
 	while (!atomic_load(&stop) && (max_iters == 0 || iters < max_iters)) {
 		int n;
@@ -2109,6 +2264,8 @@ fz_main(void *arg)
 			(void)ftruncate(f->pool[4], 0);
 	}
 	pool_close(f);
+	close(f->ord_fd);
+	f->ord_fd = -1;
 	atomic_fetch_add(&nfinished, 1);
 	return (NULL);
 }
@@ -2204,6 +2361,107 @@ on_fault(int sig, siginfo_t *si, void *ucv)
 	}
 	signal(sig, SIG_DFL);
 	raise(sig);
+}
+
+/*
+ * Read back each thread's ordered writes: whole records, and within each
+ * ring's records the order it submitted them in.  0 if all are so.
+ */
+static int
+ord_check(void)
+{
+	uint64_t total = 0, rings = 0;
+	int bad = 0;
+
+	for (int i = 0; i < nthreads; i++) {
+		struct fz *f = &fzs[i];
+		struct ord_rec r;
+		char path[96];
+		uint32_t *last;
+		FILE *fp;
+		size_t n;
+
+		snprintf(path, sizeof(path), "%s/ord%d", scratch, i);
+		if ((fp = fopen(path, "r")) == NULL) {
+			fprintf(stderr, "kqring_fuzz: FAIL: %s: %s\n", path,
+			    strerror(errno));
+			return (1);
+		}
+		last = calloc((size_t)f->ord_gen + 1, sizeof(*last));
+		if (last == NULL)
+			die("calloc");
+		struct ord_rec hist[16];
+		unsigned nh = 0;
+
+		while ((n = fread(&r, 1, sizeof(r), fp)) == sizeof(r)) {
+			hist[nh++ % 16] = r;
+			total++;
+			if (r.magic != ORD_MAGIC || r.id != (uint32_t)i ||
+			    r.gen == 0 || r.gen > f->ord_gen ||
+			    r.seq >= f->ord_seq) {
+				fprintf(stderr, "kqring_fuzz: FAIL: %s: record "
+				    "%ju is not one written (magic %#x id %u "
+				    "ring %u seq %u)\n", path,
+				    (uintmax_t)total - 1, r.magic, r.id,
+				    r.gen, r.seq);
+				bad = 1;
+				break;
+			}
+			if (last[r.gen] == 0)
+				rings++;
+			else if (r.seq + 1 <= last[r.gen]) {
+				struct ord_rec x;
+				unsigned dup = 0;
+
+				fprintf(stderr, "kqring_fuzz: FAIL: %s: ring %u "
+				    "wrote record %u after %u\n", path, r.gen,
+				    r.seq, last[r.gen] - 1);
+				fprintf(stderr, "  the file's last records:");
+				for (unsigned h = nh > 16 ? nh - 16 : 0; h < nh;
+				    h++)
+					fprintf(stderr, " %u/%u", hist[h % 16].gen,
+					    hist[h % 16].seq);
+				fprintf(stderr, "\n");
+				rewind(fp);
+				while (fread(&x, 1, sizeof(x), fp) == sizeof(x))
+					if (x.gen == r.gen && x.seq == r.seq)
+						dup++;
+				fprintf(stderr, "  record %u is in the file %u "
+				    "times\n", r.seq, dup);
+				for (uint32_t q = r.seq; q < last[r.gen] &&
+				    q < r.seq + 8; q++) {
+					struct ord_meta *m = &f->ord_meta[q];
+
+					fprintf(stderr, "  record %u: ud %ju sq "
+					    "%u (head %u) ring flags %#x flags "
+					    "%#x, before it %#x, %s; CQE %u res "
+					    "%d; entries %u room %u\n", q,
+					    (uintmax_t)m->ud,
+					    m->sq_tail, m->sq_head,
+					    m->ring_flags, m->flags,
+					    m->before, m->first ? "first of its "
+					    "batch" : "in a batch", m->cqe_at,
+					    m->res, m->sq_entries, m->room);
+				}
+				bad = 1;
+				break;
+			}
+			last[r.gen] = r.seq + 1;
+		}
+		if (bad == 0 && n != 0) {
+			fprintf(stderr, "kqring_fuzz: FAIL: %s: a torn record "
+			    "at its end (%zu bytes)\n", path, n);
+			bad = 1;
+		}
+		free(last);
+		fclose(fp);
+		if (bad)
+			break;
+	}
+	printf("kqring_fuzz: ordered writes %ju submitted, %ju written by "
+	    "%ju rings, %s\n", (uintmax_t)st_ord, (uintmax_t)total,
+	    (uintmax_t)rings, bad ? "OUT OF ORDER" : "in order");
+	return (bad);
 }
 
 int
@@ -2357,10 +2615,6 @@ main(int argc, char **argv)
 	atomic_store(&teardown_at, NULL);
 	pthread_join(tw, NULL);
 	closefrom(3);
-	if (chdir("/tmp") == 0) {
-		snprintf(cmd, sizeof(cmd), "rm -rf %s", scratch);
-		(void)system(cmd);
-	}
 	printf("kqring_fuzz: rings %ju, sqes %ju, enters %ju, registers %ju, "
 	    "cqes %ju\n", (uintmax_t)st_rings, (uintmax_t)st_sqes,
 	    (uintmax_t)st_enters, (uintmax_t)st_regs, (uintmax_t)st_cqes);
@@ -2387,6 +2641,13 @@ main(int argc, char **argv)
 	}
 	if (check_leaks(socks0, wired0, mem0) != 0)
 		rc = 1;
+	/* Every ring is gone (check_leaks()), so every write has run. */
+	if (ord_check() != 0)
+		rc = 1;
+	if (chdir("/tmp") == 0) {
+		snprintf(cmd, sizeof(cmd), "rm -rf %s", scratch);
+		(void)system(cmd);
+	}
 	printf(rc == 0 ? "[OK] kqring_fuzz\n" : "[FAIL] kqring_fuzz\n");
 	return (rc);
 }

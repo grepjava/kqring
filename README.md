@@ -329,7 +329,7 @@ See [docs/event-chains-spec.md](docs/event-chains-spec.md) for the interface.
 - **`FUTEX_WAIT`** also ends when its word changes, without a `FUTEX_WAKE`, which is a spurious wakeup as futex users must already expect: a wake by `_umtx_op(2)` can't reach a request. Cancelling a futex wait or `WAITID` returns 0, as for any other request, where Linux returns 1, and a link timeout that ends one completes with `-ETIME`.
 
 **Cancellation and process lifecycle**
-- **Worker cancellation and CQE ordering.** Cancel (`ASYNC_CANCEL`, `POLL_REMOVE`) and `LINK_TIMEOUT` request an interrupt without waiting for running worker I/O.
+- **Worker cancellation and CQE ordering.** Cancel (`ASYNC_CANCEL`, `POLL_REMOVE`) and `LINK_TIMEOUT` request an interrupt without waiting for running worker I/O. A regular file's read or write that a worker has started isn't cancelled, as in io_uring: it completes with its own result, and the cancel gets `-EALREADY`.
   - The cancel, remove or timeout CQE can therefore arrive **before** the target's `-ECANCELED` CQE; Linux posts the target's CQE first.
   - A cancellation CQE doesn't promise the I/O had no side effects. Wait for the target request's own CQE before freeing its buffers or state.
   - `IORING_REGISTER_SYNC_CANCEL` does wait: it returns once the requests it cancelled have stopped, or `ETIME` after its timeout, as on Linux.

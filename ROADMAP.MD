@@ -11,7 +11,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 1 | Ordering and poll timing | Done |
 | 2 | Make compatibility measurable | Done |
 | 3 | Wait semantics | Done |
-| 4 | Per-file write ordering | Not started |
+| 4 | Per-file write ordering | Done |
 | 5 | Worker path scalability | Not started |
 | 6 | Performance evidence | Not started |
 | 7 | Newer interfaces and real programs | Not started |
@@ -94,6 +94,10 @@ Acceptance: conformance tests for interruption, timeout expiry, repeated registe
 Buffered writes wait for their worker, which keeps writes to one file in order but makes the issuer wait, where io-wq's per-inode hashing wouldn't. They are about 9% behind aio on a ZFS file. `O_APPEND` and file-position writes wait the same way.
 
 Add per-file ordering to the worker pool, so that writes to one file stay in order, writes to different files run in parallel, and the issuer doesn't wait. This changes how the pool schedules work, so it starts with a design note and new fuzzer coverage of write ordering across files.
+
+**Done.** [docs/write-ordering.md](docs/write-ordering.md) describes it. Writes to a regular file get one of 64 buckets from their vnode, as io-wq hashes inodes. The pool runs a bucket's writes one at a time, in order, and other buckets' in parallel, and the issuer no longer waits for them. `test_write_order` checks the order with another file's writes in between, after a cancel and after the ring closes. The fuzzer checks it under its cancellations, closes and descriptor changes. A cancel or link timeout that finds a regular file's I/O already running now leaves it to complete with its own result and gets `-EALREADY`, as in io_uring, where kqring used to report the I/O as cancelled after it had happened.
+
+On this machine, throughput and CPU are unchanged, buffered or `O_SYNC`, one file or four: ZFS and the SATA SSD set the pace. What changed is latency across files. A small write to one file no longer waits behind a slow `O_SYNC` write to another: it finished first in 5 of 5 rounds, against 0 of 5 before.
 
 Acceptance: ordering and data integrity shown under concurrency, cancellation and close; parallel progress across files; CPU, throughput and latency compared with the current code.
 

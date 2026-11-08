@@ -1361,13 +1361,19 @@ test_file_rw(struct test_ring *r)
 	sqe = ring_prep(r, IORING_OP_FSYNC, fd, 7004);
 	ring_push_sqe(r);
 	ring_submit(r);
+	/*
+	 * In any order: the writes run in order on workers, but an FSYNC
+	 * not linked to them needn't wait for them, as in io_uring.
+	 */
 	assert(ring_wait(r, 3, 10000) == 0 && ring_cq_ready(r) == 3);
-	c = ring_pop_cqe(r);
-	assert(c.user_data == 7002 && c.res == 11);
-	c = ring_pop_cqe(r);
-	assert(c.user_data == 7003 && c.res == 2);
-	c = ring_pop_cqe(r);
-	assert(c.user_data == 7004 && c.res == 0);
+	for (int i = 0, seen = 0; i < 3; i++) {
+		c = ring_pop_cqe(r);
+		assert(c.user_data >= 7002 && c.user_data <= 7004);
+		assert((seen & (1 << (c.user_data - 7002))) == 0);
+		seen |= 1 << (c.user_data - 7002);
+		assert(c.res == (c.user_data == 7002 ? 11 :
+		    c.user_data == 7003 ? 2 : 0));
+	}
 	assert(lseek(fd, 0, SEEK_CUR) == 0);
 
 	/* Positioned read. */
@@ -9165,6 +9171,213 @@ test_reg_wait(void)
 	    "(EXT_ARG_REG)\n");
 }
 
+struct worder_rec {
+	uint32_t	magic;
+	uint32_t	file;
+	uint32_t	seq;
+	uint32_t	pad;
+};
+
+#define WORDER_MAGIC	0x57524f44U	/* "WROD" */
+
+/*
+ * The records of a file written by test_write_order(): whole, and in
+ * increasing order (with gaps if some were cancelled).  Returns how many.
+ */
+static unsigned
+worder_check(int fd, uint32_t file, bool gaps)
+{
+	struct worder_rec r;
+	unsigned n = 0;
+	int64_t last = -1;
+	ssize_t got;
+
+	assert(lseek(fd, 0, SEEK_SET) == 0);
+	while ((got = read(fd, &r, sizeof(r))) == (ssize_t)sizeof(r)) {
+		if (r.magic != WORDER_MAGIC || r.file != file ||
+		    (int64_t)r.seq <= last ||
+		    (!gaps && (int64_t)r.seq != last + 1)) {
+			fprintf(stderr, "file %u record %u: magic %#x file %u "
+			    "seq %u after %jd\n", file, n, r.magic, r.file,
+			    r.seq, (intmax_t)last);
+			abort();
+		}
+		last = r.seq;
+		n++;
+	}
+	assert(got == 0);
+	return (n);
+}
+
+static void
+worder_prep(struct test_ring *t, int fd, struct worder_rec *rec,
+    uint32_t file, uint32_t seq, int how)
+{
+	struct io_uring_sqe *sqe;
+
+	rec->magic = WORDER_MAGIC;
+	rec->file = file;
+	rec->seq = seq;
+	rec->pad = 0;
+	sqe = ring_prep(t, IORING_OP_WRITE, fd, 79600 + file);
+	sqe->addr = (uint64_t)(uintptr_t)rec;
+	sqe->len = sizeof(*rec);
+	/* The file position, or on fd[1] an offset, appended all the same. */
+	sqe->off = file % 2 == 1 && how % 3 == 0 ?
+	    (uint64_t)seq * sizeof(*rec) : (uint64_t)-1;
+	if (how % 2 == 0)
+		sqe->flags = IOSQE_ASYNC;
+	ring_push_sqe(t);
+}
+
+/*
+ * Writes to one regular file run on workers in the order they were
+ * submitted, one at a time, as io-wq's per-inode hashing runs them, and the
+ * issuer doesn't wait for each: through the file position, appending, mixed
+ * with IOSQE_ASYNC, with another file's writes in between, cancelled, and
+ * with the ring closed while they are out.
+ */
+static void
+test_write_order(void)
+{
+	static struct worder_rec recs[4][512];
+	char path[3][32];
+	struct test_ring t;
+	int fd[3], cancelled = 0, ok = 0, cancel_res = 0;
+	unsigned n;
+
+	for (int i = 0; i < 3; i++) {
+		snprintf(path[i], sizeof(path[i]), "/tmp/kqring_word%d.XXXXXX",
+		    i);
+		fd[i] = mkstemp(path[i]);
+		assert(fd[i] >= 0);
+		assert(unlink(path[i]) == 0);
+	}
+	/*
+	 * fd[1] appends (records of files 1 and 3), fd[0] and fd[2] write at
+	 * the file position.
+	 */
+	assert(fcntl(fd[1], F_SETFL, O_APPEND) == 0);
+
+	ring_init(&t);
+	/* 120 writes to two files, alternating, in one submission, twice. */
+	for (int round = 0; round < 2; round++) {
+		for (uint32_t i = 0; i < 60; i++) {
+			uint32_t seq = round * 60 + i;
+
+			worder_prep(&t, fd[0], &recs[0][seq], 0, seq, (int)i);
+			worder_prep(&t, fd[1], &recs[1][seq], 1, seq,
+			    (int)i + 1);
+		}
+		assert(ring_wait(&t, 120, 10000) == 0);
+		for (int i = 0; i < 120; i++) {
+			struct io_uring_cqe c = ring_pop_cqe(&t);
+
+			assert(c.res == (int)sizeof(struct worder_rec));
+		}
+	}
+	assert(worder_check(fd[0], 0, false) == 120);
+	assert(worder_check(fd[1], 1, false) == 120);
+
+	/* Cancelled: what was written is still in order. */
+	for (uint32_t i = 0; i < 100; i++)
+		worder_prep(&t, fd[2], &recs[2][i], 2, i, (int)i);
+	struct io_uring_sqe *sqe = ring_prep(&t, IORING_OP_ASYNC_CANCEL, fd[2],
+	    79699);
+	sqe->cancel_flags = IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_ALL;
+	ring_push_sqe(&t);
+	assert(ring_wait(&t, 101, 10000) == 0);
+	for (int i = 0; i < 101; i++) {
+		struct io_uring_cqe c = ring_pop_cqe(&t);
+
+		if (c.user_data == 79699) {
+			cancel_res = c.res;
+			continue;
+		}
+		if (c.res == -ECANCELED)
+			cancelled++;
+		else {
+			assert(c.res == (int)sizeof(struct worder_rec));
+			ok++;
+		}
+	}
+	assert(ok + cancelled == 100);
+	n = worder_check(fd[2], 2, true);
+	if (n != (unsigned)ok) {
+		fprintf(stderr, "%u records written, %d writes succeeded, "
+		    "%d cancelled, cancel res %d\n", n, ok, cancelled,
+		    cancel_res);
+		abort();
+	}
+
+	/* Closed with writes out: they run or not, in order, after it. */
+	assert(ftruncate(fd[1], 0) == 0);
+	for (uint32_t i = 0; i < 120; i++)
+		worder_prep(&t, fd[1], &recs[3][i], 3, i, (int)i);
+	assert(kqring_enter(t.fd, 120, 0, 0, NULL, 0) == 120);
+	close(t.fd);
+	for (off_t last = -1;;) {
+		struct stat st;
+
+		usleep(50000);
+		assert(fstat(fd[1], &st) == 0);
+		if (st.st_size == last)
+			break;
+		last = st.st_size;
+	}
+	n = worder_check(fd[1], 3, true);
+
+	/*
+	 * Different files in parallel: a small write to one file doesn't
+	 * wait behind a long O_SYNC one to another, submitted first.  Two
+	 * files share a bucket one time in 64, so it takes a fresh small
+	 * file a few times before failing.
+	 */
+	{
+		size_t big = 32 << 20;
+		char *buf = malloc(big);
+		int sfd, wfd, tries;
+		uint64_t first = 0;
+
+		assert(buf != NULL);
+		memset(buf, 'p', big);
+		snprintf(path[0], sizeof(path[0]), "/tmp/kqring_wpar.XXXXXX");
+		sfd = mkstemp(path[0]);
+		assert(sfd >= 0 && unlink(path[0]) == 0);
+		assert(fcntl(sfd, F_SETFL, O_SYNC) == 0);
+		ring_init(&t);
+		for (tries = 0; tries < 4 && first != 79600; tries++) {
+			snprintf(path[1], sizeof(path[1]),
+			    "/tmp/kqring_wpas.XXXXXX");
+			wfd = mkstemp(path[1]);
+			assert(wfd >= 0 && unlink(path[1]) == 0);
+			sqe = ring_prep(&t, IORING_OP_WRITE, sfd, 79690);
+			sqe->addr = (uint64_t)(uintptr_t)buf;
+			sqe->len = (uint32_t)big;
+			sqe->off = 0;
+			ring_push_sqe(&t);
+			worder_prep(&t, wfd, &recs[0][0], 0, 0, 1);
+			assert(ring_wait(&t, 2, 30000) == 0);
+			first = ring_pop_cqe(&t).user_data;
+			assert(ring_pop_cqe(&t).user_data != first);
+			close(wfd);
+		}
+		if (first != 79600) {
+			fprintf(stderr, "the small write completed after the "
+			    "O_SYNC one, %d times\n", tries);
+			abort();
+		}
+		close(t.fd);
+		close(sfd);
+		free(buf);
+	}
+	for (int i = 0; i < 3; i++)
+		close(fd[i]);
+	printf("[PASS] Writes to a file run in order on workers, files in "
+	    "parallel (2 files x 120, %d of 100 after a cancel, %u of 120 "
+	    "after close)\n", ok, n);
+}
+
 /*
  * Reads on workers that select from one buffer group take its head buffer
  * in turn.  One that finds it held is woken when it is free, not a clock
@@ -13511,6 +13724,7 @@ main(int argc, char **argv)
 		test_enter_sigmask();
 		test_enter_abs_timer();
 		test_reg_wait();
+		test_write_order();
 		test_tag_failed_register();
 		test_tag_release_no_drop();
 		test_sqe128_cqe32_attach_wq();

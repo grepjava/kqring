@@ -10,8 +10,13 @@
 - `IORING_ENTER_NO_IOWAIT` and `IORING_FEAT_NO_IOWAIT`. FreeBSD doesn't count time waiting for I/O apart, so the flag changes nothing.
 - `io_uring_buf_reg.min_left`, from Linux 7.3: on an `IOU_PBUF_RING_INC` ring, a buffer with less than that many bytes left is used up rather than kept for the next transfer. kqring refused it with `EINVAL` before.
 
+### Changed
+
+- Writes to a regular file no longer make the issuer wait. They run on workers one at a time per file, in the order they were issued, as io-wq's per-inode hashing runs them, and writes to different files run in parallel. Before, the issuer waited for each write, which kept them in order but held up the rest of the submission. A program that relied on an unlinked `FSYNC` or other request coming after its writes must link them, as on Linux.
+
 ### Fixed
 
+- A cancel or `LINK_TIMEOUT` that finds a regular file's read or write already running on a worker no longer reports it as cancelled. The I/O had happened, so a program told `-ECANCELED` could do it again. It now completes with its own result and the cancel gets `-EALREADY`, as in io_uring.
 - Reads of a named FIFO now complete in the order of the data, as reads of a pipe do. They also read as a pipe's do otherwise: one with data ready completes without a worker, and an empty `O_NONBLOCK` FIFO waits for data, as in io_uring, rather than failing with `EAGAIN`. `RWF_NOWAIT` still fails it.
 
 - A poll on another ring now always completes before the enter that fired it returns, on a ring without `DEFER_TASKRUN` or SQPOLL. It used to complete just after, about once in tens of thousands of rounds, when the ring's poller had taken the event and not yet recorded it, or when the ring's completion thread was posting it. Past 8 polling rings in a process, or 32 events on one ring, the rest also had to wait for the poller.
@@ -41,6 +46,9 @@
 - `tests/kqring_diff.c` runs the same cases on Linux and on kqring, and `tests/diff_compare.py` fails on a difference that isn't listed with its reason.
 - `tests/kqring_test.c` now covers `WRITEV_FIXED`, level-triggered polls, `ACCEPT_POLL_FIRST`, `IORING_OFF_CQ_RING`, how a failed SQE ends a batch, the flags kqring refuses, `SIGPIPE`, hole punching and the Capsicum rights of fixed files.
 - `tests/kqring_fuzz.c` now unmaps each ring's SQE array. It left them all mapped, a few thousand more every 10 s, and with tens of thousands each `fork(2)` and page fault slowed until a run could stop making progress.
+- `tests/kqring_test.c` checks the order of writes to one file in a submission, with another file's in between, after a cancel and after the ring closes.
+- `tests/kqring_fuzz.c` now appends numbered records to a file per thread in bursts of writes, and fails if a ring's records are torn or out of order.
+- `tests/kqring_fuzz.c` no longer prepares more SQEs than the SQ has room for. `MIN()` drew its random batch size twice, so a batch could overwrite SQEs the kernel hadn't consumed. Each file of records is also kept at a descriptor number of its own, which the fuzzer never takes as a request's: at a small number, other requests wrote into it and closed it.
 - `tests/kqring_fuzz.c` no longer puts requests that create descriptors in a trigger's chain. A chain runs again on every event, its CQEs come back as the trigger's, so the fuzzer never closed what they made, and a socket that stayed readable filled the descriptor table in minutes.
 - `tests/kqring_fuzz.c` no longer closes its own log. It closes the descriptors requests create, taken from their CQEs, and a CQE taken for another request's, whose `user_data` slot had been reused, could name its log; a run then went on silently. It now refuses the numbers of its own descriptors, says when, and fails if its log stops being its log.
 - `tests/kqring_fuzz.c` no longer reports an overrun CQ when another thread's new ring took a ring's descriptor number before it was mapped: it mapped that other ring, whose CQ is larger.

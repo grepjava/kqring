@@ -468,7 +468,7 @@ kqring_trig_cancel_runs(struct kqring_trig *trig)
 		mtx_lock(&ctx->mtx);
 		TAILQ_FOREACH(op, &ctx->active_ops, active_link) {
 			if (kqring_trig_owns(trig, op) && !op->cancelled &&
-			    !op->bio)
+			    !kqring_op_cancel_busy_locked(ctx, op))
 				break;
 		}
 		if (op != NULL)

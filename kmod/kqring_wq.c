@@ -303,6 +303,67 @@ kqring_wq_exec_op(struct kqring_ctx *ctx, struct kqring_op *op)
 	kqring_cred_exit(saved);
 }
 
+/*
+ * Queue op for type's workers: after its bucket's last queued write, if it
+ * is an ordered write (op->wq_hash), so that a bucket's writes are together.
+ */
+static void
+kqring_wq_queue_locked(struct kqring_wq *wq, struct kqring_op *op, int type)
+{
+	struct kqring_op **tailp;
+
+	mtx_assert(&wq->mtx, MA_OWNED);
+	op->wq_queued = true;
+	wq->pending[type]++;
+	if (op->wq_hash < 0) {
+		TAILQ_INSERT_TAIL(&wq->ops[type], op, wq_link);
+		return;
+	}
+	tailp = &wq->hash_tail[type][op->wq_hash];
+	if (*tailp != NULL)
+		TAILQ_INSERT_AFTER(&wq->ops[type], *tailp, op, wq_link);
+	else
+		TAILQ_INSERT_TAIL(&wq->ops[type], op, wq_link);
+	*tailp = op;
+}
+
+void
+kqring_wq_unqueue_locked(struct kqring_wq *wq, struct kqring_op *op)
+{
+	int type = op->wq_type;
+
+	mtx_assert(&wq->mtx, MA_OWNED);
+	KASSERT(op->wq_queued, ("kqring: op %p not queued", op));
+	if (op->wq_hash >= 0 && wq->hash_tail[type][op->wq_hash] == op) {
+		struct kqring_op *prev = TAILQ_PREV(op, kqring_op_list,
+		    wq_link);
+
+		wq->hash_tail[type][op->wq_hash] =
+		    prev != NULL && prev->wq_hash == op->wq_hash ? prev : NULL;
+	}
+	TAILQ_REMOVE(&wq->ops[type], op, wq_link);
+	op->wq_queued = false;
+	wq->pending[type]--;
+}
+
+/*
+ * The first op a worker of type may run: the first queued, passing over
+ * the writes of a bucket that has one running (one step per bucket, as
+ * they are together).
+ */
+static struct kqring_op *
+kqring_wq_next_locked(struct kqring_wq *wq, int type)
+{
+	struct kqring_op *op;
+
+	mtx_assert(&wq->mtx, MA_OWNED);
+	op = TAILQ_FIRST(&wq->ops[type]);
+	while (op != NULL && op->wq_hash >= 0 &&
+	    (wq->hash_busy & (1ULL << op->wq_hash)) != 0)
+		op = TAILQ_NEXT(wq->hash_tail[type][op->wq_hash], wq_link);
+	return (op);
+}
+
 static void
 kqring_wq_thread(void *arg)
 {
@@ -343,15 +404,16 @@ kqring_wq_thread(void *arg)
 			mtx_lock(&wq->mtx);
 			continue;
 		}
-		op = TAILQ_FIRST(&wq->ops[type]);
+		op = kqring_wq_next_locked(wq, type);
 		if (op != NULL) {
 			bool deferred = false;
+			int hash = op->wq_hash;
 
-			TAILQ_REMOVE(&wq->ops[type], op, wq_link);
-			op->wq_queued = false;
-			wq->pending[type]--;
+			kqring_wq_unqueue_locked(wq, op);
 			if (op->cancelled || op->wq_canceled)
 				continue;
+			if (hash >= 0)
+				wq->hash_busy |= 1ULL << hash;
 			ctx = op->ctx;
 			refcount_acquire(&ctx->refs);
 			op->wq_running = true;
@@ -386,6 +448,15 @@ kqring_wq_thread(void *arg)
 			if (!op->wq_wait_ready)
 				op->wq_done = true;
 			wq->busy[type]--;
+			/*
+			 * The bucket's next write may run: this worker takes
+			 * it next, unless it is leaving, so wake another.
+			 */
+			if (hash >= 0) {
+				wq->hash_busy &= ~(1ULL << hash);
+				if (wq->hash_tail[type][hash] != NULL)
+					wakeup_one(&wq->ops[type]);
+			}
 			wakeup(&op->wq_running);
 			mtx_unlock(&wq->mtx);
 			if (ctx->wq_abort_pending) {
@@ -456,8 +527,8 @@ kqring_wq_thread(void *arg)
 			}
 			mtx_lock(&wq->mtx);
 			wq->spinning[type]--;
-			if (!TAILQ_EMPTY(&wq->ops[type]) || wq->closing ||
-			    kqring_wq_check_suspend(wq))
+			if (kqring_wq_next_locked(wq, type) != NULL ||
+			    wq->closing || kqring_wq_check_suspend(wq))
 				continue;
 		}
 		error = msleep_sbt(&wq->ops[type], &wq->mtx, PCATCH,
@@ -535,35 +606,84 @@ kqring_wq_spin_locked(struct kqring_ctx *ctx)
 	    sched_load() < mp_ncpus);
 }
 
+/* A bucket for a vnode, as io-wq's hash_ptr() of the inode. */
+static int
+kqring_wq_hash(const void *p)
+{
+	return ((int)(((uintptr_t)p * 0x9E3779B97F4A7C15ULL) >> 58));
+}
+
 /*
  * Whether op needs no order against other requests on its file: a read, or
- * an O_DIRECT write at an offset of its own.  As io-wq, which hashes buffered
+ * an O_DIRECT write at an offset of its own, as io-wq, which hashes buffered
  * writes per inode, but not O_DIRECT ones where the filesystem can run them
- * in parallel.  Writes that use the file position or append stay in order.
+ * in parallel.  Any other write to a regular file (buffered, at the file
+ * position, appending, with RWF_* flags) gets its vnode's bucket in *hashp,
+ * which runs its writes one at a time; other ordered ops get -1.  Pipes and
+ * sockets get none, as in io-wq: a write that waits for a reader must not
+ * hold back the files that share its bucket.
  */
 static bool
-kqring_op_wq_unordered(const struct kqring_op *op)
+kqring_op_wq_order(const struct kqring_op *op, int *hashp, bool *vregp)
 {
 	const struct io_uring_sqe *sqe = &op->sqe;
 	struct thread *td = curthread;
 	struct file *fp;
-	bool direct;
+	bool read, direct, vreg;
 
-	if (kqring_op_is_read(sqe->opcode))
-		return (true);
-	if (!kqring_op_is_write(sqe->opcode) || (off_t)sqe->off == (off_t)-1 ||
-	    sqe->rw_flags != 0)
+	*hashp = -1;
+	*vregp = false;
+	read = kqring_op_is_read(sqe->opcode);
+	if (!read && !kqring_op_is_write(sqe->opcode))
 		return (false);
 	if (op->ffile != NULL)
 		fp = op->ffile->fp;
 	else if (fget(td, sqe->fd, &cap_no_rights, &fp) != 0)
-		return (false);
-	direct = fp->f_type == DTYPE_VNODE && fp->f_vnode != NULL &&
-	    fp->f_vnode->v_type == VREG &&
+		return (read);
+	vreg = fp->f_type == DTYPE_VNODE && fp->f_vnode != NULL &&
+	    fp->f_vnode->v_type == VREG;
+	direct = vreg && (off_t)sqe->off != (off_t)-1 && sqe->rw_flags == 0 &&
 	    (fp->f_flag & (O_DIRECT | O_APPEND)) == O_DIRECT;
+	if (vreg && !read && !direct)
+		*hashp = kqring_wq_hash(fp->f_vnode);
+	*vregp = vreg;
 	if (op->ffile == NULL)
 		fdrop(fp, td);
-	return (direct);
+	return (read || direct);
+}
+
+/*
+ * Whether a cancel must leave op be: disk I/O in flight, or a regular
+ * file's read or write that a worker has started or finished, which can't
+ * be undone, as io-wq can't cancel running work.  The op then completes with
+ * what it did, and the cancel finds nothing to cancel (-EALREADY).  One
+ * still queued is taken off the queue here, so that no worker starts it
+ * after this said it could be cancelled.
+ */
+bool
+kqring_op_cancel_busy_locked(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	struct kqring_wq *wq = ctx->wq;
+	bool busy;
+
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	if (op->bio)
+		return (true);
+	if (!op->wq_vreg || wq == NULL)
+		return (false);
+	mtx_lock(&wq->mtx);
+	if (op->wq_queued)
+		kqring_wq_unqueue_locked(wq, op);
+	busy = op->wq_running || op->wq_done;
+	mtx_unlock(&wq->mtx);
+	return (busy);
+}
+
+/* Whether op is such I/O, for a synchronous cancel to wait for it. */
+bool
+kqring_op_in_flight(const struct kqring_op *op)
+{
+	return (op->bio || (op->wq_vreg && (op->wq_running || op->wq_done)));
 }
 
 int
@@ -644,33 +764,35 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 {
 	struct thread *td = curthread;
 	struct kqring_wq *wq = ctx->wq;
-	bool need_spawn = false, sync, unordered;
+	bool need_spawn = false, sync, unordered, vreg;
+	int hash;
 
 	if (op->cred == NULL)
 		op->cred = crhold(td->td_ucred);
 	op->wq_type = (uint8_t)type;
 	op->wq_blocking = kqring_op_will_block(op);
-	unordered = kqring_op_wq_unordered(op);
+	/* An ordered write's order is its bucket's; the issuer needn't wait. */
+	unordered = kqring_op_wq_order(op, &hash, &vreg) || hash >= 0;
+	op->wq_hash = (int8_t)hash;
+	op->wq_vreg = vreg;
 
 	mtx_lock(&ctx->mtx);
 	mtx_lock(&wq->mtx);
 	op->cancelled = false;
 	op->wq_canceled = false;
 	op->wq_done = false;
-	op->wq_queued = true;
 	kqring_op_arm_locked(ctx, op);
-	TAILQ_INSERT_TAIL(&wq->ops[type], op, wq_link);
-	wq->pending[type]++;
+	kqring_wq_queue_locked(wq, op, type);
 	/*
-	 * A read or O_DIRECT write (kqring_op_wq_unordered()) waits for its
-	 * worker below only when nothing else could run meanwhile: no more
-	 * SQEs in this submission and no other op on its type's workers.
-	 * Otherwise a batch of them would go to the workers one at a time;
-	 * the issuer collects completions in its enter wait.  Other ops always
-	 * wait, so that writes to one file stay in order, as io-wq's per-inode
-	 * hashing keeps them.  An op not waited for is
-	 * posted by its worker, as a blocking one is (set before any worker
-	 * can take it).
+	 * A read, an O_DIRECT write or an ordered write to a regular file
+	 * (kqring_op_wq_order()) waits for its worker below only when nothing
+	 * else could run meanwhile: no more SQEs in this submission and no
+	 * other op on its type's workers.  Otherwise a batch of them would go
+	 * to the workers one at a time; the issuer collects completions in its
+	 * enter wait.  Ordered writes keep their order by bucket, as io-wq's
+	 * per-inode hashing keeps it.  Other ops always wait.  An op not waited
+	 * for is posted by its worker, as a blocking one is (set before any
+	 * worker can take it).
 	 */
 	sync = !unordered ||
 	    (!(ctx->submitting && ctx->submit_more) &&
@@ -829,12 +951,12 @@ kqring_wq_rearm_ready(struct kqring_ctx *ctx, struct kqring_op *op)
 		return;
 	}
 	op->wq_type = IO_WQ_UNBOUND;
+	op->wq_hash = -1;
+	op->wq_vreg = false;
 	op->wq_blocking = true;
 	op->wq_canceled = false;
 	op->wq_done = false;
-	op->wq_queued = true;
-	TAILQ_INSERT_TAIL(&wq->ops[IO_WQ_UNBOUND], op, wq_link);
-	wq->pending[IO_WQ_UNBOUND]++;
+	kqring_wq_queue_locked(wq, op, IO_WQ_UNBOUND);
 	if (!wq->closing && wq->total[IO_WQ_UNBOUND] <
 	    wq->pending[IO_WQ_UNBOUND] + wq->busy[IO_WQ_UNBOUND] &&
 	    wq->total[IO_WQ_UNBOUND] < wq->max[IO_WQ_UNBOUND]) {

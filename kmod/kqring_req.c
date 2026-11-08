@@ -411,11 +411,8 @@ kqring_op_disarm_locked(struct kqring_op *op)
 	if (wq != NULL) {
 		mtx_lock(&wq->mtx);
 		op->wq_canceled = true;
-		if (op->wq_queued) {
-			TAILQ_REMOVE(&wq->ops[op->wq_type], op, wq_link);
-			op->wq_queued = false;
-			wq->pending[op->wq_type]--;
-		}
+		if (op->wq_queued)
+			kqring_wq_unqueue_locked(wq, op);
 		if (op->wq_running) {
 			if (op->in_taskwork) {
 				TAILQ_REMOVE(&ctx->taskwork_ops, op,

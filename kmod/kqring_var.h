@@ -355,6 +355,8 @@ struct kqring_op {
 	struct file		*wq_fp;		/* direct OPENAT(2) file */
 	struct filecaps		wq_caps;	/* and its Capsicum rights */
 	uint8_t			wq_type;	/* IO_WQ_BOUND / IO_WQ_UNBOUND */
+	int8_t			wq_hash;	/* bucket of an ordered write, -1 */
+	bool			wq_vreg;	/* a regular file's read or write */
 	bool			wq_queued;	/* on wq_ops[wq_type] */
 	bool			wq_running;	/* worker executing this op */
 	bool			wq_blocking;	/* worker in unbounded sleep */
@@ -684,6 +686,15 @@ struct kqring_ocqe {
  * so rings in the same process can share it via IORING_SETUP_ATTACH_WQ.
  * Lock order: ctx->mtx -> wq->mtx.
  */
+/*
+ * Writes to a regular file run in order, one at a time per file, as
+ * io-wq's per-inode hashing runs them: each has a bucket from its vnode
+ * (op->wq_hash), a bucket's queued writes stay together in the queue, after
+ * hash_tail[], and while one runs (hash_busy) the workers pass over the rest.
+ * Files that share a bucket share its order, as in io-wq's 64.
+ */
+#define	KQRING_WQ_HASHES	64
+
 struct kqring_wq {
 	struct mtx		mtx;
 	uint32_t		refs;		/* rings + spawned workers */
@@ -700,6 +711,8 @@ struct kqring_wq {
 	uint32_t		busy[KQRING_WQ_TYPES];
 	uint32_t		pending[KQRING_WQ_TYPES];
 	uint32_t		spinning[KQRING_WQ_TYPES];
+	struct kqring_op	*hash_tail[KQRING_WQ_TYPES][KQRING_WQ_HASHES];
+	uint64_t		hash_busy;	/* buckets with a write running */
 	struct cpuset		*base_cpuset;
 	cpuset_t		cpumask;
 	bool			aff_set;
@@ -1783,6 +1796,10 @@ kqring_op_use_wq(const struct io_uring_sqe *sqe)
 }
 
 int	kqring_op_wq_type(const struct kqring_op *op);
+void	kqring_wq_unqueue_locked(struct kqring_wq *wq, struct kqring_op *op);
+bool	kqring_op_cancel_busy_locked(struct kqring_ctx *ctx,
+	    struct kqring_op *op);
+bool	kqring_op_in_flight(const struct kqring_op *op);
 bool	kqring_arm_nonsock_op(struct kqring_ctx *ctx, struct kqring_op *op);
 void	kqring_wq_rearm_ready(struct kqring_ctx *ctx, struct kqring_op *op);
 int	kqring_sqpoll_start(struct kqring_ctx *ctx, struct thread *td);
