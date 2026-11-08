@@ -630,7 +630,13 @@ again:
 				fdrop(fp, td);
 				return (kqring_done(op, -ECANCELED, 0));
 			}
-			pause("kqbgbz", 1);
+			/* Until kqring_bg_release(), or a tick at most. */
+			sx_xlock(&ctx->bg_sx);
+			if ((bg = kqring_bgroup_find(ctx, sqe->buf_group)) != NULL &&
+			    bg->busy)
+				(void)sx_sleep(&bg->busy, &ctx->bg_sx, 0,
+				    "kqbgbz", 1);
+			sx_xunlock(&ctx->bg_sx);
 			goto again;
 		}
 		if (error != 0) {
@@ -660,7 +666,7 @@ again:
 	if (want == 0 && !is_write) {
 		if (buf_select) {
 			sx_xlock(&ctx->bg_sx);
-			sel.bg->busy = false;
+			kqring_bg_release(sel.bg);
 			sx_xunlock(&ctx->bg_sx);
 		}
 		fdrop(fp, td);
@@ -726,7 +732,7 @@ read_busy:
 			if (!buf_select)
 				goto retry;
 			sx_xlock(&ctx->bg_sx);
-			sel.bg->busy = false;
+			kqring_bg_release(sel.bg);
 			sx_xunlock(&ctx->bg_sx);
 			goto again;
 		}
@@ -751,7 +757,7 @@ read_busy:
 		if (done == 0) {
 			if (buf_select) {
 				sx_xlock(&ctx->bg_sx);
-				sel.bg->busy = false;
+				kqring_bg_release(sel.bg);
 				sx_xunlock(&ctx->bg_sx);
 			}
 			*punt = true;
@@ -776,7 +782,7 @@ read_busy:
 	}
 	if (buf_select) {
 		sx_xlock(&ctx->bg_sx);
-		sel.bg->busy = false;
+		kqring_bg_release(sel.bg);
 		if (done > 0)
 			cflags = kqring_buf_commit_op(ctx, op, &sel, done);
 		else
@@ -863,7 +869,7 @@ kqring_exec_read_multishot(struct kqring_ctx *ctx, struct kqring_op *op,
 	error = kqring_pipe_rw_nowait(fp, &auio, false, 0, td);
 	n = (size_t)(want - auio.uio_resid);
 	sx_xlock(&ctx->bg_sx);
-	sel.bg->busy = false;
+	kqring_bg_release(sel.bg);
 	if (n == 0) {
 		sx_xunlock(&ctx->bg_sx);
 		fdrop(fp, td);

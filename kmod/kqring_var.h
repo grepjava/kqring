@@ -627,6 +627,17 @@ struct kqring_bgroup {
 	uint32_t		gen;		/* unique to this group */
 };
 
+/*
+ * A read's hold on its group's head buffer ends (bg_sx held): wake the
+ * workers waiting for it in kqring_file_rw().
+ */
+static inline void
+kqring_bg_release(struct kqring_bgroup *bg)
+{
+	bg->busy = false;
+	wakeup(&bg->busy);
+}
+
 LIST_HEAD(kqring_bgroup_list, kqring_bgroup);
 
 /* Credentials registered with IORING_REGISTER_PERSONALITY. */

@@ -691,6 +691,20 @@ ring_open(struct fz *f)
 			close(mfd);
 			return;
 		}
+		/*
+		 * Another thread's new ring can take the number between the
+		 * setup and the dup: its rings aren't the ones p describes,
+		 * and its CQ would look overrun here.
+		 */
+		if (*(unsigned *)(void *)(base + p->sq_off.ring_entries) !=
+		    p->sq_entries ||
+		    *(unsigned *)(void *)(base + p->cq_off.ring_entries) !=
+		    p->cq_entries) {
+			munmap(base, f->sqmap_len);
+			close(mfd);
+			atomic_fetch_add(&st_ring_gone, 1);
+			return;
+		}
 		f->sqmap = f->cqmap = base;
 		f->sqes = mmap(NULL, (size_t)p->sq_entries * f->sqe_size,
 		    PROT_READ | PROT_WRITE, MAP_SHARED, mfd, IORING_OFF_SQES);

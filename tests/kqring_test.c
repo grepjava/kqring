@@ -8697,6 +8697,64 @@ test_sync_cancel_waiting(void)
 }
 
 /*
+ * Reads on workers that select from one buffer group take its head buffer
+ * in turn.  One that finds it held is woken when it is free, not a clock
+ * tick later, which made 8 such reads about 5 ms (liburing's
+ * buf-ring-stress took 28 s).
+ */
+static void
+test_bgroup_worker_reads(void)
+{
+	static char data[8 * 256];
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	char path[] = "/tmp/kqring_bgw.XXXXXX";
+	uint64_t t0, ms;
+	int fd;
+
+	ring_init(&t);
+	fd = mkstemp(path);
+	assert(fd >= 0);
+	assert(unlink(path) == 0);
+	memset(data, 'g', sizeof(data));
+	assert(write(fd, data, sizeof(data)) == (ssize_t)sizeof(data));
+	t0 = now_ns();
+	for (int r = 0; r < 500; r++) {
+		for (int i = 0; i < 8; i++) {
+			sqe = ring_prep(&t, IORING_OP_READ, fd, 79200 + i);
+			sqe->off = (uint64_t)i * 256;
+			sqe->len = 256;
+			sqe->flags = IOSQE_ASYNC | IOSQE_BUFFER_SELECT;
+			sqe->buf_group = 0;
+			ring_push_sqe(&t);
+		}
+		assert(ring_wait(&t, 8, 5000) == 0);
+		assert(ring_cq_ready(&t) == 8);
+		for (int i = 0; i < 8; i++) {
+			struct io_uring_cqe c = ring_pop_cqe(&t);
+
+			assert(c.res == 256 &&
+			    (c.flags & IORING_CQE_F_BUFFER) != 0);
+			assert(memcmp(t.bufs + (size_t)(c.flags >>
+			    IORING_CQE_BUFFER_SHIFT) * BUF_SIZE, data, 256) == 0);
+			ring_offer_buf(&t, (uint16_t)(c.flags >>
+			    IORING_CQE_BUFFER_SHIFT));
+		}
+	}
+	ms = (now_ns() - t0) / 1000000;
+	close(fd);
+	close(t.fd);
+	/* About 1.2 s with the tick's wait, 50 ms without. */
+	if (ms >= 600) {
+		fprintf(stderr, "500 rounds of 8 took %llu ms\n",
+		    (unsigned long long)ms);
+		abort();
+	}
+	printf("[PASS] Worker reads share a buffer group without a tick's "
+	    "wait (%llu ms)\n", (unsigned long long)ms);
+}
+
+/*
  * A registration that fails posts no tag CQEs for the slots it had filled:
  * it was never published, so repeating it can't queue CQEs.
  */
@@ -12983,6 +13041,7 @@ main(int argc, char **argv)
 		test_cq_backpressure();
 		test_sync_cancel_worker();
 		test_sync_cancel_waiting();
+		test_bgroup_worker_reads();
 		test_tag_failed_register();
 		test_tag_release_no_drop();
 		test_sqe128_cqe32_attach_wq();
