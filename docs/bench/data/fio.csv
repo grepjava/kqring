@@ -23,7 +23,8 @@ cpu,kqring,ZFS file reads,33
 cpu,aio,ZFS file reads,72
 cpu,kqring,ZFS file writes,14
 cpu,aio,ZFS file writes,30
-liburing,tests,Passed,144
-liburing,tests,Skipped,7
-liburing,tests,Not kqring's,14
-liburing,tests,Differences,3
+liburing,tests,Passed,209
+liburing,tests,Skipped,27
+liburing,tests,Not kqring's,6
+liburing,tests,Differences,2
+liburing,tests,Not implemented,1

@@ -120,7 +120,7 @@ newer/timeout_immediate ud=3 res=-EINVAL flags=-
 newer/getsockname ud=4 res=-EOPNOTSUPP flags=-
 newer/register_zcrx_ctrl -EOPNOTSUPP
 newer/register_bpf_filter -EOPNOTSUPP
-newer/task_restrictions -EBADF
+newer/task_restrictions -EOPNOTSUPP
 newer/pbuf_min_left -EINVAL
 bad_sqe/opcode ud=1 res=-EINVAL flags=-
 bad_sqe/flags ud=2 res=-EINVAL flags=-

@@ -101,7 +101,7 @@ It also has [extensions](#kqring-extensions) of its own: event-driven chains, re
 
 ![liburing's own tests on kqring](docs/bench/liburing.svg)
 
-The 14 failures that aren't kqring's come from Linux-only assumptions in the tests, and the 3 others are deliberate differences. [`liburing/README.md`](liburing/README.md) explains each one.
+Of the 9 failures, 6 come from Linux-only assumptions in the tests, 2 are deliberate differences, and 1 needs registered waits, which aren't implemented yet. [`liburing/README.md`](liburing/README.md) explains each one.
 
 | How it's tested | Result on `v0.3.0` |
 |---|---|
@@ -246,7 +246,7 @@ The rings are mapped exactly as on Linux: `mmap(2)` on the ring descriptor at `I
 
 The wrappers make native system calls, which the module registers in free system-call slots when it loads; `sysctl kern.kqring.sys_setup`, `sys_enter` and `sys_register` give their numbers. `kqring_setup()` opens `/dev/kqring` and returns the new ring's descriptor. Where no slot was free, the wrappers fall back to `ioctl(2)` on the ring descriptor, which costs about 90 ns more per call. Like the Linux system calls, they return −1 and set `errno` on failure. Completion results (`cqe->res`) are negated **FreeBSD** errno values, and flags passed through SQEs (`O_*`, `MSG_*` and so on) use their FreeBSD values; see [Differences from Linux](#differences-from-linux).
 
-Programs that use liburing build against the port in [`liburing/`](liburing/), which fetches liburing 2.9 and builds it with kqring's system calls; see [`liburing/README.md`](liburing/README.md).
+Programs that use liburing build against the port in [`liburing/`](liburing/), which fetches liburing 2.15 and builds it with kqring's system calls; see [`liburing/README.md`](liburing/README.md).
 
 ### Requirements
 
@@ -399,7 +399,7 @@ io_uring has been a frequent source of Linux kernel vulnerabilities. kqring was 
 ## Source layout
 
 - [`include/sys/kqring.h`](include/sys/kqring.h) — the io_uring ABI (`io_uring_sqe`, `io_uring_cqe`, `io_uring_params`, `io_uring_buf_ring`, `IORING_*` constants), the `/dev/kqring` ioctls, and the `kqring_setup` / `kqring_enter` / `kqring_register` wrappers. Shared by the kernel and userspace.
-- [`liburing/`](liburing/) — the liburing port: a Makefile that fetches liburing 2.9, a small patch and Linux header shims; see its [README](liburing/README.md).
+- [`liburing/`](liburing/) — the liburing port: a Makefile that fetches liburing 2.15, a small patch and Linux header shims; see its [README](liburing/README.md).
 - [`kmod/`](kmod/) — the kernel module (`style(9)` C), split by subsystem:
   - [`kqring_var.h`](kmod/kqring_var.h) — shared structures, limits and internal prototypes.
   - [`kqring_dev.c`](kmod/kqring_dev.c) — `/dev/kqring` and the ring file's operations, the system calls and ioctls, ring setup and mapping, enter, module load/unload and process exit/exec hooks.

@@ -505,11 +505,12 @@ def main():
         lib = {x: v for _, x, v in data["liburing"]}
         parts(os.path.join(outdir, "liburing.svg"),
               f"liburing's own tests on kqring: {lib['Passed']:g} of {sum(lib.values()):g} pass",
-              "liburing 2.9, RLIMIT_MEMLOCK raised; every failure is explained in liburing/README.md",
+              "liburing 2.15, RLIMIT_MEMLOCK raised; every failure is explained in liburing/README.md",
               [("passed", lib["Passed"], S1),
                ("skipped: the test found a feature missing and said so", lib["Skipped"], P),
                ("failed: not kqring's (Linux-only assumptions in the test)", lib["Not kqring's"], S3),
-               ("failed: differences in kqring", lib["Differences"], K)])
+               ("failed: differences in kqring", lib["Differences"], K),
+               ("failed: not implemented yet", lib["Not implemented"], S4)])
 
     costs = [("NOP, 32 per enter", ns("floor", "kqring_nop_batch32")),
              ("NOP, one per enter", ns("floor", "kqring_nop")),

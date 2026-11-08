@@ -189,6 +189,8 @@ MALLOC_DECLARE(M_SELFD);
 #define KQRING_MAX_RING_MEM	(16U * 1024 * 1024)
 /* Provided buffers one bundle (IORING_RECVSEND_BUNDLE) transfer may use. */
 #define KQRING_MAX_BUNDLE	32
+/* Rounds a multishot request runs before yielding, as io_uring's MULTISHOT_MAX_RETRY. */
+#define KQRING_MSHOT_LOOPS	32
 #define KQRING_BGROUP_HASH	64
 /* Buckets of armed non-socket polls, by descriptor. */
 #define KQRING_KP_HASH		256
@@ -306,6 +308,7 @@ struct kqring_op {
 	int			kp_fd;		/* their ident */
 	uint8_t			kp_filters;	/* KQRING_KP_READ / _WRITE */
 	const void		*kp_data;	/* its file's f_data: only compared */
+	bool			kp_once;	/* own eventfd: the next CQE ends it */
 	bool			kp_on;
 	int			kp_revents;
 	u_int			kp_nev;
@@ -382,6 +385,7 @@ struct kqring_op {
 	size_t			args_len;
 	size_t			done_io;	/* MSG_WAITALL: bytes so far */
 	bool			short_io;	/* moved less than was asked */
+	bool			requeue;	/* multishot: yield to other work */
 	bool			sock_rw;	/* READ/WRITE(V) on a socket */
 	bool			connecting;	/* CONNECT: soconnect() issued */
 	bool			futex_woken;	/* FUTEX_WAKE hit; res in ->res */
@@ -602,6 +606,7 @@ struct kqring_bgroup {
 	bool			is_ring;
 	bool			busy;		/* worker reserves head, bg_sx */
 	uint16_t		ring_flags;	/* IOU_PBUF_RING_* */
+	uint32_t		min_left;	/* IOU_PBUF_RING_INC: reuse */
 	uint64_t		ring_uaddr;	/* user memory ring */
 	struct io_uring_buf_ring *ring_kva;	/* kernel mapping of ring */
 	vm_object_t		ring_obj;
@@ -1505,6 +1510,8 @@ bool	kqring_buf_none(struct kqring_ctx *ctx, uint16_t bgid);
 bool	kqring_buf_drained(const struct kqring_sel *sel);
 uint32_t kqring_buf_commit(struct kqring_ctx *ctx,
 	    const struct kqring_sel *sel, size_t done);
+uint32_t kqring_buf_eof(const struct kqring_sel *sel);
+int	kqring_register_blind(struct kqring_register_arg *ra);
 uint32_t kqring_buf_commit_op(struct kqring_ctx *ctx, struct kqring_op *op,
 	    const struct kqring_sel *sel, size_t done);
 void	kqring_buf_give_back(struct kqring_ctx *ctx,

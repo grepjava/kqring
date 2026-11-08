@@ -1060,11 +1060,20 @@ ring_resources(struct fz *f)
 	if (CALL(f, "buffers", kqring_register(f->ring,
 	    IORING_REGISTER_BUFFERS, iov, 4)) == 0)
 		f->nbufs = 4;
+	/* The pool's eventfd as the CQ's, which polls on it then watch. */
+	if (chance(f, 50) && f->pool[10] >= 0)
+		(void)CALL(f, "eventfd", kqring_register(f->ring,
+		    IORING_REGISTER_EVENTFD, &f->pool[10], 1));
 	memset(f->pbuf_page, 0, PAGE_SIZE);
 	memset(&reg, 0, sizeof(reg));
 	reg.ring_addr = (uint64_t)(uintptr_t)f->pbuf_page;
 	reg.ring_entries = PBUF_N;
 	reg.bgid = PBUF_BGID;
+	if (chance(f, 50)) {
+		reg.flags = IOU_PBUF_RING_INC;
+		if (chance(f, 50))
+			reg.min_left = (uint32_t)rn(f, 512);
+	}
 	if (CALL(f, "pbuf", kqring_register(f->ring, IORING_REGISTER_PBUF_RING,
 	    &reg, 1)) == 0) {
 		for (int i = 0; i < PBUF_N; i++) {
@@ -1259,8 +1268,16 @@ sqe_struct(struct fz *f, struct io_uring_sqe *s)
 			s->buf_group = PBUF_BGID;
 			s->addr = 0;
 			s->len = 0;
-			if (chance(f, 50))
+			if (chance(f, 50)) {
 				s->ioprio = IORING_RECV_MULTISHOT;
+				/* A cap per run, and on the total. */
+				if (chance(f, 40))
+					s->len = 1U << rn(f, 14);
+				if (chance(f, 30))
+					s->optlen = (uint32_t)rn(f, 16384);
+			}
+			if (chance(f, 30))
+				s->ioprio |= IORING_RECVSEND_BUNDLE;
 		}
 		if (chance(f, 20))
 			s->ioprio |= IORING_RECVSEND_POLL_FIRST;
@@ -1285,7 +1302,7 @@ sqe_struct(struct fz *f, struct io_uring_sqe *s)
 		break;
 	case 8:
 		s->opcode = IORING_OP_POLL_ADD;
-		s->fd = pool_fd(f, 3);
+		s->fd = chance(f, 10) ? f->pool[10] : pool_fd(f, 3);
 		s->poll32_events = chance(f, 60) ? POLLIN : chance(f, 50) ?
 		    POLLOUT : (uint32_t)rn(f, 0x200);
 		if (chance(f, 40))
@@ -1731,6 +1748,53 @@ do_register(struct fz *f)
 		op = IORING_REGISTER_RESIZE_RINGS;
 		arg = &rp;
 		nr = 1;
+	}
+	/* A synchronous cancel, mostly with a short timeout. */
+	if (chance(f, 8)) {
+		struct io_uring_sync_cancel_reg sc;
+		static const uint8_t ops[] = { IORING_OP_READ, IORING_OP_RECV,
+		    IORING_OP_POLL_ADD, IORING_OP_ACCEPT, IORING_OP_TIMEOUT };
+
+		memset(&sc, 0, sizeof(sc));
+		sc.flags = (uint32_t)rn(f, 8) & (IORING_ASYNC_CANCEL_ALL |
+		    IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_ANY);
+		if (chance(f, 40)) {
+			sc.flags |= IORING_ASYNC_CANCEL_OP;
+			sc.opcode = ops[rn(f, sizeof(ops))];
+		}
+		sc.fd = f->pool[rn(f, NPOOL)];
+		sc.addr = rn(f, 64);
+		if (chance(f, 5)) {
+			sc.timeout.tv_sec = -1;
+			sc.timeout.tv_nsec = -1;
+		} else
+			sc.timeout.tv_nsec = (long long)rn(f, 1000000);
+		op = IORING_REGISTER_SYNC_CANCEL;
+		arg = &sc;
+		nr = 1;
+		(void)CALL(f, "sync_cancel", kqring_register(f->ring, op, arg,
+		    nr));
+		atomic_fetch_add(&st_regs, 1);
+		return;
+	}
+	/* Without a ring: a message to this one, or anything at all. */
+	if (chance(f, 3)) {
+		struct io_uring_sqe ms;
+
+		memset(&ms, 0, sizeof(ms));
+		ms.opcode = IORING_OP_MSG_RING;
+		ms.fd = f->ring;
+		ms.addr = IORING_MSG_DATA;
+		ms.off = rnd(f);
+		ms.len = (uint32_t)rnd(f);
+		if (chance(f, 70)) {
+			op = IORING_REGISTER_SEND_MSG_RING;
+			arg = &ms;
+			nr = 1;
+		}
+		(void)CALL(f, "register(-1)", kqring_register(-1, op, arg, nr));
+		atomic_fetch_add(&st_regs, 1);
+		return;
 	}
 	r = CALL(f, "kqring_register", kqring_register(f->ring, op, arg, nr));
 	atomic_fetch_add(&st_regs, 1);

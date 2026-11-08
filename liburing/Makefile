@@ -12,8 +12,8 @@
 #	make check		run them, with kqring.ko loaded
 #	make clean		remove work/
 
-LIBURING_VERSION=	2.9
-LIBURING_SHA256=	897b1153b55543e8b92a5a3eb9b906537a5fedcf8afaf241f8b8787940c79f8d
+LIBURING_VERSION=	2.15
+LIBURING_SHA256=	8d052f2622dcb3678cbaee5ff582a87572672a6c0a56533cdda5b65cb636120a
 DISTFILE=	liburing-${LIBURING_VERSION}.tar.gz
 MASTER_SITE=	https://github.com/axboe/liburing/archive/refs/tags
 
@@ -79,6 +79,7 @@ examples: lib
 
 # xfail_*.c are liburing's AddressSanitizer tests (built only with ASan
 # there): without it they wait for a completion that never comes.
+# bpf_*.c need a BPF toolchain and libbpf, as in liburing's own build.
 tests: lib
 	mkdir -p ${OUT}/test
 	rm -f ${OUT}/test/xfail_*.t
@@ -86,7 +87,7 @@ tests: lib
 	cd ${WRKSRC}/test && ${CC} ${CFLAGS} ${CPPFLAGS} ${TEST_CPPFLAGS} \
 	    -c helpers.c -o ${OUT}/test/helpers.o
 	cd ${WRKSRC}/test && for s in *.c; do \
-	    case $$s in helpers.c|xfail_*) continue;; esac; \
+	    case $$s in helpers.c|xfail_*|bpf_*) continue;; esac; \
 	    ${CC} ${CFLAGS} ${CPPFLAGS} ${TEST_CPPFLAGS} $$s ${OUT}/test/helpers.o \
 	    -o ${OUT}/test/$${s%.c}.t ${OUT}/liburing.a -lpthread -lm \
 	    >/dev/null 2>&1 || echo $${s%.c} >> ${OUT}/test.unbuilt; done

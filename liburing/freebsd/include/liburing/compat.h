@@ -88,6 +88,14 @@ struct epoll_event;
 #ifndef MAP_HUGETLB
 #define MAP_HUGETLB	MAP_ALIGNED_SUPER
 #endif
+/*
+ * It asks for 2 MB pages with Linux's size bits, which FreeBSD would read
+ * as MAP_ALIGNED(n): MAP_ALIGNED_SUPER says it alone.
+ */
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_SHIFT	0
+#define MAP_HUGE_2MB	0
+#endif
 /* Done with minherit(2) in arch/freebsd/syscall.h. */
 #ifndef MADV_DONTFORK
 #define MADV_DONTFORK	0x7f00

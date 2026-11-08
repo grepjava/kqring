@@ -1827,6 +1827,12 @@ kqring_ioctl(struct file *fp, u_long cmd, void *data,
 		struct kqring_register_arg *ra =
 		    (struct kqring_register_arg *)data;
 
+		/* No ring: <sys/kqring.h> sends these to /dev/kqring. */
+		if (ra->ring_fd == -1 && !ctx->setup_done &&
+		    (ra->opcode & IORING_REGISTER_USE_REGISTERED_RING) == 0) {
+			error = kqring_register_blind(ra);
+			break;
+		}
 		if ((ra->opcode & IORING_REGISTER_USE_REGISTERED_RING) != 0) {
 			ra->opcode &= ~IORING_REGISTER_USE_REGISTERED_RING;
 			error = kqring_reg_ring_fget(td, (uint32_t)ra->ring_fd,
@@ -2029,6 +2035,11 @@ kqring_sys_register(struct thread *td, struct kqring_register_args *uap)
 	struct file *fp;
 	int error, res = 0;
 
+	if (uap->fd == -1 &&
+	    (uap->opcode & IORING_REGISTER_USE_REGISTERED_RING) == 0) {
+		td->td_retval[0] = 0;
+		return (kqring_register_blind(&ra));
+	}
 	error = kqring_sys_ring(td, uap->fd,
 	    (uap->opcode & IORING_REGISTER_USE_REGISTERED_RING) != 0, false,
 	    &fp, &ctx);

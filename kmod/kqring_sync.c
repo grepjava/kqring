@@ -331,7 +331,8 @@ kqring_msg_ring(struct kqring_ctx *ctx, const struct kqring_op *op)
 		rc->cqe.res = (int32_t)sqe->len;
 		rc->cqe.flags = (sqe->msg_ring_flags &
 		    IORING_MSG_RING_FLAGS_PASS) != 0 ? sqe->file_index : 0;
-		if ((ctx->flags & IORING_SETUP_SQE128) != 0) {
+		/* No ctx: IORING_REGISTER_SEND_MSG_RING without a ring. */
+		if (ctx != NULL && (ctx->flags & IORING_SETUP_SQE128) != 0) {
 			memcpy(rc->extra, op->sqe_extra, sizeof(rc->extra));
 			rc->has_extra = true;
 		}
@@ -739,6 +740,7 @@ kqring_cancel_wait(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe,
     bool has_timeout, sbintime_t sbt)
 {
 	sbintime_t deadline = has_timeout ? kqring_deadline(sbt) : 0;
+	sbintime_t grace = kqring_deadline(SBT_1S), left;
 	struct file *cfp = NULL;
 	struct kqring_op *op;
 	int error;
@@ -766,7 +768,16 @@ kqring_cancel_wait(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe,
 			mtx_unlock(&ctx->mtx);
 			return (ctx->closing ? EBADF : 0);
 		}
-		if (has_timeout && kqring_until(deadline) == 0) {
+		/*
+		 * A worker that was only waiting (for a pipe's data, say) is
+		 * one io_uring would have had armed as a poll, cancelled at
+		 * once: the timeout doesn't count for it, only a grace for the
+		 * aborted worker to return.
+		 */
+		left = has_timeout ? kqring_until(deadline) : SBT_1S;
+		if (left == 0 && op->wq_blocking)
+			left = kqring_until(grace);
+		if (left == 0) {
 			mtx_unlock(&ctx->mtx);
 			return (ETIME);
 		}
@@ -774,8 +785,7 @@ kqring_cancel_wait(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe,
 		if (TAILQ_EMPTY(&ctx->taskwork_ops)) {
 			ctx->sleeping++;
 			error = msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, PCATCH,
-			    "kqscan", has_timeout ? MIN(kqring_until(deadline),
-			    SBT_1S) : SBT_1S, 0, 0);
+			    "kqscan", MIN(left, SBT_1S), 0, 0);
 			ctx->sleeping--;
 			if (error == EINTR || error == ERESTART) {
 				mtx_unlock(&ctx->mtx);

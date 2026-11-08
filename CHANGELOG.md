@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- `io_uring_buf_reg.min_left`, from Linux 7.3: on an `IOU_PBUF_RING_INC` ring, a buffer with less than that many bytes left is used up rather than kept for the next transfer. kqring refused it with `EINVAL` before.
+
 ### Fixed
 
 - Reads of a named FIFO now complete in the order of the data, as reads of a pipe do. They also read as a pipe's do otherwise: one with data ready completes without a worker, and an empty `O_NONBLOCK` FIFO waits for data, as in io_uring, rather than failing with `EAGAIN`. `RWF_NOWAIT` still fails it.
@@ -18,6 +22,11 @@
 - A refused `FILES_UPDATE` now leaves its slot empty, as on Linux, rather than keeping the old file.
 - With `IORING_SETUP_SINGLE_ISSUER`, another thread's enter that submits nothing now succeeds, as on Linux, rather than failing with `EEXIST`. A wait by another thread still fails unless the CQ can already satisfy it, or always on a `DEFER_TASKRUN` ring.
 - `IORING_SETUP_TASKRUN_FLAG` now needs `COOP_TASKRUN` or `DEFER_TASKRUN`, and `SQPOLL` refuses all three, with `EINVAL`, as on Linux. Programs that set them another way will now fail at setup.
+- `io_uring_register(-1, IORING_REGISTER_SEND_MSG_RING, ...)` now sends a message without a ring of one's own, as on Linux 6.13 and later. The other ring-less registrations, the task restrictions and BPF filters, and `IORING_REGISTER_QUERY` are refused with `EOPNOTSUPP`, and the rest with `EINVAL`.
+- A provided-buffer read that reaches end of file from an `IOU_PBUF_RING_INC` ring now completes with `IORING_CQE_F_BUFFER` and `IORING_CQE_F_BUF_MORE`, as on Linux: the buffer is still the program's to reuse. Its CQE used to carry no buffer.
+- Multishot `RECV` now stops a run at the SQE's `len` bytes, or after 32 completions, and yields to other work, so one busy socket can't starve the others. With `optlen` set it ends after that many bytes in all. Both are as on Linux. It used to read for as long as data came.
+- `IORING_REGISTER_SYNC_CANCEL` with a short timeout no longer fails with `ETIME` when what it cancels is a read waiting for a pipe's data, or anything else whose worker is only waiting. Linux has such a request armed as a poll and cancels it at once; the worker kqring uses for it could take longer to stop than the timeout. liburing's `sync-cancel` failed on this, rarely.
+- A multishot poll on the ring's own registered eventfd now ends at the wakeup after its first CQE, close to Linux, which ends it at the next event after the ring's own signal. It used to fire on its own signal for ever.
 - `READ_MULTISHOT` of a file that can't be polled now completes with `EBADF`, where Linux has `EBADFD`, rather than `EOPNOTSUPP`, with or without `IOSQE_ASYNC`.
 
 ### Testing
@@ -25,8 +34,10 @@
 - Linux 7.3 and kqring now match in 16 of the 21 cases of `tests/kqring_diff.c`, and the other 5 differ on purpose. The results are in `docs/conformance/`.
 - `tests/kqring_diff.c` runs the same cases on Linux and on kqring, and `tests/diff_compare.py` fails on a difference that isn't listed with its reason.
 - `tests/kqring_test.c` now covers `WRITEV_FIXED`, level-triggered polls, `ACCEPT_POLL_FIRST`, `IORING_OFF_CQ_RING`, how a failed SQE ends a batch, the flags kqring refuses, `SIGPIPE`, hole punching and the Capsicum rights of fixed files.
+- `tests/kqring_fuzz.c` now also registers without a ring, uses incremental buffer rings with and without `min_left`, caps multishot `RECV` by `len` and `optlen`, polls the ring's own eventfd and cancels synchronously.
 - `tests/kqring_fuzz.c` now really exercises futexes, whose wake masks all failed validation before, and resizes rings with requests in flight.
 - liburing 2.9: 179 of 196 tests pass, up from 144 of 168. 28 of the 32 tests that weren't built now are, and the other 4 are listed as not portable. Tests that stopped on portability problems, or on an early failure, before they reached what they test now run, and `regbuf-merge` now really calls kqring: it used to pass by making unrelated FreeBSD system calls. Every adapted test is listed in [`liburing/README.md`](liburing/README.md#adapted-tests).
+- The liburing port moves to 2.15: 209 of its 245 tests that build pass, 27 skip and 9 fail, each for a reason given in [`liburing/README.md`](liburing/README.md). Its tests led to `min_left` and to the fixes above to ring-less registration, incremental buffers at end of file, multishot `RECV` limits, polls on a ring's own eventfd and `SYNC_CANCEL`. `liburing/compat.h` no longer turns liburing's 2 MB huge-page request into a FreeBSD alignment that `mmap(2)` refuses.
 
 ### Documentation
 

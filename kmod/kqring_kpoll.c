@@ -1183,6 +1183,7 @@ kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 	int events = sqe->poll32_events ? (int)sqe->poll32_events :
 	    sqe->poll_events;
 	bool multi = (sqe->len & IORING_POLL_ADD_MULTI) != 0;
+	bool own;
 	int rev;
 	u_int nev;
 
@@ -1193,10 +1194,12 @@ kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 	mtx_lock(&ctx->mtx);
 	/*
 	 * A multishot poll on the ring's own eventfd would be woken by the
-	 * signal for its own CQE, for ever.  io_uring ends one woken by its
-	 * eventfd signal after that CQE; any wakeup of it ends it here.
+	 * signal for its own CQE, for ever.  io_uring makes one that its own
+	 * signal woke one-shot: its first CQE has F_MORE, and the next ends
+	 * it.  Here the next wakeup ends it, which may be that signal.
 	 */
-	if (op->kp_data != NULL && op->kp_data == ctx->evfd)
+	own = op->kp_data != NULL && op->kp_data == ctx->evfd;
+	if (own && op->kp_once)
 		multi = false;
 	rev = op->kp_revents & (events | POLLERR | POLLHUP | POLLNVAL);
 	nev = op->kp_nev;
@@ -1230,6 +1233,10 @@ kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 				goto last;
 			kqring_post_cqe(ctx, sqe->user_data, rev,
 			    IORING_CQE_F_MORE);
+			if (own) {
+				op->kp_once = true;
+				break;
+			}
 		}
 		return;
 	}

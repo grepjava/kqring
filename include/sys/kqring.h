@@ -805,7 +805,8 @@ struct io_uring_buf_reg {
 	__u32	ring_entries;
 	__u16	bgid;
 	__u16	flags;
-	__u64	resv[3];
+	__u32	min_left;
+	__u32	resv[5];
 };
 
 /*
@@ -813,7 +814,8 @@ struct io_uring_buf_reg {
  * ring, which userspace maps at IORING_OFF_PBUF_RING |
  * (bgid << IORING_OFF_PBUF_SHIFT).  IOU_PBUF_RING_INC: a buffer may be
  * consumed in parts; the kernel advances its addr/len in the ring and sets
- * IORING_CQE_F_BUF_MORE while some of it is left.
+ * IORING_CQE_F_BUF_MORE while some of it is left, and at least min_left
+ * bytes (if set; only with IOU_PBUF_RING_INC): less is used up.
  */
 #define IOU_PBUF_RING_MMAP		(1U << 0)
 #define IOU_PBUF_RING_INC		(1U << 1)
@@ -1257,7 +1259,8 @@ kqring_register(int fd, unsigned op, void *arg, unsigned n)
 	if ((op & ~IORING_REGISTER_USE_REGISTERED_RING) ==
 	    IORING_REGISTER_RING_FDS)
 		(void)kqring_ctl_fd();
-	if ((op & IORING_REGISTER_USE_REGISTERED_RING) != 0) {
+	/* No ring (-1), or a registered one: through /dev/kqring. */
+	if (fd == -1 || (op & IORING_REGISTER_USE_REGISTERED_RING) != 0) {
 		ioctl_fd = kqring_ctl_fd();
 		if (ioctl_fd < 0)
 			return (-1);

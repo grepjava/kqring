@@ -779,6 +779,8 @@ read_busy:
 		sel.bg->busy = false;
 		if (done > 0)
 			cflags = kqring_buf_commit_op(ctx, op, &sel, done);
+		else
+			cflags = kqring_buf_eof(&sel);
 		sx_xunlock(&ctx->bg_sx);
 	}
 	if (error != 0 && done == 0) {

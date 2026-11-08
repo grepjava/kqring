@@ -1348,6 +1348,7 @@ test_file_rw(struct test_ring *r)
 	sqe->open_flags = O_RDWR;
 	ring_push_sqe(r);
 	ring_submit(r);
+	assert(ring_wait(r, 1, 10000) == 0);
 	struct io_uring_cqe c = ring_pop_cqe(r);
 	assert(c.user_data == 7001 && c.res >= 0);
 	int fd = c.res;
@@ -1366,7 +1367,7 @@ test_file_rw(struct test_ring *r)
 	sqe = ring_prep(r, IORING_OP_FSYNC, fd, 7004);
 	ring_push_sqe(r);
 	ring_submit(r);
-	assert(ring_cq_ready(r) == 3);
+	assert(ring_wait(r, 3, 10000) == 0 && ring_cq_ready(r) == 3);
 	c = ring_pop_cqe(r);
 	assert(c.user_data == 7002 && c.res == 11);
 	c = ring_pop_cqe(r);
@@ -1382,6 +1383,8 @@ test_file_rw(struct test_ring *r)
 	sqe->off = 6;
 	ring_push_sqe(r);
 	ring_submit(r);
+	/* A read that misses the page cache completes on a worker. */
+	assert(ring_wait(r, 1, 10000) == 0);
 	c = ring_pop_cqe(r);
 	assert(c.user_data == 7005 && c.res == 5);
 	assert(memcmp(buf, "XYrld", 5) == 0);
@@ -1394,6 +1397,8 @@ test_file_rw(struct test_ring *r)
 	sqe->off = (uint64_t)-1;
 	ring_push_sqe(r);
 	ring_submit(r);
+	/* A read that misses the page cache completes on a worker. */
+	assert(ring_wait(r, 1, 10000) == 0);
 	c = ring_pop_cqe(r);
 	assert(c.user_data == 7006 && c.res == 5);
 	assert(memcmp(buf, "hello", 5) == 0);
@@ -5473,6 +5478,29 @@ test_buffer_groups(void)
 	assert(inc[39] == 'i' && inc[40] == 'j' && inc[99] == 'j');
 	assert(pbuf_head(&t, 6) == 1);
 
+	/* min_left: a buffer with less than that left is used up. */
+	struct io_uring_buf *mb = mmap(NULL, (size_t)page,
+	    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(mb != MAP_FAILED);
+	br = (struct io_uring_buf_reg){ .ring_addr = (uint64_t)(uintptr_t)mb,
+	    .ring_entries = 2, .bgid = 7, .flags = IOU_PBUF_RING_INC,
+	    .min_left = 32 };
+	assert(reg(&t, IORING_REGISTER_PBUF_RING, &br, 1) == 0);
+	char *ml = pb + 3200;
+	mb[0] = (struct io_uring_buf){ (uint64_t)(uintptr_t)ml, 64, 31, 0 };
+	atomic_store_explicit((_Atomic uint16_t *)
+	    &((struct io_uring_buf_ring *)mb)->tail, 1, memory_order_release);
+	assert(write(sv[1], data, 32) == 32);
+	c = recv_select(&t, sv[0], 7, 0, 0, 44020);
+	assert(c.res == 32 && (c.flags >> IORING_CQE_BUFFER_SHIFT) == 31);
+	assert((c.flags & IORING_CQE_F_BUF_MORE) != 0);
+	assert(mb[0].len == 32 && pbuf_head(&t, 7) == 0);
+	assert(write(sv[1], data, 1) == 1);
+	c = recv_select(&t, sv[0], 7, 0, 0, 44021);
+	assert(c.res == 1 && (c.flags >> IORING_CQE_BUFFER_SHIFT) == 31);
+	assert((c.flags & IORING_CQE_F_BUF_MORE) == 0);
+	assert(pbuf_head(&t, 7) == 1);
+
 	/* SEND from provided buffers. */
 	memcpy(pb + 4000, "sendme", 6);
 	sqe = ring_prep(&t, IORING_OP_PROVIDE_BUFFERS, 1, 44012);
@@ -8583,7 +8611,7 @@ test_cq_backpressure(void)
 
 /*
  * REGISTER_SYNC_CANCEL returns once a request running on a worker has
- * stopped, its CQE posted; a zero timeout gives ETIME while it runs.
+ * stopped, its CQE posted.
  */
 static void
 test_sync_cancel_worker(void)
@@ -8627,6 +8655,45 @@ test_sync_cancel_worker(void)
 	close(t.fd);
 	printf("[PASS] SYNC_CANCEL waits for the worker running the "
 	    "request\n");
+}
+
+/*
+ * A read of an empty pipe only waits, as a poll would on Linux, so even a
+ * 1 ns SYNC_CANCEL cancels it rather than giving ETIME, with or without
+ * IOSQE_ASYNC (liburing's sync-cancel).
+ */
+static void
+test_sync_cancel_waiting(void)
+{
+	struct io_uring_sync_cancel_reg sc;
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	char buf[8];
+	int p[2];
+
+	ring_init(&t);
+	for (int i = 0; i < 200; i++) {
+		assert(pipe(p) == 0);
+		sqe = ring_prep(&t, IORING_OP_READ, p[0], 79100 + i);
+		sqe->addr = (uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		sqe->off = (uint64_t)-1;
+		if (i % 2 != 0)
+			sqe->flags = IOSQE_ASYNC;
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		usleep(i < 10 ? 10 * 1000 : 200);
+		memset(&sc, 0, sizeof(sc));
+		sc.flags = IORING_ASYNC_CANCEL_OP;
+		sc.opcode = IORING_OP_READ;
+		sc.timeout.tv_nsec = 1;
+		assert(reg(&t, IORING_REGISTER_SYNC_CANCEL, &sc, 1) == 0);
+		expect_cqe(&t, 79100 + i, -ECANCELED);
+		close(p[0]);
+		close(p[1]);
+	}
+	close(t.fd);
+	printf("[PASS] SYNC_CANCEL ends a waiting read within any timeout\n");
 }
 
 /*
@@ -9707,6 +9774,46 @@ test_files_update_refused(void)
 	printf("[PASS] A refused FILES_UPDATE empties its slot\n");
 }
 
+/*
+ * A multishot poll on the ring's own CQ eventfd: its first CQE has F_MORE,
+ * and the wakeup after it ends it, as io_uring makes it one-shot then.
+ */
+static void
+test_poll_own_eventfd(void)
+{
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	struct test_ring t;
+	uint64_t v = 1;
+	int e = eventfd(0, EFD_NONBLOCK);
+
+	assert(e >= 0);
+	ring_init(&t);
+	assert(reg(&t, IORING_REGISTER_EVENTFD, &e, 1) == 0);
+	sqe = ring_prep(&t, IORING_OP_POLL_ADD, e, 79301);
+	sqe->poll32_events = POLLIN;
+	sqe->len = IORING_POLL_ADD_MULTI;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	for (int i = 0; i < 2; i++) {
+		assert(write(e, &v, sizeof(v)) == sizeof(v));
+		assert(read(e, &v, sizeof(v)) == sizeof(v));
+		assert(ring_wait(&t, 1, 2000) == 0);
+		c = ring_pop_cqe(&t);
+		assert(c.user_data == 79301 && (c.res & POLLIN) != 0);
+		assert(((c.flags & IORING_CQE_F_MORE) != 0) == (i == 0));
+	}
+	usleep(20000);
+	(void)kqring_enter(t.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0);
+	assert(ring_cq_ready(&t) == 0);
+	munmap(t.ring_map, t.ring_map_len);
+	munmap(t.sqes, t.sqes_len);
+	close(t.fd);
+	close(e);
+	printf("[PASS] Multishot poll on the ring's own eventfd: F_MORE, "
+	    "then ends\n");
+}
+
 static void
 test_compat_gaps(void)
 {
@@ -9951,7 +10058,31 @@ test_compat_contracts(void)
 
 	/* Registration without a ring, and the field that was reserved. */
 	assert(kqring_register(-1, IORING_REGISTER_RESTRICTIONS, NULL, 0) ==
-	    -1 && errno == EBADF);
+	    -1 && errno == EOPNOTSUPP);
+	assert(kqring_register(-1, 37, NULL, 0) == -1 && errno == EOPNOTSUPP);
+	assert(kqring_register(-1, 35 /* QUERY */, NULL, 0) == -1 &&
+	    errno == EOPNOTSUPP);
+	assert(kqring_register(-1, IORING_REGISTER_PROBE, NULL, 0) == -1 &&
+	    errno == EINVAL);
+	{
+		/* A message from no ring. */
+		struct io_uring_sqe ms;
+
+		memset(&ms, 0, sizeof(ms));
+		ms.opcode = IORING_OP_MSG_RING;
+		ms.fd = t.fd;
+		ms.addr = IORING_MSG_DATA;
+		ms.off = 78117;
+		ms.len = 0x10;
+		assert(kqring_register(-1, IORING_REGISTER_SEND_MSG_RING, &ms,
+		    1) == 0);
+		ms.addr = IORING_MSG_SEND_FD;
+		assert(kqring_register(-1, IORING_REGISTER_SEND_MSG_RING, &ms,
+		    1) == -1 && errno == EINVAL);
+		assert(kqring_enter(t.fd, 0, 1, IORING_ENTER_GETEVENTS, NULL,
+		    0) == 0);
+		expect_cqe(&t, 78117, 0x10);
+	}
 	{
 		struct io_uring_buf_reg br;
 		void *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
@@ -9962,8 +10093,17 @@ test_compat_contracts(void)
 		br.ring_addr = (uint64_t)(uintptr_t)m;
 		br.ring_entries = 8;
 		br.bgid = 9;
-		((uint32_t *)&br)[4] = 2;	/* min_left */
+		/* min_left belongs to incremental rings only. */
+		br.min_left = 2;
 		assert(reg(&t, IORING_REGISTER_PBUF_RING, &br, 1) == -EINVAL);
+		br.flags = IOU_PBUF_RING_INC;
+		br.resv[4] = 1;
+		assert(reg(&t, IORING_REGISTER_PBUF_RING, &br, 1) == -EINVAL);
+		br.resv[4] = 0;
+		assert(reg(&t, IORING_REGISTER_PBUF_RING, &br, 1) == 0);
+		br.min_left = 0;
+		br.flags = 0;
+		assert(reg(&t, IORING_UNREGISTER_PBUF_RING, &br, 1) == 0);
 		munmap(m, 4096);
 	}
 
@@ -12835,12 +12975,14 @@ main(int argc, char **argv)
 		test_taskrun_on_wakeup();
 		test_compat_gaps();
 		test_short_links();
+		test_poll_own_eventfd();
 		test_files_update_refused();
 		test_single_issuer_wait();
 		test_compat_contracts();
 		test_exec_kthreads();
 		test_cq_backpressure();
 		test_sync_cancel_worker();
+		test_sync_cancel_waiting();
 		test_tag_failed_register();
 		test_tag_release_no_drop();
 		test_sqe128_cqe32_attach_wq();

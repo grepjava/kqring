@@ -225,7 +225,8 @@ kqring_buf_drained(const struct kqring_sel *sel)
  * Consume the selected buffers that n > 0 bytes went into, and return the
  * CQE flags reporting them (the first buffer's ID).  With
  * IOU_PBUF_RING_INC, a buffer only partly used stays at the head with
- * what is left of it, and IORING_CQE_F_BUF_MORE says so.
+ * what is left of it, and IORING_CQE_F_BUF_MORE says so, unless less than
+ * the group's min_left is left: then it is used up, as in io_uring.
  */
 uint32_t
 kqring_buf_commit(struct kqring_ctx *ctx, const struct kqring_sel *sel,
@@ -252,7 +253,8 @@ kqring_buf_commit(struct kqring_ctx *ctx, const struct kqring_sel *sel,
 		}
 		return (cflags);
 	}
-	if ((bg->ring_flags & IOU_PBUF_RING_INC) != 0 && n < sel->len0) {
+	if ((bg->ring_flags & IOU_PBUF_RING_INC) != 0 && n < sel->len0 &&
+	    sel->len0 - n >= bg->min_left) {
 		struct io_uring_buf b = {
 			.addr = sel->addr0 + n,
 			.len = sel->len0 - (uint32_t)n,
@@ -266,6 +268,20 @@ kqring_buf_commit(struct kqring_ctx *ctx, const struct kqring_sel *sel,
 	return (cflags);
 }
 
+
+/*
+ * A read that got nothing (end of file) from an IOU_PBUF_RING_INC ring:
+ * its buffer stays as it was, with room left, which io_uring reports with
+ * the buffer's ID and IORING_CQE_F_BUF_MORE.  Other groups report none.
+ */
+uint32_t
+kqring_buf_eof(const struct kqring_sel *sel)
+{
+	if (sel->from_list || (sel->bg->ring_flags & IOU_PBUF_RING_INC) == 0)
+		return (0);
+	return (IORING_CQE_F_BUFFER | IORING_CQE_F_BUF_MORE |
+	    ((uint32_t)sel->bid << IORING_CQE_BUFFER_SHIFT));
+}
 
 /*
  * kqring_buf_commit() for op, also noting, for a request of a trigger's
@@ -1180,8 +1196,13 @@ kqring_pbuf_register(struct kqring_ctx *ctx,
 	error = copyin(ra->arg, &reg, sizeof(reg));
 	if (error != 0)
 		return (error);
-	if (reg.resv[0] != 0 || reg.resv[1] != 0 || reg.resv[2] != 0 ||
-	    (reg.flags & ~(IOU_PBUF_RING_MMAP | IOU_PBUF_RING_INC)) != 0)
+	for (size_t i = 0; i < nitems(reg.resv); i++)
+		if (reg.resv[i] != 0)
+			return (EINVAL);
+	if ((reg.flags & ~(IOU_PBUF_RING_MMAP | IOU_PBUF_RING_INC)) != 0)
+		return (EINVAL);
+	/* What must be left of a buffer to reuse it: incremental rings'. */
+	if ((reg.flags & IOU_PBUF_RING_INC) == 0 && reg.min_left != 0)
 		return (EINVAL);
 	if (reg.ring_entries == 0 ||
 	    reg.ring_entries > KQRING_MAX_PBUF_ENTRIES ||
@@ -1223,6 +1244,7 @@ kqring_pbuf_register(struct kqring_ctx *ctx,
 	bg = kqring_bgroup_new(reg.bgid);
 	bg->is_ring = true;
 	bg->ring_flags = reg.flags;
+	bg->min_left = reg.min_left;
 	bg->ring_entries = reg.ring_entries;
 	bg->ring_mask = reg.ring_entries - 1;
 	if ((reg.flags & IOU_PBUF_RING_MMAP) != 0) {
@@ -1280,8 +1302,10 @@ kqring_pbuf_unregister(struct kqring_ctx *ctx,
 	error = copyin(ra->arg, &reg, sizeof(reg));
 	if (error != 0)
 		return (error);
-	if (reg.resv[0] != 0 || reg.resv[1] != 0 || reg.resv[2] != 0 ||
-	    reg.flags != 0)
+	for (size_t i = 0; i < nitems(reg.resv); i++)
+		if (reg.resv[i] != 0)
+			return (EINVAL);
+	if (reg.flags != 0 || reg.min_left != 0)
 		return (EINVAL);
 	sx_xlock(&ctx->bg_sx);
 	bg = kqring_bgroup_find(ctx, reg.bgid);

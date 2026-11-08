@@ -10,6 +10,9 @@
 #include <sys/disk.h>
 
 /* A disk's size in bytes (a 64-bit value), as DIOCGMEDIASIZE. */
+#ifndef BLKSSZGET
+#define BLKSSZGET	DIOCGSECTORSIZE
+#endif
 #ifndef BLKGETSIZE64
 #define BLKGETSIZE64	DIOCGMEDIASIZE
 #endif

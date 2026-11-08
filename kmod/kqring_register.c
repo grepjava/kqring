@@ -375,7 +375,8 @@ kqring_sync_cancel(struct kqring_ctx *ctx,
 
 /*
  * IORING_REGISTER_SEND_MSG_RING: MSG_RING (IORING_MSG_DATA only, as in
- * io_uring) without a submission, from any thread.
+ * io_uring) without a submission, from any thread, or with no ring at all
+ * (ctx NULL).
  */
 static int
 kqring_register_send_msg(struct kqring_ctx *ctx,
@@ -892,6 +893,26 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 		return (-res);
 	*resp = res;
 	return (0);
+}
+
+/*
+ * A registration with no ring (descriptor -1), as io_uring_register(2)
+ * takes for these opcodes since Linux 6.13.  Only SEND_MSG_RING is
+ * implemented; the others exist, so they fail as unsupported.
+ */
+int
+kqring_register_blind(struct kqring_register_arg *ra)
+{
+	switch (ra->opcode) {
+	case IORING_REGISTER_SEND_MSG_RING:
+		return (kqring_register_send_msg(NULL, ra));
+	case 35:	/* IORING_REGISTER_QUERY */
+	case IORING_REGISTER_RESTRICTIONS:
+	case 37:	/* IORING_REGISTER_BPF_FILTER */
+		return (EOPNOTSUPP);
+	default:
+		return (EINVAL);
+	}
 }
 
 /*

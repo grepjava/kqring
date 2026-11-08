@@ -22,10 +22,10 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 
 FreeBSD-native extensions add persistent event-driven chains, result and buffer forwarding between steps, native kevent requests and a kqueue bridge. These stay an opt-in interface alongside the Linux-compatible API.
 
-The liburing 2.9 port passes 179 of the 196 tests it builds, with `RLIMIT_MEMLOCK` raised. That isn't a compatibility percentage:
+The liburing 2.15 port passes 209 of the 245 tests it builds, with `RLIMIT_MEMLOCK` raised. That isn't a compatibility percentage:
 
-- 6 more tests can't be built here, each for a recorded reason.
-- The port carries portability shims and adapts some tests, 10 tests skip, and 6 of the 7 failures are intentional differences or the platform's.
+- 13 more tests can't be built here, each for a recorded reason.
+- The port carries portability shims and adapts some tests, 27 tests skip, and 8 of the 9 failures are intentional differences or the platform's.
 - A test stops at its first failure, so the subtests after it haven't run.
 
 The probe also can't speak for every variant of an operation. `SYNC_FILE_RANGE` syncs the whole file, `URING_CMD` supports four socket commands only, and `IORING_REGISTER_CLOCK` is recorded but has no effect.
@@ -45,11 +45,11 @@ This comes before new features, so that what follows is measured against somethi
 
 **Done.** Of the 32 unbuilt tests, 28 now build, and 4 are listed as not portable. Tests that used to stop on portability problems, or on an early failure, before reaching what they test now run too, and `regbuf-merge`, which passed without ever calling kqring, now calls it. This found a wake order bug in `FUTEX_WAKE`, a refused empty set of restrictions, and `IORING_SQ_TASKRUN` being set late. See the [accounting](liburing/README.md#test-results), which lists every adapted test.
 
-Acceptance: every liburing 2.9 test is passing, skipped, failing with a documented reason, or listed as not portable with a reason.
+Acceptance: every liburing test is passing, skipped, failing with a documented reason, or listed as not portable with a reason.
 
 ### Versioned compatibility matrix
 
-**Done.** [`COMPATIBILITY.MD`](COMPATIBILITY.MD) lists all 215 capabilities against Linux 7.3 and liburing 2.9, and [`tests/compat_check.py`](tests/compat_check.py) fails if it stops matching the source. Its [validation gaps](COMPATIBILITY.MD#validation-gaps) list what is still unchecked.
+**Done.** [`COMPATIBILITY.MD`](COMPATIBILITY.MD) lists all 215 capabilities against Linux 7.3 and liburing 2.15, and [`tests/compat_check.py`](tests/compat_check.py) fails if it stops matching the source. Its [validation gaps](COMPATIBILITY.MD#validation-gaps) list what is still unchecked.
 
 Document every supported opcode, setup flag, enter flag, registration and important subflag against a stated Linux kernel and liburing baseline. Classify each as equivalent, partial, unsupported or intentionally different, and record platform and filesystem dependencies separately from limits of the module.
 
@@ -75,7 +75,7 @@ Acceptance: kernel versions, commits, build options, filesystem, resource limits
 
 ## Phase 3: Wait semantics
 
-This is the largest gap the review found in the existing liburing 2.9 interface. Today `kqring_enter()` rejects a signal mask in both forms with `EINVAL`, timeouts are always relative, and `IORING_ENTER_ABS_TIMER`, `IORING_ENTER_EXT_ARG_REG` and `IORING_REGISTER_MEM_REGION` don't exist.
+This is the largest gap the review found in the existing liburing interface. Today `kqring_enter()` rejects a signal mask in both forms with `EINVAL`, timeouts are always relative, and `IORING_ENTER_ABS_TIMER`, `IORING_ENTER_EXT_ARG_REG` and `IORING_REGISTER_MEM_REGION` don't exist.
 
 In order:
 

@@ -380,7 +380,10 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	bool bundle = sqe->opcode == IORING_OP_RECV &&
 	    (sqe->ioprio & IORING_RECVSEND_BUNDLE) != 0;
 	bool bg_lock = buf_select && kqring_bg_locks(ctx);
-	bool drained = false, waitall;
+	/* As io_uring: sqe->optlen bounds all a multishot RECV receives. */
+	bool mshot_total = multishot && sqe->opcode == IORING_OP_RECV &&
+	    sqe->optlen != 0;
+	bool drained = false, last = false, waitall;
 	size_t n;
 	int error, flags, rc;
 
@@ -430,9 +433,15 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	}
 
 	if (buf_select) {
+		uint32_t cap = kqring_buf_cap(op);
+
+		/* What is left of a multishot receive's total (sqe->optlen). */
+		if (mshot_total)
+			cap = cap != 0 ? MIN(cap, sqe->optlen - op->done_io) :
+			    sqe->optlen - (uint32_t)op->done_io;
 		if (bg_lock)
 			sx_xlock(&ctx->bg_sx);
-		error = kqring_recv_pick_buf(ctx, op, so, kqring_buf_cap(op),
+		error = kqring_recv_pick_buf(ctx, op, so, cap,
 		    biov, bundle ? KQRING_MAX_BUNDLE : 1, &sel);
 		if (error != 0) {
 			if (bg_lock)
@@ -488,7 +497,11 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 		if (bg_lock)
 			sx_xunlock(&ctx->bg_sx);
 	}
-	if (multishot && n > 0) {
+	if (mshot_total && n > 0) {
+		op->done_io += n;
+		last = op->done_io >= sqe->optlen;
+	}
+	if (multishot && n > 0 && !last) {
 		cqe_flags |= IORING_CQE_F_MORE;
 		/* Out of buffers: go again, to end with ENOBUFS. */
 		*more_out = drained || kqring_so_rcv_pending(so, true);
@@ -502,7 +515,7 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	}
 	kqring_sock_short(op, n, (size_t)want,
 	    (flags & (MSG_TRUNC | MSG_CTRUNC)) != 0);
-	kqring_put_sock(op, fp, multishot ? EAGAIN : 0);
+	kqring_put_sock(op, fp, multishot && !last ? EAGAIN : 0);
 	return (kqring_done(op, kqring_xfer_res(n), cqe_flags));
 }
 

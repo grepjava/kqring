@@ -814,6 +814,8 @@ static int
 kqring_op_attempt(struct kqring_ctx *ctx, struct kqring_op *op,
     struct socket *expect)
 {
+	size_t burst = 0;
+	u_int loops = 0;
 	bool more;
 	int rc;
 
@@ -876,7 +878,44 @@ kqring_op_attempt(struct kqring_ctx *ctx, struct kqring_op *op,
 			    op->cflags);
 		if (!more)
 			return (EAGAIN);
+		/*
+		 * As io_uring: a multishot request yields to the ring's other
+		 * work after KQRING_MSHOT_LOOPS rounds, and a multishot
+		 * receive once this run took all the length it may (sqe->len),
+		 * so that one busy socket can't starve the rest.  It stays
+		 * armed, and goes to the back of the taskwork queue.
+		 */
+		if (op->res > 0)
+			burst += (size_t)op->res;
+		if (++loops >= KQRING_MSHOT_LOOPS ||
+		    (op->sqe.opcode == IORING_OP_RECV && op->sqe.len != 0 &&
+		    burst >= op->sqe.len)) {
+			op->requeue = true;
+			return (EAGAIN);
+		}
 	}
+}
+
+/*
+ * Whether kqring_op_attempt() asked op to yield (clearing the request).
+ * Taken before op is armed again: a failed arm completes and frees it.
+ */
+static bool
+kqring_op_take_requeue(struct kqring_op *op)
+{
+	bool requeue = op->requeue;
+
+	op->requeue = false;
+	return (requeue);
+}
+
+/* Put op, armed on its socket by this thread, behind the other work. */
+static void
+kqring_op_requeue(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	mtx_lock(&ctx->mtx);
+	kqring_taskwork_add_locked(ctx, op);
+	mtx_unlock(&ctx->mtx);
 }
 
 
@@ -2161,7 +2200,7 @@ static void
 kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 {
 	const struct io_uring_sqe *sqe = &op->sqe;
-	bool armed = false;
+	bool armed = false, requeue;
 
 	switch (sqe->opcode) {
 	case IORING_OP_READ:
@@ -2280,6 +2319,7 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 			kqring_req_complete(ctx, op, -EAGAIN, 0);
 			return;
 		}
+		requeue = kqring_op_take_requeue(op);
 		if ((sqe->opcode == IORING_OP_POLL_ADD ||
 		    sqe->opcode == IORING_OP_READ_MULTISHOT) &&
 		    !kqring_op_is_socket(op))
@@ -2287,6 +2327,9 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 		else
 			armed = kqring_arm_socket_op(ctx, op,
 			    kqring_op_dirs(sqe));
+		/* Not armed: op is complete, and may be gone. */
+		if (armed && requeue)
+			kqring_op_requeue(ctx, op);
 		break;
 	case IORING_OP_TIMEOUT:
 		kqring_timeout_arm(ctx, op);
@@ -2506,13 +2549,23 @@ kqring_taskwork_run_one(struct kqring_ctx *ctx, struct kqring_op *op)
 	struct ucred *saved = kqring_cred_enter(op);
 
 	if (kqring_op_attempt(ctx, op, op->so) == EAGAIN) {
+		/*
+		 * Requeue only an op still armed here: a failed arm completes
+		 * (frees) it, and a worker's op is the worker's.
+		 */
+		bool requeue = kqring_op_take_requeue(op);
+
 		if (op->so != NULL && (!op->armed || (!op->listening &&
 		    op->sw[0] == NULL && op->sw[1] == NULL))) {
-			(void)kqring_arm_socket_op(ctx, op,
-			    kqring_op_dirs(&op->sqe));
+			if (!kqring_arm_socket_op(ctx, op,
+			    kqring_op_dirs(&op->sqe)))
+				requeue = false;
 		} else if (op->wq_wait_ready) {
 			kqring_wq_rearm_ready(ctx, op);
+			requeue = false;
 		}
+		if (requeue)
+			kqring_op_requeue(ctx, op);
 		kqring_cred_exit(saved);
 		return;
 	}

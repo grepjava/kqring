@@ -2,7 +2,7 @@
 
 This file lists every io_uring capability against one baseline, says how kqring behaves, and points at the code and the test behind that claim. [`tests/compat_check.py`](tests/compat_check.py) checks it against the source, so a capability can't be added or removed without this file changing too.
 
-**Baseline:** Linux 7.3, whose UAPI header (`linux/io_uring.h`, from `linux-libc-dev` 7.3.0-9.9 on Ubuntu 26.10) lists the capabilities and whose running kernel is what [`tests/kqring_diff.c`](tests/kqring_diff.c) compares against, and liburing 2.9. kqring's opcode numbers match that header up to `IORING_OP_PIPE`, and what Linux has after it is refused. kqring 0.3.0 on FreeBSD 15.1-RELEASE, amd64.
+**Baseline:** Linux 7.3, whose UAPI header (`linux/io_uring.h`, from `linux-libc-dev` 7.3.0-9.9 on Ubuntu 26.10) lists the capabilities and whose running kernel is what [`tests/kqring_diff.c`](tests/kqring_diff.c) compares against, and liburing 2.15. kqring's opcode numbers match that header up to `IORING_OP_PIPE`, and what Linux has after it is refused. kqring 0.3.0 on FreeBSD 15.1-RELEASE, amd64.
 
 This matrix records what kqring is designed to do and what its tests check. [Differential conformance](ROADMAP.MD#differential-conformance) compares the behaviour that matters most with a running Linux kernel, case by case; rows outside those cases rest on kqring's own tests and on liburing's.
 
@@ -21,7 +21,7 @@ Three differences apply everywhere and aren't repeated in the rows:
 - A ring belongs to one process. See [Boundaries](#boundaries).
 - Worker cancellation can post the cancel's CQE before its target's. See [Boundaries](#boundaries).
 
-In the **Tests** column, `test_*` is a function in [`tests/kqring_test.c`](tests/kqring_test.c), `liburing/*` is a test from liburing 2.9, which may be [adapted](liburing/README.md#adapted-tests), and `fuzz` is [`tests/kqring_fuzz.c`](tests/kqring_fuzz.c). A liburing test that fails appears only on a row that isn't `Equivalent`, and the [accounting](liburing/README.md#test-results) gives the reason. `gap` means nothing tests it yet; every gap is also in [Validation gaps](#validation-gaps). **Source** names the function or table that holds the behaviour.
+In the **Tests** column, `test_*` is a function in [`tests/kqring_test.c`](tests/kqring_test.c), `liburing/*` is a test from liburing 2.15, which may be [adapted](liburing/README.md#adapted-tests), and `fuzz` is [`tests/kqring_fuzz.c`](tests/kqring_fuzz.c). A liburing test that fails appears only on a row that isn't `Equivalent`, and the [accounting](liburing/README.md#test-results) gives the reason. `gap` means nothing tests it yet; every gap is also in [Validation gaps](#validation-gaps). **Source** names the function or table that holds the behaviour.
 
 Platform and filesystem limits are marked **Platform** in the contract, because they don't come from the module.
 
@@ -46,7 +46,7 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_OP_ASYNC_CANCEL` | Different | Doesn't wait for running worker I/O. In-flight disk I/O gives `-EALREADY`. | `kqring_cancel` | `test_cancel`, `test_cancel_flags`, `test_worker_cancel_and_timeout`, `liburing/io-cancel`, `fuzz` |
 | `IORING_OP_LINK_TIMEOUT` | Different | Doesn't wait for running worker I/O. A futex wait or `WAITID` it ends completes with `-ETIME`. | `kqring_ltimeout_arm` | `test_link_timeout`, `test_worker_cancel_and_timeout`, `liburing/link-timeout`, `fuzz` |
 | `IORING_OP_CONNECT` | Equivalent | | `kqring_exec_connect` | `test_socket_ops`, `liburing/connect`, `fuzz` |
-| `IORING_OP_FALLOCATE` | Partial | Modes 0 and `KEEP_SIZE \| PUNCH_HOLE` only, `-EOPNOTSUPP` otherwise. **Platform:** ZFS has no preallocation, so mode 0 gives `-EOPNOTSUPP` there. | `kqring_exec_fallocate` | `test_path_ops`, `test_fixed_file_ops`, `test_compat_contracts`, `liburing/fallocate`, `fuzz` |
+| `IORING_OP_FALLOCATE` | Partial | Modes 0 and `KEEP_SIZE \| PUNCH_HOLE` only, `-EOPNOTSUPP` otherwise. **Platform:** ZFS has no preallocation, so mode 0 gives `-EOPNOTSUPP` there. | `kqring_exec_fallocate` | `test_path_ops`, `test_fixed_file_ops`, `test_compat_contracts`, `fuzz` |
 | `IORING_OP_OPENAT` | Equivalent | | `kqring_exec_openat` | `test_file_rw`, `test_direct_descriptors`, `liburing/open-close`, `fuzz` |
 | `IORING_OP_CLOSE` | Equivalent | | `kqring_exec_close` | `test_socket_ops`, `test_direct_descriptors`, `liburing/open-close`, `fuzz` |
 | `IORING_OP_FILES_UPDATE` | Equivalent | | `kqring_files_update` | `test_fixed_files`, `liburing/file-update`, `fuzz` |
@@ -77,7 +77,7 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_OP_SOCKET` | Equivalent | | `kqring_exec_socket` | `test_socket_ops`, `test_direct_descriptors`, `liburing/socket`, `fuzz` |
 | `IORING_OP_URING_CMD` | Partial | Sockets only: `SIOCINQ`, `SIOCOUTQ`, `GETSOCKOPT`, `SETSOCKOPT`. Anything else gives `-EOPNOTSUPP`. | `kqring_exec_uring_cmd` | `test_uring_cmd`, `liburing/socket-getsetsock-cmd` |
 | `IORING_OP_SEND_ZC` | Partial | Zero-copy on connected stream sockets for at least a page, otherwise copied with the notification posted at once. | `kqring_exec_send` | `test_send_zc`, `test_send_zc_spans`, `liburing/send-zerocopy`, `fuzz` |
-| `IORING_OP_SENDMSG_ZC` | Partial | As `SEND_ZC`. | `kqring_exec_sendmsg` | `test_send_zc`, `liburing/send-zerocopy` |
+| `IORING_OP_SENDMSG_ZC` | Partial | As `SEND_ZC`. | `kqring_exec_sendmsg` | `test_send_zc`, `liburing/send-zerocopy`, `liburing/sendzc-bug` |
 | `IORING_OP_READ_MULTISHOT` | Equivalent | On a file that can't be polled gives `-EBADF`, where Linux gives `EBADFD`, which FreeBSD lacks. | `kqring_exec_read_multishot` | `test_read_multishot`, `test_pipe_multishot_drained`, `liburing/read-mshot`, `fuzz` |
 | `IORING_OP_WAITID` | Different | Cancelling gives 0, where Linux gives 1; a link timeout gives `-ETIME`. | `kqring_exec_waitid` | `test_waitid`, `liburing/waitid` |
 | `IORING_OP_FUTEX_WAIT` | Different | Also ends when the word changes with no `FUTEX_WAKE`. Cancelling gives 0, where Linux gives 1. | `kqring_futex_arm` | `test_futex_wait`, `liburing/futex`, `fuzz` |
@@ -174,14 +174,14 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_UNREGISTER_RING_FDS` | Equivalent | | `kqring_ring_fds_unregister` | `test_registered_rings`, `fuzz` |
 | `IORING_REGISTER_PBUF_RING` | Partial | Mapped rings hold at most 16 MiB per ring. | `kqring_pbuf_register` | `test_buffer_groups`, `liburing/buf-ring`, `fuzz` |
 | `IORING_UNREGISTER_PBUF_RING` | Partial | `EBUSY` while a worker holds a reservation in the group. | `kqring_pbuf_unregister` | `test_buffer_groups`, `liburing/buf-ring` |
-| `IORING_REGISTER_SYNC_CANCEL` | Different | Waits for what it cancelled, as on Linux. Cancelling a futex wait or `WAITID` gives 0. | `kqring_sync_cancel` | `test_sync_cancel_worker`, `test_fixed_cancel`, `liburing/sync-cancel` |
+| `IORING_REGISTER_SYNC_CANCEL` | Different | Waits for what it cancelled, as on Linux. A request whose worker was only waiting, for a pipe's data say, is cancelled within any timeout, as a poll is on Linux. Cancelling a futex wait or `WAITID` gives 0. | `kqring_sync_cancel`, `kqring_cancel_wait` | `test_sync_cancel_worker`, `test_sync_cancel_waiting`, `test_fixed_cancel`, `liburing/sync-cancel` |
 | `IORING_REGISTER_FILE_ALLOC_RANGE` | Equivalent | | `kqring_file_alloc_range` | `test_direct_descriptors`, `liburing/file-register` |
 | `IORING_REGISTER_PBUF_STATUS` | Equivalent | | `kqring_pbuf_status` | `test_buffer_groups`, `liburing/ringbuf-status` |
 | `IORING_REGISTER_NAPI` | Partial | Sets only a busy-wait: a wait spins up to `busy_poll_to` µs. **Platform:** FreeBSD has no NAPI polling. | `kqring_register_napi` | `test_napi_busy_poll` |
 | `IORING_UNREGISTER_NAPI` | Partial | As `REGISTER_NAPI`. | `kqring_register_napi` | `test_napi_busy_poll` |
 | `IORING_REGISTER_CLOCK` | Partial | Recorded, with no effect, because timeouts are relative. Phase 3 gives it one. | `kqring_register_clock` | `test_fixed_file_ops` |
 | `IORING_REGISTER_CLONE_BUFFERS` | Partial | Both rings must have the same owner thread. | `kqring_bufs_clone` | `test_registered_buffers`, `test_registered_rings`, `liburing/regbuf-clone` |
-| `IORING_REGISTER_SEND_MSG_RING` | Equivalent | Works from any thread. | `kqring_register_send_msg` | `test_send_fd`, `liburing/msg-ring` |
+| `IORING_REGISTER_SEND_MSG_RING` | Equivalent | Works from any thread, or with no ring (descriptor -1). | `kqring_register_send_msg`, `kqring_register_blind` | `test_send_fd`, `test_compat_contracts`, `liburing/msg-ring` |
 | `IORING_REGISTER_RESIZE_RINGS` | Equivalent | On `DEFER_TASKRUN` rings, as on Linux. | `kqring_resize_rings` | `test_resize_rings`, `liburing/resize-rings`, `fuzz` |
 | `IORING_REGISTER_USE_REGISTERED_RING` | Equivalent | | `kqring_register_op` | `test_registered_rings`, `liburing/reg-reg-ring` |
 | `IORING_REGISTER_ZCRX_IFQ` | Unsupported | `EOPNOTSUPP`. **Platform:** needs driver support FreeBSD lacks. | `kqring_register_op` | `test_compat_contracts` |
@@ -189,8 +189,8 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_REGISTER_QUERY` | Unsupported | `EOPNOTSUPP`. | `kqring_register_op` | `test_compat_contracts` |
 | `IORING_REGISTER_ZCRX_CTRL` | Unsupported | `EOPNOTSUPP`. **Platform:** needs driver support FreeBSD lacks. | `kqring_register_op` | `test_compat_contracts` |
 | `IORING_REGISTER_BPF_FILTER` | Unsupported | `EOPNOTSUPP`. | `kqring_register_op` | `test_compat_contracts` |
-| `io_uring_task_restriction` | Unsupported | Restrictions apply to one ring, so registering without a ring fails with `EBADF`. | `kqring_ioc_register` | `test_compat_contracts` |
-| `io_uring_buf_reg.min_left` | Unsupported | `EINVAL`: kqring still treats the field as reserved. | `kqring_register_op` | `test_compat_contracts` |
+| `io_uring_task_restriction` | Unsupported | `EOPNOTSUPP`: restrictions apply to one ring. | `kqring_register_blind` | `test_compat_contracts` |
+| `io_uring_buf_reg.min_left` | Equivalent | Only with `IOU_PBUF_RING_INC`, else `EINVAL`. A buffer with less than `min_left` bytes left is used up, without `IORING_CQE_F_BUF_MORE`. | `kqring_pbuf_register`, `kqring_buf_commit` | `test_buffer_groups`, `test_compat_contracts`, `liburing/recvmsg-inc-tail`, `fuzz` |
 
 ## Features
 
@@ -232,7 +232,7 @@ These are the `IORING_FEAT_*` bits setup returns.
 | `IORING_TIMEOUT_ETIME_SUCCESS` | Equivalent | | `kqring_timeout_prep` | `test_timeouts` |
 | `IORING_TIMEOUT_MULTISHOT` | Equivalent | | `kqring_timeout_fire` | `test_timeouts`, `liburing/timeout` |
 | `IORING_TIMEOUT_IMMEDIATE_ARG` | Unsupported | `-EINVAL`. | `kqring_timeout_prep` | `test_compat_contracts` |
-| `IORING_POLL_ADD_MULTI` | Equivalent | On the ring's own eventfd it ends after the first CQE. | `kqring_kpoll_arm` | `test_nonsock_poll`, `liburing/poll-mshot-update` |
+| `IORING_POLL_ADD_MULTI` | Partial | On the ring's own eventfd its first CQE has `F_MORE` and the next wakeup ends it, which may be the ring's own signal; Linux ends it at the next event after that signal. | `kqring_kpoll_deliver` | `test_nonsock_poll`, `test_poll_own_eventfd`, `liburing/poll-mshot-update`, `liburing/poll-mshot-wake` |
 | `IORING_POLL_ADD_LEVEL` | Equivalent | In the UAPI, but refused with `EINVAL`, as on Linux. | `kqring_req_prep` | `test_compat_gaps` |
 | `IORING_POLL_UPDATE_EVENTS` | Equivalent | | `kqring_poll_remove` | `liburing/poll-mshot-update` |
 | `IORING_POLL_UPDATE_USER_DATA` | Equivalent | | `kqring_poll_remove` | `test_poll_remove`, `liburing/poll-mshot-update` |
@@ -243,7 +243,7 @@ These are the `IORING_FEAT_*` bits setup returns.
 | `IORING_ASYNC_CANCEL_USERDATA` | Equivalent | | `kqring_cancel_match_req` | `test_cancel` |
 | `IORING_ASYNC_CANCEL_OP` | Equivalent | | `kqring_cancel_match_req` | `test_cancel_flags` |
 | `IORING_RECVSEND_POLL_FIRST` | Equivalent | A hint. | `kqring_req_prep` | `test_multishot_and_eof`, `liburing/send-zerocopy` |
-| `IORING_RECV_MULTISHOT` | Equivalent | | `kqring_exec_recv` | `test_multishot_and_eof`, `liburing/recv-multishot` |
+| `IORING_RECV_MULTISHOT` | Equivalent | `sqe->len` caps one run's bytes, after which the request yields to other work, and `sqe->optlen` caps the total. | `kqring_exec_recv`, `kqring_op_attempt` | `test_multishot_and_eof`, `liburing/recv-multishot`, `liburing/recv-mshot-fair` |
 | `IORING_RECVSEND_FIXED_BUF` | Equivalent | | `kqring_req_resources` | `test_registered_buffers`, `liburing/send-zerocopy` |
 | `IORING_RECVSEND_BUNDLE` | Partial | Up to 32 buffers per CQE. | `kqring_exec_recv` | `liburing/recvsend_bundle` |
 | `IORING_SEND_ZC_REPORT_USAGE` | Equivalent | | `kqring_req_complete` | `test_send_zc`, `liburing/send-zerocopy` |
@@ -258,7 +258,7 @@ These are the `IORING_FEAT_*` bits setup returns.
 | `IORING_FILE_INDEX_ALLOC` | Equivalent | | `kqring_fixed_alloc` | `test_direct_descriptors`, `liburing/open-direct-pick` |
 | `IORING_FIXED_FD_NO_CLOEXEC` | Equivalent | | `kqring_exec_fixed_fd_install` | `test_direct_descriptors`, `liburing/fd-install` |
 | `IOU_PBUF_RING_MMAP` | Equivalent | | `kqring_pbuf_register` | `test_buffer_groups`, `liburing/buf-ring` |
-| `IOU_PBUF_RING_INC` | Equivalent | | `kqring_buf_commit` | `test_buffer_groups`, `liburing/read-inc-file` |
+| `IOU_PBUF_RING_INC` | Equivalent | A read at end of file reports the buffer it didn't use, with `IORING_CQE_F_BUF_MORE`. | `kqring_buf_commit`, `kqring_buf_eof` | `test_buffer_groups`, `liburing/read-inc-file`, `liburing/read-inc-buf-more` |
 | `IORING_CQE_F_SOCK_NONEMPTY` | Equivalent | | `kqring_exec_accept` | `liburing/accept-non-empty` |
 | `IORING_CQE_F_BUF_MORE` | Equivalent | | `kqring_buf_commit` | `test_buffer_groups` |
 | `IORING_CQ_EVENTFD_DISABLED` | Equivalent | | `kqring_evfd_signal_locked` | `test_eventfd`, `liburing/eventfd-disable` |
