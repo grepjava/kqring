@@ -1035,7 +1035,7 @@ struct kqring_ext_setup {
  * Without CQE32 only udata and data arrive, so give each event a udata that
  * says what it is.  An io_uring_enter() with IORING_ENTER_GETEVENTS looks
  * at the kqueue as a kevent(2) call would: an event that is not EV_CLEAR
- * is reported at each one until its condition ends.  Take events with
+ * is reported once at each one until its condition ends.  Take events with
  * kevent(2) as well, and each goes to whichever looks first.
  *
  * The request runs until cancelled (by the SQE's user_data): its final CQE

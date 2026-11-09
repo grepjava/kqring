@@ -18,6 +18,7 @@
 
 ### Fixed
 
+- A kqueue attached with `KQRING_EXT_KQUEUE` now reports an event that isn't `EV_CLEAR` once per enter, as one `kevent(2)` call does. An enter could take the kqueue twice, once for its own look and once for the wakeup from when the kqueue was attached, and post the event twice. In a loop of attach, two enters and a read on a Ryzen 3 PRO 4350G, 106 of 3000 rounds had a second CQE still queued after the read; this made `test_kqueue_bridge_level` fail now and then.
 - A cancel or `LINK_TIMEOUT` that finds a regular file's read or write already running on a worker no longer reports it as cancelled. The I/O had happened, so a program told `-ECANCELED` could do it again. It now completes with its own result and the cancel gets `-EALREADY`, as in io_uring.
 - Reads of a named FIFO now complete in the order of the data, as reads of a pipe do. They also read as a pipe's do otherwise: one with data ready completes without a worker, and an empty `O_NONBLOCK` FIFO waits for data, as in io_uring, rather than failing with `EAGAIN`. `RWF_NOWAIT` still fails it.
 

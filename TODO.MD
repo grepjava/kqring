@@ -9,10 +9,6 @@ Known limits are in [BENCHMARK.MD](BENCHMARK.MD#known-gaps) and [Differences fro
 - **ZFS at 32 in flight.** kqring is 4–5% behind aio in IOPS with a longer p99, at less than half the CPU.
 - **A zero-copy benchmark with the receiver in its own thread.** Loopback delivers through the netisr thread, so a single-threaded send-then-receive mostly measures that hand-off for small sends.
 
-## Correctness
-
-- **`test_kqueue_bridge_level` fails now and then.** After the pipe it watches has been read empty, an enter sometimes reports the level-triggered read event once more within 30 ms, where the test expects none. Seen on the Ryzen test machine on 2026-11-09, once in eight runs, with the module from before and after the inline-read change alike. Either a stale level report in the kqueue bridge or a race in the test; not yet known which.
-
 ## Measurement
 
 - **Run on UFS with a real disk, and on NVMe.** Storage results so far are from a SATA SSD with ZFS, and md(4) disks.

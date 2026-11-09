@@ -13198,8 +13198,8 @@ test_kqueue_bridge(void)
 
 /*
  * An event that isn't EV_CLEAR, as libevent and libuv register them: each
- * enter reports it while its condition lasts, as each kevent(2) would, and
- * new data after it ended wakes an enter already waiting.
+ * enter reports it once while its condition lasts, as each kevent(2) would,
+ * and new data after it ended wakes an enter already waiting.
  */
 static void
 test_kqueue_bridge_level(void)
@@ -13218,6 +13218,7 @@ test_kqueue_bridge_level(void)
 	kqb_attach(&r, kq, 51);
 	(void)kqb_event(&r, 0x4444, 3);
 	(void)kqb_event(&r, 0x4444, 3);		/* still readable */
+	assert(ring_cq_ready(&r) == 0);		/* once per enter */
 	assert(read(p[0], buf, sizeof(buf)) == 3);
 	assert(ring_wait(&r, 1, 30) == ETIMEDOUT);
 
@@ -13231,6 +13232,7 @@ test_kqueue_bridge_level(void)
 		}
 		assert(ring_wait(&r, 1, 2000) == 0);
 		(void)kqb_event(&r, 0x4444, 2);
+		assert(ring_cq_ready(&r) == 0);
 		assert(waitpid(pid, NULL, 0) == pid);
 		assert(read(p[0], buf, sizeof(buf)) == 2);
 		assert(ring_wait(&r, 1, 30) == ETIMEDOUT);

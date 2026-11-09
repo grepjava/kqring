@@ -117,6 +117,7 @@ kqring_kp_copyout(void *arg, struct kevent *kevp, int count)
  * ready or wakeups came since the last one.
  */
 static struct file *kqring_kp_getfp(struct kqring_ctx *ctx);
+static void kqring_kp_scan(struct kqring_ctx *ctx, struct thread *td);
 
 /*
  * A wakeup from anywhere (another process's write(2), say): wake an enter
@@ -1150,7 +1151,13 @@ kqring_kq_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 	kqring_req_complete(ctx, op, res, 0);
 }
 
-/* An enter by the owner: its attached kqueues are looked at, as taskwork. */
+/*
+ * An enter by the owner: its attached kqueues are looked at, as taskwork.
+ * What the poller hasn't taken yet is taken first, so that a wakeup from
+ * before this enter (one at attach, say, for the events already queued)
+ * joins this look instead of taking the kqueue again in the same enter,
+ * which would report an event that isn't EV_CLEAR twice.
+ */
 void
 kqring_kq_rescan(struct kqring_ctx *ctx)
 {
@@ -1159,6 +1166,7 @@ kqring_kq_rescan(struct kqring_ctx *ctx)
 	if (atomic_load_int(&ctx->kq_bridges) == 0 ||
 	    ctx->owner_proc != curproc)
 		return;
+	kqring_kp_scan(ctx, curthread);
 	mtx_lock(&ctx->mtx);
 	for (int i = 0; i < KQRING_KP_HASH; i++) {
 		TAILQ_FOREACH(op, &ctx->kp_ops[i], kp_link) {
