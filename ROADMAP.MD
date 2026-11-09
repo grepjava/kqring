@@ -12,7 +12,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 2 | Make compatibility measurable | Done |
 | 3 | Wait semantics | Done |
 | 4 | Per-file write ordering | Done |
-| 5 | Worker path scalability | Not started |
+| 5 | Worker path scalability | Done |
 | 6 | Performance evidence | Not started |
 | 7 | Newer interfaces and real programs | Not started |
 
