@@ -9230,6 +9230,109 @@ worder_prep(struct test_ring *t, int fd, struct worder_rec *rec,
 	ring_push_sqe(t);
 }
 
+static u_long
+sysctl_ulong(const char *name)
+{
+	u_long v = 0;
+	size_t len = sizeof(v);
+
+	assert(sysctlbyname(name, &v, &len, NULL, 0) == 0);
+	return (v);
+}
+
+/*
+ * Bound work that rarely sleeps runs on a few awake workers (the pool's
+ * cap).  If those then block for good, here in OPENATs of a FIFO with no
+ * writer, work queued behind them still runs: after a millisecond without
+ * progress the pool lifts the cap and wakes its reserve.
+ */
+static void
+test_wq_cap_stall(void)
+{
+	struct test_ring t;
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	char path[] = "/tmp/kqring_cap.XXXXXX", fifo[64];
+	static char data[64 * 4096], buf[4096];
+	u_long capped, stalls;
+	int fd, wfd, ncpu, cap, n;
+	size_t len = sizeof(ncpu);
+
+	assert(sysctlbyname("hw.ncpu", &ncpu, &len, NULL, 0) == 0);
+	cap = ncpu / 2 > 4 ? ncpu / 2 : 4;	/* KQRING_WQ_CPU_MIN, ncpu / 2 */
+	fd = mkstemp(path);
+	assert(fd >= 0 && unlink(path) == 0);
+	memset(data, 'c', sizeof(data));
+	assert(write(fd, data, sizeof(data)) == (ssize_t)sizeof(data));
+	assert(pread(fd, data, sizeof(data), 0) == (ssize_t)sizeof(data));
+	snprintf(fifo, sizeof(fifo), "/tmp/kqring_capfifo.%d", (int)getpid());
+	(void)unlink(fifo);
+	assert(mkfifo(fifo, 0600) == 0);
+	ring_init(&t);
+
+	/*
+	 * Cached reads on workers: the pool caps its awake workers once about
+	 * 90 in a row haven't slept (kqring_wq_note_sleep_locked()).
+	 */
+	capped = sysctl_ulong("kern.kqring.wq_capped");
+	for (int round = 0; round < 40 &&
+	    sysctl_ulong("kern.kqring.wq_capped") == capped; round++) {
+		for (int i = 0; i < 16; i++) {
+			sqe = ring_prep(&t, IORING_OP_READ, fd, 81000 + i);
+			sqe->addr = (uint64_t)(uintptr_t)buf;
+			sqe->len = sizeof(buf);
+			sqe->off = (uint64_t)i * 4096;
+			sqe->flags = IOSQE_ASYNC;
+			ring_push_sqe(&t);
+		}
+		assert(ring_wait(&t, 16, 10000) == 0);
+		for (int i = 0; i < 16; i++)
+			assert(ring_pop_cqe(&t).res == 4096);
+	}
+	assert(sysctl_ulong("kern.kqring.wq_capped") > capped);
+
+	/* One more OPENAT than the cap: every awake worker blocks. */
+	stalls = sysctl_ulong("kern.kqring.wq_stalls");
+	for (int i = 0; i <= cap; i++) {
+		sqe = ring_prep(&t, IORING_OP_OPENAT, AT_FDCWD, 82000 + i);
+		sqe->addr = (uint64_t)(uintptr_t)fifo;
+		sqe->open_flags = O_RDONLY;
+		ring_push_sqe(&t);
+	}
+	ring_submit(&t);
+	sqe = ring_prep(&t, IORING_OP_READ, fd, 83000);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->off = 0;
+	sqe->flags = IOSQE_ASYNC;
+	ring_push_sqe(&t);
+	assert(ring_wait(&t, 1, 5000) == 0);
+	c = ring_pop_cqe(&t);
+	if (c.user_data != 83000 || c.res != 4096) {
+		fprintf(stderr, "the read behind blocked OPENATs: ud %ju res %d\n",
+		    (uintmax_t)c.user_data, c.res);
+		abort();
+	}
+	assert(sysctl_ulong("kern.kqring.wq_stalls") > stalls);
+
+	/* A writer lets the OPENATs finish. */
+	wfd = open(fifo, O_WRONLY);
+	assert(wfd >= 0);
+	for (n = 0; n <= cap; n++) {
+		assert(ring_wait(&t, 1, 5000) == 0);
+		c = ring_pop_cqe(&t);
+		assert(c.user_data >= 82000 && c.user_data <= 82000U + cap &&
+		    c.res >= 0);
+		close(c.res);
+	}
+	close(wfd);
+	close(t.fd);
+	close(fd);
+	assert(unlink(fifo) == 0);
+	printf("[PASS] Capped workers that block don't hold back queued work "
+	    "(%d OPENATs of a FIFO, then a read)\n", cap + 1);
+}
+
 /*
  * Writes to one regular file run on workers in the order they were
  * submitted, one at a time, as io-wq's per-inode hashing runs them, and the
@@ -13725,6 +13828,7 @@ main(int argc, char **argv)
 		test_enter_abs_timer();
 		test_reg_wait();
 		test_write_order();
+		test_wq_cap_stall();
 		test_tag_failed_register();
 		test_tag_release_no_drop();
 		test_sqe128_cqe32_attach_wq();

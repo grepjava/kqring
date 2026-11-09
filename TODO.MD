@@ -4,8 +4,7 @@ Known limits are in [BENCHMARK.MD](BENCHMARK.MD#known-gaps) and [Differences fro
 
 ## Performance
 
-- **Per-file ordering in the worker pool**, as io-wq hashes buffered writes per inode, so that writes to different files run in parallel and the issuer doesn't wait. Buffered writes are about 9% behind aio on a ZFS file.
-- **The worker hand-off ceiling.** Cached reads through workers stop near 530,000 IOPS on a 4-core machine, and `psync` passes them from 4 jobs.
+- **The worker hand-off ceiling.** Cached ZFS reads through workers stay near 1.1 million IOPS on an 8-thread machine from 2 jobs on, and `psync` passes them from 4 jobs. Phase 5 cut the wake-ups but not the hand-off ([docs/worker-wakeups.md](docs/worker-wakeups.md)). Next: run reads that won't sleep in the submitting thread, many per enter; later, ZFS reads that complete from ZFS's own I/O callback without a worker.
 - **ZFS at 32 in flight.** kqring is 4–5% behind aio in IOPS with a longer p99, at less than half the CPU.
 - **A zero-copy benchmark with the receiver in its own thread.** Loopback delivers through the netisr thread, so a single-threaded send-then-receive mostly measures that hand-off for small sends.
 

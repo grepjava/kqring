@@ -107,6 +107,10 @@ Cached reads through workers stop near 530,000 IOPS on a 4-core machine, and `ps
 
 Profile first. These two may have different causes, and each request crossing to another thread may set a limit that can't be removed. If so, the outcome is a documented cost of that path, not a scheduling change.
 
+**Done.** [docs/worker-wakeups.md](docs/worker-wakeups.md) has the profile and the change. One ring is limited by its submitting thread. Several rings are limited by CPU, and what they spent beyond `pread(2)` went on about 1.6 thread switches per read, because the pool woke a worker for each request. The pool now notes whether its file I/O sleeps, and while it rarely does, keeps only `MAX(4, ncpu / 2)` workers awake to take the queued requests themselves. Writes count as sleeping, and queued work that makes no progress for 1 ms lifts the cap. `test_wq_cap_stall` checks the stall path.
+
+On the second test machine (Ryzen 3 PRO 4350G, 8 threads), thread switches per read fell by 60% and kqring's own pool benchmark gained 5%. fio gained 2.5% at one job and nothing at more: kqring stays near 1.1 million cached IOPS from two jobs on, while `psync` passes it at four and reaches 1.6 million at eight. The hand-off itself is the limit, and `BENCHMARK.MD` lists it under known gaps. SSD reads and writes are unchanged. Removing the hand-off is next: cached reads run in the submitting thread when they won't sleep, and, as research, ZFS reads that complete without a worker.
+
 Acceptance: a profile that names the limit, then either a measured improvement or the limit documented in `BENCHMARK.MD`.
 
 ## Phase 6: Performance evidence

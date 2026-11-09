@@ -13,6 +13,7 @@
 ### Changed
 
 - Writes to a regular file no longer make the issuer wait. They run on workers one at a time per file, in the order they were issued, as io-wq's per-inode hashing runs them, and writes to different files run in parallel. Before, the issuer waited for each write, which kept them in order but held up the rest of the submission. A program that relied on an unlinked `FSYNC` or other request coming after its writes must link them, as on Linux.
+- File reads that don't sleep, such as ZFS reads the ARC serves, no longer wake a worker for each request. When a pool's file I/O has rarely slept lately, at most `MAX(4, ncpu / 2)` of its workers stay awake and take the queued requests themselves. Reads and writes that wait for the disk, and all writes, are unaffected, and queued work that makes no progress for 1 ms wakes the rest. On a Ryzen 3 PRO 4350G, cached ZFS reads through the pool took 60% fewer thread switches and gained 5%, or 2.5% with fio at one job and nothing at more; the hand-off to a worker is still their limit. See [docs/worker-wakeups.md](docs/worker-wakeups.md). `kern.kqring.wq_capped` and `kern.kqring.wq_stalls` count the caps and the stalls.
 
 ### Fixed
 

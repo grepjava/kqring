@@ -10,6 +10,14 @@
 #include <sys/sysent.h>
 #include <sys/umtxvar.h>
 
+static u_long kqring_wq_capped, kqring_wq_stalls;
+SYSCTL_ULONG(_kern_kqring, OID_AUTO, wq_capped, CTLFLAG_RD,
+    &kqring_wq_capped, 0,
+    "Times a pool capped its awake bound workers (work rarely sleeping)");
+SYSCTL_ULONG(_kern_kqring, OID_AUTO, wq_stalls, CTLFLAG_RD,
+    &kqring_wq_stalls, 0,
+    "Times capped bound work made no progress and the cap was lifted");
+
 void
 kqring_wq_abort_td(struct thread *wtd)
 {
@@ -114,8 +122,89 @@ kqring_wq_alloc(struct thread *td)
 	wq->max[IO_WQ_BOUND] = MIN((uint32_t)mp_ncpus * 4,
 	    KQRING_WQ_MAX_WORKERS);
 	wq->max[IO_WQ_UNBOUND] = KQRING_WQ_MAX_WORKERS;
+	wq->sleep_avg = 1024;
+	wq->cpu_cap = MAX(KQRING_WQ_CPU_MIN, (uint32_t)mp_ncpus / 2);
+	callout_init_mtx(&wq->stall_co, &wq->mtx, 0);
 	wq->base_cpuset = cpuset_ref(td->td_cpuset);
 	return (wq);
+}
+
+/*
+ * How many of type's workers may be awake (running a request or spinning
+ * for one): all of them, unless bound work rarely sleeps.  Then a few,
+ * which take the next request themselves when they finish, so that one
+ * isn't woken and put back to sleep for each, as io-wq starts another
+ * worker only when one blocks.  Workers are still created as before, and
+ * sleep as a reserve that kqring_wq_stall_cb() can wake.
+ */
+static uint32_t
+kqring_wq_awake_cap_locked(const struct kqring_wq *wq, int type)
+{
+	mtx_assert(&wq->mtx, MA_OWNED);
+	if (type != IO_WQ_BOUND || !wq->cpu_bound)
+		return (UINT32_MAX);
+	return (MIN(wq->max[type], wq->cpu_cap));
+}
+
+/*
+ * Bound work was capped and queued, and none ran for KQRING_WQ_STALL_SBT:
+ * the awake workers are sleeping after all.  Stop capping and wake them.
+ */
+static void
+kqring_wq_stall_cb(void *arg)
+{
+	struct kqring_wq *wq = arg;
+
+	mtx_assert(&wq->mtx, MA_OWNED);
+	if (wq->closing || !wq->cpu_bound || wq->pending[IO_WQ_BOUND] == 0)
+		return;
+	if (wq->bound_done != wq->stall_done) {
+		wq->stall_done = wq->bound_done;
+		callout_reset_sbt(&wq->stall_co, KQRING_WQ_STALL_SBT, 0,
+		    kqring_wq_stall_cb, wq, 0);
+		return;
+	}
+	wq->cpu_bound = false;
+	wq->sleep_avg = 1024;
+	atomic_add_long(&kqring_wq_stalls, 1);
+	wakeup(&wq->ops[IO_WQ_BOUND]);
+}
+
+/* A bound request ran, and slept or not: update the average and the cap. */
+static void
+kqring_wq_note_sleep_locked(struct kqring_wq *wq, bool slept)
+{
+	mtx_assert(&wq->mtx, MA_OWNED);
+	wq->bound_done++;
+	/*
+	 * Slow to cap, quick to stop: about 90 requests in a row that don't
+	 * sleep cap the pool, which a mix of cache hits and misses doesn't
+	 * reach by chance; three that sleep stop it.
+	 */
+	if (slept)
+		wq->sleep_avg += (1024 - wq->sleep_avg) >> 2;
+	else
+		wq->sleep_avg -= wq->sleep_avg >> 6;
+	if (!wq->cpu_bound && wq->sleep_avg < KQRING_WQ_CPU_ENTER) {
+		wq->cpu_bound = true;
+		atomic_add_long(&kqring_wq_capped, 1);
+	} else if (wq->cpu_bound && wq->sleep_avg > KQRING_WQ_CPU_LEAVE) {
+		wq->cpu_bound = false;
+		if (wq->pending[IO_WQ_BOUND] > wq->spinning[IO_WQ_BOUND])
+			wakeup(&wq->ops[IO_WQ_BOUND]);
+	}
+}
+
+/* Bound work queued without waking a worker: watch for a stall. */
+static void
+kqring_wq_stall_arm_locked(struct kqring_wq *wq)
+{
+	mtx_assert(&wq->mtx, MA_OWNED);
+	if (wq->closing || callout_pending(&wq->stall_co))
+		return;
+	wq->stall_done = wq->bound_done;
+	callout_reset_sbt(&wq->stall_co, KQRING_WQ_STALL_SBT, 0,
+	    kqring_wq_stall_cb, wq, 0);
 }
 
 static void
@@ -127,7 +216,9 @@ kqring_wq_rele_locked(struct kqring_wq *wq)
 		mtx_unlock(&wq->mtx);
 		return;
 	}
+	wq->closing = true;		/* the stall callout doesn't rearm */
 	mtx_unlock(&wq->mtx);
+	callout_drain(&wq->stall_co);
 	if (wq->base_cpuset != NULL)
 		cpuset_rel(wq->base_cpuset);
 	mtx_destroy(&wq->mtx);
@@ -378,6 +469,7 @@ kqring_wq_thread(void *arg)
 	struct kqring_ctx *ctx;
 	struct kqring_op *op;
 	uint32_t aff_gen = UINT32_MAX;
+	bool capped;
 	int error;
 
 	/*
@@ -404,10 +496,13 @@ kqring_wq_thread(void *arg)
 			mtx_lock(&wq->mtx);
 			continue;
 		}
-		op = kqring_wq_next_locked(wq, type);
+		/* Enough others awake (kqring_wq_awake_cap_locked()): sleep. */
+		capped = wq->busy[type] >= kqring_wq_awake_cap_locked(wq, type);
+		op = capped ? NULL : kqring_wq_next_locked(wq, type);
 		if (op != NULL) {
 			bool deferred = false;
 			int hash = op->wq_hash;
+			long nvcsw;
 
 			kqring_wq_unqueue_locked(wq, op);
 			if (op->cancelled || op->wq_canceled)
@@ -439,6 +534,7 @@ kqring_wq_thread(void *arg)
 				mtx_unlock(&wq->mtx);
 			}
 
+			nvcsw = td->td_ru.ru_nvcsw;
 			kqring_wq_exec_op(ctx, op);
 
 			mtx_lock(&ctx->mtx);
@@ -448,6 +544,16 @@ kqring_wq_thread(void *arg)
 			if (!op->wq_wait_ready)
 				op->wq_done = true;
 			wq->busy[type]--;
+			/*
+			 * A write counts as one that slept: one that returned
+			 * at once may stall in the filesystem's write throttle
+			 * with all the others the next moment, and capped
+			 * workers would then hold the queue back.
+			 */
+			if (type == IO_WQ_BOUND)
+				kqring_wq_note_sleep_locked(wq,
+				    td->td_ru.ru_nvcsw != nvcsw ||
+				    kqring_op_is_write(op->sqe.opcode));
 			/*
 			 * The bucket's next write may run: this worker takes
 			 * it next, unless it is leaving, so wake another.
@@ -511,9 +617,10 @@ kqring_wq_thread(void *arg)
 		 * One idle worker spins for the next op; the rest sleep.  With
 		 * every idle worker spinning, each op sent them all at wq->mtx.
 		 * Not with every CPU taken: a spinner then only keeps the
-		 * thread with the next op, or its issuer, from running.
+		 * thread with the next op, or its issuer, from running.  Nor
+		 * when capped: the awake workers take what is queued.
 		 */
-		if (mp_ncpus > 1 && wq->spinning[type] == 0 &&
+		if (!capped && mp_ncpus > 1 && wq->spinning[type] == 0 &&
 		    sched_load() < mp_ncpus) {
 			wq->spinning[type]++;
 			mtx_unlock(&wq->mtx);
@@ -531,8 +638,15 @@ kqring_wq_thread(void *arg)
 			    wq->closing || kqring_wq_check_suspend(wq))
 				continue;
 		}
+		if (type == IO_WQ_BOUND)
+			wq->sleepers++;
 		error = msleep_sbt(&wq->ops[type], &wq->mtx, PCATCH,
 		    "kqwqid", KQRING_WQ_IDLE_SBT, 0, 0);
+		if (type == IO_WQ_BOUND) {
+			wq->sleepers--;
+			if (wq->woken > 0)
+				wq->woken--;
+		}
 		if (error == EWOULDBLOCK &&
 		    TAILQ_EMPTY(&wq->ops[type]))
 			break;
@@ -805,8 +919,25 @@ kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 		wq->refs++;
 		need_spawn = true;
 	}
-	if (wq->spinning[type] < wq->pending[type])
-		wakeup_one(&wq->ops[type]);
+	if (wq->spinning[type] < wq->pending[type]) {
+		uint32_t cap = kqring_wq_awake_cap_locked(wq, type);
+
+		if (cap == UINT32_MAX) {
+			wakeup_one(&wq->ops[type]);
+		} else if (wq->busy[type] + wq->spinning[type] + wq->woken <
+		    cap) {
+			/*
+			 * Count the woken until they run: with every CPU
+			 * taken they wait, and each op would wake another.
+			 */
+			if (wq->sleepers > wq->woken) {
+				wq->woken++;
+				wakeup_one(&wq->ops[type]);
+			}
+		} else {
+			kqring_wq_stall_arm_locked(wq);
+		}
+	}
 	mtx_unlock(&wq->mtx);
 	if (need_spawn) {
 		mtx_unlock(&ctx->mtx);

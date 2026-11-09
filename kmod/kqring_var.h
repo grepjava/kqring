@@ -200,6 +200,18 @@ MALLOC_DECLARE(M_SELFD);
 #define KQRING_WQ_TYPES		2
 #define KQRING_WQ_MAX_WORKERS	256U
 #define KQRING_WQ_IDLE_SBT	(5 * SBT_1S)
+/*
+ * Bound work that rarely sleeps (reads the cache serves) runs on at most
+ * MAX(KQRING_WQ_CPU_MIN, ncpu / 2) awake workers, which take the next
+ * request themselves, rather than a worker woken for each.  How often it
+ * sleeps is a running average out of 1024 (kqring_wq_note_sleep_locked()):
+ * below KQRING_WQ_CPU_ENTER the pool caps, above KQRING_WQ_CPU_LEAVE it stops.
+ * Queued work that makes no progress for KQRING_WQ_STALL_SBT stops it too.
+ */
+#define KQRING_WQ_CPU_MIN	4U
+#define KQRING_WQ_CPU_ENTER	256
+#define KQRING_WQ_CPU_LEAVE	512
+#define KQRING_WQ_STALL_SBT	SBT_1MS
 
 /* io_uring_params flags accepted by KQRING_IOC_SETUP. */
 #define	KQRING_SETUP_FLAGS						\
@@ -713,6 +725,15 @@ struct kqring_wq {
 	uint32_t		spinning[KQRING_WQ_TYPES];
 	struct kqring_op	*hash_tail[KQRING_WQ_TYPES][KQRING_WQ_HASHES];
 	uint64_t		hash_busy;	/* buckets with a write running */
+	/* Bound work's running average of requests that slept, of 1024. */
+	uint32_t		sleep_avg;
+	bool			cpu_bound;	/* awake workers capped */
+	uint32_t		sleepers;	/* bound workers idle asleep */
+	uint32_t		woken;		/* of them woken, not yet up */
+	uint32_t		cpu_cap;
+	uint64_t		bound_done;	/* bound requests run */
+	uint64_t		stall_done;	/* bound_done when armed */
+	struct callout		stall_co;	/* under mtx */
 	struct cpuset		*base_cpuset;
 	cpuset_t		cpumask;
 	bool			aff_set;
