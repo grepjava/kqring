@@ -34,37 +34,37 @@
 <line x1="56" y1="332.0" x2="570" y2="332.0" class="axis"/>
 <text x="48" y="336.0" class="tick" text-anchor="end">0k</text>
 <line x1="56" y1="284.8" x2="570" y2="284.8" class="grid"/>
-<text x="48" y="288.8" class="tick" text-anchor="end">160k</text>
+<text x="48" y="288.8" class="tick" text-anchor="end">400k</text>
 <line x1="56" y1="237.6" x2="570" y2="237.6" class="grid"/>
-<text x="48" y="241.6" class="tick" text-anchor="end">320k</text>
+<text x="48" y="241.6" class="tick" text-anchor="end">800k</text>
 <line x1="56" y1="190.4" x2="570" y2="190.4" class="grid"/>
-<text x="48" y="194.4" class="tick" text-anchor="end">480k</text>
+<text x="48" y="194.4" class="tick" text-anchor="end">1,200k</text>
 <line x1="56" y1="143.2" x2="570" y2="143.2" class="grid"/>
-<text x="48" y="147.2" class="tick" text-anchor="end">640k</text>
+<text x="48" y="147.2" class="tick" text-anchor="end">1,600k</text>
 <line x1="56" y1="96.0" x2="570" y2="96.0" class="grid"/>
-<text x="48" y="100.0" class="tick" text-anchor="end">800k</text>
+<text x="48" y="100.0" class="tick" text-anchor="end">2,000k</text>
 <text x="56.0" y="358" class="tick" text-anchor="middle">1</text>
 <text x="227.3" y="358" class="tick" text-anchor="middle">2</text>
 <text x="398.7" y="358" class="tick" text-anchor="middle">4</text>
 <text x="570.0" y="358" class="tick" text-anchor="middle">8</text>
 <text x="313.0" y="374" class="tick" text-anchor="middle">jobs</text>
-<polyline points="56.0,240.0 227.3,236.1 398.7,242.3 570.0,251.8" fill="none" stroke="var(--kqueue)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<circle cx="56.0" cy="240.0" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>aio: 312k k IOPS</title></circle>
-<circle cx="227.3" cy="236.1" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>aio: 325k k IOPS</title></circle>
-<circle cx="398.7" cy="242.3" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>aio: 304k k IOPS</title></circle>
-<circle cx="570.0" cy="251.8" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>aio: 272k k IOPS</title></circle>
-<polyline points="56.0,206.9 227.3,176.2 398.7,184.2 570.0,175.1" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<circle cx="56.0" cy="206.9" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring: 424k k IOPS</title></circle>
-<circle cx="227.3" cy="176.2" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring: 528k k IOPS</title></circle>
-<circle cx="398.7" cy="184.2" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring: 501k k IOPS</title></circle>
-<circle cx="570.0" cy="175.1" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring: 532k k IOPS</title></circle>
-<polyline points="56.0,246.4 227.3,198.7 398.7,124.0 570.0,100.7" fill="none" stroke="var(--plain)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<circle cx="56.0" cy="246.4" r="4" fill="var(--plain)" stroke="var(--surface)" stroke-width="2"><title>psync: 290k k IOPS</title></circle>
-<circle cx="227.3" cy="198.7" r="4" fill="var(--plain)" stroke="var(--surface)" stroke-width="2"><title>psync: 452k k IOPS</title></circle>
-<circle cx="398.7" cy="124.0" r="4" fill="var(--plain)" stroke="var(--surface)" stroke-width="2"><title>psync: 705k k IOPS</title></circle>
-<circle cx="570.0" cy="100.7" r="4" fill="var(--plain)" stroke="var(--surface)" stroke-width="2"><title>psync: 784k k IOPS</title></circle>
-<text x="580.0" y="104.7" class="val">psync 784k</text>
-<text x="580.0" y="179.1" class="val">kqring 532k</text>
-<text x="580.0" y="255.8" class="val">aio 272k</text>
+<polyline points="56.0,246.3 227.3,245.7 398.7,254.5 570.0,265.4" fill="none" stroke="var(--kqueue)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="56.0" cy="246.3" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>aio: 726k k IOPS</title></circle>
+<circle cx="227.3" cy="245.7" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>aio: 731k k IOPS</title></circle>
+<circle cx="398.7" cy="254.5" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>aio: 657k k IOPS</title></circle>
+<circle cx="570.0" cy="265.4" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>aio: 564k k IOPS</title></circle>
+<polyline points="56.0,226.7 227.3,205.9 398.7,202.8 570.0,154.8" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="56.0" cy="226.7" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring: 892k k IOPS</title></circle>
+<circle cx="227.3" cy="205.9" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring: 1,069k k IOPS</title></circle>
+<circle cx="398.7" cy="202.8" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring: 1,095k k IOPS</title></circle>
+<circle cx="570.0" cy="154.8" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring: 1,502k k IOPS</title></circle>
+<polyline points="56.0,284.8 227.3,250.8 398.7,190.4 570.0,135.9" fill="none" stroke="var(--plain)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="56.0" cy="284.8" r="4" fill="var(--plain)" stroke="var(--surface)" stroke-width="2"><title>psync: 400k k IOPS</title></circle>
+<circle cx="227.3" cy="250.8" r="4" fill="var(--plain)" stroke="var(--surface)" stroke-width="2"><title>psync: 688k k IOPS</title></circle>
+<circle cx="398.7" cy="190.4" r="4" fill="var(--plain)" stroke="var(--surface)" stroke-width="2"><title>psync: 1,200k k IOPS</title></circle>
+<circle cx="570.0" cy="135.9" r="4" fill="var(--plain)" stroke="var(--surface)" stroke-width="2"><title>psync: 1,662k k IOPS</title></circle>
+<text x="580.0" y="139.9" class="val">psync 1,662k</text>
+<text x="580.0" y="158.8" class="val">kqring 1,502k</text>
+<text x="580.0" y="269.4" class="val">aio 564k</text>
 <text x="740" y="75" class="tick" text-anchor="end">k IOPS</text>
 </svg>

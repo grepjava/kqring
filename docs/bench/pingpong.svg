@@ -38,48 +38,48 @@
 <line x1="102.0" y1="94" x2="102.0" y2="392" class="grid"/>
 <text x="102.0" y="408" class="tick" text-anchor="middle">0</text>
 <line x1="219.6" y1="94" x2="219.6" y2="392" class="grid"/>
-<text x="219.6" y="408" class="tick" text-anchor="middle">400</text>
+<text x="219.6" y="408" class="tick" text-anchor="middle">300</text>
 <line x1="337.2" y1="94" x2="337.2" y2="392" class="grid"/>
-<text x="337.2" y="408" class="tick" text-anchor="middle">800</text>
+<text x="337.2" y="408" class="tick" text-anchor="middle">600</text>
 <line x1="454.8" y1="94" x2="454.8" y2="392" class="grid"/>
-<text x="454.8" y="408" class="tick" text-anchor="middle">1,200</text>
+<text x="454.8" y="408" class="tick" text-anchor="middle">900</text>
 <line x1="572.4" y1="94" x2="572.4" y2="392" class="grid"/>
-<text x="572.4" y="408" class="tick" text-anchor="middle">1,600</text>
+<text x="572.4" y="408" class="tick" text-anchor="middle">1,200</text>
 <line x1="690.0" y1="94" x2="690.0" y2="392" class="grid"/>
-<text x="690.0" y="408" class="tick" text-anchor="middle">2,000</text>
+<text x="690.0" y="408" class="tick" text-anchor="middle">1,500</text>
 <text x="740" y="408" class="tick" text-anchor="end">ns</text>
 <text x="92.0" y="143.0" class="lab" text-anchor="end">AF_UNIX 64 B</text>
-<path d="M102.0,100.0 H311.1 Q315.1,100.0 315.1,104.0 V110.0 Q315.1,114.0 311.1,114.0 H102.0 Z" fill="var(--plain)"><title>AF_UNIX 64 B — write + recv floor: 725 ns</title></path>
-<text x="320.1" y="111" class="val">725</text>
-<path d="M102.0,116.0 H426.5 Q430.5,116.0 430.5,120.0 V126.0 Q430.5,130.0 426.5,130.0 H102.0 Z" fill="var(--kqueue)"><title>AF_UNIX 64 B — kqueue: 1,117 ns</title></path>
-<text x="435.5" y="127" class="val">1,117</text>
-<path d="M102.0,132.0 H356.9 Q360.9,132.0 360.9,136.0 V142.0 Q360.9,146.0 356.9,146.0 H102.0 Z" fill="var(--s1)"><title>AF_UNIX 64 B — kqring RECV, one buffer: 881 ns</title></path>
-<text x="365.9" y="143" class="val">881</text>
-<path d="M102.0,148.0 H374.2 Q378.2,148.0 378.2,152.0 V158.0 Q378.2,162.0 374.2,162.0 H102.0 Z" fill="var(--s2)"><title>AF_UNIX 64 B — kqring multishot: 939 ns</title></path>
-<text x="383.2" y="159" class="val">939</text>
-<path d="M102.0,164.0 H507.7 Q511.7,164.0 511.7,168.0 V174.0 Q511.7,178.0 507.7,178.0 H102.0 Z" fill="var(--s3)"><title>AF_UNIX 64 B — kqring RECV armed: 1,393 ns</title></path>
-<text x="516.7" y="175" class="val">1,393</text>
+<path d="M102.0,100.0 H233.8 Q237.8,100.0 237.8,104.0 V110.0 Q237.8,114.0 233.8,114.0 H102.0 Z" fill="var(--plain)"><title>AF_UNIX 64 B — write + recv floor: 346 ns</title></path>
+<text x="242.8" y="111" class="val">346</text>
+<path d="M102.0,116.0 H310.0 Q314.0,116.0 314.0,120.0 V126.0 Q314.0,130.0 310.0,130.0 H102.0 Z" fill="var(--kqueue)"><title>AF_UNIX 64 B — kqueue: 541 ns</title></path>
+<text x="319.0" y="127" class="val">541</text>
+<path d="M102.0,132.0 H314.6 Q318.6,132.0 318.6,136.0 V142.0 Q318.6,146.0 314.6,146.0 H102.0 Z" fill="var(--s1)"><title>AF_UNIX 64 B — kqring RECV, one buffer: 552 ns</title></path>
+<text x="323.6" y="143" class="val">552</text>
+<path d="M102.0,148.0 H343.0 Q347.0,148.0 347.0,152.0 V158.0 Q347.0,162.0 343.0,162.0 H102.0 Z" fill="var(--s2)"><title>AF_UNIX 64 B — kqring multishot: 625 ns</title></path>
+<text x="352.0" y="159" class="val">625</text>
+<path d="M102.0,164.0 H487.1 Q491.1,164.0 491.1,168.0 V174.0 Q491.1,178.0 487.1,178.0 H102.0 Z" fill="var(--s3)"><title>AF_UNIX 64 B — kqring RECV armed: 992 ns</title></path>
+<text x="496.1" y="175" class="val">992</text>
 <text x="92.0" y="239.0" class="lab" text-anchor="end">AF_UNIX 1 KiB</text>
-<path d="M102.0,196.0 H319.7 Q323.7,196.0 323.7,200.0 V206.0 Q323.7,210.0 319.7,210.0 H102.0 Z" fill="var(--plain)"><title>AF_UNIX 1 KiB — write + recv floor: 754 ns</title></path>
-<text x="328.7" y="207" class="val">754</text>
-<path d="M102.0,212.0 H437.7 Q441.7,212.0 441.7,216.0 V222.0 Q441.7,226.0 437.7,226.0 H102.0 Z" fill="var(--kqueue)"><title>AF_UNIX 1 KiB — kqueue: 1,155 ns</title></path>
-<text x="446.7" y="223" class="val">1,155</text>
-<path d="M102.0,228.0 H368.5 Q372.5,228.0 372.5,232.0 V238.0 Q372.5,242.0 368.5,242.0 H102.0 Z" fill="var(--s1)"><title>AF_UNIX 1 KiB — kqring RECV, one buffer: 920 ns</title></path>
-<text x="377.5" y="239" class="val">920</text>
-<path d="M102.0,244.0 H403.1 Q407.1,244.0 407.1,248.0 V254.0 Q407.1,258.0 403.1,258.0 H102.0 Z" fill="var(--s2)"><title>AF_UNIX 1 KiB — kqring multishot: 1,038 ns</title></path>
-<text x="412.1" y="255" class="val">1,038</text>
-<path d="M102.0,260.0 H539.9 Q543.9,260.0 543.9,264.0 V270.0 Q543.9,274.0 539.9,274.0 H102.0 Z" fill="var(--s3)"><title>AF_UNIX 1 KiB — kqring RECV armed: 1,503 ns</title></path>
-<text x="548.9" y="271" class="val">1,503</text>
+<path d="M102.0,196.0 H252.8 Q256.8,196.0 256.8,200.0 V206.0 Q256.8,210.0 252.8,210.0 H102.0 Z" fill="var(--plain)"><title>AF_UNIX 1 KiB — write + recv floor: 395 ns</title></path>
+<text x="261.8" y="207" class="val">395</text>
+<path d="M102.0,212.0 H345.2 Q349.2,212.0 349.2,216.0 V222.0 Q349.2,226.0 345.2,226.0 H102.0 Z" fill="var(--kqueue)"><title>AF_UNIX 1 KiB — kqueue: 631 ns</title></path>
+<text x="354.2" y="223" class="val">631</text>
+<path d="M102.0,228.0 H348.3 Q352.3,228.0 352.3,232.0 V238.0 Q352.3,242.0 348.3,242.0 H102.0 Z" fill="var(--s1)"><title>AF_UNIX 1 KiB — kqring RECV, one buffer: 638 ns</title></path>
+<text x="357.3" y="239" class="val">638</text>
+<path d="M102.0,244.0 H375.5 Q379.5,244.0 379.5,248.0 V254.0 Q379.5,258.0 375.5,258.0 H102.0 Z" fill="var(--s2)"><title>AF_UNIX 1 KiB — kqring multishot: 708 ns</title></path>
+<text x="384.5" y="255" class="val">708</text>
+<path d="M102.0,260.0 H517.2 Q521.2,260.0 521.2,264.0 V270.0 Q521.2,274.0 517.2,274.0 H102.0 Z" fill="var(--s3)"><title>AF_UNIX 1 KiB — kqring RECV armed: 1,069 ns</title></path>
+<text x="526.2" y="271" class="val">1,069</text>
 <text x="92.0" y="335.0" class="lab" text-anchor="end">AF_UNIX 4 KiB</text>
-<path d="M102.0,292.0 H343.2 Q347.2,292.0 347.2,296.0 V302.0 Q347.2,306.0 343.2,306.0 H102.0 Z" fill="var(--plain)"><title>AF_UNIX 4 KiB — write + recv floor: 834 ns</title></path>
-<text x="352.2" y="303" class="val">834</text>
-<path d="M102.0,308.0 H470.6 Q474.6,308.0 474.6,312.0 V318.0 Q474.6,322.0 470.6,322.0 H102.0 Z" fill="var(--kqueue)"><title>AF_UNIX 4 KiB — kqueue: 1,267 ns</title></path>
-<text x="479.6" y="319" class="val">1,267</text>
-<path d="M102.0,324.0 H402.9 Q406.9,324.0 406.9,328.0 V334.0 Q406.9,338.0 402.9,338.0 H102.0 Z" fill="var(--s1)"><title>AF_UNIX 4 KiB — kqring RECV, one buffer: 1,037 ns</title></path>
-<text x="411.9" y="335" class="val">1,037</text>
-<path d="M102.0,340.0 H460.1 Q464.1,340.0 464.1,344.0 V350.0 Q464.1,354.0 460.1,354.0 H102.0 Z" fill="var(--s2)"><title>AF_UNIX 4 KiB — kqring multishot: 1,232 ns</title></path>
-<text x="469.1" y="351" class="val">1,232</text>
-<path d="M102.0,356.0 H597.7 Q601.7,356.0 601.7,360.0 V366.0 Q601.7,370.0 597.7,370.0 H102.0 Z" fill="var(--s3)"><title>AF_UNIX 4 KiB — kqring RECV armed: 1,700 ns</title></path>
-<text x="606.7" y="367" class="val">1,700</text>
+<path d="M102.0,292.0 H278.0 Q282.0,292.0 282.0,296.0 V302.0 Q282.0,306.0 278.0,306.0 H102.0 Z" fill="var(--plain)"><title>AF_UNIX 4 KiB — write + recv floor: 459 ns</title></path>
+<text x="287.0" y="303" class="val">459</text>
+<path d="M102.0,308.0 H424.2 Q428.2,308.0 428.2,312.0 V318.0 Q428.2,322.0 424.2,322.0 H102.0 Z" fill="var(--kqueue)"><title>AF_UNIX 4 KiB — kqueue: 832 ns</title></path>
+<text x="433.2" y="319" class="val">832</text>
+<path d="M102.0,324.0 H428.7 Q432.7,324.0 432.7,328.0 V334.0 Q432.7,338.0 428.7,338.0 H102.0 Z" fill="var(--s1)"><title>AF_UNIX 4 KiB — kqring RECV, one buffer: 844 ns</title></path>
+<text x="437.7" y="335" class="val">844</text>
+<path d="M102.0,340.0 H508.9 Q512.9,340.0 512.9,344.0 V350.0 Q512.9,354.0 508.9,354.0 H102.0 Z" fill="var(--s2)"><title>AF_UNIX 4 KiB — kqring multishot: 1,048 ns</title></path>
+<text x="517.9" y="351" class="val">1,048</text>
+<path d="M102.0,356.0 H653.3 Q657.3,356.0 657.3,360.0 V366.0 Q657.3,370.0 653.3,370.0 H102.0 Z" fill="var(--s3)"><title>AF_UNIX 4 KiB — kqring RECV armed: 1,417 ns</title></path>
+<text x="662.3" y="367" class="val">1,417</text>
 <line x1="102.0" y1="94" x2="102.0" y2="392" class="axis"/>
 </svg>

@@ -32,30 +32,30 @@
 <line x1="114.0" y1="94" x2="114.0" y2="248" class="grid"/>
 <text x="114.0" y="264" class="tick" text-anchor="middle">0%</text>
 <line x1="229.2" y1="94" x2="229.2" y2="248" class="grid"/>
-<text x="229.2" y="264" class="tick" text-anchor="middle">20%</text>
+<text x="229.2" y="264" class="tick" text-anchor="middle">8%</text>
 <line x1="344.4" y1="94" x2="344.4" y2="248" class="grid"/>
-<text x="344.4" y="264" class="tick" text-anchor="middle">40%</text>
+<text x="344.4" y="264" class="tick" text-anchor="middle">16%</text>
 <line x1="459.6" y1="94" x2="459.6" y2="248" class="grid"/>
-<text x="459.6" y="264" class="tick" text-anchor="middle">60%</text>
+<text x="459.6" y="264" class="tick" text-anchor="middle">24%</text>
 <line x1="574.8" y1="94" x2="574.8" y2="248" class="grid"/>
-<text x="574.8" y="264" class="tick" text-anchor="middle">80%</text>
+<text x="574.8" y="264" class="tick" text-anchor="middle">32%</text>
 <line x1="690.0" y1="94" x2="690.0" y2="248" class="grid"/>
-<text x="690.0" y="264" class="tick" text-anchor="middle">100%</text>
+<text x="690.0" y="264" class="tick" text-anchor="middle">40%</text>
 <text x="740" y="264" class="tick" text-anchor="end">% CPU</text>
 <text x="104.0" y="119.0" class="lab" text-anchor="end">Raw disk reads</text>
-<path d="M114.0,100.0 H668.7 Q672.7,100.0 672.7,104.0 V110.0 Q672.7,114.0 668.7,114.0 H114.0 Z" fill="var(--kqueue)"><title>Raw disk reads — aio: 97% % CPU</title></path>
-<text x="677.7" y="111" class="val">97%</text>
-<path d="M114.0,116.0 H369.2 Q373.2,116.0 373.2,120.0 V126.0 Q373.2,130.0 369.2,130.0 H114.0 Z" fill="var(--s1)"><title>Raw disk reads — kqring: 45% % CPU</title></path>
-<text x="378.2" y="127" class="val">45%</text>
+<path d="M114.0,100.0 H556.4 Q560.4,100.0 560.4,104.0 V110.0 Q560.4,114.0 556.4,114.0 H114.0 Z" fill="var(--kqueue)"><title>Raw disk reads — aio: 31% % CPU</title></path>
+<text x="565.4" y="111" class="val">31%</text>
+<path d="M114.0,116.0 H470.0 Q474.0,116.0 474.0,120.0 V126.0 Q474.0,130.0 470.0,130.0 H114.0 Z" fill="var(--s1)"><title>Raw disk reads — kqring: 25% % CPU</title></path>
+<text x="479.0" y="127" class="val">25%</text>
 <text x="104.0" y="167.0" class="lab" text-anchor="end">ZFS file reads</text>
-<path d="M114.0,148.0 H524.7 Q528.7,148.0 528.7,152.0 V158.0 Q528.7,162.0 524.7,162.0 H114.0 Z" fill="var(--kqueue)"><title>ZFS file reads — aio: 72% % CPU</title></path>
-<text x="533.7" y="159" class="val">72%</text>
-<path d="M114.0,164.0 H300.1 Q304.1,164.0 304.1,168.0 V174.0 Q304.1,178.0 300.1,178.0 H114.0 Z" fill="var(--s1)"><title>ZFS file reads — kqring: 33% % CPU</title></path>
-<text x="309.1" y="175" class="val">33%</text>
+<path d="M114.0,148.0 H441.2 Q445.2,148.0 445.2,152.0 V158.0 Q445.2,162.0 441.2,162.0 H114.0 Z" fill="var(--kqueue)"><title>ZFS file reads — aio: 23% % CPU</title></path>
+<text x="450.2" y="159" class="val">23%</text>
+<path d="M114.0,164.0 H311.6 Q315.6,164.0 315.6,168.0 V174.0 Q315.6,178.0 311.6,178.0 H114.0 Z" fill="var(--s1)"><title>ZFS file reads — kqring: 14% % CPU</title></path>
+<text x="320.6" y="175" class="val">14%</text>
 <text x="104.0" y="215.0" class="lab" text-anchor="end">ZFS file writes</text>
-<path d="M114.0,196.0 H282.8 Q286.8,196.0 286.8,200.0 V206.0 Q286.8,210.0 282.8,210.0 H114.0 Z" fill="var(--kqueue)"><title>ZFS file writes — aio: 30% % CPU</title></path>
-<text x="291.8" y="207" class="val">30%</text>
-<path d="M114.0,212.0 H190.6 Q194.6,212.0 194.6,216.0 V222.0 Q194.6,226.0 190.6,226.0 H114.0 Z" fill="var(--s1)"><title>ZFS file writes — kqring: 14% % CPU</title></path>
-<text x="199.6" y="223" class="val">14%</text>
+<path d="M114.0,196.0 H153.2 Q157.2,196.0 157.2,200.0 V206.0 Q157.2,210.0 153.2,210.0 H114.0 Z" fill="var(--kqueue)"><title>ZFS file writes — aio: 3% % CPU</title></path>
+<text x="162.2" y="207" class="val">3%</text>
+<path d="M114.0,212.0 H138.8 Q142.8,212.0 142.8,216.0 V222.0 Q142.8,226.0 138.8,226.0 H114.0 Z" fill="var(--s1)"><title>ZFS file writes — kqring: 2% % CPU</title></path>
+<text x="147.8" y="223" class="val">2%</text>
 <line x1="114.0" y1="94" x2="114.0" y2="248" class="axis"/>
 </svg>

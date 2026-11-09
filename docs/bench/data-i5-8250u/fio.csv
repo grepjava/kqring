@@ -1,0 +1,30 @@
+section,series,x,value
+md,kqring,1,544
+md,kqring,2,965
+md,kqring,4,1031
+md,aio,1,453
+md,aio,2,558
+md,aio,4,323
+cached,kqring,1,424
+cached,kqring,2,528
+cached,kqring,4,501
+cached,kqring,8,532
+cached,aio,1,312
+cached,aio,2,325
+cached,aio,4,304
+cached,aio,8,272
+cached,psync,1,290
+cached,psync,2,452
+cached,psync,4,705
+cached,psync,8,784
+cpu,kqring,Raw disk reads,45
+cpu,aio,Raw disk reads,97
+cpu,kqring,ZFS file reads,33
+cpu,aio,ZFS file reads,72
+cpu,kqring,ZFS file writes,14
+cpu,aio,ZFS file writes,30
+liburing,tests,Passed,210
+liburing,tests,Skipped,27
+liburing,tests,Not kqring's,6
+liburing,tests,Differences,2
+liburing,tests,Not implemented,0

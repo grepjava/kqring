@@ -40,38 +40,38 @@
 <line x1="144.0" y1="112" x2="144.0" y2="330" class="grid"/>
 <text x="144.0" y="346" class="tick" text-anchor="middle">0</text>
 <line x1="253.2" y1="112" x2="253.2" y2="330" class="grid"/>
-<text x="253.2" y="346" class="tick" text-anchor="middle">300</text>
+<text x="253.2" y="346" class="tick" text-anchor="middle">200</text>
 <line x1="362.4" y1="112" x2="362.4" y2="330" class="grid"/>
-<text x="362.4" y="346" class="tick" text-anchor="middle">600</text>
+<text x="362.4" y="346" class="tick" text-anchor="middle">400</text>
 <line x1="471.6" y1="112" x2="471.6" y2="330" class="grid"/>
-<text x="471.6" y="346" class="tick" text-anchor="middle">900</text>
+<text x="471.6" y="346" class="tick" text-anchor="middle">600</text>
 <line x1="580.8" y1="112" x2="580.8" y2="330" class="grid"/>
-<text x="580.8" y="346" class="tick" text-anchor="middle">1,200</text>
+<text x="580.8" y="346" class="tick" text-anchor="middle">800</text>
 <line x1="690.0" y1="112" x2="690.0" y2="330" class="grid"/>
-<text x="690.0" y="346" class="tick" text-anchor="middle">1,500</text>
+<text x="690.0" y="346" class="tick" text-anchor="middle">1,000</text>
 <text x="740" y="346" class="tick" text-anchor="end">ns</text>
 <text x="134.0" y="153.0" class="lab" text-anchor="end">Pipe READ, 64 B</text>
-<path d="M144.0,118.0 H365.4 Q369.4,118.0 369.4,122.0 V128.0 Q369.4,132.0 365.4,132.0 H144.0 Z" fill="var(--plain)"><title>Pipe READ, 64 B — read(2) / pread(2): 619 ns</title></path>
-<text x="374.4" y="129" class="val">619</text>
-<path d="M144.0,134.0 H513.3 Q517.3,134.0 517.3,138.0 V144.0 Q517.3,148.0 513.3,148.0 H144.0 Z" fill="var(--kqueue)"><title>Pipe READ, 64 B — kqueue: 1,026 ns</title></path>
-<text x="522.3" y="145" class="val">1,026</text>
-<path d="M144.0,150.0 H447.8 Q451.8,150.0 451.8,154.0 V160.0 Q451.8,164.0 447.8,164.0 H144.0 Z" fill="var(--s1)"><title>Pipe READ, 64 B — kqring, inline: 846 ns</title></path>
-<text x="456.8" y="161" class="val">846</text>
-<path d="M144.0,166.0 H448.9 Q452.9,166.0 452.9,170.0 V176.0 Q452.9,180.0 448.9,180.0 H144.0 Z" fill="var(--s4)"><title>Pipe READ, 64 B — kqring, blocking pipe, inline: 848 ns</title></path>
-<text x="457.9" y="177" class="val">848</text>
+<path d="M144.0,118.0 H279.7 Q283.7,118.0 283.7,122.0 V128.0 Q283.7,132.0 279.7,132.0 H144.0 Z" fill="var(--plain)"><title>Pipe READ, 64 B — read(2) / pread(2): 256 ns</title></path>
+<text x="288.7" y="129" class="val">256</text>
+<path d="M144.0,134.0 H378.3 Q382.3,134.0 382.3,138.0 V144.0 Q382.3,148.0 378.3,148.0 H144.0 Z" fill="var(--kqueue)"><title>Pipe READ, 64 B — kqueue: 436 ns</title></path>
+<text x="387.3" y="145" class="val">436</text>
+<path d="M144.0,150.0 H401.2 Q405.2,150.0 405.2,154.0 V160.0 Q405.2,164.0 401.2,164.0 H144.0 Z" fill="var(--s1)"><title>Pipe READ, 64 B — kqring, inline: 478 ns</title></path>
+<text x="410.2" y="161" class="val">478</text>
+<path d="M144.0,166.0 H401.3 Q405.3,166.0 405.3,170.0 V176.0 Q405.3,180.0 401.3,180.0 H144.0 Z" fill="var(--s4)"><title>Pipe READ, 64 B — kqring, blocking pipe, inline: 478 ns</title></path>
+<text x="410.3" y="177" class="val">478</text>
 <text x="134.0" y="225.0" class="lab" text-anchor="end">UFS file READ, 4 KiB</text>
-<path d="M144.0,198.0 H572.8 Q576.8,198.0 576.8,202.0 V208.0 Q576.8,212.0 572.8,212.0 H144.0 Z" fill="var(--plain)"><title>UFS file READ, 4 KiB — read(2) / pread(2): 1,189 ns</title></path>
-<text x="581.8" y="209" class="val">1,189</text>
-<path d="M144.0,214.0 H623.2 Q627.2,214.0 627.2,218.0 V224.0 Q627.2,228.0 623.2,228.0 H144.0 Z" fill="var(--s1)"><title>UFS file READ, 4 KiB — kqring, inline: 1,328 ns</title></path>
-<text x="632.2" y="225" class="val">1,328</text>
-<path d="M144.0,230.0 H514.4 Q518.4,230.0 518.4,234.0 V240.0 Q518.4,244.0 514.4,244.0 H144.0 Z" fill="var(--s3)"><title>UFS file READ, 4 KiB — kqring, inline, 32 per enter: 1,028 ns</title></path>
-<text x="523.4" y="241" class="val">1,028</text>
+<path d="M144.0,198.0 H591.4 Q595.4,198.0 595.4,202.0 V208.0 Q595.4,212.0 591.4,212.0 H144.0 Z" fill="var(--plain)"><title>UFS file READ, 4 KiB — read(2) / pread(2): 827 ns</title></path>
+<text x="600.4" y="209" class="val">827</text>
+<path d="M144.0,214.0 H665.2 Q669.2,214.0 669.2,218.0 V224.0 Q669.2,228.0 665.2,228.0 H144.0 Z" fill="var(--s1)"><title>UFS file READ, 4 KiB — kqring, inline: 962 ns</title></path>
+<text x="674.2" y="225" class="val">962</text>
+<path d="M144.0,230.0 H595.5 Q599.5,230.0 599.5,234.0 V240.0 Q599.5,244.0 595.5,244.0 H144.0 Z" fill="var(--s3)"><title>UFS file READ, 4 KiB — kqring, inline, 32 per enter: 834 ns</title></path>
+<text x="604.5" y="241" class="val">834</text>
 <text x="134.0" y="289.0" class="lab" text-anchor="end">Empty op (NOP)</text>
-<path d="M144.0,262.0 H245.0 Q249.0,262.0 249.0,266.0 V272.0 Q249.0,276.0 245.0,276.0 H144.0 Z" fill="var(--kqueue)"><title>Empty op (NOP) — kqueue: 288 ns</title></path>
-<text x="254.0" y="273" class="val">288</text>
-<path d="M144.0,278.0 H262.1 Q266.1,278.0 266.1,282.0 V288.0 Q266.1,292.0 262.1,292.0 H144.0 Z" fill="var(--s1)"><title>Empty op (NOP) — kqring, inline: 336 ns</title></path>
-<text x="271.1" y="289" class="val">336</text>
-<path d="M144.0,294.0 H528.2 Q532.2,294.0 532.2,298.0 V304.0 Q532.2,308.0 528.2,308.0 H144.0 Z" fill="var(--s2)"><title>Empty op (NOP) — kqring, via worker: 1,067 ns</title></path>
-<text x="537.2" y="305" class="val">1,067</text>
+<path d="M144.0,262.0 H196.8 Q200.8,262.0 200.8,266.0 V272.0 Q200.8,276.0 196.8,276.0 H144.0 Z" fill="var(--kqueue)"><title>Empty op (NOP) — kqueue: 104 ns</title></path>
+<text x="205.8" y="273" class="val">104</text>
+<path d="M144.0,278.0 H242.3 Q246.3,278.0 246.3,282.0 V288.0 Q246.3,292.0 242.3,292.0 H144.0 Z" fill="var(--s1)"><title>Empty op (NOP) — kqring, inline: 187 ns</title></path>
+<text x="251.3" y="289" class="val">187</text>
+<path d="M144.0,294.0 H540.3 Q544.3,294.0 544.3,298.0 V304.0 Q544.3,308.0 540.3,308.0 H144.0 Z" fill="var(--s2)"><title>Empty op (NOP) — kqring, via worker: 733 ns</title></path>
+<text x="549.3" y="305" class="val">733</text>
 <line x1="144.0" y1="112" x2="144.0" y2="330" class="axis"/>
 </svg>

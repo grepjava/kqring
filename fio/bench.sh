@@ -10,6 +10,8 @@
 # The device is only read (fio's --readonly).  All writes go to a file in
 # the dataset, which this script creates and destroys, with data caching
 # off so that reads reach the disk.  psync runs depth threads, one I/O each.
+# Before each read run it waits until the disk has had no writes for 5
+# seconds, so the reads don't meet the flush of the previous writes.
 
 set -eu
 FIO=$1 DEV=$2 DS=$3 OUT=$4 REPS=${5:-3} SECS=${6:-20}
@@ -18,9 +20,29 @@ SIZE=8g
 mkdir -p "$OUT"
 ulimit -l 65536
 
+# The disk under DEV, for iostat: ada0 for /dev/ada0 or /dev/ada0p4.
+DISK=$(basename "$DEV" | sed 's/p[0-9]*$//')
+
+# Wait for the disk to go quiet: ZFS flushes random writes for a while after
+# they return, and the SSD then stalls reads for up to a second at a time,
+# whichever engine issues them.  Sync, then wait until iostat shows no writes
+# for 5 seconds in a row (at most 2 minutes).
+settle() {
+	zpool sync
+	quiet=0 t=0
+	while [ "$quiet" -lt 5 ] && [ "$t" -lt 120 ]; do
+		w=$(iostat -x -d -w 1 -c 2 "$DISK" |
+		    awk -v d="$DISK" '$1 == d { w = $3 } END { printf "%d", w }')
+		if [ "$w" -eq 0 ]; then quiet=$((quiet + 1)); else quiet=0; fi
+		t=$((t + 1))
+	done
+}
+
 run() {	# name engine depth extra...
 	name=$1 eng=$2 qd=$3
 	shift 3
+	# Reads measure the disk, not the last writes' flush.
+	case $name in *read*) settle ;; esac
 	case $eng in
 	psync)	par="--numjobs=$qd --iodepth=1 --thread --group_reporting" ;;
 	*)	par="--iodepth=$qd" ;;

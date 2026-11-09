@@ -342,7 +342,9 @@ def parts(path, title, subtitle, items, width=760):
 # --- main ---------------------------------------------------------------------
 
 def main():
-    outdir, paths = sys.argv[1], sys.argv[2:]
+    outdir = sys.argv[1]
+    # Skip directories, so that data/* can be passed whole.
+    paths = [p for p in sys.argv[2:] if not os.path.isdir(p)]
     base = [os.path.basename(p) for p in paths]
     mt_paths = [p for p, b in zip(paths, base) if b.startswith("mt.")]
     disk_paths = [p for p, b in zip(paths, base) if b.startswith("diskbench.")]

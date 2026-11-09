@@ -117,7 +117,7 @@ Acceptance: a profile that names the limit, then either a measured improvement o
 
 ## Phase 6: Performance evidence
 
-- Re-measure the full set after phases 4 and 5, and regenerate `BENCHMARK.MD` with `tests/bench_doc.py`. Now on the Ryzen 3 PRO 4350G, the machine the later phases were measured on.
+- Re-measure the full set after phases 4 and 5, and regenerate `BENCHMARK.MD` with `tests/bench_doc.py`. Now on the Ryzen 3 PRO 4350G, the machine the later phases were measured on. **Done:** `BENCHMARK.MD` is from `7641bf4` on the Ryzen, with the laptop's `v0.3.0` runs kept in `docs/bench/data-i5-8250u/`. Without PTI a system call is cheap, so single requests and fan-in trail kqueue there, where they led on the laptop; `v0.3.0` and `7641bf4` alternated on the Ryzen differ by a median of 0.7%, so the change is the machine's. On the SSD, the three engines are level once reads no longer meet the flush of earlier ZFS writes, which `fio/bench.sh` now waits out, and from 8 in flight kqring uses less CPU than aio.
 - Run comparable Linux io_uring workloads on the same machine. Wins against kqueue and aio don't establish parity with Linux. **Done:** [docs/linux-comparison.md](docs/linux-comparison.md), on a laptop that boots both, with the raw results. kqring is ahead on the SSD with less CPU and per batched operation, an enter costs it about 250 ns more than io_uring's, and io_uring is ahead on cached file reads from several threads, which it can try without blocking.
 - A benchmark in which the receiver has its own thread, and an explanation of ZFS's two cached-read speeds.
 - Deferred: UFS on a real disk, and NVMe, which needs hardware the project doesn't have.

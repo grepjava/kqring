@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" class="viz" width="760" height="496" viewBox="0 0 760 496" role="img" aria-label="kqring.ko by source file: 18,676 lines">
-<title>kqring.ko by source file: 18,676 lines</title>
+<svg xmlns="http://www.w3.org/2000/svg" class="viz" width="760" height="496" viewBox="0 0 760 496" role="img" aria-label="kqring.ko by source file: 19,181 lines">
+<title>kqring.ko by source file: 19,181 lines</title>
 
 <style>
   .viz { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
@@ -23,7 +23,7 @@
 </style>
 
 <rect width="760" height="496" rx="8" fill="var(--surface)"/>
-<text x="20" y="28" class="title">kqring.ko by source file: 18,676 lines</text>
+<text x="20" y="28" class="title">kqring.ko by source file: 19,181 lines</text>
 <text x="20" y="48" class="sub">Lines per file, including comments</text>
 <line x1="126.0" y1="72" x2="126.0" y2="466" class="grid"/>
 <text x="126.0" y="482" class="tick" text-anchor="middle">0</text>
@@ -39,29 +39,29 @@
 <text x="690.0" y="482" class="tick" text-anchor="middle">3,000</text>
 <text x="740" y="482" class="tick" text-anchor="end">lines</text>
 <text x="116.0" y="89.0" class="lab" text-anchor="end">kqring_req.c</text>
-<path d="M126.0,78.0 H648.2 Q652.2,78.0 652.2,82.0 V88.0 Q652.2,92.0 648.2,92.0 H126.0 Z" fill="var(--s1)"><title>kqring_req.c — lines: 2,799 lines</title></path>
-<text x="657.2" y="89" class="val">2,799</text>
+<path d="M126.0,78.0 H649.0 Q653.0,78.0 653.0,82.0 V88.0 Q653.0,92.0 649.0,92.0 H126.0 Z" fill="var(--s1)"><title>kqring_req.c — lines: 2,803 lines</title></path>
+<text x="658.0" y="89" class="val">2,803</text>
 <text x="116.0" y="121.0" class="lab" text-anchor="end">kqring_dev.c</text>
-<path d="M126.0,110.0 H607.6 Q611.6,110.0 611.6,114.0 V120.0 Q611.6,124.0 607.6,124.0 H126.0 Z" fill="var(--s1)"><title>kqring_dev.c — lines: 2,583 lines</title></path>
-<text x="616.6" y="121" class="val">2,583</text>
+<path d="M126.0,110.0 H608.5 Q612.5,110.0 612.5,114.0 V120.0 Q612.5,124.0 608.5,124.0 H126.0 Z" fill="var(--s1)"><title>kqring_dev.c — lines: 2,588 lines</title></path>
+<text x="617.5" y="121" class="val">2,588</text>
 <text x="116.0" y="153.0" class="lab" text-anchor="end">kqring_sock.c</text>
 <path d="M126.0,142.0 H592.8 Q596.8,142.0 596.8,146.0 V152.0 Q596.8,156.0 592.8,156.0 H126.0 Z" fill="var(--s1)"><title>kqring_sock.c — lines: 2,504 lines</title></path>
 <text x="601.8" y="153" class="val">2,504</text>
 <text x="116.0" y="185.0" class="lab" text-anchor="end">kqring_var.h</text>
-<path d="M126.0,174.0 H473.2 Q477.2,174.0 477.2,178.0 V184.0 Q477.2,188.0 473.2,188.0 H126.0 Z" fill="var(--s1)"><title>kqring_var.h — lines: 1,868 lines</title></path>
-<text x="482.2" y="185" class="val">1,868</text>
+<path d="M126.0,174.0 H488.8 Q492.8,174.0 492.8,178.0 V184.0 Q492.8,188.0 488.8,188.0 H126.0 Z" fill="var(--s1)"><title>kqring_var.h — lines: 1,951 lines</title></path>
+<text x="497.8" y="185" class="val">1,951</text>
 <text x="116.0" y="217.0" class="lab" text-anchor="end">kqring_file.c</text>
-<path d="M126.0,206.0 H470.2 Q474.2,206.0 474.2,210.0 V216.0 Q474.2,220.0 470.2,220.0 H126.0 Z" fill="var(--s1)"><title>kqring_file.c — lines: 1,852 lines</title></path>
-<text x="479.2" y="217" class="val">1,852</text>
-<text x="116.0" y="249.0" class="lab" text-anchor="end">kqring_rsrc.c</text>
-<path d="M126.0,238.0 H388.2 Q392.2,238.0 392.2,242.0 V248.0 Q392.2,252.0 388.2,252.0 H126.0 Z" fill="var(--s1)"><title>kqring_rsrc.c — lines: 1,416 lines</title></path>
-<text x="397.2" y="249" class="val">1,416</text>
-<text x="116.0" y="281.0" class="lab" text-anchor="end">kqring_kpoll.c</text>
-<path d="M126.0,270.0 H384.4 Q388.4,270.0 388.4,274.0 V280.0 Q388.4,284.0 384.4,284.0 H126.0 Z" fill="var(--s1)"><title>kqring_kpoll.c — lines: 1,396 lines</title></path>
-<text x="393.4" y="281" class="val">1,396</text>
-<text x="116.0" y="313.0" class="lab" text-anchor="end">kqring_wq.c</text>
-<path d="M126.0,302.0 H348.9 Q352.9,302.0 352.9,306.0 V312.0 Q352.9,316.0 348.9,316.0 H126.0 Z" fill="var(--s1)"><title>kqring_wq.c — lines: 1,207 lines</title></path>
-<text x="357.9" y="313" class="val">1,207</text>
+<path d="M126.0,206.0 H474.5 Q478.5,206.0 478.5,210.0 V216.0 Q478.5,220.0 474.5,220.0 H126.0 Z" fill="var(--s1)"><title>kqring_file.c — lines: 1,875 lines</title></path>
+<text x="483.5" y="217" class="val">1,875</text>
+<text x="116.0" y="249.0" class="lab" text-anchor="end">kqring_wq.c</text>
+<path d="M126.0,238.0 H420.0 Q424.0,238.0 424.0,242.0 V248.0 Q424.0,252.0 420.0,252.0 H126.0 Z" fill="var(--s1)"><title>kqring_wq.c — lines: 1,585 lines</title></path>
+<text x="429.0" y="249" class="val">1,585</text>
+<text x="116.0" y="281.0" class="lab" text-anchor="end">kqring_rsrc.c</text>
+<path d="M126.0,270.0 H388.2 Q392.2,270.0 392.2,274.0 V280.0 Q392.2,284.0 388.2,284.0 H126.0 Z" fill="var(--s1)"><title>kqring_rsrc.c — lines: 1,416 lines</title></path>
+<text x="397.2" y="281" class="val">1,416</text>
+<text x="116.0" y="313.0" class="lab" text-anchor="end">kqring_kpoll.c</text>
+<path d="M126.0,302.0 H386.7 Q390.7,302.0 390.7,306.0 V312.0 Q390.7,316.0 386.7,316.0 H126.0 Z" fill="var(--s1)"><title>kqring_kpoll.c — lines: 1,408 lines</title></path>
+<text x="395.7" y="313" class="val">1,408</text>
 <text x="116.0" y="345.0" class="lab" text-anchor="end">kqring_register.c</text>
 <path d="M126.0,334.0 H333.5 Q337.5,334.0 337.5,338.0 V344.0 Q337.5,348.0 333.5,348.0 H126.0 Z" fill="var(--s1)"><title>kqring_register.c — lines: 1,125 lines</title></path>
 <text x="342.5" y="345" class="val">1,125</text>

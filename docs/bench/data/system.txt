@@ -1,0 +1,13 @@
+Mon Nov  9 15:09:37 UTC 2026
+FreeBSD freebsd 15.1-RELEASE FreeBSD 15.1-RELEASE releng/15.1-n283562-96841ea08dcf GENERIC amd64
+AMD Ryzen 3 PRO 4350G with Radeon Graphics
+8
+7867863040
+zfs-2.4.2-1-FreeBSD_g6330a45b0
+zfs-kmod-2.4.2-1-FreeBSD_g6330a45b0
+pass0: <SanDisk SD7TB6S-256G-1016 X3541216> ACS-2 ATA SATA 3.x device
+pass0: 600.000MB/s transfers (SATA 3.x, UDMA6, PIO 512bytes)
+
+protocol              ACS-2 ATA SATA 3.x
+device model          SanDisk SD7TB6S-256G-1016
+firmware revision     X3541216

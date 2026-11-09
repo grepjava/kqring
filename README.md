@@ -120,29 +120,31 @@ It has also been reviewed against the classes of bugs behind Linux io_uring's CV
 
 ![kqring vs kqueue: speed-up per operation](docs/bench/summary.svg)
 
-Compared with `kqueue(2)`, or the plain system call where kqueue has no role, on a 4-core i5-8250U running FreeBSD 15.1. Medians of 5 runs of `v0.3.0`, in ns per operation, lower is better.
+Compared with `kqueue(2)`, or the plain system call where kqueue has no role, on FreeBSD 15.1. The figures are from an 8-thread AMD Ryzen 3 PRO 4350G, medians of 5 runs of `7641bf4` in ns per operation, lower is better. The last column is the same comparison on a 4-core Intel i5-8250U, from `v0.3.0`.
 
-| Workload | Baseline | kqring | Result |
-|---|---:|---:|---|
-| Fan-in, 16 sockets, 64 B | 831 (kqueue) | 676 (multishot `RECV`) | **19% faster** |
-| Fan-in, 1,024 sockets, 64 B | 870 (kqueue) | 709 (batched `RECV`) | **18% faster** |
-| AF_UNIX ping-pong, 64 B | 1,117 (kqueue) | 881 (`RECV`, reused buffer) | **21% faster** |
-| AF_UNIX ping-pong, 64 B | 1,117 (kqueue) | 939 (multishot `RECV`) | **16% faster** |
-| AF_UNIX ping-pong, 64 B | 1,117 (kqueue) | 1,393 (`RECV` armed first) | 25% slower |
-| TCP ping-pong, 64 B | 5,948 (kqueue) | 5,891 (multishot `RECV`) | level |
-| TCP `ACCEPT` | 16,283 (kqueue) | 16,113 (multishot) | level |
-| TCP `ACCEPT` | 16,283 (kqueue) | 14,320 (multishot, 50 µs busy-poll) | **12% faster** |
-| Pipe read, 64 B, data ready | 1,026 (kqueue) | 848 (`READ`) | **17% faster** |
-| 1 µs timer | 9,412 (`EVFILT_TIMER`) | 4,898 (`TIMEOUT`) | **1.9× faster** |
-| Empty call | 288 (`kevent`) | 336 (`NOP`, one per enter) | 16% slower |
-| Empty call | 288 (`kevent`) | 69 (`NOP`, 32 per enter) | **4.2× faster** |
-| AF_UNIX send, 256 KiB | 25,746 (`write`) | 11,069 (`SEND_ZC`, registered) | **2.3× faster** |
-| TCP send, 256 KiB | 56,215 (`write`) | 41,974 (`SEND_ZC`, registered) | **25% faster** |
-| TCP send, 16 KiB | 7,433 (`write`) | 7,685 (`SEND`) | 3% slower |
-| 4 KiB disk read | 5,280 (`pread`) | 1,837 (`READ`, 32 per enter) | **2.9× faster** |
-| 4 KiB disk read | 5,280 (`pread`) | 5,842 (`READ`, one per enter) | 11% slower |
-| 4 KiB UFS cached read | 1,189 (`pread`) | 1,028 (`READ`, 32 per enter) | **13% faster** |
-| 4 KiB UFS cached read | 1,189 (`pread`) | 1,328 (`READ`, one per enter) | 12% slower |
+| Workload | Baseline | kqring | Result | On the i5-8250U |
+|---|---:|---:|---|---|
+| Fan-in, 16 sockets, 64 B | 402 (kqueue) | 509 (multishot `RECV`) | 26% slower | **19% faster** |
+| Fan-in, 1,024 sockets, 64 B | 487 (kqueue) | 644 (batched `RECV`) | 32% slower | **18% faster** |
+| AF_UNIX ping-pong, 64 B | 541 (kqueue) | 552 (`RECV`, reused buffer) | level | **21% faster** |
+| AF_UNIX ping-pong, 64 B | 541 (kqueue) | 625 (multishot `RECV`) | 16% slower | **16% faster** |
+| AF_UNIX ping-pong, 64 B | 541 (kqueue) | 992 (`RECV` armed first) | 84% slower | 25% slower |
+| TCP ping-pong, 64 B | 3,015 (kqueue) | 3,061 (multishot `RECV`) | level | level |
+| TCP `ACCEPT` | 7,271 (kqueue) | 7,386 (multishot) | level | level |
+| TCP `ACCEPT` | 7,271 (kqueue) | 7,324 (multishot, 50 µs busy-poll) | level | **12% faster** |
+| Pipe read, 64 B, data ready | 436 (kqueue) | 478 (`READ`) | 10% slower | **17% faster** |
+| 1 µs timer | 4,010 (`EVFILT_TIMER`) | 3,542 (`TIMEOUT`) | **12% faster** | **1.9× faster** |
+| Empty call | 104 (`kevent`) | 187 (`NOP`, one per enter) | 80% slower | 16% slower |
+| Empty call | 104 (`kevent`) | 76 (`NOP`, 32 per enter) | **27% faster** | **4.2× faster** |
+| AF_UNIX send, 256 KiB | 53,884 (`write`) | 24,593 (`SEND_ZC`, registered) | **2.2× faster** | **2.3× faster** |
+| TCP send, 256 KiB | 67,818 (`write`) | 45,669 (`SEND_ZC`, registered) | **33% faster** | **25% faster** |
+| TCP send, 16 KiB | 4,328 (`write`) | 4,558 (`SEND`) | 5% slower | 3% slower |
+| 4 KiB disk read | 3,422 (`pread`) | 1,463 (`READ`, 32 per enter) | **2.3× faster** | **2.9× faster** |
+| 4 KiB disk read | 3,422 (`pread`) | 3,772 (`READ`, one per enter) | 10% slower | 11% slower |
+| 4 KiB UFS cached read | 827 (`pread`) | 834 (`READ`, 32 per enter) | level | **13% faster** |
+| 4 KiB UFS cached read | 827 (`pread`) | 962 (`READ`, one per enter) | 16% slower | 12% slower |
+
+**The CPU decides much of this.** kqring saves system calls but does more work per request than the call it replaces. On the i5, FreeBSD isolates the kernel's page tables against Meltdown (PTI), so a system call costs nearly three times what it does on the Ryzen, which doesn't need it, and kqring's savings come out ahead. On the Ryzen, its own cost per request decides, and on single requests and fan-in kqueue wins. kqring itself didn't change between the two: `v0.3.0` and `7641bf4`, run alternately on the Ryzen, differ by a median of 0.7% per benchmark. [`BENCHMARK.MD`](BENCHMARK.MD#why-the-results-depend-on-the-cpu) has the breakdown.
 
 <p align="center">
   <img src="docs/bench/fanin.svg" alt="Fan-in across N sockets" width="49%">
@@ -161,24 +163,24 @@ These are mostly single-threaded loopback measurements of what each mechanism co
 
 ### Where kqring is faster
 
-1. **Servers with many active connections:** 18%–19% faster. One enter collects every ready message.
-2. **Steady receive:** multishot `RECV`, or `RECV` into a reused buffer, needs no separate wake-up before the read.
-3. **Bulk sends from 32–64 KiB up:** `SEND_ZC` from a registered buffer avoids copying user memory into the kernel.
-4. **Disks with requests in flight:** batched requests reach the driver together, which one thread calling `pread(2)` can't do.
-5. **Anything you can batch:** 32 `NOP`s per enter cost 69 ns each, against 288 ns for an empty `kevent(2)`.
-6. **Event-driven chains:** a [trigger](#kqring-extensions) echo server spends less CPU per message than kqueue, because it never returns to user space between messages.
+1. **Anything you can batch:** 32 `NOP`s per enter cost 76 ns each, against 104 ns for an empty `kevent(2)`.
+2. **Disks with requests in flight:** batched requests reach the driver together, which one thread calling `pread(2)` can't do.
+3. **Bulk sends:** at 256 KiB, `SEND_ZC` from a registered buffer avoids copying user memory into the kernel and takes 33–54% less time than `write(2)`. At 64 KiB and below it costs more on the Ryzen.
+4. **Timers:** a `TIMEOUT` costs less than an `EVFILT_TIMER` event.
+5. **Event-driven chains:** a [trigger](#kqring-extensions) echo server spends less CPU per message than kqueue, because it never returns to user space between messages.
+6. **Where system calls are expensive** (PTI, or other mitigations that make each kernel entry cost more): servers with many active connections and steady receive, where kqring collects messages that kqueue needs a call each for. On the i5-8250U, fan-in was 18–19% faster than kqueue.
 
 ### Where kqueue or direct system calls are better
 
-1. **One-shot `RECV` armed before the data arrives:** 25% slower at 64 B. It takes a second enter and sets up a socket upcall each time. Use multishot.
-2. **One operation at a time:** a single request per enter costs more than the plain call, as the `NOP` and `READ` rows show. The ring pays off with several requests in flight.
-3. **Cached reads on ZFS:** ZFS has no page-cache read path, so reads go through a worker, and `pread(2)` is faster. On UFS, batched reads win.
-4. **Many threads reading cached data:** from 4 threads, `pread(2)` passes kqring's worker path, because a thread reading the cache itself needs no hand-off. Once the readers take most of the CPUs, kqring runs those reads in the submitting thread too; on an 8-thread Ryzen that cut `psync`'s lead at 8 jobs from 32% to 10%. With 4 to 16 reads per enter, kqring is ahead of `psync` up to 4 jobs and 2% behind at 8 ([docs/worker-wakeups.md](docs/worker-wakeups.md#where-the-rest-of-the-gap-is-and-batching)).
+1. **One operation at a time:** a single request per enter costs more than the plain call, as the `NOP`, pipe and `READ` rows show. Where system calls are cheap, as on the Ryzen, that includes fan-in and ping-pong. The ring pays off with several requests per enter.
+2. **One-shot `RECV` armed before the data arrives:** it takes a second enter and sets up a socket upcall each time. Use multishot.
+3. **Single cached reads on ZFS:** ZFS has no page-cache read path, so a read goes through a worker, or runs in the enter once the readers take most of the CPUs. One `READ` per enter costs more than `pread(2)`, 1,920 against 1,152 ns on the Ryzen (medians); 32 per enter cost less, 742 ns. On UFS, one per enter is 16% slower than `pread(2)` and 32 per enter level.
+4. **Many threads reading cached data:** from 4 threads, `pread(2)` passes kqring's worker path, because a thread reading the cache itself needs no hand-off. Once the readers take most of the CPUs, kqring runs those reads in the submitting thread too. With 4 to 16 reads per enter, kqring is ahead of `psync` up to 4 jobs and 2% behind at 8 ([docs/worker-wakeups.md](docs/worker-wakeups.md#where-the-rest-of-the-gap-is-and-batching)).
 5. **`sendfile(2)` with kernel TLS:** for serving files to the network, keep `sendfile(2)`. It moves file pages to the NIC without passing through user space.
 
 ## Storage performance
 
-With [fio](fio/README.md)'s own `io_uring` engine, on a SATA SSD and on `md(4)` disks. kqring reaches what the SSD can do, 98,876 IOPS at 32 in flight, with less than half of `aio(4)`'s CPU.
+With [fio](fio/README.md)'s own `io_uring` engine, on a SATA SSD and on `md(4)` disks. On the raw disk, kqring reaches what the SSD can do, 84,952 IOPS at 32 in flight, at 25% CPU, where `aio(4)` reaches 80,655 at 31%.
 
 ![CPU per engine on a SATA SSD](docs/bench/fio_cpu.svg)
 
@@ -187,7 +189,7 @@ With [fio](fio/README.md)'s own `io_uring` engine, on a SATA SSD and on `md(4)` 
   <img src="docs/bench/fio_cached.svg" alt="fio on a cached ZFS file by jobs" width="49%">
 </p>
 
-On a ZFS file at 32 in flight, kqring is 4–5% behind `aio(4)` in IOPS and has a longer latency tail, at less than half the CPU. See [`BENCHMARK.MD`](BENCHMARK.MD#fio-on-a-real-ssd).
+On a ZFS file at 32 in flight, kqring, `aio(4)` and `psync` read at the same rate, kqring at 14% CPU against aio's 23%. See [`BENCHMARK.MD`](BENCHMARK.MD#fio-on-a-real-ssd).
 
 ## Against Linux io_uring
 

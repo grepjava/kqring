@@ -1,0 +1,11 @@
+06:32:03 quiet.kqring.1 8476 iops p99.99 864 us max 1447 us
+06:32:26 quiet.psync.1 8744 iops p99.99 289 us max 2853 us
+06:32:49 quiet.kqring.2 8709 iops p99.99 261 us max 3061 us
+06:33:11 quiet.psync.2 8739 iops p99.99 297 us max 2502 us
+06:33:34 quiet.kqring.3 8713 iops p99.99 251 us max 1989 us
+06:33:56 quiet.psync.3 8749 iops p99.99 253 us max 1696 us
+06:34:50 afterwrites.io_uring.1 7327 iops p99.99 50594 us max 476059 us
+06:35:34 afterwrites.psync.1 7804 iops p99.99 2703 us max 1336462 us
+06:36:17 afterwrites.io_uring.2 6931 iops p99.99 31064 us max 630233 us
+06:37:01 afterwrites.psync.2 8230 iops p99.99 7766 us max 94875 us
+06:37:01 ALLDONE
