@@ -5,7 +5,7 @@ Known limits are in [BENCHMARK.MD](BENCHMARK.MD#known-gaps) and [Differences fro
 ## Performance
 
 - **Cached ZFS reads, `psync` still ahead from 4 jobs.** On an 8-thread machine kqring is 11% behind at 4 jobs, where its reads still go through workers, and 10% at 8, where they run in the submitting thread ([docs/worker-wakeups.md](docs/worker-wakeups.md#reads-in-the-submitting-thread)). Next: ZFS reads that complete from ZFS's own I/O callback, without a worker or a guess ([docs/async-zfs-reads.md](docs/async-zfs-reads.md)).
-- **1 to 4 jobs lost 1.3–3% to the inline-read change.** No read runs in the enter there, so it's the bookkeeping: a clock read per request on the workers or the count per enter. Not yet traced.
+- **2 and 4 jobs lose 1–1.5% to the inline-read change.** No read runs in the enter there. At 1 job the count of threads in enters was the cost, and `counter(9)` cut it to 0.6%; at 2 jobs the loss stays without the count, and neither the clock read per worker request nor the `inline_ok` check alone explains it. Next: the spin check and the second average under the pool mutex, or code layout.
 - **ZFS at 32 in flight.** kqring is 4–5% behind aio in IOPS with a longer p99, at less than half the CPU.
 - **A zero-copy benchmark with the receiver in its own thread.** Loopback delivers through the netisr thread, so a single-threaded send-then-receive mostly measures that hand-off for small sends.
 
@@ -17,7 +17,7 @@ Known limits are in [BENCHMARK.MD](BENCHMARK.MD#known-gaps) and [Differences fro
 ## Measurement
 
 - **Run on UFS with a real disk, and on NVMe.** Storage results so far are from a SATA SSD with ZFS, and md(4) disks.
-- **Explain ZFS's two speeds.** The same cached file reads at about 1.5 µs or 6–14 µs from run to run, with plain `pread(2)` too.
+- **Explain ZFS's two speeds.** The same cached file reads at about 1.5 µs or 6–14 µs from run to run, with plain `pread(2)` too. One lead: a benchmark that wrote its 512 MiB file and read it without `zpool sync` first got 250,000–330,000 IOPS with kqring at 1 and 2 jobs, against about 890,000 with the sync (2026-11-09, Ryzen). Reads of blocks still dirty in the open transaction group may be the slow speed.
 
 ## Not planned
 

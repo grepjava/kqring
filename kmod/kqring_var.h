@@ -45,6 +45,7 @@
 #include <sys/rmlock.h>
 #include <sys/sx.h>
 #include <sys/condvar.h>
+#include <sys/counter.h>
 #include <sys/queue.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
@@ -1804,7 +1805,6 @@ void	kqring_wq_close(struct kqring_wq *wq);
 void	kqring_wq_put(struct kqring_wq *wq);
 bool	kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op,
 	    int type);
-void	kqring_wq_enter_count(int n);
 bool	kqring_wq_inline_ok(struct kqring_ctx *ctx);
 bool	kqring_wq_try_inline(struct kqring_ctx *ctx, struct kqring_op *op);
 
@@ -1931,5 +1931,19 @@ void	kqring_zc_rele(struct kqring_zc_notif *zc, bool in_issuer);
 void	kqring_zc_abort(struct kqring_zc_notif *zc);
 void	kqring_zc_mext_free(struct mbuf *m);
 bool	kqring_zc_hold(void);
+
+/*
+ * Threads in io_uring_enter(2) on any ring: per CPU, one unlocked add
+ * (a thread may leave on another CPU than it entered on, so one CPU's
+ * count can go negative; the sum is right).  kqring_wq_inline_ok() sums
+ * it, at most once a tick.
+ */
+extern counter_u64_t kqring_entered;
+
+static inline void
+kqring_wq_enter_count(int n)
+{
+	counter_u64_add(kqring_entered, n);
+}
 
 #endif /* !_KQRING_VAR_H_ */

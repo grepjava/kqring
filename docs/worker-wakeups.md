@@ -100,7 +100,7 @@ The Ryzen 3 PRO 4350G again, with the module from before (`075669e`) and after l
 
 aio and `psync` are from the runs with the module from before; with the new one they were within 1%. At 8 jobs, kqring is 10% behind `psync` where it was 32% behind. Its reads there are run by the 8 submitting threads, not by the 4 workers the cap keeps awake. The rest of the gap is what kqring adds to each read, about 0.4 µs in the kernel to copy the SQE, set up the request and post the CQE, plus fio's io_uring engine in user space; fio submits one read per enter in these runs, so there's no batch to spread it over.
 
-At 1 to 4 jobs no read runs inline, and kqring is 1.3–3% slower. The change adds a clock read to each request on the workers and a count to each enter; which of them costs the 3% hasn't been traced. kqring stays ahead of aio at every job count, and ahead of `psync` up to 2 jobs.
+At 1 to 4 jobs no read runs inline, and kqring was 1.3–3% slower. At 1 job that was the count of threads in enters: with the count taken out, 1 job matched the module from before (895,000 against 891,000 IOPS, medians of 5 runs), and with each of the other added pieces taken out it didn't. The count is now a `counter(9)`, one unlocked add per enter where it was two critical sections and two function calls, and 1 job is 0.6% behind (886,000). 2 jobs stay about 1% behind with or without the count, and 4 jobs about 1.5%; neither is traced yet. kqring stays ahead of aio at every job count, and ahead of `psync` up to 2 jobs.
 
 md(4) reads, through kqring's direct bio path, are unchanged. So is work that waits for the SSD, with no read run inline (fio 3.43, 20 seconds, three repetitions, medians):
 

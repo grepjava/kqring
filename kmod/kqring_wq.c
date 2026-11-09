@@ -10,38 +10,13 @@
 #include <sys/sysent.h>
 #include <sys/umtxvar.h>
 
-/*
- * Threads in io_uring_enter(2) on any ring, per CPU (a thread may leave on
- * another CPU than it entered on, so one CPU's count can go negative; the
- * sum is right).  kqring_wq_inline_ok() sums it.
- */
-DPCPU_DEFINE_STATIC(int, kqring_entered);
+/* kqring_wq_enter_count(): threads in enters, per CPU. */
+COUNTER_U64_DEFINE_EARLY(kqring_entered);
 
-void
-kqring_wq_enter_count(int n)
-{
-	/* Only this CPU writes its count: no locked instruction needed. */
-	critical_enter();
-	*DPCPU_PTR(kqring_entered) += n;
-	critical_exit();
-}
-
-/* File reads run inline by kqring_wq_try_inline(), per CPU. */
-DPCPU_DEFINE_STATIC(u_long, kqring_inline_reads);
-
-static int
-kqring_wq_inline_sysctl(SYSCTL_HANDLER_ARGS)
-{
-	u_long n = 0;
-	u_int i;
-
-	CPU_FOREACH(i)
-		n += *DPCPU_ID_PTR(i, kqring_inline_reads);
-	return (sysctl_handle_long(oidp, &n, 0, req));
-}
-SYSCTL_PROC(_kern_kqring, OID_AUTO, wq_inline,
-    CTLTYPE_ULONG | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
-    kqring_wq_inline_sysctl, "LU",
+/* File reads run inline by kqring_wq_try_inline(). */
+static COUNTER_U64_DEFINE_EARLY(kqring_inline_reads);
+SYSCTL_COUNTER_U64(_kern_kqring, OID_AUTO, wq_inline, CTLFLAG_RD,
+    &kqring_inline_reads,
     "File reads run by the thread that submitted them (pool's reads cached, CPUs busy)");
 
 /*
@@ -55,13 +30,12 @@ static bool kqring_busy;
 static bool
 kqring_wq_cpus_busy(void)
 {
-	u_int i, t = (u_int)ticks;
-	int n = 0;
+	u_int t = (u_int)ticks;
+	int64_t n;
 
 	if (atomic_load_int(&kqring_busy_tick) == t)
 		return (atomic_load_bool(&kqring_busy));
-	CPU_FOREACH(i)
-		n += atomic_load_int(DPCPU_ID_PTR(i, kqring_entered));
+	n = (int64_t)counter_u64_fetch(kqring_entered);
 	atomic_store_bool(&kqring_busy, n * 2 > mp_ncpus);
 	atomic_store_int(&kqring_busy_tick, t);
 	return (n * 2 > mp_ncpus);
@@ -603,9 +577,7 @@ kqring_wq_try_inline(struct kqring_ctx *ctx, struct kqring_op *op)
 	mtx_lock(&wq->mtx);
 	kqring_wq_note_sleep_locked(wq, switched, slept);
 	mtx_unlock(&wq->mtx);
-	critical_enter();
-	(*DPCPU_PTR(kqring_inline_reads))++;
-	critical_exit();
+	counter_u64_add(kqring_inline_reads, 1);
 	return (true);
 }
 
