@@ -1739,6 +1739,8 @@ bool	kqring_arm_socket_op(struct kqring_ctx *ctx, struct kqring_op *op,
 bool	kqring_pipe_will_block(const struct file *fp, bool is_write,
 	    size_t want);
 void	kqring_iov_skip(struct iovec **iovp, u_int *cntp, size_t done);
+int	kqring_exec_file_read_local(struct kqring_ctx *ctx,
+	    struct kqring_op *op, bool *punt);
 int	kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 	    bool is_write);
 /* kqring_file_rw_inline() results. */

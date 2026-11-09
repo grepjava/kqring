@@ -547,31 +547,18 @@ kqring_wq_try_inline(struct kqring_ctx *ctx, struct kqring_op *op)
 {
 	struct kqring_wq *wq = ctx->wq;
 	struct thread *td = curthread;
-	struct file *fp;
-	struct vnode *vp;
-	struct mount *mp;
 	uint64_t t0;
 	long nvcsw;
-	bool local, slept, switched;
+	bool punt, slept, switched;
 
 	if (!ctx->submit_inline || wq == NULL ||
 	    !atomic_load_bool(&wq->cached))
 		return (false);
-	if (op->ffile != NULL)
-		fp = op->ffile->fp;
-	else if (fget(td, op->sqe.fd, &cap_no_rights, &fp) != 0)
-		return (false);
-	vp = fp->f_type == DTYPE_VNODE ? fp->f_vnode : NULL;
-	mp = vp != NULL && vp->v_type == VREG ?
-	    atomic_load_ptr(&vp->v_mount) : NULL;
-	local = mp != NULL && (mp->mnt_flag & MNT_LOCAL) != 0;
-	if (op->ffile == NULL)
-		fdrop(fp, td);
-	if (!local)
-		return (false);
 	nvcsw = td->td_ru.ru_nvcsw;
 	t0 = cpu_ticks();
-	(void)kqring_exec_file_rw(ctx, op, false);
+	(void)kqring_exec_file_read_local(ctx, op, &punt);
+	if (punt)
+		return (false);
 	switched = td->td_ru.ru_nvcsw != nvcsw;
 	slept = switched &&
 	    cputick2usec(cpu_ticks() - t0) >= KQRING_WQ_SLEPT_US;

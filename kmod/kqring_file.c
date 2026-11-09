@@ -11,7 +11,7 @@
 #include <geom/geom.h>
 
 static int	kqring_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
-	    bool is_write, bool nowait, bool *punt);
+	    bool is_write, bool nowait, bool local, bool *punt);
 
 /*
  * A FIFO's file is a pipe's for reading: pipeops, a struct pipe in f_data,
@@ -434,7 +434,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 		bool punt;
 
 		fdrop(fp, td);
-		kqring_file_rw(ctx, op, is_write, true, &punt);
+		kqring_file_rw(ctx, op, is_write, true, false, &punt);
 		return (punt ? KQRING_RW_PUNT : KQRING_RW_DONE);
 	}
 	vp = fp->f_vnode;
@@ -535,7 +535,19 @@ kqring_exec_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 {
 	bool punt;
 
-	return (kqring_file_rw(ctx, op, is_write, false, &punt));
+	return (kqring_file_rw(ctx, op, is_write, false, false, &punt));
+}
+
+/*
+ * As kqring_exec_file_rw(), for a read run by the thread that submitted it
+ * (kqring_wq_try_inline()): only of a regular file on a local filesystem.
+ * Anything else sets *punt, with op unchanged, for a worker to read.
+ */
+int
+kqring_exec_file_read_local(struct kqring_ctx *ctx, struct kqring_op *op,
+    bool *punt)
+{
+	return (kqring_file_rw(ctx, op, false, false, true, punt));
 }
 
 /*
@@ -565,10 +577,12 @@ kqring_pipe_rw_nowait(struct file *fp, struct uio *uio, bool is_write,
  * As kqring_exec_file_rw(); with nowait (the issuer, on a pipe), a pipe is
  * never waited for: *punt is set, with op unchanged, if it would have to,
  * or with op->done_io set to what a write got in before the pipe filled.
+ * With local, *punt is set, with op unchanged, unless the file is a regular
+ * file on a local filesystem (kqring_exec_file_read_local()).
  */
 static int
 kqring_file_rw(struct kqring_ctx *ctx, struct kqring_op *op, bool is_write,
-    bool nowait, bool *punt)
+    bool nowait, bool local, bool *punt)
 {
 	const struct io_uring_sqe *sqe = &op->sqe;
 	struct thread *td = curthread;
@@ -592,6 +606,15 @@ kqring_file_rw(struct kqring_ctx *ctx, struct kqring_op *op, bool is_write,
 	 * saw it ready, and the issuer must then punt rather than wait.
 	 */
 	nowait = nowait && fp->f_ops == &pipeops;
+	if (local) {
+		struct vnode *vp = fp->f_type == DTYPE_VNODE ?
+		    fp->f_vnode : NULL;
+		struct mount *mp = vp != NULL && vp->v_type == VREG ?
+		    atomic_load_ptr(&vp->v_mount) : NULL;
+
+		if (mp == NULL || (mp->mnt_flag & MNT_LOCAL) == 0)
+			goto punt;
+	}
 
 	if (buf_select) {
 		struct kqring_bgroup *bg;
