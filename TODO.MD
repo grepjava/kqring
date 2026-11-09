@@ -17,7 +17,7 @@ Known limits are in [BENCHMARK.MD](BENCHMARK.MD#known-gaps) and [Differences fro
 ## Measurement
 
 - **Run on UFS with a real disk, and on NVMe.** Storage results so far are from a SATA SSD with ZFS, and md(4) disks.
-- **Explain ZFS's two speeds.** The same cached file reads at about 1.5 µs or 6–14 µs from run to run, with plain `pread(2)` too. One lead: a benchmark that wrote its 512 MiB file and read it without `zpool sync` first got 250,000–330,000 IOPS with kqring at 1 and 2 jobs, against about 890,000 with the sync (2026-11-09, Ryzen). Reads of blocks still dirty in the open transaction group may be the slow speed.
+- **Explain ZFS's two speeds.** The same cached file reads at about 1.5 µs or 6–14 µs from run to run, with plain `pread(2)` too. Seen again on 2026-11-09 on the Ryzen: 250,000–330,000 IOPS with kqring at 1 and 2 jobs, slower at 2 than at 1, with the module from before the inline-read change and after, where 890,000 is usual. That run skipped `zpool sync` after writing the file, but three trials with and without the sync were all fast, and so were three after squeezing the ARC target to 755 MB, with no ARC misses, so neither reproduces it. With `vfs.zfs.dio_enabled=0`, the default on 15.1, fio's `--direct=1` reads are ZFS's uncached reads, which build and drop a dbuf for every read; buffered reads, which keep a dbuf cache of 1/32 of the ARC target, were about as fast. `fio/scale.sh` now writes the ARC hits, misses and size for each cached run to `arc.txt`, so the next slow run shows whether it went to the disk.
 
 ## Not planned
 

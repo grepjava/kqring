@@ -47,4 +47,6 @@ The arguments are fio, a device to read, a ZFS dataset to create, an output dire
 sudo sh scale.sh $PWD/work/fio-fio-3.43/fio zroot/fioscale $PWD/out 3 10
 ```
 
-On FreeBSD 15.1 `vfs.zfs.dio_enabled` is 0 by default, so ZFS treats `O_DIRECT` as ordinary I/O through its own buffers.
+It writes each run's JSON to the output directory, and the ARC's hits, misses and size around each cached run to `arc.txt`: cached reads that come out slow with misses there were partly read from the disk.
+
+On FreeBSD 15.1 `vfs.zfs.dio_enabled` is 0 by default, so ZFS reads an `O_DIRECT` file through the ARC as uncached I/O: a hit is copied from the ARC, and the dbuf it made is dropped after each read rather than kept in the dbuf cache. On the Ryzen this was about as fast as buffered reads.

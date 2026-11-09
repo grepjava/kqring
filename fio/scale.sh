@@ -30,6 +30,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ARC counters around each cached run, in $OUT/arc.txt: cached reads that
+# come out slow with misses were partly read from the disk.
+arcstat() { sysctl -n kstat.zfs.misc.arcstats.$1; }
+
 COMMON="--thread --group_reporting --direct=1 --time_based \
     --runtime=$SECS --ramp_time=1 --norandommap --randrepeat=0 \
     --output-format=json --rw=randread --bs=4k"
@@ -61,10 +65,16 @@ while [ "$rep" -le "$REPS" ]; do
 			psync)	qd=1 ;;
 			*)	qd=16 ;;
 			esac
+			h0=$(arcstat hits) m0=$(arcstat misses)
 			"$FIO" --name=z --ioengine=$eng --iodepth=$qd \
 			    --numjobs=$j --filename="$FILE" --size=512m \
 			    $COMMON \
 			    --output="$OUT/zfscached.$eng.j$j.r$rep.json"
+			echo "zfscached.$eng.j$j.r$rep" \
+			    "hits=$(($(arcstat hits) - h0))" \
+			    "misses=$(($(arcstat misses) - m0))" \
+			    "arc_target=$(arcstat c)" "arc_size=$(arcstat size)" \
+			    >> "$OUT/arc.txt"
 		done
 	done
 	for j in 1 2 4; do
