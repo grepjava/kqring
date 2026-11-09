@@ -9333,6 +9333,128 @@ test_wq_cap_stall(void)
 	    "(%d OPENATs of a FIFO, then a read)\n", cap + 1);
 }
 
+#define INLINE_BLOCKS	256
+#define INLINE_QD	16
+
+struct inline_arg {
+	int		fd;
+	u_long		inline0;
+	unsigned	seed;
+	long		reads;
+	int		bad;
+};
+
+/* A block's pattern: its number in every word, so a read shows where it came from. */
+static void
+inline_fill(uint32_t *w, uint32_t block)
+{
+	for (size_t i = 0; i < 4096 / sizeof(*w); i++)
+		w[i] = block * 2654435761U + (uint32_t)i;
+}
+
+static void *
+inline_reader(void *argp)
+{
+	struct inline_arg *a = argp;
+	static _Thread_local uint32_t buf[INLINE_QD][1024], want[1024];
+	struct test_ring t;
+	struct timespec t0, now;
+	uint32_t blk[INLINE_QD];
+
+	ring_init(&t);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (;;) {
+		for (int i = 0; i < INLINE_QD; i++) {
+			struct io_uring_sqe *sqe;
+
+			blk[i] = (uint32_t)(rand_r(&a->seed) % INLINE_BLOCKS);
+			sqe = ring_prep(&t, IORING_OP_READ, a->fd, (uint64_t)i);
+			sqe->addr = (uint64_t)(uintptr_t)buf[i];
+			sqe->len = 4096;
+			sqe->off = (uint64_t)blk[i] * 4096;
+			ring_push_sqe(&t);
+		}
+		assert(ring_wait(&t, INLINE_QD, 10000) == 0);
+		for (int i = 0; i < INLINE_QD; i++) {
+			struct io_uring_cqe c = ring_pop_cqe(&t);
+
+			assert(c.user_data < INLINE_QD);
+			inline_fill(want, blk[c.user_data]);
+			if (c.res != 4096 ||
+			    memcmp(buf[c.user_data], want, 4096) != 0)
+				a->bad++;
+			a->reads++;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		/* At least 1 s, and until reads ran inline or 15 s passed. */
+		if (now.tv_sec - t0.tv_sec >= 15 || (now.tv_sec - t0.tv_sec >= 1 &&
+		    sysctl_ulong("kern.kqring.wq_inline") > a->inline0))
+			break;
+	}
+	close(t.fd);
+	return (NULL);
+}
+
+/*
+ * Cached file reads, while threads in enters take most of the CPUs, run in
+ * the thread that submitted them rather than on workers
+ * (kqring_wq_try_inline()).  One thread per CPU reads a cached file at
+ * random through its own ring, and every block must come back whole and
+ * from where it was asked for, whichever thread ran the read.
+ */
+static void
+test_wq_inline(void)
+{
+	char path[] = "/tmp/kqring_inline.XXXXXX";
+	static uint32_t blk[1024];
+	struct inline_arg *a;
+	pthread_t *th;
+	u_long inline0;
+	long reads = 0;
+	int fd, ncpu, bad = 0;
+	size_t len = sizeof(ncpu);
+
+	assert(sysctlbyname("hw.ncpu", &ncpu, &len, NULL, 0) == 0);
+	fd = mkstemp(path);
+	assert(fd >= 0 && unlink(path) == 0);
+	for (uint32_t b = 0; b < INLINE_BLOCKS; b++) {
+		inline_fill(blk, b);
+		assert(write(fd, blk, 4096) == 4096);
+	}
+	for (uint32_t b = 0; b < INLINE_BLOCKS; b++)
+		assert(pread(fd, blk, 4096, (off_t)b * 4096) == 4096);
+	inline0 = sysctl_ulong("kern.kqring.wq_inline");
+	a = calloc((size_t)ncpu, sizeof(*a));
+	th = calloc((size_t)ncpu, sizeof(*th));
+	assert(a != NULL && th != NULL);
+	for (int i = 0; i < ncpu; i++) {
+		a[i].fd = fd;
+		a[i].inline0 = inline0;
+		a[i].seed = 7919U * (unsigned)(i + 1);
+		assert(pthread_create(&th[i], NULL, inline_reader, &a[i]) == 0);
+	}
+	for (int i = 0; i < ncpu; i++) {
+		assert(pthread_join(th[i], NULL) == 0);
+		reads += a[i].reads;
+		bad += a[i].bad;
+	}
+	if (bad != 0) {
+		fprintf(stderr, "%d of %ld reads came back wrong\n", bad, reads);
+		abort();
+	}
+	if (sysctl_ulong("kern.kqring.wq_inline") == inline0) {
+		fprintf(stderr, "no read ran inline in %ld reads on %d threads\n",
+		    reads, ncpu);
+		abort();
+	}
+	free(th);
+	free(a);
+	close(fd);
+	printf("[PASS] Cached reads run by their submitter while the CPUs are "
+	    "busy (%ld reads on %d threads, %lu inline, all intact)\n", reads,
+	    ncpu, sysctl_ulong("kern.kqring.wq_inline") - inline0);
+}
+
 /*
  * Writes to one regular file run on workers in the order they were
  * submitted, one at a time, as io-wq's per-inode hashing runs them, and the
@@ -13829,6 +13951,7 @@ main(int argc, char **argv)
 		test_reg_wait();
 		test_write_order();
 		test_wq_cap_stall();
+		test_wq_inline();
 		test_tag_failed_register();
 		test_tag_release_no_drop();
 		test_sqe128_cqe32_attach_wq();

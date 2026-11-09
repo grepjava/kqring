@@ -1373,7 +1373,9 @@ kqring_ioc_enter(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 {
 	int error;
 
+	kqring_wq_enter_count(1);
 	error = kqring_ioc_enter_body(ctx, ea, td);
+	kqring_wq_enter_count(-1);
 	if (__predict_false(ctx->woke_pollers)) {
 		ctx->woke_pollers = false;
 		kqring_kpoll_run(td);
@@ -1549,7 +1551,10 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 		return (EBADF);
 	}
 	if (ea->to_submit > 0) {
+		/* Cached file reads run here: kqring_wq_try_inline(). */
+		ctx->submit_inline = kqring_wq_inline_ok(ctx);
 		kqring_submit_sqes(ctx, ea->to_submit, &submitted);
+		ctx->submit_inline = false;
 		ea->SUBMITTED_out = submitted;
 	} else {
 		kqring_flush_overflow(ctx);

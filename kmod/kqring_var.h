@@ -212,6 +212,13 @@ MALLOC_DECLARE(M_SELFD);
 #define KQRING_WQ_CPU_ENTER	256
 #define KQRING_WQ_CPU_LEAVE	512
 #define KQRING_WQ_STALL_SBT	SBT_1MS
+/*
+ * A request slept if its thread switched out voluntarily and it took this
+ * long: a contended lock in a cached read blocks briefly, a disk read longer.
+ */
+#define KQRING_WQ_SLEPT_SBT	(30 * SBT_1US)
+/* Ticks a ring stays inline once the CPUs look free: kqring_wq_inline_ok(). */
+#define KQRING_WQ_INLINE_HOLD	10
 
 /* io_uring_params flags accepted by KQRING_IOC_SETUP. */
 #define	KQRING_SETUP_FLAGS						\
@@ -728,6 +735,9 @@ struct kqring_wq {
 	/* Bound work's running average of requests that slept, of 1024. */
 	uint32_t		sleep_avg;
 	bool			cpu_bound;	/* awake workers capped */
+	/* Of them, ones that slept long (a disk read), of 1024. */
+	uint32_t		cache_avg;
+	bool			cached;		/* reads may run inline */
 	uint32_t		sleepers;	/* bound workers idle asleep */
 	uint32_t		woken;		/* of them woken, not yet up */
 	uint32_t		cpu_cap;
@@ -876,6 +886,9 @@ struct kqring_ctx {
 	bool			evfd_async;
 	bool			submitting;
 	bool			submit_more;
+	/* An enter's own submission, running cached reads: kqring_wq_try_inline(). */
+	bool			submit_inline;
+	int			inline_until;	/* ticks; kqring_wq_inline_ok() */
 	uint32_t		evfd_cqes;
 	/*
 	 * poll(2) / select(2) / kevent(2) on the ring descriptor: readable
@@ -1778,6 +1791,9 @@ void	kqring_wq_close(struct kqring_wq *wq);
 void	kqring_wq_put(struct kqring_wq *wq);
 bool	kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op,
 	    int type);
+void	kqring_wq_enter_count(int n);
+bool	kqring_wq_inline_ok(struct kqring_ctx *ctx);
+bool	kqring_wq_try_inline(struct kqring_ctx *ctx, struct kqring_op *op);
 
 static inline bool
 kqring_op_use_wq(const struct io_uring_sqe *sqe)

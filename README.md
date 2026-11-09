@@ -173,7 +173,7 @@ These are mostly single-threaded loopback measurements of what each mechanism co
 1. **One-shot `RECV` armed before the data arrives:** 25% slower at 64 B. It takes a second enter and sets up a socket upcall each time. Use multishot.
 2. **One operation at a time:** a single request per enter costs more than the plain call, as the `NOP` and `READ` rows show. The ring pays off with several requests in flight.
 3. **Cached reads on ZFS:** ZFS has no page-cache read path, so reads go through a worker, and `pread(2)` is faster. On UFS, batched reads win.
-4. **Many threads reading cached data:** from 4 threads, `pread(2)` passes kqring's worker path, because a thread reading the cache itself needs no hand-off.
+4. **Many threads reading cached data:** from 4 threads, `pread(2)` passes kqring's worker path, because a thread reading the cache itself needs no hand-off. Once the readers take most of the CPUs, kqring runs those reads in the submitting thread too; on an 8-thread Ryzen that cut `psync`'s lead at 8 jobs from 32% to 10% ([docs/worker-wakeups.md](docs/worker-wakeups.md#reads-in-the-submitting-thread)).
 5. **`sendfile(2)` with kernel TLS:** for serving files to the network, keep `sendfile(2)`. It moves file pages to the NIC without passing through user space.
 
 ## Storage performance
@@ -260,7 +260,7 @@ Programs that use liburing build against the port in [`liburing/`](liburing/), w
 
 **How requests run.**
 - **Sockets** are tried inline in `kqring_enter()` (unless `IOSQE_ASYNC` is set); if the socket isn't ready, the request waits on a socket upcall.
-- **Also inline:** positioned file reads that the page cache satisfies, and a `READ` on a pipe that has data or a `WRITE` to one with room, blocking or not.
+- **Also inline:** positioned file reads that the page cache satisfies, and a `READ` on a pipe that has data or a `WRITE` to one with room, blocking or not. So are reads of a file on a local filesystem whose ring's recent reads didn't sleep, such as ZFS reads the ARC serves, while threads in enters take more than half the CPUs ([docs/worker-wakeups.md](docs/worker-wakeups.md#reads-in-the-submitting-thread)).
 - **Straight to the disk driver:** positioned `READ` and `WRITE` (plain, vectored and `_FIXED`) on a disk device (`/dev/ada0`, `nda0`, `md0`, GEOM partitions) go to the driver as bios over the held user pages, as `aio(4)` does, with no worker thread and any number in flight. Lengths must be whole sectors; anything else runs on a worker. In-flight disk I/O can't be cancelled (`ASYNC_CANCEL` returns `-EALREADY`, as io_uring does for running block I/O).
 - **On workers:** other file, pipe and VFS requests, `WAITID` and `IOSQE_ASYNC` requests run on per-ring kernel worker threads (`IO_WQ_BOUND` and `IO_WQ_UNBOUND`, `IORING_FEAT_NATIVE_WORKERS`). These live in the ring owner's process, sharing its address space and descriptor table, and hand completions back to the owner.
 - **On the owner's path:** futexes and timers.
@@ -316,6 +316,7 @@ See [docs/event-chains-spec.md](docs/event-chains-spec.md) for the interface.
 - **Ring descriptors can't be passed over UNIX sockets.** `sendmsg(2)` with `SCM_RIGHTS` fails with `EOPNOTSUPP` (Linux 6.7 and later refuse with `EINVAL`), so a ring can't end up in flight on a socket held in its own fixed-file table. A child still inherits a ring across `fork(2)`.
 - **Signal masks are FreeBSD's `sigset_t`.** A wait's signal mask, plain, in `io_uring_getevents_arg` or in a registered wait, is 16 bytes where Linux's is 8, so its size must be `sizeof(sigset_t)`. liburing's `_NSIG / 8` gives that on FreeBSD.
 - **One clock.** FreeBSD defines `CLOCK_BOOTTIME` as `CLOCK_MONOTONIC`, so `IORING_REGISTER_CLOCK` takes either and `IORING_ENTER_ABS_TIMER` deadlines are times of that one clock.
+- **A cached ZFS read is a guess.** Linux runs a read in the enter only if the page cache can serve it without blocking (`IOCB_NOWAIT`). ZFS can't be asked, so kqring goes by whether the ring's recent reads slept, and a read it runs in the enter that misses the ARC holds up that enter until the disk answers, as it would hold up a `pread(2)` caller. After a few such reads, the ring's reads go back to workers. `IOSQE_ASYNC` always means a worker.
 - **`SIGPIPE`** is never raised.
 
 **Values and formats**

@@ -67,11 +67,53 @@ One job gains 2.5%. From two jobs on, kqring stays near 1.1 million either way, 
 
 Writes ranged from 8,600 to 22,100 IOPS between runs with either module, as the SSD's garbage collection came and went, and the hit-and-miss mix from 46,800 to 72,700. Its means are 64,416 before and 65,128 after. p99 latency is the same within the spread.
 
+## Reads in the submitting thread
+
+The cap removed wake-ups, not the hand-off. Every cached ZFS read still crossed from the thread that submitted it to a worker and back as a CQE, and a thread calling `pread(2)` never does. With fio, kqring stayed near 1.1 million IOPS from two jobs on, while `psync` passed it at four and reached 1.6 million at eight. So a read that won't sleep now runs in `io_uring_enter(2)` itself, as `pread(2)` would and as Linux runs a cached read before io-wq sees it.
+
+**Which reads.** A read of a regular file on a local filesystem (`MNT_LOCAL`), at issue in an enter's own submission, without `IOSQE_ASYNC` or `RWF_NOWAIT`. A filesystem over the network could hold the enter for as long as its server takes, so its reads still go to workers. The read completes before the enter returns, and counts toward the pool's averages as a worker's read would.
+
+**When the pool's reads look cached.** FreeBSD can't ask ZFS whether a read would block, as Linux asks the page cache with `IOCB_NOWAIT`, so kqring goes by what the pool's reads did lately. A second average (`cache_avg`), kept like the first, counts a read as one that slept only if its thread switched out *and* it took 30 µs or more (`KQRING_WQ_SLEPT_SBT`). A plain switch count also counts brief waits for ZFS's locks, and fio's pools never looked cached by it. A read from the SSD takes longer than 30 µs, so a pool whose reads start to miss the ARC goes back to workers within a few reads. One that misses while inline holds up that enter, as it would hold up a `pread(2)` caller.
+
+**Only when the CPUs are taken.** With CPUs to spare, workers run one ring's reads in parallel, faster than its one thread can: an early version that ran reads inline whenever they looked cached gave 373,000 IOPS at one job, against 900,000 through workers. Each enter adds one to a per-CPU count of threads in enters, and takes it off as it leaves. Reads run inline only while those threads take more than half the CPUs, so that workers could only run in their place. The counts live on other CPUs' cache lines, which each enter writes, and summing them for every submission made one job slower, so they're summed at most once a clock tick.
+
+**And then for a while.** Threads come and go from enters, so the count dips below half for moments while the CPUs stay taken. A read sent to a worker then costs far more than its share: the worker fights the issuers for a CPU and spins on the ZFS locks they hold. In one version 2% of the reads reached workers that way and took about 4 CPUs between them. So once its reads run inline, a ring keeps them inline for 10 ticks (`KQRING_WQ_INLINE_HOLD`) after the CPUs last looked busy. For the same reason, idle workers don't spin for work while the CPUs are busy.
+
+Designs that queued the reads and had the submitting thread help the workers run them cost more than running each read directly; none of them was kept. `kern.kqring.wq_inline` counts the reads run inline.
+
+### What shows it works
+
+- `test_wq_inline` starts a thread per CPU, each with its own ring and 16 random 4 KiB reads in flight from a cached 1 MiB file whose every block is different. Every read's data is checked, and some read must have run inline within 15 seconds.
+- On a `GENERIC-DEBUG` kernel (`INVARIANTS`, `WITNESS`), the suite passed three times (1.5 to 4.2 million reads inline between them), the fuzzer for 30 minutes with 4 threads and 10 with 8, and the stress test for 10 minutes, with no leaks and no `WITNESS` warnings. The fuzzer ran few reads inline (1 and 18), because its mix rarely makes a pool's reads look cached; [TODO.MD](../TODO.MD#correctness) has that.
+- On the stock kernel, the suite passed three times, and the differential conformance test ran three times with the same output each time. liburing's `evloop` failed, but it fails as often with the module from before the change (123 and 125 runs in 200); TODO.MD has it.
+
+### Measured
+
+The Ryzen 3 PRO 4350G again, with the module from before (`075669e`) and after loaded in turn within each repetition. fio's cached reads ([`fio/scale.sh`](../fio/scale.sh)), medians of three repetitions in thousands of IOPS; runs of a case differ by about 1%:
+
+| Jobs | kqring before | kqring after | Change | aio | `psync` |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 901 | 874 | −3% | 720 | 394 |
+| 2 | 1,058 | 1,044 | −1.3% | 727 | 681 |
+| 4 | 1,083 | 1,067 | −1.5% | 655 | **1,198** |
+| 8 | 1,105 | 1,456 | **+32%** | 562 | **1,626** |
+
+aio and `psync` are from the runs with the module from before; with the new one they were within 1%. At 8 jobs, kqring is 10% behind `psync` where it was 32% behind. Its reads there are run by the 8 submitting threads, not by the 4 workers the cap keeps awake. The rest of the gap is what kqring adds to each read, about 0.4 µs in the kernel to copy the SQE, set up the request and post the CQE, plus fio's io_uring engine in user space; fio submits one read per enter in these runs, so there's no batch to spread it over.
+
+At 1 to 4 jobs no read runs inline, and kqring is 1.3–3% slower. The change adds a clock read to each request on the workers and a count to each enter; which of them costs the 3% hasn't been traced. kqring stays ahead of aio at every job count, and ahead of `psync` up to 2 jobs.
+
+md(4) reads, through kqring's direct bio path, are unchanged. So is work that waits for the SSD, with no read run inline (fio 3.43, 20 seconds, three repetitions, medians):
+
+| Case | In flight | Before | After |
+|---|---:|---:|---:|
+| Random reads, 8 GiB file, `primarycache=metadata` | 1 | 7,800 | 7,800 |
+| Random reads, same file | 32 | 58,700 | 58,800 |
+| Random writes, same file | 32 | 11,800 | 11,700 |
+| Random reads, 12 GiB file, ARC hits and misses | 32 | 84,700 | 77,400 |
+
+The hit-and-miss mix ranged from 78,600 to 89,800 before and 76,600 to 85,800 after, as the SSD's garbage collection came and went; p99 latency was the same.
+
 ## What's left
 
-The cap removes wake-ups, not the hand-off. Every cached ZFS read still crosses from the thread that submitted it to a worker and back as a CQE, and a thread calling `pread(2)` never does. With one ring, the submitting thread is the limit. With more, the CPUs are, and the hand-off's share of each read is what keeps kqring near 1.1 million IOPS on this machine while `psync` keeps scaling. kqring stays ahead of aio at every job count, and ahead of `psync` until there are as many threads as cores to read with.
-
-Removing the hand-off needs a read that doesn't go to a worker when it won't sleep. Two ways are being looked at:
-
-- **Reads in the submitting thread.** When the pool's average says its reads don't sleep, run them in `io_uring_enter(2)` itself, as `pread(2)` would, but many per call. A read that does sleep then holds up that enter, as it would hold up a `pread(2)` caller, and the average sends the next ones back to workers. `IOSQE_ASYNC` still means a worker. This is close to Linux, which tries a read in the submitting thread with `IOCB_NOWAIT` before io-wq sees it.
-- **ZFS reads that complete on their own.** ZFS reads are asynchronous inside: its I/O pipeline calls back when a disk read finishes, and only the layer above waits. A read issued below that layer would complete at once on a hit and from ZFS's callback on a miss, with no worker either way, as FreeBSD's asynchronous `sendfile(2)` does for the page cache. It depends on ZFS internals, so it needs a design note of its own first.
+- **The last 10% to `psync`.** Batching would spread kqring's cost per read, but only for programs that submit many reads per enter.
+- **ZFS reads that complete on their own.** ZFS reads are asynchronous inside: its I/O pipeline calls back when a disk read finishes, and only the layer above waits. A read issued below that layer would complete at once on a hit and from ZFS's callback on a miss, with no worker and no guess about whether it will sleep, as FreeBSD's asynchronous `sendfile(2)` does for the page cache. It depends on ZFS internals, so it's under research in the [roadmap](../ROADMAP.MD#research).

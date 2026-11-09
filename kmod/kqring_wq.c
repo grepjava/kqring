@@ -10,6 +10,93 @@
 #include <sys/sysent.h>
 #include <sys/umtxvar.h>
 
+/*
+ * Threads in io_uring_enter(2) on any ring, per CPU (a thread may leave on
+ * another CPU than it entered on, so one CPU's count can go negative; the
+ * sum is right).  kqring_wq_inline_ok() sums it.
+ */
+DPCPU_DEFINE_STATIC(int, kqring_entered);
+
+void
+kqring_wq_enter_count(int n)
+{
+	/* Only this CPU writes its count: no locked instruction needed. */
+	critical_enter();
+	*DPCPU_PTR(kqring_entered) += n;
+	critical_exit();
+}
+
+/* File reads run inline by kqring_wq_try_inline(), per CPU. */
+DPCPU_DEFINE_STATIC(u_long, kqring_inline_reads);
+
+static int
+kqring_wq_inline_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	u_long n = 0;
+	u_int i;
+
+	CPU_FOREACH(i)
+		n += *DPCPU_ID_PTR(i, kqring_inline_reads);
+	return (sysctl_handle_long(oidp, &n, 0, req));
+}
+SYSCTL_PROC(_kern_kqring, OID_AUTO, wq_inline,
+    CTLTYPE_ULONG | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    kqring_wq_inline_sysctl, "LU",
+    "File reads run by the thread that submitted them (pool's reads cached, CPUs busy)");
+
+/*
+ * Threads in enters take more than half the CPUs.  Summed at most once a
+ * tick: the counts live on other CPUs' cache lines, which each enter
+ * writes, and reading them all for every submission cost more than it saved.
+ */
+static u_int kqring_busy_tick;
+static bool kqring_busy;
+
+static bool
+kqring_wq_cpus_busy(void)
+{
+	u_int i, t = (u_int)ticks;
+	int n = 0;
+
+	if (atomic_load_int(&kqring_busy_tick) == t)
+		return (atomic_load_bool(&kqring_busy));
+	CPU_FOREACH(i)
+		n += atomic_load_int(DPCPU_ID_PTR(i, kqring_entered));
+	atomic_store_bool(&kqring_busy, n * 2 > mp_ncpus);
+	atomic_store_int(&kqring_busy_tick, t);
+	return (n * 2 > mp_ncpus);
+}
+
+/*
+ * Whether ctx's enter runs its cached file reads itself
+ * (kqring_wq_try_inline()): while its pool's file I/O rarely sleeps, and
+ * threads in enters already take more than half the CPUs, so that workers
+ * could only run in their place.  With CPUs to spare, workers run a ring's
+ * reads in parallel, faster than its one thread could.
+ */
+bool
+kqring_wq_inline_ok(struct kqring_ctx *ctx)
+{
+	struct kqring_wq *wq = ctx->wq;
+
+	if (wq == NULL || !atomic_load_bool(&wq->cached))
+		return (false);
+	/*
+	 * Threads come and go from enters all the time, so the count dips
+	 * below half for moments while the CPUs stay taken.  A read sent to a
+	 * worker then costs far more than its share: the worker fights the
+	 * issuers for a CPU and spins on the locks they hold.  So once inline,
+	 * a ring stays so for KQRING_WQ_INLINE_HOLD ticks after the CPUs last
+	 * looked busy.  Only its issuer, under the enter lock, uses it.
+	 */
+	if (kqring_wq_cpus_busy()) {
+		ctx->inline_until = ticks + KQRING_WQ_INLINE_HOLD;
+		return (true);
+	}
+	/* 0: never set (ticks wrap, so compare only a set one). */
+	return (ctx->inline_until != 0 && ctx->inline_until - ticks > 0);
+}
+
 static u_long kqring_wq_capped, kqring_wq_stalls;
 SYSCTL_ULONG(_kern_kqring, OID_AUTO, wq_capped, CTLFLAG_RD,
     &kqring_wq_capped, 0,
@@ -123,6 +210,7 @@ kqring_wq_alloc(struct thread *td)
 	    KQRING_WQ_MAX_WORKERS);
 	wq->max[IO_WQ_UNBOUND] = KQRING_WQ_MAX_WORKERS;
 	wq->sleep_avg = 1024;
+	wq->cache_avg = 1024;
 	wq->cpu_cap = MAX(KQRING_WQ_CPU_MIN, (uint32_t)mp_ncpus / 2);
 	callout_init_mtx(&wq->stall_co, &wq->mtx, 0);
 	wq->base_cpuset = cpuset_ref(td->td_cpuset);
@@ -170,18 +258,33 @@ kqring_wq_stall_cb(void *arg)
 	wakeup(&wq->ops[IO_WQ_BOUND]);
 }
 
-/* A bound request ran, and slept or not: update the average and the cap. */
+/*
+ * A bound request ran: switched, if its thread switched out voluntarily
+ * (and so might have run on a worker in its place); slept, if it also took
+ * KQRING_WQ_SLEPT_SBT or more, as a read from the disk does and one waiting
+ * briefly for a lock in the cache doesn't.  The first decides the cap on
+ * awake workers, the second whether reads may run inline
+ * (kqring_wq_try_inline()).
+ */
 static void
-kqring_wq_note_sleep_locked(struct kqring_wq *wq, bool slept)
+kqring_wq_note_sleep_locked(struct kqring_wq *wq, bool switched, bool slept)
 {
 	mtx_assert(&wq->mtx, MA_OWNED);
 	wq->bound_done++;
+	if (slept)
+		wq->cache_avg += (1024 - wq->cache_avg) >> 2;
+	else
+		wq->cache_avg -= wq->cache_avg >> 6;
+	if (!wq->cached && wq->cache_avg < KQRING_WQ_CPU_ENTER)
+		wq->cached = true;
+	else if (wq->cached && wq->cache_avg > KQRING_WQ_CPU_LEAVE)
+		wq->cached = false;
 	/*
 	 * Slow to cap, quick to stop: about 90 requests in a row that don't
 	 * sleep cap the pool, which a mix of cache hits and misses doesn't
 	 * reach by chance; three that sleep stop it.
 	 */
-	if (slept)
+	if (switched)
 		wq->sleep_avg += (1024 - wq->sleep_avg) >> 2;
 	else
 		wq->sleep_avg -= wq->sleep_avg >> 6;
@@ -455,6 +558,57 @@ kqring_wq_next_locked(struct kqring_wq *wq, int type)
 	return (op);
 }
 
+/*
+ * A read of a regular file, at issue in an enter's own submission, while
+ * ctx's pool's file I/O rarely sleeps: run it here, as pread(2) would and
+ * as Linux runs a cached read in io_uring_enter(2), rather than hand it to
+ * a worker and back.  It counts toward the pool's average as a worker's
+ * read would, so reads that start to sleep go back to the workers.  Only
+ * on a local filesystem: one over a network could hold the enter for as
+ * long as its server takes.  Returns whether it ran, with op->res and
+ * op->cflags set.
+ */
+bool
+kqring_wq_try_inline(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	struct kqring_wq *wq = ctx->wq;
+	struct thread *td = curthread;
+	struct file *fp;
+	struct vnode *vp;
+	struct mount *mp;
+	sbintime_t t0;
+	long nvcsw;
+	bool local, slept, switched;
+
+	if (!ctx->submit_inline || wq == NULL ||
+	    !atomic_load_bool(&wq->cached))
+		return (false);
+	if (op->ffile != NULL)
+		fp = op->ffile->fp;
+	else if (fget(td, op->sqe.fd, &cap_no_rights, &fp) != 0)
+		return (false);
+	vp = fp->f_type == DTYPE_VNODE ? fp->f_vnode : NULL;
+	mp = vp != NULL && vp->v_type == VREG ?
+	    atomic_load_ptr(&vp->v_mount) : NULL;
+	local = mp != NULL && (mp->mnt_flag & MNT_LOCAL) != 0;
+	if (op->ffile == NULL)
+		fdrop(fp, td);
+	if (!local)
+		return (false);
+	nvcsw = td->td_ru.ru_nvcsw;
+	t0 = sbinuptime();
+	(void)kqring_exec_file_rw(ctx, op, false);
+	switched = td->td_ru.ru_nvcsw != nvcsw;
+	slept = switched && sbinuptime() - t0 >= KQRING_WQ_SLEPT_SBT;
+	mtx_lock(&wq->mtx);
+	kqring_wq_note_sleep_locked(wq, switched, slept);
+	mtx_unlock(&wq->mtx);
+	critical_enter();
+	(*DPCPU_PTR(kqring_inline_reads))++;
+	critical_exit();
+	return (true);
+}
+
 static void
 kqring_wq_thread(void *arg)
 {
@@ -500,7 +654,8 @@ kqring_wq_thread(void *arg)
 		capped = wq->busy[type] >= kqring_wq_awake_cap_locked(wq, type);
 		op = capped ? NULL : kqring_wq_next_locked(wq, type);
 		if (op != NULL) {
-			bool deferred = false;
+			sbintime_t t0;
+			bool deferred = false, slept, switched;
 			int hash = op->wq_hash;
 			long nvcsw;
 
@@ -535,7 +690,11 @@ kqring_wq_thread(void *arg)
 			}
 
 			nvcsw = td->td_ru.ru_nvcsw;
+			t0 = sbinuptime();
 			kqring_wq_exec_op(ctx, op);
+			switched = td->td_ru.ru_nvcsw != nvcsw;
+			slept = switched &&
+			    sbinuptime() - t0 >= KQRING_WQ_SLEPT_SBT;
 
 			mtx_lock(&ctx->mtx);
 			mtx_lock(&wq->mtx);
@@ -552,8 +711,8 @@ kqring_wq_thread(void *arg)
 			 */
 			if (type == IO_WQ_BOUND)
 				kqring_wq_note_sleep_locked(wq,
-				    td->td_ru.ru_nvcsw != nvcsw ||
-				    kqring_op_is_write(op->sqe.opcode));
+				    switched || kqring_op_is_write(op->sqe.opcode),
+				    slept || kqring_op_is_write(op->sqe.opcode));
 			/*
 			 * The bucket's next write may run: this worker takes
 			 * it next, unless it is leaving, so wake another.
@@ -616,12 +775,13 @@ kqring_wq_thread(void *arg)
 		/*
 		 * One idle worker spins for the next op; the rest sleep.  With
 		 * every idle worker spinning, each op sent them all at wq->mtx.
-		 * Not with every CPU taken: a spinner then only keeps the
+		 * Not with every CPU taken, or with issuers taking most of
+		 * them (kqring_wq_cpus_busy()): a spinner then only keeps the
 		 * thread with the next op, or its issuer, from running.  Nor
 		 * when capped: the awake workers take what is queued.
 		 */
 		if (!capped && mp_ncpus > 1 && wq->spinning[type] == 0 &&
-		    sched_load() < mp_ncpus) {
+		    sched_load() < mp_ncpus && !kqring_wq_cpus_busy()) {
 			wq->spinning[type]++;
 			mtx_unlock(&wq->mtx);
 			for (int s = 0; s < 2048; s++) {

@@ -2253,6 +2253,13 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 			}
 			if (rw == KQRING_RW_BIO) {
 				armed = true;
+			} else if ((sqe->flags & IOSQE_ASYNC) == 0 &&
+			    (sqe->rw_flags & KQRING_RWF_NOWAIT) == 0 &&
+			    kqring_op_is_read(sqe->opcode) &&
+			    kqring_wq_try_inline(ctx, op)) {
+				kqring_req_complete(ctx, op, op->res,
+				    op->cflags);
+				return;
 			} else if ((sqe->rw_flags & KQRING_RWF_NOWAIT) != 0) {
 				/* RWF_NOWAIT: no worker, which might block. */
 				kqring_req_complete(ctx, op, -EAGAIN, 0);
