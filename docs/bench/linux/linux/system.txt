@@ -1,0 +1,29 @@
+date: 2026-11-09T15:05:01Z
+Linux ubuntu 7.3.0-9-generic #9-Ubuntu SMP PREEMPT_DYNAMIC Mon Oct  5 10:38:02 UTC 2026 x86_64 GNU/Linux
+fio-3.43
+model name	: Intel(R) Core(TM) i5-8250U CPU @ 1.60GHz
+8
+MemTotal:        3374556 kB
+BOOT_IMAGE=/boot/vmlinuz-7.3.0-9-generic root=UUID=00aa766b-aa4f-4362-9158-524039864439 ro quiet splash crashkernel=2G-4G:320M,4G-32G:512M,32G-64G:1024M,64G-128G:2048M,128G-:4096M
+/sys/devices/system/cpu/vulnerabilities/spectre_v2:Mitigation: IBRS; IBPB: conditional; STIBP: conditional; RSB filling; PBRSB-eIBRS: Not affected; BHI: Not affected
+/sys/devices/system/cpu/vulnerabilities/indirect_target_selection:Not affected
+/sys/devices/system/cpu/vulnerabilities/itlb_multihit:KVM: Mitigation: Split huge pages
+/sys/devices/system/cpu/vulnerabilities/ghostwrite:Not affected
+/sys/devices/system/cpu/vulnerabilities/vmscape:Mitigation: IBPB before exit to userspace
+/sys/devices/system/cpu/vulnerabilities/mmio_stale_data:Mitigation: Clear CPU buffers; SMT vulnerable
+/sys/devices/system/cpu/vulnerabilities/mds:Mitigation: Clear CPU buffers; SMT vulnerable
+/sys/devices/system/cpu/vulnerabilities/reg_file_data_sampling:Not affected
+/sys/devices/system/cpu/vulnerabilities/tsa:Not affected
+/sys/devices/system/cpu/vulnerabilities/l1tf:Mitigation: PTE Inversion; VMX: conditional cache flushes, SMT vulnerable
+/sys/devices/system/cpu/vulnerabilities/spec_store_bypass:Mitigation: Speculative Store Bypass disabled via prctl
+/sys/devices/system/cpu/vulnerabilities/tsx_async_abort:Not affected
+/sys/devices/system/cpu/vulnerabilities/old_microcode:Not affected
+/sys/devices/system/cpu/vulnerabilities/spectre_v1:Mitigation: usercopy/swapgs barriers and __user pointer sanitization
+/sys/devices/system/cpu/vulnerabilities/gather_data_sampling:Vulnerable
+/sys/devices/system/cpu/vulnerabilities/retbleed:Mitigation: IBRS
+/sys/devices/system/cpu/vulnerabilities/spec_rstack_overflow:Not affected
+/sys/devices/system/cpu/vulnerabilities/srbds:Mitigation: Microcode
+/sys/devices/system/cpu/vulnerabilities/meltdown:Mitigation: PTI
+powersave
+Filename				Type		Size		Used		Priority
+/swap.img                               file		3898364		39412		-1

@@ -13,7 +13,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 3 | Wait semantics | Done |
 | 4 | Per-file write ordering | Done |
 | 5 | Worker path scalability | Done |
-| 6 | Performance evidence | Not started |
+| 6 | Performance evidence | In progress |
 | 7 | Newer interfaces and real programs | Not started |
 
 ## Where kqring stands
@@ -117,10 +117,10 @@ Acceptance: a profile that names the limit, then either a measured improvement o
 
 ## Phase 6: Performance evidence
 
-- Re-measure the full set after phases 4 and 5, and regenerate `BENCHMARK.MD` with `tests/bench_doc.py`.
-- Run comparable Linux io_uring workloads on the same machine. Wins against kqueue and aio don't establish parity with Linux.
-- Measure UFS on a real disk, with a benchmark in which the receiver has its own thread, and explain ZFS's two cached-read speeds.
-- NVMe measurements need hardware the project doesn't have yet.
+- Re-measure the full set after phases 4 and 5, and regenerate `BENCHMARK.MD` with `tests/bench_doc.py`. Now on the Ryzen 3 PRO 4350G, the machine the later phases were measured on.
+- Run comparable Linux io_uring workloads on the same machine. Wins against kqueue and aio don't establish parity with Linux. **Done:** [docs/linux-comparison.md](docs/linux-comparison.md), on a laptop that boots both, with the raw results. kqring is ahead on the SSD with less CPU and per batched operation, an enter costs it about 250 ns more than io_uring's, and io_uring is ahead on cached file reads from several threads, which it can try without blocking.
+- A benchmark in which the receiver has its own thread, and an explanation of ZFS's two cached-read speeds.
+- Deferred: UFS on a real disk, and NVMe, which needs hardware the project doesn't have.
 
 Acceptance: hardware, kernel, filesystem settings, queue depths, batch sizes, CPU use, latency distributions and raw repeated runs are published. Device saturation, filesystem costs and ring or worker overhead are told apart.
 

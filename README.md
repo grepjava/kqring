@@ -189,6 +189,15 @@ With [fio](fio/README.md)'s own `io_uring` engine, on a SATA SSD and on `md(4)` 
 
 On a ZFS file at 32 in flight, kqring is 4–5% behind `aio(4)` in IOPS and has a longer latency tail, at less than half the CPU. See [`BENCHMARK.MD`](BENCHMARK.MD#fio-on-a-real-ssd).
 
+## Against Linux io_uring
+
+On one laptop that boots both systems, with the same fio build ([docs/linux-comparison.md](docs/linux-comparison.md), raw results included):
+
+- **SSD reads:** kqring reaches 97,100 IOPS at 32 in flight with 43% CPU, io_uring 88,600 with 57%.
+- **Batches:** 32 `NOP`s per enter cost kqring 75 ns each, io_uring 94 ns.
+- **One request per enter:** kqring costs about 250 ns more than io_uring above each system's own system call floor.
+- **Cached file reads from several threads:** io_uring is ahead, because Linux can try a read without blocking and send only those that would block to a worker. FreeBSD's filesystems can't.
+
 ## Should you use it?
 
 **Try it** if you're porting or testing software written for io_uring on FreeBSD, measuring whether a ring helps your workload, or want to work on kqring itself.

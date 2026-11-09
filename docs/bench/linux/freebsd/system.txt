@@ -1,0 +1,15 @@
+date: 2026-11-09T15:20:26Z
+FreeBSD freebsd 15.1-RELEASE FreeBSD 15.1-RELEASE releng/15.1-n283562-96841ea08dcf GENERIC amd64
+fio-3.43
+Intel(R) Core(TM) i5-8250U CPU @ 1.60GHz
+8
+4142227456
+Id Refs Address                Size Name
+28    1 0xffffffff83dc5000    2b1d8 kqring.ko (/home/grepjava/kqring-p6/kmod/kqring.ko)
+	Contains modules:
+vm.pmap.pti: 1
+hw.ibrs_disable: 1
+hw.mds_disable: 0
+hw.spec_store_bypass_disable: 0
+Device:       512-blocks      Used:
+/dev/gpt/freebsdswap   16777216          0

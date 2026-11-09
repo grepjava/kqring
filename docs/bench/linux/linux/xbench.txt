@@ -1,0 +1,8 @@
+# Linux 7.3.0-9-generic x86_64
+getppid               576.8 ns  (574.8-577.7)  getppid(2): the system call floor
+nop1                  754.6 ns  (752.9-757.4)  1 NOP per enter, waited for
+nop32                  93.8 ns  (93.6-94.0)  32 NOPs per enter, waited for, per NOP
+pipe_read_syscall    1499.3 ns  (1498.4-1530.1)  write(2) 64 B then read(2) it from a pipe
+pipe_read_ring       1787.9 ns  (1785.6-1788.3)  write(2) 64 B then READ it from a pipe
+unix_recv_syscall    2183.9 ns  (2165.1-2190.2)  write(2) 64 B then recv(2) it, AF_UNIX stream
+unix_recv_ring       2431.7 ns  (2430.1-2452.3)  write(2) 64 B then RECV it, AF_UNIX stream
