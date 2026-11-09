@@ -217,7 +217,7 @@ MALLOC_DECLARE(M_SELFD);
  * A request slept if its thread switched out voluntarily and it took this
  * long: a contended lock in a cached read blocks briefly, a disk read longer.
  */
-#define KQRING_WQ_SLEPT_SBT	(30 * SBT_1US)
+#define KQRING_WQ_SLEPT_US	30
 /* Ticks a ring stays inline once the CPUs look free: kqring_wq_inline_ok(). */
 #define KQRING_WQ_INLINE_HOLD	10
 

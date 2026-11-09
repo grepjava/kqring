@@ -5,7 +5,7 @@ Known limits are in [BENCHMARK.MD](BENCHMARK.MD#known-gaps) and [Differences fro
 ## Performance
 
 - **Cached ZFS reads, `psync` still ahead from 4 jobs.** On an 8-thread machine kqring is 11% behind at 4 jobs, where its reads still go through workers, and 10% at 8, where they run in the submitting thread ([docs/worker-wakeups.md](docs/worker-wakeups.md#reads-in-the-submitting-thread)). Next: ZFS reads that complete from ZFS's own I/O callback, without a worker or a guess ([docs/async-zfs-reads.md](docs/async-zfs-reads.md)).
-- **2 and 4 jobs lose 1–1.5% to the inline-read change.** No read runs in the enter there. At 1 job the count of threads in enters was the cost, and `counter(9)` cut it to 0.6%; at 2 jobs the loss stays without the count, and neither the clock read per worker request nor the `inline_ok` check alone explains it. Next: the spin check and the second average under the pool mutex, or code layout.
+- **1 to 4 jobs lose up to 0.6% to the inline-read change.** No read runs in the enter there. What's left is spread over several small pieces (the count of threads in enters, the `inline_ok` check, the spinner's check, the second average), none of which alone made a measurable difference ([docs/worker-wakeups.md](docs/worker-wakeups.md#reads-in-the-submitting-thread)).
 - **ZFS at 32 in flight.** kqring is 4–5% behind aio in IOPS with a longer p99, at less than half the CPU.
 - **A zero-copy benchmark with the receiver in its own thread.** Loopback delivers through the netisr thread, so a single-threaded send-then-receive mostly measures that hand-off for small sends.
 

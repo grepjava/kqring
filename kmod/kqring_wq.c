@@ -235,7 +235,7 @@ kqring_wq_stall_cb(void *arg)
 /*
  * A bound request ran: switched, if its thread switched out voluntarily
  * (and so might have run on a worker in its place); slept, if it also took
- * KQRING_WQ_SLEPT_SBT or more, as a read from the disk does and one waiting
+ * KQRING_WQ_SLEPT_US or more, as a read from the disk does and one waiting
  * briefly for a lock in the cache doesn't.  The first decides the cap on
  * awake workers, the second whether reads may run inline
  * (kqring_wq_try_inline()).
@@ -550,7 +550,7 @@ kqring_wq_try_inline(struct kqring_ctx *ctx, struct kqring_op *op)
 	struct file *fp;
 	struct vnode *vp;
 	struct mount *mp;
-	sbintime_t t0;
+	uint64_t t0;
 	long nvcsw;
 	bool local, slept, switched;
 
@@ -570,10 +570,11 @@ kqring_wq_try_inline(struct kqring_ctx *ctx, struct kqring_op *op)
 	if (!local)
 		return (false);
 	nvcsw = td->td_ru.ru_nvcsw;
-	t0 = sbinuptime();
+	t0 = cpu_ticks();
 	(void)kqring_exec_file_rw(ctx, op, false);
 	switched = td->td_ru.ru_nvcsw != nvcsw;
-	slept = switched && sbinuptime() - t0 >= KQRING_WQ_SLEPT_SBT;
+	slept = switched &&
+	    cputick2usec(cpu_ticks() - t0) >= KQRING_WQ_SLEPT_US;
 	mtx_lock(&wq->mtx);
 	kqring_wq_note_sleep_locked(wq, switched, slept);
 	mtx_unlock(&wq->mtx);
@@ -626,7 +627,7 @@ kqring_wq_thread(void *arg)
 		capped = wq->busy[type] >= kqring_wq_awake_cap_locked(wq, type);
 		op = capped ? NULL : kqring_wq_next_locked(wq, type);
 		if (op != NULL) {
-			sbintime_t t0;
+			uint64_t t0;
 			bool deferred = false, slept, switched;
 			int hash = op->wq_hash;
 			long nvcsw;
@@ -661,12 +662,17 @@ kqring_wq_thread(void *arg)
 				mtx_unlock(&wq->mtx);
 			}
 
+			/*
+			 * The CPU's tick counter, which is cheaper to read than
+			 * sbinuptime(), converted only for a request that
+			 * switched: this is on every worker request.
+			 */
 			nvcsw = td->td_ru.ru_nvcsw;
-			t0 = sbinuptime();
+			t0 = cpu_ticks();
 			kqring_wq_exec_op(ctx, op);
 			switched = td->td_ru.ru_nvcsw != nvcsw;
-			slept = switched &&
-			    sbinuptime() - t0 >= KQRING_WQ_SLEPT_SBT;
+			slept = switched && cputick2usec(cpu_ticks() - t0) >=
+			    KQRING_WQ_SLEPT_US;
 
 			mtx_lock(&ctx->mtx);
 			mtx_lock(&wq->mtx);
