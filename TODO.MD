@@ -4,7 +4,7 @@ Known limits are in [BENCHMARK.MD](BENCHMARK.MD#known-gaps) and [Differences fro
 
 ## Performance
 
-- **Cached ZFS reads, `psync` still ahead from 4 jobs.** On an 8-thread machine kqring is 11% behind at 4 jobs, where its reads still go through workers, and 10% at 8, where they run in the submitting thread ([docs/worker-wakeups.md](docs/worker-wakeups.md#reads-in-the-submitting-thread)). Next: ZFS reads that complete from ZFS's own I/O callback, without a worker or a guess (ROADMAP research).
+- **Cached ZFS reads, `psync` still ahead from 4 jobs.** On an 8-thread machine kqring is 11% behind at 4 jobs, where its reads still go through workers, and 10% at 8, where they run in the submitting thread ([docs/worker-wakeups.md](docs/worker-wakeups.md#reads-in-the-submitting-thread)). Next: ZFS reads that complete from ZFS's own I/O callback, without a worker or a guess ([docs/async-zfs-reads.md](docs/async-zfs-reads.md)).
 - **1 to 4 jobs lost 1.3–3% to the inline-read change.** No read runs in the enter there, so it's the bookkeeping: a clock read per request on the workers or the count per enter. Not yet traced.
 - **ZFS at 32 in flight.** kqring is 4–5% behind aio in IOPS with a longer p99, at less than half the CPU.
 - **A zero-copy benchmark with the receiver in its own thread.** Loopback delivers through the netisr thread, so a single-threaded send-then-receive mostly measures that hand-off for small sends.
