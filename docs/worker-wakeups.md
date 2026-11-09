@@ -113,7 +113,43 @@ md(4) reads, through kqring's direct bio path, are unchanged. So is work that wa
 
 The hit-and-miss mix ranged from 78,600 to 89,800 before and 76,600 to 85,800 after, as the SSD's garbage collection came and went; p99 latency was the same.
 
+### Where the rest of the gap is, and batching
+
+Two measurements on the same machine, `508fcf9`, fio's cached reads as above.
+
+**Reads in the enter at every job count.** A build that runs a ring's cached reads in the enter whatever the CPUs, as a ZFS read that can't block would allow ([async-zfs-reads.md](async-zfs-reads.md)), against the policy above (medians of 4 rounds, thousands of IOPS):
+
+| Jobs | Workers below 8 jobs, enter at 8 | Always in the enter | `psync` |
+|---:|---:|---:|---:|
+| 1 | **886** | 320 | 386 |
+| 2 | **1,050** | 557 | 654 |
+| 4 | 1,069 | 1,025 | **1,175** |
+| 8 | 1,469 | 1,470 | **1,623** |
+
+With CPUs to spare, workers read one ring's requests in parallel and win by far; a read in the enter only pays once the CPUs are taken, which is what the policy already does. So a read that can't block would make the enter safe for reads that miss, but wouldn't make cached reads faster.
+
+**Cost per read.** DTrace sampling of fio at 1 job, every read in the enter, against `psync`, 8 seconds each (two runs agreed within 1%):
+
+| Per read | kqring | `psync` |
+|---|---:|---:|
+| The read itself (`vn_read()` and below) | 1.97 µs | 1.92 µs |
+| The rest of the kernel | 0.64 µs | 0.29 µs |
+| fio, in user space | 0.50 µs | 0.35 µs |
+
+The extra 0.35 µs in the kernel is spread over about 25 functions, none above 0.03 µs: the enter, the SQE, the request, the CQE. That's io_uring's fixed cost per call, and what it's built to spread over many requests. One part could go: a read in the enter looked up its file twice, once to see that it's a local regular file and once to read it. It now looks once, which gained 0.3–0.5% at 8 jobs (6 rounds; ahead in 11 of 12 pairs).
+
+**Batching.** fio submits one read per enter unless told otherwise. With `--iodepth_batch_submit` and `--iodepth_batch_complete_min` set to 4 or 16 (medians of 3 rounds, thousands of IOPS):
+
+| Jobs | 1 per enter | 4 per enter | 16 per enter | `psync` |
+|---:|---:|---:|---:|---:|
+| 1 | 890 | **1,078** | 675 | 395 |
+| 2 | 1,069 | **1,223** | 1,122 | 683 |
+| 4 | 1,098 | 1,223 | **1,368** | 1,209 |
+| 8 | 1,484 | 1,598 | 1,633 | **1,662** |
+
+With its best batch, kqring is ahead of `psync` up to 4 jobs (by 13% at 4) and 1.7% behind at 8. 16 per enter is slower at 1 and 2 jobs because fio then waits for all 16 before it submits again, which leaves the workers idle.
+
 ## What's left
 
-- **The last 10% to `psync`.** Batching would spread kqring's cost per read, but only for programs that submit many reads per enter.
-- **ZFS reads that complete on their own.** ZFS reads are asynchronous inside: its I/O pipeline calls back when a disk read finishes, and only the layer above waits. A read issued below that layer would complete at once on a hit and from ZFS's callback on a miss, with no worker and no guess about whether it will sleep, as FreeBSD's asynchronous `sendfile(2)` does for the page cache. It depends on ZFS internals, so it's under research: [async-zfs-reads.md](async-zfs-reads.md).
+- **The last 2% to `psync` at 8 jobs, with batching**, and 10% with one read per enter. What's left is per-call work spread thinly over the path, and fio's own bookkeeping per read in its io_uring engine.
+- **A read in the enter that misses the ARC holds up the enter.** A ZFS read that fails rather than blocks would remove the guess, but as measured above, not raise throughput, and it needs a change to OpenZFS: [async-zfs-reads.md](async-zfs-reads.md).

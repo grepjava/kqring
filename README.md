@@ -173,7 +173,7 @@ These are mostly single-threaded loopback measurements of what each mechanism co
 1. **One-shot `RECV` armed before the data arrives:** 25% slower at 64 B. It takes a second enter and sets up a socket upcall each time. Use multishot.
 2. **One operation at a time:** a single request per enter costs more than the plain call, as the `NOP` and `READ` rows show. The ring pays off with several requests in flight.
 3. **Cached reads on ZFS:** ZFS has no page-cache read path, so reads go through a worker, and `pread(2)` is faster. On UFS, batched reads win.
-4. **Many threads reading cached data:** from 4 threads, `pread(2)` passes kqring's worker path, because a thread reading the cache itself needs no hand-off. Once the readers take most of the CPUs, kqring runs those reads in the submitting thread too; on an 8-thread Ryzen that cut `psync`'s lead at 8 jobs from 32% to 10% ([docs/worker-wakeups.md](docs/worker-wakeups.md#reads-in-the-submitting-thread)).
+4. **Many threads reading cached data:** from 4 threads, `pread(2)` passes kqring's worker path, because a thread reading the cache itself needs no hand-off. Once the readers take most of the CPUs, kqring runs those reads in the submitting thread too; on an 8-thread Ryzen that cut `psync`'s lead at 8 jobs from 32% to 10%. With 4 to 16 reads per enter, kqring is ahead of `psync` up to 4 jobs and 2% behind at 8 ([docs/worker-wakeups.md](docs/worker-wakeups.md#where-the-rest-of-the-gap-is-and-batching)).
 5. **`sendfile(2)` with kernel TLS:** for serving files to the network, keep `sendfile(2)`. It moves file pages to the NIC without passing through user space.
 
 ## Storage performance

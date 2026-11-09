@@ -1,6 +1,6 @@
 # Design note: ZFS reads that complete without a worker
 
-**Status:** research, not implemented. Listed under [Research](../ROADMAP.MD#research) in the roadmap. Line references are to OpenZFS as shipped in FreeBSD 15.1 (`sys/contrib/openzfs`).
+**Status:** research, not implemented, and not worth building for throughput alone: see [Measured before building](#measured-before-building). Listed under [Research](../ROADMAP.MD#research) in the roadmap. Line references are to OpenZFS as shipped in FreeBSD 15.1 (`sys/contrib/openzfs`).
 
 ## Why
 
@@ -85,6 +85,16 @@ Each of these needs either a non-waiting form or, in step 1, a fail-fast with `E
 - **Step 1:** fio's cached reads with the in-enter policy and no history guess match 7a34dcc's numbers, and a hit-and-miss mix never has a read held up behind a miss in the enter (p99 of the hits stays at hit latency). At 1 to 4 jobs there's no regression.
 - **Step 2:** SSD reads at 1 and 32 in flight with no worker running (`wq_inline` and the worker counters at 0), the same or better IOPS and p99 than through workers, and less CPU per read. `sendfile(2)` of an uncached ZFS file from one thread to many sockets no longer serializes on the disk.
 - In both: the suite, fuzzer and stress test on a `GENERIC-DEBUG` kernel, plus ZFS's own test suite for anything changed in ZFS.
+
+## Measured before building
+
+Measured on 2026-11-09 on the Ryzen 3 PRO 4350G, with fio's cached ZFS reads ([worker-wakeups.md](worker-wakeups.md#where-the-rest-of-the-gap-is-and-batching)):
+
+- **Step 1 doesn't make cached reads faster.** A kqring build that runs every cached read in the enter, as step 1 would make safe, is far slower than workers at 1 and 2 jobs (320,000 against 886,000 IOPS at 1), 4% slower at 4, and equal at 8, where the enter already runs them. Workers read one ring's requests in parallel. Step 1's gain is that a read that misses the ARC no longer holds up an enter, and the `cache_avg` guess goes.
+- **The gap to `psync` isn't ZFS.** At 1 job the read itself (`vn_read()` and below) takes 1.97 µs in kqring and 1.92 µs in `pread(2)`. The difference is kqring's per-call work and fio's io_uring engine, and batched submission spreads it: with 4 to 16 reads per enter kqring is ahead of `psync` up to 4 jobs and within 2% at 8.
+- **It can't be done in kqring alone.** `zfs.ko` exports none of its functions (every DMU and dbuf symbol is local), so a module can't call `dbuf_hold_impl()` or `dbuf_read()`. Both steps mean a patched `zfs.ko`, which on a ZFS-root machine can't be swapped while it runs.
+
+That leaves step 2 for what it was always mainly for: reads that miss, many in flight, without a thread each, and asynchronous `sendfile(2)` on ZFS. It should be judged on SSD-bound reads and `sendfile(2)`, not on cached ones.
 
 ## Open questions
 
