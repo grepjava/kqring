@@ -20,7 +20,9 @@
  * descriptors, provided and fixed buffers, multishot receives and polls,
  * timeouts, cancellations and poll removals aimed at recent requests,
  * MSG_RING, futexes, splice; its file is O_DIRECT half the time), bursts of
- * reads of one pipe or FIFO, chained with links and link timeouts, with
+ * reads of one pipe or FIFO, runs of 64-255 reads of the file, long enough
+ * that the ring's reads look cached and run in the enter itself, all
+ * chained with links and link timeouts, with
  * data written to the other ends of the pipes and sockets they wait on.
  * Enters wait with signal masks (never blocking the fuzzer's own signals),
  * absolute deadlines and registered waits, in the caller's or the module's
@@ -124,6 +126,8 @@ static _Atomic uint64_t	st_dyn_reserved;	/* refused, see dyn_add() */
 static struct stat	out_st, err_st;		/* OUT_FD, ERR_FD at start */
 /* Reads in pipe bursts submitted; those that got data. */
 static _Atomic uint64_t	st_piperd, st_piperd_data;
+/* Reads in file runs submitted. */
+static _Atomic uint64_t	st_fileread;
 /* Pipe slots opened as FIFOs. */
 static _Atomic uint64_t	st_fifo;
 static _Atomic int	cq_bad, nfinished;
@@ -176,6 +180,7 @@ struct fz {
 	bool		tmpl_echo;	/* they are a buffer-passing pair */
 	int		echo_fd;	/* on this socket */
 	unsigned	pipe_left;	/* reads of a burst still due */
+	unsigned	file_left;	/* reads of a file run still due */
 	int		ord_fd;		/* O_APPEND file of numbered records */
 	char		*ord_buf;	/* the records, each written once */
 	struct ord_meta	*ord_meta;	/* how each was submitted */
@@ -1327,6 +1332,24 @@ sqe_ord_write(struct fz *f, struct io_uring_sqe *s, struct io_uring_sqe *prev)
 
 	if (f->ord_fd < 0 || f->ord_seq >= ORD_MAX)
 		return (false);
+	/*
+	 * The SQE before this one goes in with it if the kernel hasn't taken
+	 * it yet (an enter may submit fewer than were queued), and a link on
+	 * it then puts this write behind its chain, as on Linux.  Within this
+	 * batch that's prev, cleared below; before it, the ring's last slot.
+	 * An SQPOLL thread may be reading it, so then don't write at all.
+	 */
+	if (prev == NULL && atomic_load(f->sq_khead) != f->sq_tail) {
+		struct io_uring_sqe *b = (struct io_uring_sqe *)(void *)
+		    (f->sqes + (size_t)((f->sq_tail - 1) & f->sq_mask) *
+		    f->sqe_size);
+
+		if ((b->flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK)) != 0) {
+			if ((f->p.flags & IORING_SETUP_SQPOLL) != 0)
+				return (false);
+			b->flags &= ~(IOSQE_IO_LINK | IOSQE_IO_HARDLINK);
+		}
+	}
 	r = (struct ord_rec *)(void *)f->ord_buf + f->ord_seq;
 	{
 		struct ord_meta *m = &f->ord_meta[f->ord_seq];
@@ -1392,6 +1415,38 @@ sqe_pipe_read(struct fz *f, struct io_uring_sqe *s)
 	f->ops[ud % NOPS].op = OP_PIPERD;
 	f->ops[ud % NOPS].addr = 0;
 	atomic_fetch_add(&st_piperd, 1);
+}
+
+/*
+ * One of a run of reads of the thread's scratch file, in place of the
+ * request sqe_fill() put in s.  Enough of them in a row, with nothing that
+ * sleeps on the workers between, make the ring's reads look cached, and
+ * then, with the CPUs taken, they run in the enter itself
+ * (kqring_wq_try_inline()) while the rest of the fuzzer cancels, closes
+ * and forks around them.
+ */
+static void
+sqe_file_read(struct fz *f, struct io_uring_sqe *s)
+{
+	uint64_t ud = s->user_data;
+
+	memset(s, 0, f->sqe_size);
+	s->user_data = ud;
+	s->opcode = IORING_OP_READ;
+	s->fd = pool_fd(f, 0);
+	s->off = rn(f, 64 * 1024);
+	s->len = 1 + (uint32_t)rn(f, 4096);
+	if (f->pbuf && chance(f, 25)) {
+		s->flags = IOSQE_BUFFER_SELECT;
+		s->buf_group = PBUF_BGID;
+		s->len = MIN(s->len, 64);
+	} else {
+		s->addr = arena_buf(f, s->len);
+	}
+	maybe_fixed(f, s);
+	f->ops[ud % NOPS].op = IORING_OP_READ;
+	f->ops[ud % NOPS].addr = s->addr;
+	atomic_fetch_add(&st_fileread, 1);
 }
 
 /* Use the fixed-file slot of pool slot i instead, if there is one. */
@@ -1843,9 +1898,20 @@ do_submit(struct fz *f)
 				f->pipe_left = 2 + (unsigned)rn(f, 5);
 				f->pipe_fd = pool_fd(f, 1);
 			}
+			if (f->valid && f->tmpl_left == 0 &&
+			    f->pipe_left == 0 && f->file_left == 0 &&
+			    f->ord_left == 0 && f->pool[4] >= 0 &&
+			    (f->p.flags & IORING_SETUP_IOPOLL) == 0 &&
+			    rn(f, 1000) < 15)
+				f->file_left = 64 + (unsigned)rn(f, 192);
 			if (f->pipe_left > 0 && f->tmpl_left == 0) {
 				sqe_pipe_read(f, s);
 				f->pipe_left--;
+			} else if (f->file_left > 0 && f->tmpl_left == 0) {
+				/* Most of the run; a few random ones between. */
+				if (chance(f, 95))
+					sqe_file_read(f, s);
+				f->file_left--;
 			} else if (f->valid && f->tmpl_left == 0 &&
 			    !f->sq_chaos &&
 			    (f->p.flags & IORING_SETUP_IOPOLL) == 0) {
@@ -2469,7 +2535,7 @@ main(int argc, char **argv)
 {
 	pthread_t tw;
 	struct sigaction sa;
-	long socks0, wired0, mem0;
+	long socks0, wired0, mem0, inline0;
 	uint64_t t0, last = 0;
 	char cmd[128];
 	int ch, rc = 0;
@@ -2522,6 +2588,7 @@ main(int argc, char **argv)
 	socks0 = open_sockets();
 	wired0 = sysctl_num("vm.stats.vm.v_user_wire_count");
 	mem0 = kqring_malloc_inuse();
+	inline0 = sysctl_num("kern.kqring.wq_inline");
 	names_init();
 	printf("kqring_fuzz: seed %ju, %d threads, %d s, in %s\n",
 	    (uintmax_t)seed, nthreads, run_secs, scratch);
@@ -2635,6 +2702,9 @@ main(int argc, char **argv)
 	printf("kqring_fuzz: pipe burst reads %ju, with data %ju, FIFOs %ju\n",
 	    (uintmax_t)st_piperd, (uintmax_t)st_piperd_data,
 	    (uintmax_t)st_fifo);
+	printf("kqring_fuzz: file run reads %ju, reads run inline %ju\n",
+	    (uintmax_t)st_fileread,
+	    (uintmax_t)(sysctl_num("kern.kqring.wq_inline") - inline0));
 	if (atomic_load(&cq_bad)) {
 		fprintf(stderr, "kqring_fuzz: FAIL: a CQ ring overran\n");
 		rc = 1;

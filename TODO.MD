@@ -12,7 +12,6 @@ Known limits are in [BENCHMARK.MD](BENCHMARK.MD#known-gaps) and [Differences fro
 ## Correctness
 
 - **`test_kqueue_bridge_level` fails now and then.** After the pipe it watches has been read empty, an enter sometimes reports the level-triggered read event once more within 30 ms, where the test expects none. Seen on the Ryzen test machine on 2026-11-09, once in eight runs, with the module from before and after the inline-read change alike. Either a stale level report in the kqueue bridge or a race in the test; not yet known which.
-- **The fuzzer seldom runs reads inline.** Its mix of requests rarely makes a pool's reads look cached, so it ran 18 inline in 10 minutes with 8 threads. `test_wq_inline` covers the path; the fuzzer should too.
 
 ## Measurement
 
