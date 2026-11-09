@@ -10740,8 +10740,10 @@ test_files_update_refused(void)
 }
 
 /*
- * A multishot poll on the ring's own CQ eventfd: its first CQE has F_MORE,
- * and the wakeup after it ends it, as io_uring makes it one-shot then.
+ * A multishot poll on the ring's own CQ eventfd.  Woken by a write of the
+ * program's, its CQE has F_MORE, and the ring's signal for that CQE ends
+ * it.  Woken by the ring's signal for another CQE (liburing's evloop), its
+ * one CQE is its last, as io_uring makes it one-shot then.
  */
 static void
 test_poll_own_eventfd(void)
@@ -10775,8 +10777,51 @@ test_poll_own_eventfd(void)
 	munmap(t.sqes, t.sqes_len);
 	close(t.fd);
 	close(e);
-	printf("[PASS] Multishot poll on the ring's own eventfd: F_MORE, "
-	    "then ends\n");
+
+	for (int round = 0; round < 50; round++) {
+		bool nop = false, poll = false;
+
+		e = eventfd(0, EFD_NONBLOCK);
+		assert(e >= 0);
+		ring_init(&t);
+		assert(reg(&t, IORING_REGISTER_EVENTFD, &e, 1) == 0);
+		sqe = ring_prep(&t, IORING_OP_POLL_ADD, e, 79302);
+		sqe->poll32_events = POLLIN;
+		sqe->len = IORING_POLL_ADD_MULTI;
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		(void)ring_prep(&t, IORING_OP_NOP, -1, 79303);
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		for (int i = 0; i < 2; i++) {
+			assert(ring_wait(&t, 1, 2000) == 0);
+			c = ring_pop_cqe(&t);
+			if (c.user_data == 79303) {
+				assert(!nop && c.res == 0);
+				nop = true;
+			} else {
+				assert(c.user_data == 79302 && !poll);
+				assert((c.res & POLLIN) != 0 &&
+				    (c.flags & IORING_CQE_F_MORE) == 0);
+				poll = true;
+			}
+		}
+		usleep(2000);
+		(void)kqring_enter(t.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0);
+		if (ring_cq_ready(&t) != 0) {
+			c = ring_pop_cqe(&t);
+			fprintf(stderr, "round %d: a third CQE, %llu res %d "
+			    "flags %#x\n", round,
+			    (unsigned long long)c.user_data, c.res, c.flags);
+			abort();
+		}
+		munmap(t.ring_map, t.ring_map_len);
+		munmap(t.sqes, t.sqes_len);
+		close(t.fd);
+		close(e);
+	}
+	printf("[PASS] Multishot poll on the ring's own eventfd: F_MORE "
+	    "after a write, one-shot after the ring's signal\n");
 }
 
 static void

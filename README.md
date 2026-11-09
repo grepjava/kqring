@@ -359,7 +359,7 @@ See [docs/event-chains-spec.md](docs/event-chains-spec.md) for the interface.
 - **`IORING_MSG_SEND_FD` errors.** If the target ring can't install the file (no table, bad slot, no free slot), the error is reported in the target's CQE. Linux reports it to the sender.
 - **`CLONE_BUFFERS`.** Both rings must have the same owner thread.
 - **Direct `PIPE`.** The new pipe briefly has descriptors in the process before moving to its fixed slots, because FreeBSD has no way to create a pipe without them.
-- **Eventfd** is signalled once per enter that posted CQEs, and when work is queued for an idle ring. A multishot `POLL_ADD` on the ring's own registered eventfd ends after its first CQE; Linux ends it only when the wakeup came from the ring's own signal.
+- **Eventfd** is signalled once per enter that posted CQEs, and when work is queued for an idle ring. A multishot `POLL_ADD` on the ring's own registered eventfd becomes one-shot when the ring's signal for posted CQEs wakes it, as on Linux. If a program's write and that signal wake it together, kqring posts one last CQE where Linux posts one with `F_MORE` and then the last.
 
 **Polling**
 - **An AF_UNIX stream peer's `shutdown(SHUT_WR)` on fixed files only.** FreeBSD 15 runs no socket upcall when the peer of an AF_UNIX stream socket shuts down writing ([PR 300494](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=300494), see [BSDBUG.MD](BSDBUG.MD)). kqring watches such sockets with a knote instead, through the descriptor, so a `RECV`, `POLL_ADD` or trigger armed through a descriptor completes as on Linux. A request that names the socket only by a fixed-file index has no descriptor to watch, and it doesn't complete until something else happens on the socket. A peer that closes is seen at once either way.

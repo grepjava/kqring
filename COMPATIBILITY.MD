@@ -233,7 +233,7 @@ These are the `IORING_FEAT_*` bits setup returns.
 | `IORING_TIMEOUT_ETIME_SUCCESS` | Equivalent | | `kqring_timeout_prep` | `test_timeouts` |
 | `IORING_TIMEOUT_MULTISHOT` | Equivalent | | `kqring_timeout_fire` | `test_timeouts`, `liburing/timeout` |
 | `IORING_TIMEOUT_IMMEDIATE_ARG` | Unsupported | `-EINVAL`. | `kqring_timeout_prep` | `test_compat_contracts` |
-| `IORING_POLL_ADD_MULTI` | Partial | On the ring's own eventfd its first CQE has `F_MORE` and the next wakeup ends it, which may be the ring's own signal; Linux ends it at the next event after that signal. | `kqring_kpoll_deliver` | `test_nonsock_poll`, `test_poll_own_eventfd`, `liburing/poll-mshot-update`, `liburing/poll-mshot-wake` |
+| `IORING_POLL_ADD_MULTI` | Partial | On the ring's own eventfd, a wakeup after the ring signalled it for posted CQEs makes the poll one-shot, as Linux's `EPOLL_URING_WAKE` does. If a program's write and that signal wake it together, kqring posts one last CQE where Linux posts one with `F_MORE` and then the last. | `kqring_kpoll_deliver` | `test_nonsock_poll`, `test_poll_own_eventfd`, `liburing/evloop`, `liburing/poll-mshot-update`, `liburing/poll-mshot-wake` |
 | `IORING_POLL_ADD_LEVEL` | Equivalent | In the UAPI, but refused with `EINVAL`, as on Linux. | `kqring_req_prep` | `test_compat_gaps` |
 | `IORING_POLL_UPDATE_EVENTS` | Equivalent | | `kqring_poll_remove` | `liburing/poll-mshot-update` |
 | `IORING_POLL_UPDATE_USER_DATA` | Equivalent | | `kqring_poll_remove` | `test_poll_remove`, `liburing/poll-mshot-update` |

@@ -738,6 +738,7 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	op->kp_fd = sqe->fd;
 	op->kp_filters = filters;
 	op->kp_data = fp->f_data;
+	op->kp_evfd_seq = ctx->evfd_signals;
 	op->kp_revents = 0;
 	op->kp_nev = 0;
 	op->kp_seen[0] = op->kp_seen[1] = 0;
@@ -1194,13 +1195,18 @@ kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 	mtx_lock(&ctx->mtx);
 	/*
 	 * A multishot poll on the ring's own eventfd would be woken by the
-	 * signal for its own CQE, for ever.  io_uring makes one that its own
-	 * signal woke one-shot: its first CQE has F_MORE, and the next ends
-	 * it.  Here the next wakeup ends it, which may be that signal.
+	 * signal for its own CQE, for ever.  io_uring makes a poll that the
+	 * ring's own signal woke (EPOLL_URING_WAKE) one-shot, so that CQE is
+	 * its last.  Here: if the ring signalled the eventfd since the poll
+	 * was armed or last delivered.  A write by anyone else still gives a
+	 * CQE with F_MORE, whose own signal then ends the poll, as in io_uring.
 	 */
 	own = op->kp_data != NULL && op->kp_data == ctx->evfd;
-	if (own && op->kp_once)
-		multi = false;
+	if (own) {
+		if (op->kp_evfd_seq != ctx->evfd_signals)
+			multi = false;
+		op->kp_evfd_seq = ctx->evfd_signals;
+	}
 	rev = op->kp_revents & (events | POLLERR | POLLHUP | POLLNVAL);
 	nev = op->kp_nev;
 	op->kp_revents = 0;
@@ -1233,10 +1239,8 @@ kqring_kpoll_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 				goto last;
 			kqring_post_cqe(ctx, sqe->user_data, rev,
 			    IORING_CQE_F_MORE);
-			if (own) {
-				op->kp_once = true;
+			if (own)
 				break;
-			}
 		}
 		return;
 	}

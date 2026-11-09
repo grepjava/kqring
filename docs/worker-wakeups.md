@@ -85,7 +85,7 @@ Designs that queued the reads and had the submitting thread help the workers run
 
 - `test_wq_inline` starts a thread per CPU, each with its own ring and 16 random 4 KiB reads in flight from a cached 1 MiB file whose every block is different. Every read's data is checked, and some read must have run inline within 15 seconds.
 - On a `GENERIC-DEBUG` kernel (`INVARIANTS`, `WITNESS`), the suite passed three times (1.5 to 4.2 million reads inline between them), the fuzzer for 30 minutes with 4 threads and 10 with 8, and the stress test for 10 minutes, with no leaks and no `WITNESS` warnings. The fuzzer ran few reads inline (1 and 18), because its mix rarely makes a pool's reads look cached; [TODO.MD](../TODO.MD#correctness) has that.
-- On the stock kernel, the suite passed three times, and the differential conformance test ran three times with the same output each time. liburing's `evloop` failed, but it fails as often with the module from before the change (123 and 125 runs in 200); TODO.MD has it.
+- On the stock kernel, the suite passed three times, and the differential conformance test ran three times with the same output each time. liburing's `evloop` failed, but it failed as often with the module from before the change (123 and 125 runs in 200); it was a bug in polls on the ring's own eventfd, fixed since.
 
 ### Measured
 

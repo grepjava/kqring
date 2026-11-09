@@ -331,7 +331,7 @@ struct kqring_op {
 	int			kp_fd;		/* their ident */
 	uint8_t			kp_filters;	/* KQRING_KP_READ / _WRITE */
 	const void		*kp_data;	/* its file's f_data: only compared */
-	bool			kp_once;	/* own eventfd: the next CQE ends it */
+	uint32_t		kp_evfd_seq;	/* ctx->evfd_signals when last delivered */
 	bool			kp_on;
 	int			kp_revents;
 	u_int			kp_nev;
@@ -890,6 +890,7 @@ struct kqring_ctx {
 	bool			submit_inline;
 	int			inline_until;	/* ticks; kqring_wq_inline_ok() */
 	uint32_t		evfd_cqes;
+	uint32_t		evfd_signals;	/* times signalled, under mtx */
 	/*
 	 * poll(2) / select(2) / kevent(2) on the ring descriptor: readable
 	 * while CQEs or taskwork wait (kqring_ring_readable()), woken with
@@ -1141,15 +1142,21 @@ kqring_bgroup_bucket(struct kqring_ctx *ctx, uint16_t bgid)
 /*
  * Signal the registered eventfd, unless userspace set
  * IORING_CQ_EVENTFD_DISABLED.  ctx->mtx keeps the eventfd registered.
+ * cqes: for posted CQEs, counted in evfd_signals (a poll on the eventfd
+ * that this wakes is one-shot, kqring_kpoll_deliver()); not for queued
+ * taskwork, which may be that poll's own delivery.
  */
 static inline void
-kqring_evfd_signal_locked(struct kqring_ctx *ctx)
+kqring_evfd_signal_common(struct kqring_ctx *ctx, bool cqes)
 {
 	mtx_assert(&ctx->mtx, MA_OWNED);
 	if (ctx->evfd != NULL && ctx->shm != NULL &&
 	    (atomic_load_32(&ctx->shm->cq_flags) &
-	    IORING_CQ_EVENTFD_DISABLED) == 0)
+	    IORING_CQ_EVENTFD_DISABLED) == 0) {
+		if (cqes)
+			ctx->evfd_signals++;
 		eventfd_signal(ctx->evfd);
+	}
 	/*
 	 * And whoever polls the ring descriptor itself; an enter that did
 	 * this runs kqring_kpoll_run() before it returns.
@@ -1161,6 +1168,12 @@ kqring_evfd_signal_locked(struct kqring_ctx *ctx)
 	}
 	if (ctx->evfd != NULL)
 		ctx->woke_pollers = true;
+}
+
+static inline void
+kqring_evfd_signal_locked(struct kqring_ctx *ctx)
+{
+	kqring_evfd_signal_common(ctx, true);
 }
 
 /*
@@ -1233,7 +1246,7 @@ kqring_taskwork_add_common(struct kqring_ctx *ctx, struct kqring_op *op,
 	 */
 	if (TAILQ_EMPTY(&ctx->taskwork_ops) &&
 	    (!ctx->evfd_async || !ctx->submitting))
-		kqring_evfd_signal_locked(ctx);
+		kqring_evfd_signal_common(ctx, false);
 	TAILQ_INSERT_TAIL(&ctx->taskwork_ops, op, taskwork_link);
 	if (ctx->shm != NULL)
 		atomic_set_32(&ctx->shm->sq_flags, IORING_SQ_TASKRUN);
