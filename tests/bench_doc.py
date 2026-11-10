@@ -224,12 +224,43 @@ def vs_aio(x):
     return "level with" if round(abs(x) * 100) == 0 else f"{abs(x) * 100:.0f}% {'ahead of' if x > 0 else 'behind'}"
 
 
-ab_pread_max = max(float(l.split()[3]) for f in glob.glob(AB + '*.out') for l in open(f, encoding='utf-8')
-                   if l.startswith('ROW file_4k pread '))
-zr_fast = min(float(l.split()[3]) for f in glob.glob(AB + '*.out') for l in open(f, encoding='utf-8')
-              if l.startswith('ROW file_4k pread '))
-ab_pread_slow = sum(1 for f in glob.glob(AB + 'kqring-p6.*.out') for l in open(f, encoding='utf-8')
-                    if l.startswith('ROW file_4k pread ') and float(l.split()[3]) > 2 * zr_fast)
+ZD = D + 'zfs-dbuf/'
+zfit = br.load(glob.glob(ZD + 'file-s3.*.out'))
+zthr = br.load(glob.glob(ZD + 'file-s5.*.out'))
+def zd_note(shift, field):
+    """MiB figure from the '# file_4k start:' lines of one regime's runs."""
+    vals = {int(l.split(field + ' ')[1].split()[0]) for f in glob.glob(ZD + f'file-s{shift}.*.out')
+            for l in open(f, encoding='utf-8') if l.startswith('# file_4k start:')}
+    assert len(vals) == 1, (shift, field, vals)
+    return vals.pop()
+z_arc, z_t5, z_t3 = zd_note(5, 'ARC target'), zd_note(5, 'dbuf cache target'), zd_note(3, 'dbuf cache target')
+def zd_series(name):
+    rows = [l.split() for l in open(ZD + name, encoding='utf-8') if not l.startswith('#')]
+    return [(float(r[0]), float(r[1])) for r in rows]
+zs_f = zd_series('zfs_dbuf.f.out')
+zs_r = zd_series('zfs_dbuf.random.out')
+z_before = statistics.median(ns for t, ns in zs_f + zs_r if ns < 2000)
+z_after = statistics.median(ns for _, ns in zs_f[-3:] + zs_r[-3:])
+z_switch = sorted(max(t for t, ns in z if ns < 2000) for z in (zs_f, zs_r))
+def zd_prof(name, fn):
+    c = t = None
+    for l in open(ZD + name, encoding='utf-8'):
+        x = l.split()
+        if len(x) == 2 and x[0].endswith(fn):
+            c = int(x[1])
+        elif len(x) == 2 and x[0] == 'total':
+            t = int(x[1])
+    return 100 * c / t
+z_lz4 = zd_prof('profile.f.txt', 'LZ4_uncompress_unknownOutputSize')
+z_cpy = zd_prof('profile.random.txt', 'memcpy_std')
+AB_SLOW = sorted(os.path.basename(f) for f in glob.glob(AB + '*.out')
+                 if any(l.startswith('ROW file_4k') and float(l.split()[3]) > 5000 for l in open(f, encoding='utf-8')))
+def zrow(label, k):
+    return (f"| {label} | {zfit[('file_4k', k)][0]:,.0f} | {'' if k == 'pread' else faster(zfit[('file_4k', k)][0], zfit[('file_4k', 'pread')][0])} "
+            f"| {zthr[('file_4k', k)][0]:,.0f} | {'' if k == 'pread' else faster(zthr[('file_4k', k)][0], zthr[('file_4k', 'pread')][0])} |")
+zspread = max(x[1] for x in list(zfit.values()) + list(zthr.values())) * 100
+
+
 def eng_gap(sec, qds):
     return max((max(v) - min(v)) / min(v) for v in
                ([fv(sec, e, q) for e in ('kqring', 'aio', 'psync')] for q in qds))
@@ -240,7 +271,6 @@ zfs_eng = eng_gap('zfsread', (1, 32))
 wspread = max(fv('zfswritespread', e, q) for e in ('kqring', 'aio', 'psync') for q in (1, 32))
 rspread = max(fv('zfsreadspread', e, q) for e in ('kqring', 'aio', 'psync') for q in (1, 32))
 dspread = max(iops[(k, 'read')][1] for k in ('md_kqring_32', 'md_aio_32'))
-zr = {k: raw_runs('file_4k', k) for k in ('pread', 'kqring_read', 'kqring_read_batch32')}
 stable = sum(1 for k, x in m.items() if x[1] < 0.05 and not k[0].startswith('stream_'))
 nstable = sum(1 for k in m if not k[0].startswith('stream_'))
 spread_send = max(x[1] for k, x in m.items() if k[0].startswith('send_') and x[1] >= 0.05) * 100
@@ -276,7 +306,7 @@ doc = f"""# kqring benchmarks
 
 How `kqring` compares with FreeBSD's `kqueue(2)` on the same workloads, and with `aio(4)` and plain system calls on storage. Where kqueue has no role (regular files, disks, bulk sends into a socket with room), the comparison is the plain system call.
 
-Every figure here is from one build, `7641bf4`, on the machine under [Setup](#setup), an 8-thread AMD Ryzen, except the [streaming](#streaming-the-receiver-in-its-own-thread) group's, from `{STREAM_BUILD}`. The raw runs are in [`docs/bench/data/`](docs/bench/data/). Earlier editions were measured on an Intel laptop; how the two machines differ, and why it matters for kqring, is under [Why the results depend on the CPU](#why-the-results-depend-on-the-cpu). For kqring against Linux io_uring on one machine, see [docs/linux-comparison.md](docs/linux-comparison.md).
+Every figure here is from one build, `7641bf4`, on the machine under [Setup](#setup), an 8-thread AMD Ryzen, except the [streaming](#streaming-the-receiver-in-its-own-thread) group's and the [file on ZFS](#pipes-and-files-inline-or-through-a-worker) table, from `{STREAM_BUILD}`. The raw runs are in [`docs/bench/data/`](docs/bench/data/). Earlier editions were measured on an Intel laptop; how the two machines differ, and why it matters for kqring, is under [Why the results depend on the CPU](#why-the-results-depend-on-the-cpu). For kqring against Linux io_uring on one machine, see [docs/linux-comparison.md](docs/linux-comparison.md).
 
 ![kqring vs kqueue: speed-up per operation](docs/bench/summary.svg)
 
@@ -316,7 +346,7 @@ The kqueue rows, which are mostly system calls, got much cheaper on the Ryzen; k
 | Memory | 8 GB |
 | Disk | SanDisk SD7TB6S 256 GB SATA SSD |
 | OS | FreeBSD 15.1-RELEASE, `GENERIC` kernel, amd64; root on ZFS (OpenZFS 2.4.2) |
-| kqring | `kqring.ko` from `7641bf4` (the stream group from `{STREAM_BUILD}`), entered through its native system calls, with `kern.kqring.zc_local_min_len` at its default of 32 KiB |
+| kqring | `kqring.ko` from `7641bf4` (the stream group and the file on ZFS from `{STREAM_BUILD}`), entered through its native system calls, with `kern.kqring.zc_local_min_len` at its default of 32 KiB |
 | Ring | `SINGLE_ISSUER \\| DEFER_TASKRUN`, 1,024 SQ / 8,192 CQ entries, one buffer ring of 4,096 × 4 KiB |
 | Benchmarks | [`tests/kqring_bench.c`](tests/kqring_bench.c), [`tests/kqring_mt_bench.c`](tests/kqring_mt_bench.c) and [`tests/kqring_diskbench.c`](tests/kqring_diskbench.c), built with `cc -O2` |
 | Limits | `ulimit -l 65536` (the FreeBSD default of 64 KiB is too small to register the send buffers) |
@@ -326,7 +356,7 @@ The kqueue rows, which are mostly system calls, got much cheaper on the Ryzen; k
 - Each `kqring_bench` and `kqring_mt_bench` figure is the **median of 5 runs**, and each `kqring_diskbench` figure the median of 3 runs of 10 seconds. The module was unloaded and reloaded before each `kqring_bench` and `kqring_mt_bench` run.
 - A run measures the mean wall-clock time per operation over 20,000–524,288 operations. An operation is one message received or sent, one connection accepted, one read or one timer.
 - `kqring_bench` is **single-threaded on loopback**, and the process isn't pinned to a CPU. The sender and receiver are the same thread, so it measures the per-operation cost of each mechanism, not throughput under load. The echo group uses two threads.
-- {stable} of {nstable} rows outside the streaming group vary less than 5% between runs. The exceptions are some sends of 16–64 KiB (up to {spread_send:.0f}%), AF_UNIX ping-pong at 1 KiB (up to {spread_pp:.0f}%), and the file group's reads in `/tmp`, which is ZFS here and ran in ZFS's slow mode in some runs (see [Pipes and files](#pipes-and-files-inline-or-through-a-worker)).
+- {stable} of {nstable} rows outside the streaming group vary less than 5% between runs. The exceptions are some sends of 16–64 KiB (up to {spread_send:.0f}%), AF_UNIX ping-pong at 1 KiB (up to {spread_pp:.0f}%), and the file group's reads in `/tmp`, which is ZFS here: in some runs ZFS synced the file partway through the group, which slows its reads by an order of magnitude (see [Pipes and files](#pipes-and-files-inline-or-through-a-worker); the ZFS table there comes from separate runs that wait for the sync).
 - The charts are drawn from the raw runs by [`tests/bench_report.py`](tests/bench_report.py), and this document is written from them by [`tests/bench_doc.py`](tests/bench_doc.py).
 
 ## Results
@@ -524,7 +554,18 @@ Everything else goes to a worker thread, including a pipe `READ` that has to wai
 
 A registered file saves almost nothing, so descriptor lookups aren't where the single-read gap comes from. It is the fixed cost of an enter, plus the SQE and CQE.
 
-**File on ZFS.** ZFS caches in the ARC rather than the page cache, so `READ` goes to a worker, or runs in the enter once the readers take most of the CPUs. These reads don't give one stable figure on this machine: the same 64 MiB file in `/tmp` (lz4, 128 KiB records) runs in a fast mode or a slow one, and plain `pread(2)` does too. In the [`v0.3.0` against `7641bf4` runs](docs/bench/data-v030-vs-head/), `pread(2)` took up to {ab_pread_max:,.0f} ns, in {ab_pread_slow} of the 5 `7641bf4` runs and none of the `v0.3.0` ones. `pread(2)` runs first in the group, so it was slow before kqring had read the file in that run, and the slow mode is in ZFS, not kqring's read path; whether something earlier in the run sets it isn't known. Across the 5 runs here, `pread(2)` took {zr['pread'][0]:,.0f}–{zr['pread'][-1]:,.0f} ns, one `READ` per enter {zr['kqring_read'][0]:,.0f}–{zr['kqring_read'][-1]:,.0f} ns, and 32 per enter {zr['kqring_read_batch32'][0]:,.0f}–{zr['kqring_read_batch32'][-1]:,.0f} ns. In the fast mode, 32 `READ`s per enter take {zr['kqring_read_batch32'][0]:,.0f} ns each against {zr['pread'][0]:,.0f} for `pread(2)`. For ZFS, the [fio tables](#fio-on-a-real-ssd) are the better guide.
+**File on ZFS: the same reads from a 64 MiB file in `/tmp`** (lz4, 128 KiB records). ZFS caches in the ARC rather than the page cache, so `READ` goes to a worker, or runs in the enter once the readers take most of the CPUs. ZFS serves these reads at one of two speeds, depending on whether the file fits in its dbuf cache, which holds records ready to read and is capped at 1/32 of the ARC target (`vfs.zfs.dbuf.cache_shift=5`). Here the ARC target was {z_arc:,} MiB, so the cache held {z_t5} MiB, and the file didn't fit; at 1/8 (`cache_shift=3`, {z_t3} MiB) it does. The runs alternated between the two, 5 of each, with `kqring.ko` from `{STREAM_BUILD}` ([raw runs](docs/bench/data/zfs-dbuf/)); every row varies less than {max(1, round(zspread))}% between runs.
+
+| Variant | Fits: ns/op | vs `pread` | Doesn't fit: ns/op | vs `pread` |
+|---|---:|---:|---:|---:|
+{zrow('`pread(2)`', 'pread')}
+{zrow('kqring `READ`, one per enter', 'kqring_read')}
+{zrow('kqring `READ`, one per enter, registered file', 'kqring_read_fixed')}
+{zrow('kqring `READ`, 32 per enter', 'kqring_read_batch32')}
+
+When the file fits, one `READ` per enter pays the worker hand-off on top of `pread(2)`, and 32 per enter more than make it up. When it doesn't, each 4 KiB read evicts a record from the cache and rebuilds a whole 128 KiB one from the ARC, and that dominates every variant; 32 per enter still win, since the rebuilds run on several workers at once. A kernel profile of `pread(2)` alone in that state ([`tests/zfs_dbuf.c`](tests/zfs_dbuf.c)) spends {z_lz4:.0f}% of its samples in lz4 decompression for this all-`'f'` file and {z_cpy:.0f}% in `memcpy` for incompressible data, both at about the same time per read.
+
+A file just written reads fast either way until its transaction group syncs (`vfs.zfs.txg.timeout`, 5 s): its dirty records are still in memory whole. `zfs_dbuf` shows the switch at the sync, from {z_before:,.0f} to {z_after:,.0f} ns a read; in its two runs, reads were still fast {z_switch[0]:.1f} and {z_switch[1]:.1f} s after the write and slow at the next sample. Earlier editions of this group read within a second of writing the file, so whether the sync landed inside the group was luck. That was the fast and slow mode of earlier runs, including the [`v0.3.0` against `7641bf4` runs](docs/bench/data-v030-vs-head/), where reads were slow from some point in the group on in {len(AB_SLOW)} of the 10 runs, with both builds. The group now waits for the sync on ZFS and prints the dbuf cache target with each run. The ARC target, and with it the dbuf cache, shrinks under memory pressure and grows back only as the ARC fills: when these runs were made, after the other benchmarks, the ARC held about 250 MB, its target was {z_arc:,} MiB, and its ceiling 6.3 GiB. For ZFS under load, the [fio tables](#fio-on-a-real-ssd) are the better guide.
 
 ### Disk device: 4 KiB random reads and writes
 
@@ -681,7 +722,7 @@ python3 tests/bench_report.py docs/bench docs/bench/data/*
 python3 tests/bench_doc.py
 ```
 
-Runs on other file systems and disks are selected by name and environment: `KQRING_BENCH_FILE_DIR` puts the `file` group's 64 MiB temporary file in a directory of your choice (these tables use a UFS file system on an md(4) disk, saved as `ufs.*.out`), and the `disk` group runs only with `KQRING_BENCH_DISK` set to a device it may overwrite (`sudo mdconfig -a -t malloc -s 64m -u 9 && sudo chown $USER /dev/md9`, filled with `dd if=/dev/urandom of=/dev/md9 bs=1m`, saved as `disk.*.out`).
+Runs on other file systems and disks are selected by name and environment: `KQRING_BENCH_FILE_DIR` puts the `file` group's 64 MiB temporary file in a directory of your choice (these tables use a UFS file system on an md(4) disk, saved as `ufs.*.out`), and the `disk` group runs only with `KQRING_BENCH_DISK` set to a device it may overwrite (`sudo mdconfig -a -t malloc -s 64m -u 9 && sudo chown $USER /dev/md9`, filled with `dd if=/dev/urandom of=/dev/md9 bs=1m`, saved as `disk.*.out`). On ZFS the `file` group first waits for the file's transaction group to sync, and prints the dbuf cache target: the ZFS table's two columns are runs of `./tests/kqring_bench file` with `vfs.zfs.dbuf.cache_shift` at 3 and at 5, alternated ([`run.sh`](docs/bench/data/zfs-dbuf/run.sh)). `./tests/zfs_dbuf [-r]` shows the switch at the sync with `pread(2)` alone, without kqring.
 
 The storage tables come from `kqring_diskbench`; the comment at the top of [`tests/kqring_diskbench.c`](tests/kqring_diskbench.c) lists its options. For example, on a 1 GiB md disk and a file on ZFS:
 

@@ -4,7 +4,7 @@ CC?=		cc
 CFLAGS=		-O2 -Wall -Wextra -Werror -std=c11 -I../include -pthread
 
 all: kqring_test kqring_bench kqring_mt_bench kqring_stress kqring_diskbench \
-    kqring_fuzz kqring_diff kqring_xbench
+    kqring_fuzz kqring_diff kqring_xbench zfs_dbuf
 
 kqring_test: kqring_test.c ../include/sys/kqring.h
 	$(CC) $(CFLAGS) -o kqring_test kqring_test.c
@@ -30,6 +30,9 @@ kqring_diff: kqring_diff.c ../include/sys/kqring.h
 kqring_xbench: kqring_xbench.c ../include/sys/kqring.h
 	$(CC) $(CFLAGS) -o kqring_xbench kqring_xbench.c
 
+zfs_dbuf: zfs_dbuf.c
+	$(CC) $(CFLAGS) -o zfs_dbuf zfs_dbuf.c
+
 clean:
 	rm -f kqring_test kqring_bench kqring_mt_bench kqring_stress \
-	    kqring_diskbench kqring_fuzz kqring_diff kqring_xbench
+	    kqring_diskbench kqring_fuzz kqring_diff kqring_xbench zfs_dbuf

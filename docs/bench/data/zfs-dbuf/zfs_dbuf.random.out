@@ -1,0 +1,16 @@
+# incompressible data, 64 MiB file, txg timeout 5 s, dbuf cache_shift 5, ARC target 1052 MiB
+# seconds_since_write ns_per_read dbuf_target_mib dbuf_size_mib
+0.2 972 32 0
+0.4 971 32 0
+0.6 970 32 0
+0.8 969 32 0
+1.0 969 32 0
+1.2 973 32 0
+1.4 972 32 0
+1.6 970 32 0
+1.8 971 32 0
+3.4 8328 32 32
+6.9 17483 32 30
+10.4 17467 32 32
+13.9 17505 32 30
+17.4 17557 32 30

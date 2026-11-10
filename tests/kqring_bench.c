@@ -23,8 +23,10 @@
 #include <sys/event.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -807,6 +809,16 @@ bench_pipe(void)
 /* ------------------------------------------------------------------------
  * file: 4 KiB random reads from a 64 MiB file in the page cache.  kqueue
  * cannot wait on regular files, so the comparison is pread(2).
+ *
+ * On ZFS a cached read runs at one of two speeds.  Until the transaction
+ * group that holds the writes syncs (vfs.zfs.txg.timeout, 5 s), the dirty
+ * records stay in memory uncompressed.  After it they live in the dbuf
+ * cache, which keeps at most 1/2^vfs.zfs.dbuf.cache_shift (1/32) of the
+ * ARC target: if the file doesn't fit, every read evicts a 128 KiB record
+ * and rebuilds another from the ARC (decompressing or copying all 128 KiB),
+ * at about 18 us a read on a Ryzen 3 PRO 4350G against 1.3 us.
+ * So on ZFS the group waits for the sync, to measure the state that lasts,
+ * and prints the dbuf cache target, which says which speed was measured.
  * ------------------------------------------------------------------------
  */
 
@@ -814,6 +826,36 @@ bench_pipe(void)
 #define FILE_BLK	4096
 #define FILE_ITERS	200000
 #define FILE_BATCH	32
+
+static uint64_t
+sysctl_u64(const char *name)
+{
+	union { uint64_t u64; uint32_t u32; } v = { 0 };
+	size_t len = sizeof(v);
+
+	if (sysctlbyname(name, &v, &len, NULL, 0) != 0)
+		return (0);
+	return (len == sizeof(v.u32) ? v.u32 : v.u64);
+}
+
+static bool
+file_on_zfs(int fd)
+{
+	struct statfs sf;
+
+	assert(fstatfs(fd, &sf) == 0);
+	return (strcmp(sf.f_fstypename, "zfs") == 0);
+}
+
+static void
+file_dbuf_note(const char *when)
+{
+	printf("# file_4k %s: ZFS dbuf cache target %ju MiB, ARC target %ju "
+	    "MiB, file %u MiB\n", when, (uintmax_t)(sysctl_u64(
+	    "kstat.zfs.misc.dbufstats.cache_target_bytes") >> 20),
+	    (uintmax_t)(sysctl_u64("kstat.zfs.misc.arcstats.c") >> 20),
+	    FILE_SIZE >> 20);
+}
 
 static void
 bench_file(void)
@@ -825,6 +867,7 @@ bench_file(void)
 	struct ring r;
 	uint64_t t0;
 	off_t off;
+	bool zfs;
 	int fd, n;
 
 	n = snprintf(path, sizeof(path), "%s/kqring_bench.XXXXXX",
@@ -836,8 +879,18 @@ bench_file(void)
 	memset(payload, 'f', sizeof(payload));
 	for (off = 0; off < FILE_SIZE; off += FILE_BLK)
 		assert(pwrite(fd, payload, FILE_BLK, off) == FILE_BLK);
+	zfs = file_on_zfs(fd);
+	if (zfs) {
+		/* Past the sync of the writes' transaction group. */
+		u_int wait = (u_int)sysctl_u64("vfs.zfs.txg.timeout") + 2;
+
+		assert(fsync(fd) == 0);
+		sleep(wait < 3 ? 3 : wait);
+	}
 	for (off = 0; off < FILE_SIZE; off += FILE_BLK)	/* warm the cache */
 		assert(pread(fd, buf[0], FILE_BLK, off) == FILE_BLK);
+	if (zfs)
+		file_dbuf_note("start");
 
 #define NEXT_OFF()							\
 	(seed = seed * 1103515245U + 12345U,				\
@@ -891,6 +944,8 @@ bench_file(void)
 	    (FILE_ITERS / FILE_BATCH) * FILE_BATCH);
 	ring_fini(&r);
 #undef NEXT_OFF
+	if (zfs)
+		file_dbuf_note("end");
 	close(fd);
 }
 

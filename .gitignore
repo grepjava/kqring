@@ -17,6 +17,7 @@ tests/kqring_bench
 vmcore.*
 graphify-out/
 tests/kqring_mt_bench
+tests/zfs_dbuf
 
 # liburing port: fetched release, build output
 liburing/work/
