@@ -527,7 +527,23 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
  * unregistered buffer on AF_LOCAL, kern.kqring.zc_local_min_len.  Builds an
  * EXT_SFBUF mbuf chain over the held physical pages and submits it via
  * pr_send.  Returns EOPNOTSUPP if the caller should fall back to copying.
+ *
+ * A MSG_WAITALL send that was short comes back for the rest with its
+ * notification in op->zc_notif: the attempt pins into `pin`, hands those
+ * buffers to the notification, and adds its mbufs' references, so that one
+ * notification covers every attempt, as in io_uring.
  */
+static void
+kqring_zc_unwind(struct kqring_zc_notif *zc, struct kqring_zc_notif *pz,
+    struct kqring_rcqe *rcqe, bool retry)
+{
+	kqring_zc_notif_free_bufs(pz);
+	if (!retry) {
+		free(rcqe, M_KQRING);
+		free(zc, M_KQRING);
+	}
+}
+
 static int
 kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
     struct socket *so, const struct iovec *iov, u_int iovcnt, size_t want,
@@ -535,13 +551,14 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 {
 	const struct io_uring_sqe *sqe = &op->sqe;
 	struct kqring_zc_buf *zbuf = NULL;
-	struct kqring_zc_notif *zc;
-	struct kqring_rcqe *rcqe;
+	struct kqring_zc_notif *zc, *pz, pin = { 0 };
+	struct kqring_rcqe *rcqe = NULL;
 	struct mbuf *top = NULL, *mtail = NULL;
 	vm_offset_t cur;
 	size_t avail = 0, send_len = 0, rem;
 	u_int nzbufs = 0, nmbufs = 0;
 	bool fixed = (sqe->ioprio & IORING_RECVSEND_FIXED_BUF) != 0;
+	bool retry = op->zc_notif != NULL;
 	int dom = so->so_proto->pr_domain->dom_family;
 	size_t min_len = dom == AF_LOCAL && !fixed ?
 	    MAX(atomic_load_int(&kqring_zc_local_min_len), KQRING_ZC_MIN_LEN) :
@@ -566,13 +583,18 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 		zbuf = op->fbuf->zbuf;
 	}
 
-	zc = malloc(sizeof(*zc), M_KQRING, M_WAITOK | M_ZERO);
-	rcqe = malloc(sizeof(*rcqe), M_KQRING, M_WAITOK | M_ZERO);
+	if (retry)
+		zc = op->zc_notif;
+	else {
+		zc = malloc(sizeof(*zc), M_KQRING, M_WAITOK | M_ZERO);
+		rcqe = malloc(sizeof(*rcqe), M_KQRING, M_WAITOK | M_ZERO);
+	}
+	/* What this attempt pins. */
+	pz = retry ? &pin : zc;
 
 	error = SOCK_IO_SEND_LOCK(so, SBL_WAIT);
 	if (error != 0) {
-		free(rcqe, M_KQRING);
-		free(zc, M_KQRING);
+		kqring_zc_unwind(zc, pz, rcqe, retry);
 		return (error);
 	}
 
@@ -585,8 +607,7 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 		if (SOLISTENING(so)) {
 			SOCK_RECVBUF_UNLOCK(so);
 			SOCK_IO_SEND_UNLOCK(so);
-			free(rcqe, M_KQRING);
-			free(zc, M_KQRING);
+			kqring_zc_unwind(zc, pz, rcqe, retry);
 			return (ENOTCONN);
 		}
 		so2 = so->so_rcv.uxst_peer;
@@ -595,8 +616,7 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 			    EPIPE : ENOTCONN;
 			SOCK_RECVBUF_UNLOCK(so);
 			SOCK_IO_SEND_UNLOCK(so);
-			free(rcqe, M_KQRING);
-			free(zc, M_KQRING);
+			kqring_zc_unwind(zc, pz, rcqe, retry);
 			return (error);
 		}
 		soref(so2);
@@ -696,9 +716,9 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 			rem_cnt -= iov[i].iov_len;
 		}
 		if (nzbufs > 1) {
-			zc->zbufs = malloc(nzbufs * sizeof(*zc->zbufs),
+			pz->zbufs = malloc(nzbufs * sizeof(*pz->zbufs),
 			    M_KQRING, M_WAITOK | M_ZERO);
-			zc->nzbufs = nzbufs;
+			pz->nzbufs = nzbufs;
 		}
 		for (u_int i = 0; i < iovcnt && rem_pin > 0; i++) {
 			size_t seg_len = MIN(iov[i].iov_len, rem_pin);
@@ -715,51 +735,50 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 				break;
 			}
 			if (nzbufs == 1)
-				zc->zbuf = zb;
+				pz->zbuf = zb;
 			else
-				zc->zbufs[k] = zb;
+				pz->zbufs[k] = zb;
 			k++;
 			rem_pin -= seg_len;
 		}
 	}
 	if (error != 0) {
 		SOCK_IO_SEND_UNLOCK(so);
-		kqring_zc_notif_free_bufs(zc);
-		free(rcqe, M_KQRING);
-		free(zc, M_KQRING);
+		kqring_zc_unwind(zc, pz, rcqe, retry);
 		return (error);
 	}
 
-	if (!kqring_zc_hold()) {
+	if (!retry && !kqring_zc_hold()) {
 		SOCK_IO_SEND_UNLOCK(so);
-		kqring_zc_notif_free_bufs(zc);
-		free(rcqe, M_KQRING);
-		free(zc, M_KQRING);
+		kqring_zc_unwind(zc, pz, rcqe, retry);
 		return (EOPNOTSUPP);
 	}
 
-	rcqe->cqe.user_data = sqe->user_data;
-	rcqe->cqe.res = 0;
-	rcqe->cqe.flags = IORING_CQE_F_NOTIF;
-
-	refcount_init(&zc->refs, 1);
 	if (fixed) {
+		/* A copy-on-write refresh may have replaced it since. */
 		refcount_acquire(&zbuf->refs);
-		zc->zbuf = zbuf;
+		pz->zbuf = zbuf;
 	}
-	zc->ctx = ctx;
-	zc->rcqe = rcqe;
+	if (!retry) {
+		rcqe->cqe.user_data = sqe->user_data;
+		rcqe->cqe.res = 0;
+		rcqe->cqe.flags = IORING_CQE_F_NOTIF;
 
-	mtx_lock(&kqring_zc_mtx);
-	mtx_lock(&ctx->mtx);
-	if (!ctx->closing) {
-		TAILQ_INSERT_TAIL(&ctx->zc_pending, zc, link);
-		zc->on_ctx = true;
-	} else {
-		zc->ctx = NULL;
+		refcount_init(&zc->refs, 1);
+		zc->ctx = ctx;
+		zc->rcqe = rcqe;
+
+		mtx_lock(&kqring_zc_mtx);
+		mtx_lock(&ctx->mtx);
+		if (!ctx->closing) {
+			TAILQ_INSERT_TAIL(&ctx->zc_pending, zc, link);
+			zc->on_ctx = true;
+		} else {
+			zc->ctx = NULL;
+		}
+		mtx_unlock(&ctx->mtx);
+		mtx_unlock(&kqring_zc_mtx);
 	}
-	mtx_unlock(&ctx->mtx);
-	mtx_unlock(&kqring_zc_mtx);
 
 	rem = send_len;
 	for (u_int i = 0, k = 0; i < iovcnt && rem > 0; i++) {
@@ -769,7 +788,7 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 		if (seg_rem == 0)
 			continue;
 		seg_zb = fixed ? zbuf :
-		    (nzbufs == 1 ? zc->zbuf : zc->zbufs[k]);
+		    (nzbufs == 1 ? pz->zbuf : pz->zbufs[k]);
 		k++;
 		cur = (vm_offset_t)iov[i].iov_base;
 		while (seg_rem > 0) {
@@ -831,6 +850,8 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 
 	/* The chain is private until pr_send(), so reserve its references once. */
 	refcount_acquiren(&zc->refs, nmbufs);
+	if (retry)
+		kqring_zc_notif_merge(zc, &pin);
 	pr_flags = (flags & MSG_MORETOCOME) != 0 ? PRUS_MORETOCOME : 0;
 	CURVNET_SET(so->so_vnet);
 	error = so->so_proto->pr_send(so, pr_flags, top, NULL, NULL, td);
@@ -838,13 +859,31 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 	SOCK_IO_SEND_UNLOCK(so);
 
 	if (error != 0) {
-		kqring_zc_abort(zc);
+		/*
+		 * pr_send() freed the chain.  A retry's notification stays
+		 * with the request, for what earlier attempts sent.
+		 */
+		if (!retry)
+			kqring_zc_abort(zc);
 		return (error);
 	}
 	td->td_ru.ru_msgsnd++;
 	op->zc_notif = zc;
 	*np = send_len;
 	return (0);
+}
+
+/* Advance an iovec array past n bytes, in place, leaving spent ones empty. */
+static void
+kqring_iov_consume(struct iovec *iov, u_int cnt, size_t n)
+{
+	for (u_int i = 0; i < cnt && n > 0; i++) {
+		size_t c = MIN(iov[i].iov_len, n);
+
+		iov[i].iov_base = (char *)iov[i].iov_base + c;
+		iov[i].iov_len -= c;
+		n -= c;
+	}
 }
 
 /* Drop the first `done` bytes of an iovec array (in place). */
@@ -953,7 +992,7 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 	    kqring_so_stream(so);
 	flags &= ~MSG_WAITALL;
 	if (sqe->opcode == IORING_OP_SEND_ZC &&
-	    to == NULL && !waitall &&
+	    to == NULL &&
 	    (sqe->msg_flags & (MSG_OOB | MSG_EOR | MSG_EOF |
 	    MSG_DONTROUTE)) == 0 &&
 	    want >= (ssize_t)KQRING_ZC_MIN_LEN) {
@@ -964,12 +1003,22 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 				kqring_put_sock(op, fp, rc);
 				return (rc);
 			}
+			want += op->done_io;
+			if (waitall &&
+			    kqring_waitall(op, n, (size_t)want, &n) == EAGAIN) {
+				kqring_put_sock(op, fp, EAGAIN);
+				return (EAGAIN);
+			}
+			kqring_sock_short(op, n, (size_t)want, false);
 			kqring_put_sock(op, fp, 0);
 			return (kqring_done(op, kqring_xfer_res(n), 0));
 		}
 	}
 	error = sosend(so, to, &auio, NULL, NULL, flags, td);
 	n = (size_t)(want - auio.uio_resid);
+	/* The notification says so if any part of a SEND_ZC was copied. */
+	if (sqe->opcode == IORING_OP_SEND_ZC && n > 0)
+		op->zc_copied = true;
 
 	/*
 	 * A bundle on a stream socket sends its whole batch, as io_uring
@@ -1398,7 +1447,7 @@ kqring_exec_sendmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 	flags = ((int)sqe->msg_flags & ~MSG_WAITALL) | MSG_DONTWAIT |
 	    MSG_NOSIGNAL;
 	if (sqe->opcode == IORING_OP_SENDMSG_ZC &&
-	    msg.msg_name == NULL && msg.msg_controllen == 0 && !waitall &&
+	    msg.msg_name == NULL && msg.msg_controllen == 0 &&
 	    (sqe->msg_flags & (MSG_OOB | MSG_EOR | MSG_EOF |
 	    MSG_DONTROUTE)) == 0 &&
 	    want >= KQRING_ZC_MIN_LEN) {
@@ -1413,6 +1462,19 @@ kqring_exec_sendmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 				kqring_put_sock(op, fp, rc);
 				return (rc);
 			}
+			/*
+			 * The zero-copy path leaves the iovecs as they were;
+			 * the next attempt starts after what went, as
+			 * kqring_sendit()'s uiomove() leaves them.
+			 */
+			kqring_iov_consume(msg.msg_iov, (u_int)msg.msg_iovlen,
+			    n);
+			want += op->done_io;
+			if (waitall && kqring_waitall(op, n, want, &n) == EAGAIN) {
+				kqring_put_sock(op, fp, EAGAIN);
+				return (EAGAIN);
+			}
+			kqring_sock_short(op, n, want, false);
 			kqring_put_sock(op, fp, 0);
 			return (kqring_done(op, kqring_xfer_res(n), 0));
 		}
@@ -1425,6 +1487,8 @@ kqring_exec_sendmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 		    msg.msg_controllen);
 	}
 	error = kqring_sendit(td, so, &msg, flags, control, &n);
+	if (sqe->opcode == IORING_OP_SENDMSG_ZC && n > 0)
+		op->zc_copied = true;
 
 	if ((rc = kqring_xfer_end(op, error, n)) >= 0) {
 		kqring_put_sock(op, fp, rc);

@@ -2068,11 +2068,18 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 	if (op->zc_notif != NULL) {
 		struct kqring_zc_notif *zcn = op->zc_notif;
 
+		/*
+		 * The CQE above announced the notification (F_MORE), so it
+		 * comes, whatever the result.  It reports a copy if any part
+		 * of a MSG_WAITALL send was copied, as io_uring's does.  The
+		 * request's reference keeps zcn->rcqe until the release.
+		 */
 		op->zc_notif = NULL;
-		if (res < 0)
-			kqring_zc_abort(zcn);
-		else
-			kqring_zc_rele(zcn, true);
+		if (op->zc_copied && zcn->rcqe != NULL &&
+		    (op->sqe.ioprio & IORING_SEND_ZC_REPORT_USAGE) != 0)
+			zcn->rcqe->cqe.res =
+			    (int32_t)IORING_NOTIF_USAGE_ZC_COPIED;
+		kqring_zc_rele(zcn, true);
 	} else if (zc) {
 		kqring_post_cqe(ctx, op->sqe.user_data,
 		    (op->sqe.ioprio & IORING_SEND_ZC_REPORT_USAGE) != 0 ?

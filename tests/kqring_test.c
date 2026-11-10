@@ -3055,6 +3055,156 @@ test_send_zc_spans(void)
 	close(r.fd);
 }
 
+/*
+ * Read n bytes from a non-blocking socket into buf.  The ring is
+ * DEFER_TASKRUN, so a send waiting for room goes on only when its owner
+ * enters: enter between reads, as a program would.
+ */
+static void
+zc_read_all(struct test_ring *r, int fd, char *buf, size_t n)
+{
+	size_t got = 0;
+	int idle = 0;
+
+	while (got < n) {
+		struct pollfd pfd = { .fd = fd, .events = POLLIN };
+		ssize_t k;
+
+		if (poll(&pfd, 1, 20) != 1) {
+			assert(++idle < 250);	/* 5 s without data */
+			assert(kqring_enter(r->fd, 0, 0, IORING_ENTER_GETEVENTS,
+			    NULL, 0) == 0);
+			continue;
+		}
+		idle = 0;
+		k = read(fd, buf + got, n - got);
+		assert(k > 0 || (k < 0 && errno == EAGAIN));
+		if (k > 0)
+			got += (size_t)k;
+	}
+}
+
+/*
+ * SEND_ZC and SENDMSG_ZC with MSG_WAITALL on a stream socket send the whole
+ * buffer, zero-copy, across as many attempts as the socket needs, with one
+ * CQE and one notification, as in io_uring.  They used to copy everything.
+ * A cancel while one is part-sent still gets its notification: the CQE has
+ * IORING_CQE_F_MORE whatever its result.
+ */
+static void
+test_send_zc_waitall(struct test_ring *r)
+{
+	size_t page = (size_t)sysconf(_SC_PAGESIZE), len = 12 * page;
+	int small = (int)(4 * page), lfd, cfd, afd;
+	char *src, *dst = malloc(len);
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	uint16_t port;
+
+	assert(dst != NULL);
+	src = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
+	    -1, 0);
+	assert(src != MAP_FAILED);
+	for (size_t i = 0; i < len; i++)
+		src[i] = (char)(i % 251);
+
+	/* Room for less than the send: no autotuning, small buffers. */
+	lfd = tcp_listener(&port);
+	cfd = tcp_connect(port);
+	wait_readable(lfd);
+	afd = accept(lfd, NULL, NULL);
+	assert(afd >= 0);
+	assert(fcntl(afd, F_SETFL, O_NONBLOCK) == 0);
+	assert(setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &small,
+	    sizeof(small)) == 0);
+	assert(setsockopt(afd, SOL_SOCKET, SO_RCVBUF, &small,
+	    sizeof(small)) == 0);
+
+	for (int v = 0; v < 2; v++) {
+		struct iovec iov[3] = {
+			{ .iov_base = src, .iov_len = 4 * page },
+			{ .iov_base = src + 4 * page, .iov_len = 4 * page },
+			{ .iov_base = src + 8 * page, .iov_len = 4 * page },
+		};
+		struct msghdr msg = { .msg_iov = iov, .msg_iovlen = 3 };
+		uint64_t ud = 30600 + (uint64_t)v;
+
+		if (v == 0) {
+			sqe = ring_prep(r, IORING_OP_SEND_ZC, cfd, ud);
+			sqe->addr = (uint64_t)(uintptr_t)src;
+			sqe->len = (uint32_t)len;
+		} else {
+			sqe = ring_prep(r, IORING_OP_SENDMSG_ZC, cfd, ud);
+			sqe->addr = (uint64_t)(uintptr_t)&msg;
+			sqe->len = 1;
+		}
+		sqe->msg_flags = MSG_WAITALL;
+		sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
+		ring_push_sqe(r);
+		ring_submit(r);
+		/* The connection holds only part of it: the rest waits. */
+		assert(ring_cq_ready(r) == 0);
+		memset(dst, 0, len);
+		zc_read_all(r, afd, dst, len);
+		assert(memcmp(src, dst, len) == 0);
+		assert(ring_wait(r, 1, 2000) == 0);
+		c = ring_pop_cqe(r);
+		assert(c.user_data == ud && c.res == (int32_t)len);
+		assert((c.flags & IORING_CQE_F_MORE) != 0);
+		if (ring_cq_ready(r) == 0)
+			assert(ring_wait(r, 1, 2000) == 0);
+		c = ring_pop_cqe(r);
+		assert(c.user_data == ud && c.flags == IORING_CQE_F_NOTIF);
+		/* A short tail below a page goes by copy, and says so. */
+		assert(c.res == 0 ||
+		    c.res == (int32_t)IORING_NOTIF_USAGE_ZC_COPIED);
+		printf("  %s, MSG_WAITALL: %s\n", v == 0 ? "SEND_ZC" :
+		    "SENDMSG_ZC", c.res == 0 ? "zero-copy" : "partly copied");
+		assert(ring_cq_ready(r) == 0);
+	}
+
+	/* Cancelled part-way: its CQE, then the notification. */
+	sqe = ring_prep(r, IORING_OP_SEND_ZC, cfd, 30610);
+	sqe->addr = (uint64_t)(uintptr_t)src;
+	sqe->len = (uint32_t)len;
+	sqe->msg_flags = MSG_WAITALL;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 0);
+	sqe = ring_prep(r, IORING_OP_ASYNC_CANCEL, -1, 30611);
+	sqe->addr = 30610;
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_cq_ready(r) == 2);
+	c = ring_pop_cqe(r);
+	assert(c.user_data == 30610);
+	assert(c.res == -ECANCELED || (c.res > 0 && c.res < (int32_t)len));
+	assert((c.flags & IORING_CQE_F_MORE) != 0);
+	c = ring_pop_cqe(r);
+	assert(c.user_data == 30611 && c.res == 0);
+	/* Drain what went; the pages are released once it's acknowledged. */
+	for (;;) {
+		struct pollfd pfd = { .fd = afd, .events = POLLIN };
+
+		if (poll(&pfd, 1, 200) != 1)
+			break;
+		if (read(afd, dst, len) <= 0)
+			break;
+	}
+	assert(ring_wait(r, 1, 2000) == 0);
+	c = ring_pop_cqe(r);
+	assert(c.user_data == 30610 && c.flags == IORING_CQE_F_NOTIF);
+	assert(ring_cq_ready(r) == 0);
+
+	close(afd);
+	close(cfd);
+	close(lfd);
+	munmap(src, len);
+	free(dst);
+	printf("[PASS] SEND_ZC/SENDMSG_ZC with MSG_WAITALL: whole, one "
+	    "notification, also when cancelled part-way\n");
+}
+
 static void
 test_send_zc(struct test_ring *r)
 {
@@ -13938,6 +14088,7 @@ main(int argc, char **argv)
 		test_recvmsg_multishot(&r);
 		test_waitall(&r);
 		test_send_zc(&r);
+		test_send_zc_waitall(&r);
 		test_socket_ops(&r);
 		test_accept_multishot(&r);
 		test_path_ops(&r);

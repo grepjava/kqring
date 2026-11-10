@@ -411,6 +411,7 @@ struct kqring_op {
 	size_t			args_len;
 	size_t			done_io;	/* MSG_WAITALL: bytes so far */
 	bool			short_io;	/* moved less than was asked */
+	bool			zc_copied;	/* SEND_ZC: some bytes copied */
 	bool			requeue;	/* multishot: yield to other work */
 	bool			sock_rw;	/* READ/WRITE(V) on a socket */
 	bool			connecting;	/* CONNECT: soconnect() issued */
@@ -1927,6 +1928,8 @@ int	kqring_zc_buf_alloc(struct thread *td, vm_offset_t start, size_t len,
 	    vm_prot_t prot, size_t discount_pages, struct kqring_zc_buf **zbp);
 void	kqring_zc_buf_rele(struct kqring_zc_buf *zb);
 void	kqring_zc_notif_free_bufs(struct kqring_zc_notif *zc);
+void	kqring_zc_notif_merge(struct kqring_zc_notif *zc,
+	    struct kqring_zc_notif *from);
 int	kqring_zc_refresh_cow(struct kqring_ctx *ctx, struct kqring_rsrc *r,
 	    struct thread *td);
 void	kqring_zc_rele(struct kqring_zc_notif *zc, bool in_issuer);

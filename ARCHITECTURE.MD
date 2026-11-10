@@ -416,6 +416,8 @@ Pipes, FIFOs, eventfds, ttys, kqueues, ring descriptors and devices with a `d_kq
 
 `kqring` implements true zero-copy transmit for connected `AF_UNIX` and `AF_INET`/`AF_INET6` TCP stream sockets on transfers of at least `PAGE_SIZE` (4 KiB; on `AF_UNIX`, an unregistered buffer must reach `kern.kqring.zc_local_min_len`, 32 KiB by default, below which copying is cheaper than pinning per send), supporting both **Phase A** (`IORING_RECVSEND_FIXED_BUF` registered buffers) and **Phase B** (unregistered user buffers and multi-segment scatter/gather `SENDMSG_ZC`).
 
+A send sends what the socket has room for. With `MSG_WAITALL` on a stream socket, a short one waits for room and goes on from where it stopped, zero-copy again, as io_uring retries it. The request keeps its one `kqring_zc_notif` across the attempts: each attempt pins its range into a temporary holder, hands those buffers to the notification (`kqring_zc_notif_merge()`), and adds its mbufs' references, so the single `IORING_CQE_F_NOTIF` comes once every attempt's pages are released. A remainder below a page, or one that can't be pinned, is copied, and the notification then reports `IORING_NOTIF_USAGE_ZC_COPIED` if `IORING_SEND_ZC_REPORT_USAGE` asked, as io_uring's does when any part was copied. Since the CQE always carries `IORING_CQE_F_MORE`, the notification is posted whatever the result, a cancel included.
+
 ```mermaid
 sequenceDiagram
     box rgba(0,114,178,0.2) Program

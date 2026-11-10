@@ -174,6 +174,41 @@ kqring_zc_notif_free_bufs(struct kqring_zc_notif *zc)
 	}
 }
 
+/*
+ * Move the buffers `from` holds to `zc`, which keeps them until its last
+ * reference: a MSG_WAITALL send that goes on zero-copy pins more for each
+ * attempt, and its one notification covers them all.  The caller holds a
+ * reference to zc, so nothing frees its buffers meanwhile.
+ */
+void
+kqring_zc_notif_merge(struct kqring_zc_notif *zc, struct kqring_zc_notif *from)
+{
+	struct kqring_zc_buf **v;
+	u_int k = 0, n;
+
+	n = (zc->zbuf != NULL) + zc->nzbufs + (from->zbuf != NULL) +
+	    from->nzbufs;
+	if (from->zbuf == NULL && from->nzbufs == 0)
+		return;
+	v = malloc(n * sizeof(*v), M_KQRING, M_WAITOK | M_ZERO);
+	if (zc->zbuf != NULL)
+		v[k++] = zc->zbuf;
+	for (u_int i = 0; i < zc->nzbufs; i++)
+		v[k++] = zc->zbufs[i];
+	if (from->zbuf != NULL)
+		v[k++] = from->zbuf;
+	for (u_int i = 0; i < from->nzbufs; i++)
+		v[k++] = from->zbufs[i];
+	free(zc->zbufs, M_KQRING);
+	free(from->zbufs, M_KQRING);
+	zc->zbuf = NULL;
+	zc->zbufs = v;
+	zc->nzbufs = k;
+	from->zbuf = NULL;
+	from->zbufs = NULL;
+	from->nzbufs = 0;
+}
+
 int
 kqring_zc_refresh_cow(struct kqring_ctx *ctx, struct kqring_rsrc *r,
     struct thread *td)

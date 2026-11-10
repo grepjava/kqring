@@ -76,8 +76,8 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_OP_GETXATTR` | Partial | As `FSETXATTR`. | `kqring_exec_getxattr` | `test_xattr`, `liburing/xattr`, `fuzz` |
 | `IORING_OP_SOCKET` | Equivalent | | `kqring_exec_socket` | `test_socket_ops`, `test_direct_descriptors`, `liburing/socket`, `fuzz` |
 | `IORING_OP_URING_CMD` | Partial | Sockets only: `SIOCINQ`, `SIOCOUTQ`, `GETSOCKOPT`, `SETSOCKOPT`. Anything else gives `-EOPNOTSUPP`. | `kqring_exec_uring_cmd` | `test_uring_cmd`, `liburing/socket-getsetsock-cmd` |
-| `IORING_OP_SEND_ZC` | Partial | Zero-copy on connected stream sockets for at least a page, otherwise copied with the notification posted at once. | `kqring_exec_send` | `test_send_zc`, `test_send_zc_spans`, `liburing/send-zerocopy`, `fuzz` |
-| `IORING_OP_SENDMSG_ZC` | Partial | As `SEND_ZC`. | `kqring_exec_sendmsg` | `test_send_zc`, `liburing/send-zerocopy`, `liburing/sendzc-bug` |
+| `IORING_OP_SEND_ZC` | Partial | Zero-copy on connected stream sockets for at least a page, otherwise copied with the notification posted at once. With `MSG_WAITALL`, a short send goes on zero-copy until the whole buffer is sent, with one notification. | `kqring_exec_send` | `test_send_zc`, `test_send_zc_spans`, `test_send_zc_waitall`, `liburing/send-zerocopy`, `fuzz` |
+| `IORING_OP_SENDMSG_ZC` | Partial | As `SEND_ZC`. | `kqring_exec_sendmsg` | `test_send_zc`, `test_send_zc_waitall`, `liburing/send-zerocopy`, `liburing/sendzc-bug` |
 | `IORING_OP_READ_MULTISHOT` | Equivalent | On a file that can't be polled gives `-EBADF`, where Linux gives `EBADFD`, which FreeBSD lacks. | `kqring_exec_read_multishot` | `test_read_multishot`, `test_pipe_multishot_drained`, `liburing/read-mshot`, `fuzz` |
 | `IORING_OP_WAITID` | Different | Cancelling gives 0, where Linux gives 1; a link timeout gives `-ETIME`. | `kqring_exec_waitid` | `test_waitid`, `liburing/waitid` |
 | `IORING_OP_FUTEX_WAIT` | Different | Also ends when the word changes with no `FUTEX_WAKE`. Cancelling gives 0, where Linux gives 1. | `kqring_futex_arm` | `test_futex_wait`, `liburing/futex`, `fuzz` |
