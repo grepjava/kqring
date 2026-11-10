@@ -22,7 +22,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 
 FreeBSD-native extensions add persistent event-driven chains, result and buffer forwarding between steps, native kevent requests and a kqueue bridge. These stay an opt-in interface alongside the Linux-compatible API.
 
-The liburing 2.15 port passes 211 of the 245 tests it builds, with `RLIMIT_MEMLOCK` raised. That isn't a compatibility percentage:
+The liburing 2.15 port passes 218 of the 245 tests it builds, with `RLIMIT_MEMLOCK` raised. That isn't a compatibility percentage:
 
 - 13 more tests can't be built here, each for a recorded reason.
 - The port carries portability shims and adapts some tests, 27 tests skip, and the 7 failures are intentional differences or the platform's.
@@ -134,7 +134,8 @@ Evaluate mixed-size SQEs and CQEs, hybrid IOPOLL, SQ rewind, `NOP128`, `URING_CM
 - **liburing:** 2.15 is still the newest release (2.16 isn't tagged; checked 2026-11-10), and the port is on it.
 - **Header audit:** against Linux's UAPI header at `21662435a5ee` (2026-11-04), the only capability added since the 7.3 baseline is `IORING_FEAT_REGBUF_TYPES`, for dma-buf registered buffers, which has no FreeBSD counterpart.
 - **PostgreSQL 18.6:** **Done.** [`postgresql/`](postgresql/) builds it unpatched and runs it with `io_method=io_uring`. It needed rings that move between processes, which kqring now supports ([docs/cross-process-rings.md](docs/cross-process-rings.md)); before that, every backend PANICked on its first submission with `EEXIST`. All 231 regression tests pass, and pgbench runs level with PostgreSQL's own `worker` and `sync` methods. The same change makes liburing's `across-fork` pass.
-- **Newer interfaces, by what liburing's tests need:** mixed-size SQEs and CQEs with `NOP128`, `URING_CMD128` and `CQE_F_SKIP` (7 tests skip without them), then `IORING_REGISTER_QUERY` (2). BPF filters, task restrictions and `SQ_REWIND` are used only by BPF tests. Hybrid IOPOLL doesn't apply, since kqring has no `IOPOLL` on `O_DIRECT` files.
+- **Mixed-size SQEs and CQEs:** **Done.** `IORING_SETUP_CQE_MIXED`, `IORING_SETUP_SQE_MIXED` and `IORING_SETUP_SQ_REWIND`, with `NOP128`, `URING_CMD128`, `IORING_NOP_CQE32` and `IORING_CQE_F_SKIP`, as in Linux; `test_mixed_sizes` covers the wrap, overflow and resize cases. The 7 liburing tests that skipped without them pass, and liburing is at 218 of 245.
+- **Next, by what liburing's tests need:** `IORING_REGISTER_QUERY` (2 tests). BPF filters and task restrictions are used only by BPF tests. Hybrid IOPOLL doesn't apply, since kqring has no `IOPOLL` on `O_DIRECT` files.
 
 Acceptance: reproducible build and run instructions, and a result per program showing the patches it needs, the configurations supported and what still blocks it. New API additions need semantic tests, not just matching constants.
 
