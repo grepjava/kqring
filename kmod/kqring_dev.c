@@ -659,15 +659,16 @@ kqring_teardown_sq_lock(struct kqring_ctx *ctx)
 }
 
 /*
- * The first part of teardown: mark the ring closing, wait for its kthreads
- * and take sq_sx.  With nowait (kqring_teardown_tq) it does not wait but
+ * The first part of teardown: mark the ring closing (or, with release, its
+ * owner gone: see kqring_ctx_release()), wait for its kthreads and take
+ * sq_sx.  With nowait (kqring_teardown_tq) it does not wait but
  * returns EWOULDBLOCK.  Returns with sq_sx and ctx->mtx held and the ring
  * marked cancelling by curthread (0), or EINTR (defer), or EALREADY:
  * another thread is cancelling it (waited for, unless nowait or that is
  * curthread).
  */
 static int
-kqring_ctx_cancel_begin(struct kqring_ctx *ctx, bool nowait)
+kqring_ctx_cancel_begin(struct kqring_ctx *ctx, bool nowait, bool release)
 {
 	int error;
 
@@ -679,7 +680,13 @@ kqring_ctx_cancel_begin(struct kqring_ctx *ctx, bool nowait)
 	 * this ring), defer teardown to the end of kqring_sqpoll_thread().
 	 */
 	mtx_lock(&ctx->mtx);
-	ctx->closing = true;
+	if (release) {
+		/* The kthreads exit as for closing; the ring stays open. */
+		ctx->release = true;
+		ctx->detaching = true;
+	} else {
+		ctx->closing = true;
+	}
 	if (ctx->sleeping)
 		wakeup(&ctx->wakeup_chan);
 	if (ctx->pollers) {
@@ -734,9 +741,13 @@ static void
 kqring_ctx_cancel_task(void *arg, int pending __unused)
 {
 	struct kqring_ctx *ctx = arg;
+	bool release;
 	int error;
 
-	error = kqring_ctx_cancel_begin(ctx, true);
+	mtx_lock(&ctx->mtx);
+	release = ctx->release && !ctx->closing;
+	mtx_unlock(&ctx->mtx);
+	error = kqring_ctx_cancel_begin(ctx, true, release);
 	if (error == EWOULDBLOCK) {
 		/* A kthread is still parked for the stop: look again soon. */
 		pause("kqtdwt", hz / 50 + 1);
@@ -749,12 +760,23 @@ kqring_ctx_cancel_task(void *arg, int pending __unused)
 	kqring_worker_rele();
 }
 
-void
-kqring_ctx_cancel_all(struct kqring_ctx *ctx)
+/*
+ * Whether a ring whose owner exits stays open for another process that
+ * holds it (kqring_ctx_release()): one another process could take over.
+ */
+static bool
+kqring_ctx_releasable(const struct kqring_ctx *ctx)
+{
+	return (ctx->shared && (ctx->flags & IORING_SETUP_SQPOLL) == 0 &&
+	    ctx->setup_done);
+}
+
+static void
+kqring_ctx_cancel_all_mode(struct kqring_ctx *ctx, bool release)
 {
 	bool defer;
 
-	switch (kqring_ctx_cancel_begin(ctx, false)) {
+	switch (kqring_ctx_cancel_begin(ctx, false, release)) {
 	case 0:
 		kqring_ctx_cancel_locked(ctx);
 		return;
@@ -774,6 +796,154 @@ kqring_ctx_cancel_all(struct kqring_ctx *ctx)
 	}
 }
 
+void
+kqring_ctx_cancel_all(struct kqring_ctx *ctx)
+{
+	kqring_ctx_cancel_all_mode(ctx, false);
+}
+
+/*
+ * The owner process is exiting (docs/cross-process-rings.md): cancel its
+ * requests, stop its kthreads and drop its fixed files and buffers, as
+ * close does, but leave the ring open and unowned for another process that
+ * holds it, which takes it over (kqring_ctx_takeover()).  A close that
+ * comes meanwhile finishes the teardown as a close.
+ */
+void
+kqring_ctx_release(struct kqring_ctx *ctx)
+{
+	kqring_ctx_cancel_all_mode(ctx, true);
+}
+
+/*
+ * Whether ctx can move to another process now (docs/cross-process-rings.md):
+ * nothing in flight, and nothing that holds the owner's addresses,
+ * credentials or kqueue.  Queued and overflowed CQEs are only records and
+ * go with the ring.  Under ctx->mtx, with sq_sx, which every submitter of
+ * a ring without SINGLE_ISSUER takes, so the answer holds until it drops.
+ */
+static bool
+kqring_ctx_movable_locked(struct kqring_ctx *ctx)
+{
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	sx_assert(&ctx->sq_sx, SA_XLOCKED);
+	if (!kqring_ctx_releasable(ctx) || ctx->closing || ctx->cancelling ||
+	    ctx->detaching || ctx->handover_td != NULL)
+		return (false);
+	if (ctx->nreqs != 0 || !TAILQ_EMPTY(&ctx->active_ops) ||
+	    !TAILQ_EMPTY(&ctx->retired_ops) ||
+	    !TAILQ_EMPTY(&ctx->taskwork_ops) || ctx->nbio != 0 ||
+	    !TAILQ_EMPTY(&ctx->zc_pending))
+		return (false);
+	if (ctx->bufs != NULL || ctx->ncreds != 0 || ctx->nprovided != 0 ||
+	    ctx->ring_mem != 0 || ctx->npolled != 0 || ctx->kq_bridges != 0 ||
+	    ctx->ntriggers != 0)
+		return (false);
+	for (int i = 0; i < KQRING_BGROUP_HASH; i++) {
+		if (!LIST_EMPTY(&ctx->bgroups[i]))
+			return (false);
+	}
+	return (true);
+}
+
+/*
+ * A thread of td's process that isn't taking the ring over waits for the
+ * one that is (ctx->handover_td) before it submits or registers.
+ */
+int
+kqring_handover_wait(struct kqring_ctx *ctx, struct thread *td)
+{
+	int error = 0;
+
+	mtx_lock(&ctx->mtx);
+	while (ctx->handover_td != NULL && ctx->handover_td != td) {
+		error = msleep(&ctx->handover_td, &ctx->mtx, PCATCH, "kqhoff",
+		    0);
+		if (error != 0) {
+			error = EINTR;
+			break;
+		}
+	}
+	mtx_unlock(&ctx->mtx);
+	return (error);
+}
+
+/*
+ * td submits to or registers with a ring another process owns, or one whose
+ * owner exited: take the ring over if it can move (docs/cross-process-
+ * rings.md), or fail with EEXIST.  The old owner's kthreads exit, its
+ * worker pool is closed, and the ring gets a pool and, without
+ * DEFER_TASKRUN, a kqtask thread in td's process.  Its requests from then
+ * on run with td's process's descriptors, memory and credentials.
+ */
+int
+kqring_ctx_takeover(struct kqring_ctx *ctx, struct thread *td)
+{
+	struct kqring_wq *owq, *nwq;
+	int error = 0;
+
+	if (!kqring_ctx_releasable(ctx))
+		return (EEXIST);
+	nwq = kqring_wq_alloc(td);
+	if (sx_xlock_sig(&ctx->sq_sx) != 0) {
+		kqring_wq_put(nwq);
+		return (EINTR);
+	}
+	mtx_lock(&ctx->mtx);
+	if (kqring_is_owner(ctx, td)) {
+		/* Another thread of td's process took it meanwhile. */
+		mtx_unlock(&ctx->mtx);
+		sx_xunlock(&ctx->sq_sx);
+		kqring_wq_put(nwq);
+		return (kqring_handover_wait(ctx, td));
+	}
+	if (!kqring_ctx_movable_locked(ctx)) {
+		mtx_unlock(&ctx->mtx);
+		sx_xunlock(&ctx->sq_sx);
+		kqring_wq_put(nwq);
+		return (EEXIST);
+	}
+	/* From here the old owner's enters are another process's. */
+	kqring_set_owner(ctx, td);
+	ctx->handover_td = td;
+	ctx->detaching = true;
+	if (ctx->sleeping)
+		wakeup(&ctx->wakeup_chan);
+	mtx_unlock(&ctx->mtx);
+	/* The kqtask thread takes sq_sx to see detaching. */
+	sx_xunlock(&ctx->sq_sx);
+
+	mtx_lock(&ctx->mtx);
+	while (ctx->sqpoll_running) {
+		wakeup(&ctx->wakeup_chan);
+		(void)msleep(&ctx->sqpoll_running, &ctx->mtx, 0, "kqhosq",
+		    hz / 100 + 1);
+	}
+	/* Wakes the poller asleep in kevent, then reports if it still runs. */
+	while (kqring_kpoll_stop(ctx, true) != 0)
+		(void)msleep(&ctx->kp_running, &ctx->mtx, 0, "kqhokp",
+		    hz / 100 + 1);
+	owq = ctx->wq;
+	ctx->wq = nwq;
+	mtx_unlock(&ctx->mtx);
+	kqring_kpoll_close(ctx);
+	if (owq != NULL) {
+		kqring_wq_close(owq);
+		kqring_wq_rele(owq);
+	}
+
+	mtx_lock(&ctx->mtx);
+	ctx->detaching = false;
+	mtx_unlock(&ctx->mtx);
+	if (ctx->enabled && kqring_has_kthread(ctx))
+		error = kqring_sqpoll_start(ctx, td);
+	mtx_lock(&ctx->mtx);
+	ctx->handover_td = NULL;
+	wakeup(&ctx->handover_td);
+	mtx_unlock(&ctx->mtx);
+	return (error);
+}
+
 /*
  * The rest of teardown, entered from kqring_ctx_cancel_begin() with sq_sx
  * and ctx->mtx held; releases both.
@@ -784,6 +954,7 @@ kqring_ctx_cancel_locked(struct kqring_ctx *ctx)
 	struct kqring_op *op;
 	struct kqring_rcqe *rc;
 	struct kqring_wq *wq;
+	bool release;
 
 	mtx_assert(&ctx->mtx, MA_OWNED);
 	sx_assert(&ctx->sq_sx, SA_XLOCKED);
@@ -819,8 +990,14 @@ kqring_ctx_cancel_locked(struct kqring_ctx *ctx)
 		mtx_lock(&ctx->mtx);
 	}
 	wq = ctx->wq;
+	/* A released ring gets a new pool from the process taking it over. */
+	release = ctx->release;
+	if (release)
+		ctx->wq = NULL;
 	mtx_unlock(&ctx->mtx);
 	kqring_wq_close(wq);
+	if (release)
+		kqring_wq_rele(wq);
 	/* No poll is armed and the poller is gone: close the kqueue. */
 	kqring_kpoll_close(ctx);
 
@@ -864,8 +1041,16 @@ kqring_ctx_cancel_locked(struct kqring_ctx *ctx)
 	sx_xunlock(&ctx->sq_sx);
 
 	mtx_lock(&ctx->mtx);
-	ctx->cancelled = true;
 	ctx->cancel_td = NULL;
+	if (ctx->release && !ctx->closing) {
+		/* The owner is gone; the ring stays, for another to take. */
+		kqring_clear_owner(ctx);
+		ctx->cancelling = false;
+	} else {
+		ctx->cancelled = true;
+	}
+	ctx->release = false;
+	ctx->detaching = false;
 	wakeup(&ctx->cancelled);
 	mtx_unlock(&ctx->mtx);
 }
@@ -1206,6 +1391,9 @@ kqring_poll_fallback_locked(struct kqring_ctx *ctx)
 void
 kqring_run_checks(struct kqring_ctx *ctx)
 {
+	/* The owner's work, as kqring_run_taskwork(). */
+	if (__predict_false(ctx->owner_proc != curproc))
+		return;
 	/* Each is a no-op without its kind of request: skip the calls. */
 	if (ctx->nfutex != 0)
 		kqring_check_futexes(ctx);
@@ -1252,7 +1440,7 @@ kqring_enter_unlock(struct kqring_ctx *ctx, bool lock)
 }
 
 static int kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
-    bool has_timeout, sbintime_t sbt, bool lock);
+    bool has_timeout, sbintime_t sbt, bool lock, bool foreign);
 
 /*
  * The wait of an enter, with io_uring's min_wait_usec: wait up to min_sbt
@@ -1262,7 +1450,8 @@ static int kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
  */
 static int
 kqring_enter_wait(struct kqring_ctx *ctx, uint32_t min_complete,
-    bool has_timeout, sbintime_t sbt, sbintime_t min_sbt, bool lock)
+    bool has_timeout, sbintime_t sbt, sbintime_t min_sbt, bool lock,
+    bool foreign)
 {
 	bool sqpoll = (ctx->flags & IORING_SETUP_SQPOLL) != 0;
 	sbintime_t deadline;
@@ -1271,10 +1460,11 @@ kqring_enter_wait(struct kqring_ctx *ctx, uint32_t min_complete,
 	if (min_sbt == 0 || min_complete <= 1)
 		return (sqpoll ? kqring_sqpoll_wait_cqes(ctx, min_complete,
 		    has_timeout, sbt) : kqring_wait_cqes(ctx, min_complete,
-		    has_timeout, sbt, lock));
+		    has_timeout, sbt, lock, foreign));
 	deadline = has_timeout ? kqring_deadline(sbt) : 0;
 	error = sqpoll ? kqring_sqpoll_wait_cqes(ctx, min_complete, true,
-	    min_sbt) : kqring_wait_cqes(ctx, min_complete, true, min_sbt, lock);
+	    min_sbt) : kqring_wait_cqes(ctx, min_complete, true, min_sbt, lock,
+	    foreign);
 	if (error != ETIMEDOUT)
 		return (error);
 	if (has_timeout && sbt <= min_sbt)
@@ -1283,7 +1473,7 @@ kqring_enter_wait(struct kqring_ctx *ctx, uint32_t min_complete,
 	if (has_timeout && sbt == 0)
 		return (ETIMEDOUT);
 	return (sqpoll ? kqring_sqpoll_wait_cqes(ctx, 1, has_timeout, sbt) :
-	    kqring_wait_cqes(ctx, 1, has_timeout, sbt, lock));
+	    kqring_wait_cqes(ctx, 1, has_timeout, sbt, lock, foreign));
 }
 
 /*
@@ -1297,7 +1487,7 @@ kqring_enter_wait(struct kqring_ctx *ctx, uint32_t min_complete,
 static int
 kqring_enter_wait_sig(struct kqring_ctx *ctx, uint32_t min_complete,
     bool has_timeout, sbintime_t sbt, sbintime_t min_sbt, bool lock,
-    const void *usig, size_t sigsz, bool abs)
+    const void *usig, size_t sigsz, bool abs, bool foreign)
 {
 	struct kqring_shm_header *shm = ctx->shm;
 	struct thread *td = curthread;
@@ -1317,7 +1507,7 @@ kqring_enter_wait_sig(struct kqring_ctx *ctx, uint32_t min_complete,
 	    atomic_load_acq_32(&shm->cq_head) >= min_complete ||
 	    !KQRING_STQ_EMPTY_HINT(&ctx->ocq)) {
 		error = kqring_enter_wait(ctx, min_complete, has_timeout, sbt,
-		    min_sbt, lock);
+		    min_sbt, lock, foreign);
 	} else {
 		if (sigsz != sizeof(set))
 			return (EINVAL);
@@ -1329,7 +1519,7 @@ kqring_enter_wait_sig(struct kqring_ctx *ctx, uint32_t min_complete,
 			return (error);
 		td->td_pflags |= TDP_OLDMASK;
 		error = kqring_enter_wait(ctx, min_complete, has_timeout, sbt,
-		    min_sbt, lock);
+		    min_sbt, lock, foreign);
 		if (error == EINTR) {
 			ast_sched(td, TDA_SIGSUSPEND);
 		} else {
@@ -1394,7 +1584,7 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	bool sqpoll = (ctx->flags & IORING_SETUP_SQPOLL) != 0;
 	bool iopoll = (ctx->flags & IORING_SETUP_IOPOLL) != 0;
 	bool lock = kqring_enter_locks(ctx, td);
-	bool wait;
+	bool wait, foreign = false;
 	const void *usig = NULL;
 	size_t sigsz = 0;
 	int error = 0;
@@ -1416,25 +1606,45 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	wait = (ea->flags & IORING_ENTER_GETEVENTS) != 0 &&
 	    (ea->min_complete != 0 || iopoll);
 	/*
-	 * SINGLE_ISSUER: only the owner submits, or waits on a DEFER_TASKRUN
-	 * ring.  With SQPOLL the kthread is the issuer, so any thread or
-	 * process may wake it and wait, as in io_uring.  Anyone else's enter
-	 * is allowed, but the ring's state is the owner's, without locks:
-	 * it sees the CQ as it stands, and a wait the CQ can't satisfy yet
-	 * fails, as no one might run the completions it needs.
+	 * Only the owner submits (docs/cross-process-rings.md).  Another
+	 * thread of a SINGLE_ISSUER ring gets EEXIST; another process takes a
+	 * ring without SINGLE_ISSUER over when it can move, or gets EEXIST.
+	 * With SQPOLL the kthread is the issuer, so any thread or process may
+	 * wake it and wait, as in io_uring.  Another process may wait on a
+	 * ring without SINGLE_ISSUER (which therefore isn't DEFER_TASKRUN)
+	 * too (foreign), but runs none of the ring's work: the owner's kqtask
+	 * thread posts the completions.  Not on an IOPOLL ring, whose waits
+	 * do the polling.
 	 */
 	if (!sqpoll && !kqring_is_owner(ctx, td)) {
-		if (ea->to_submit > 0 ||
-		    ((ea->flags & IORING_ENTER_GETEVENTS) != 0 &&
-		    (ctx->flags & IORING_SETUP_DEFER_TASKRUN) != 0) ||
-		    (wait && (iopoll || atomic_load_acq_32(&shm->cq_tail) -
-		    atomic_load_acq_32(&shm->cq_head) < ea->min_complete)))
+		if (!ctx->shared) {
+			/*
+			 * SINGLE_ISSUER: another thread sees the CQ as it
+			 * stands, and a wait it can't satisfy yet fails.
+			 */
+			if (ea->to_submit > 0 ||
+			    ((ea->flags & IORING_ENTER_GETEVENTS) != 0 &&
+			    (ctx->flags & IORING_SETUP_DEFER_TASKRUN) != 0) ||
+			    (wait && (iopoll ||
+			    atomic_load_acq_32(&shm->cq_tail) -
+			    atomic_load_acq_32(&shm->cq_head) <
+			    ea->min_complete)))
+				return (EEXIST);
+			ea->SUBMITTED_out = 0;
+			return (0);
+		}
+		if (ea->to_submit > 0) {
+			if ((error = kqring_ctx_takeover(ctx, td)) != 0)
+				return (error);
+			lock = kqring_enter_locks(ctx, td);
+		} else if (wait && iopoll) {
 			return (EEXIST);
-		ea->SUBMITTED_out = 0;
-		return (0);
+		} else {
+			foreign = true;
+		}
 	}
 	/* Waiting for events is when kevent(2) would look at a kqueue. */
-	if ((ea->flags & IORING_ENTER_GETEVENTS) != 0)
+	if (!foreign && (ea->flags & IORING_ENTER_GETEVENTS) != 0)
 		kqring_kq_rescan(ctx);
 
 	/*
@@ -1488,6 +1698,15 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 		}
 	}
 
+	if (foreign) {
+		ea->SUBMITTED_out = 0;
+		if (!wait)
+			return (0);
+		return (kqring_enter_wait_sig(ctx, ea->min_complete,
+		    has_timeout, sbt, min_sbt, false, usig, sigsz,
+		    (ea->flags & IORING_ENTER_ABS_TIMER) != 0, true));
+	}
+
 	if (sqpoll) {
 		/* The kthread submits; report to_submit, as io_uring does. */
 		ea->SUBMITTED_out = ea->to_submit;
@@ -1529,7 +1748,7 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 			return (0);
 		return (kqring_enter_wait_sig(ctx, ea->min_complete,
 		    has_timeout, sbt, min_sbt, false, usig, sigsz,
-		    (ea->flags & IORING_ENTER_ABS_TIMER) != 0));
+		    (ea->flags & IORING_ENTER_ABS_TIMER) != 0, false));
 	}
 
 	/*
@@ -1544,11 +1763,26 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	 * 2. Drain and submit queued SQEs.  Nothing is done yet: a stop
 	 * restarts the call (ERESTART).
 	 */
+relock:
 	if ((error = kqring_enter_lock(ctx, lock)) != 0)
 		return (error);
 	if (ctx->closing) {
 		kqring_enter_unlock(ctx, lock);
 		return (EBADF);
+	}
+	/*
+	 * The ring may have moved to another process since the check above,
+	 * or be moving to this one in another thread: look again under
+	 * sq_sx, which a ring that can move is always entered with.
+	 */
+	if (__predict_false(ctx->handover_td != NULL ||
+	    !kqring_is_owner(ctx, td))) {
+		kqring_enter_unlock(ctx, lock);
+		if (!kqring_is_owner(ctx, td))
+			return (EEXIST);
+		if ((error = kqring_handover_wait(ctx, td)) != 0)
+			return (error);
+		goto relock;
 	}
 	if (ea->to_submit > 0) {
 		/* Cached file reads run here: kqring_wq_try_inline(). */
@@ -1597,7 +1831,7 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	 */
 	error = kqring_enter_wait_sig(ctx, ea->min_complete, has_timeout, sbt,
 	    min_sbt, lock, usig, sigsz,
-	    (ea->flags & IORING_ENTER_ABS_TIMER) != 0);
+	    (ea->flags & IORING_ENTER_ABS_TIMER) != 0, false);
 	kqring_evfd_flush(ctx);
 	if (error != 0 && submitted > 0)
 		error = 0;
@@ -1606,16 +1840,18 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 
 /*
  * Wait until the CQ holds min_complete entries (or overflowed), or until the
- * timeout expires or a signal arrives.
+ * timeout expires or a signal arrives.  A foreign wait, from a process
+ * other than the owner, only sleeps: the owner's work (taskwork, polls,
+ * timeouts) is left to its kqtask thread.
  */
 static int
 kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
-    bool has_timeout, sbintime_t sbt, bool lock)
+    bool has_timeout, sbintime_t sbt, bool lock, bool foreign)
 {
 	struct kqring_shm_header *shm = ctx->shm;
 	bool iopoll = (ctx->flags & IORING_SETUP_IOPOLL) != 0;
-	bool may_poll = true, deadline_set = false;
-	sbintime_t spin = ctx->busy_poll_sbt, deadline = 0;
+	bool may_poll = !foreign, deadline_set = false;
+	sbintime_t spin = foreign ? 0 : ctx->busy_poll_sbt, deadline = 0;
 	uint32_t timeouts = atomic_load_acq_32(&ctx->cq_timeouts);
 	int error;
 
@@ -1674,18 +1910,23 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		}
 
 		/* Tell an eventfd watcher about CQEs before sleeping. */
-		kqring_evfd_flush(ctx);
+		if (!foreign)
+			kqring_evfd_flush(ctx);
 		mtx_lock(&ctx->mtx);
+		if (foreign && ctx->closing) {
+			mtx_unlock(&ctx->mtx);
+			return (EBADF);
+		}
 		/* Poll at most once per sleep so EAGAIN can't spin us. */
 		if (ctx->npolled > 0 && may_poll) {
 			kqring_poll_fallback_locked(ctx);
 			may_poll = false;
 		}
-		if (!TAILQ_EMPTY(&ctx->retired_ops))
+		if (!foreign && !TAILQ_EMPTY(&ctx->retired_ops))
 			(void)kqring_wq_abort_retired_locked(ctx);
-		if (!TAILQ_EMPTY(&ctx->taskwork_ops) ||
+		if (!foreign && (!TAILQ_EMPTY(&ctx->taskwork_ops) ||
 		    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) ||
-		    atomic_load_acq_int(&ctx->kp_kick) != 0) {
+		    atomic_load_acq_int(&ctx->kp_kick) != 0)) {
 			mtx_unlock(&ctx->mtx);
 			goto drain;
 		}
@@ -1734,21 +1975,25 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		if (--ctx->cq_sleepers != 0)
 			ctx->cq_wait_nr = 1;
 		ctx->sleeping--;
-		may_poll = true;
+		may_poll = !foreign;
 		mtx_unlock(&ctx->mtx);
 
 		if (error == EINTR || error == ERESTART)
 			return (EINTR);
 		if (error == EWOULDBLOCK && has_timeout) {
 			if (kqring_until(deadline) == 0) {
-				if (kqring_enter_lock(ctx, lock) != 0)
+				if (foreign) {
+					/* Nothing of the owner's to run. */
+				} else if (kqring_enter_lock(ctx, lock) != 0) {
 					return (EINTR);
-				if (!ctx->closing) {
-					kqring_run_taskwork(ctx);
-					kqring_run_checks(ctx);
-					kqring_flush_overflow(ctx);
+				} else {
+					if (!ctx->closing) {
+						kqring_run_taskwork(ctx);
+						kqring_run_checks(ctx);
+						kqring_flush_overflow(ctx);
+					}
+					kqring_enter_unlock(ctx, lock);
 				}
-				kqring_enter_unlock(ctx, lock);
 				cq_count = atomic_load_acq_32(&shm->cq_tail) -
 				    atomic_load_acq_32(&shm->cq_head);
 				if (cq_count > 0 || !KQRING_STQ_EMPTY_HINT(&ctx->ocq))
@@ -1756,6 +2001,8 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 				return (ETIMEDOUT);
 			}
 		}
+		if (foreign)
+			continue;
 drain:
 		/* Events a knote woke us for (kqring_kp_filt_event()). */
 		kqring_kpoll_kicked(ctx);
@@ -1841,18 +2088,45 @@ kqring_proc_clear(struct proc *p)
 	free(pr, M_KQRING);
 }
 
+/*
+ * Process exit or exec.  Exec closes the rings the process owns, or whose
+ * workers run in it.  Exit closes them too, except that a ring it owns
+ * which another process could take over is only released.
+ */
 static void
-kqring_proc_rings_teardown(struct proc *p)
+kqring_proc_rings_teardown(struct proc *p, bool exiting)
 {
 	struct kqring_ctx *ctx;
+	bool release = false;
 
 	kqring_proc_clear(p);
 	for (;;) {
 		mtx_lock(&kqring_proc_mtx);
 		LIST_FOREACH(ctx, &kqring_ctx_list, proc_link) {
-			if ((ctx->owner_proc == p ||
-			    (ctx->wq != NULL && ctx->wq->proc == p)) &&
-			    !ctx->closing) {
+			/*
+			 * Changing process: kqring_ctx_takeover() moves it
+			 * off p's threads, or its release is under way.
+			 */
+			if (ctx->closing || ctx->detaching ||
+			    ctx->handover_td != NULL)
+				continue;
+			release = exiting && ctx->owner_proc == p &&
+			    kqring_ctx_releasable(ctx);
+			if (release) {
+				/*
+				 * Unowned at once, as a closed ring is: p may
+				 * be reused before a deferred release ends.
+				 * detaching keeps others from taking it.
+				 */
+				mtx_lock(&ctx->mtx);
+				ctx->detaching = true;
+				kqring_clear_owner(ctx);
+				mtx_unlock(&ctx->mtx);
+				refcount_acquire(&ctx->refs);
+				break;
+			}
+			if (ctx->owner_proc == p ||
+			    (ctx->wq != NULL && ctx->wq->proc == p)) {
 				ctx->in_ctx_list = false;
 				LIST_REMOVE(ctx, proc_link);
 				refcount_acquire(&ctx->refs);
@@ -1862,6 +2136,11 @@ kqring_proc_rings_teardown(struct proc *p)
 		mtx_unlock(&kqring_proc_mtx);
 		if (ctx == NULL)
 			break;
+		if (release) {
+			kqring_ctx_release(ctx);
+			kqring_ctx_rele(ctx);
+			continue;
+		}
 		mtx_lock(&ctx->mtx);
 		if (ctx->owner_proc == p)
 			kqring_clear_owner(ctx);
@@ -1874,14 +2153,14 @@ kqring_proc_rings_teardown(struct proc *p)
 static void
 kqring_proc_exit(void *arg __unused, struct proc *p)
 {
-	kqring_proc_rings_teardown(p);
+	kqring_proc_rings_teardown(p, true);
 }
 
 static void
 kqring_proc_exec(void *arg __unused, struct proc *p,
     struct image_params *imgp __unused)
 {
-	kqring_proc_rings_teardown(p);
+	kqring_proc_rings_teardown(p, false);
 }
 
 static void

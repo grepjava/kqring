@@ -526,6 +526,239 @@ test_single_issuer(struct test_ring *r)
  * it stands.  Linux would wait; here the owner's state can't be run from
  * another thread, so a wait the CQ can't satisfy fails rather than hang.
  */
+/*
+ * Rings used by more than one process (docs/cross-process-rings.md), as
+ * PostgreSQL uses them: a ring set up without SINGLE_ISSUER moves to a
+ * process that submits to it while it is idle, another process may wait on
+ * it, and its owner's exit leaves it to the others.
+ */
+
+/* A ring as io_uring_queue_init(n, &ring, 0) makes it. */
+static void
+xp_ring(struct test_ring *r)
+{
+	struct io_uring_params p;
+
+	memset(&p, 0, sizeof(p));
+	memset(r, 0, sizeof(*r));
+	r->fd = (int)kqring_setup(SQ_ENTRIES, &p);
+	assert(r->fd >= 0);
+	ring_map(r, &p);
+}
+
+/* Take up the SQ tail where another process left it. */
+static void
+xp_resync(struct test_ring *r)
+{
+	r->sq_tail = atomic_load_explicit(r->sq_ktail, memory_order_acquire);
+}
+
+static int
+xp_child_status(pid_t pid)
+{
+	int status;
+
+	assert(waitpid(pid, &status, 0) == pid);
+	return (WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
+}
+
+/* A temporary file holding text, open for reading and writing. */
+static int
+xp_file(const char *text)
+{
+	char path[] = "/tmp/kqring_xp.XXXXXX";
+	int fd = mkstemp(path);
+
+	assert(fd >= 0);
+	unlink(path);
+	assert(write(fd, text, strlen(text)) == (ssize_t)strlen(text));
+	return (fd);
+}
+
+static void
+xp_prep_read(struct test_ring *r, int fd, void *buf, unsigned len,
+    uint64_t ud)
+{
+	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_READ, fd, ud);
+
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = len;
+	sqe->off = 0;
+	ring_push_sqe(r);
+}
+
+/*
+ * Submit a NOP and report the enter's errno (0 if it went in).  A refused
+ * NOP is taken back off the shared SQ, so the next submitter doesn't issue
+ * it.
+ */
+static int
+xp_child_nop(struct test_ring *r)
+{
+	unsigned tail;
+	int error;
+
+	xp_resync(r);
+	tail = r->sq_tail;
+	(void)ring_prep(r, IORING_OP_NOP, -1, 91900);
+	ring_push_sqe(r);
+	if (kqring_enter(r->fd, 1, 0, 0, NULL, 0) == 1)
+		return (0);
+	error = errno;
+	r->sq_tail = tail;
+	atomic_store_explicit(r->sq_ktail, tail, memory_order_release);
+	return (error);
+}
+
+static void
+test_cross_process_rings(void)
+{
+	struct test_ring t;
+	char pbuf[16], late[4];
+	int pfd, pp[2], qp[2];
+	pid_t pid;
+
+	xp_ring(&t);
+	pfd = xp_file("parent-data");
+	assert(pipe(pp) == 0 && pipe(qp) == 0);
+
+	/*
+	 * 1. A child takes the idle ring over: its read uses its own
+	 * descriptor and lands in its own memory.  The parent then takes it
+	 * back.
+	 */
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		char cbuf[16];
+		int cfd = xp_file("child-data");
+
+		xp_resync(&t);
+		memset(cbuf, 0, sizeof(cbuf));
+		xp_prep_read(&t, cfd, cbuf, sizeof(cbuf), 91001);
+		if (ring_wait(&t, 1, 5000) != 0 || ring_cq_ready(&t) != 1)
+			_exit(1);
+		struct io_uring_cqe c = ring_pop_cqe(&t);
+		_exit(c.user_data == 91001 && c.res == 10 &&
+		    memcmp(cbuf, "child-data", 10) == 0 ? 0 : 2);
+	}
+	assert(xp_child_status(pid) == 0);
+	assert(ring_cq_ready(&t) == 0);
+	xp_resync(&t);
+	memset(pbuf, 0, sizeof(pbuf));
+	xp_prep_read(&t, pfd, pbuf, sizeof(pbuf), 91002);
+	assert(ring_wait(&t, 1, 5000) == 0);
+	expect_cqe(&t, 91002, 11);
+	assert(memcmp(pbuf, "parent-data", 11) == 0);
+
+	/*
+	 * 2. Another process waits on the ring and wakes on the owner's
+	 * completion, posted while the owner is elsewhere.  With nothing to
+	 * come, its wait times out.
+	 */
+	xp_prep_read(&t, pp[0], pbuf, 4, 91003);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 0);
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		if (ring_wait(&t, 1, 5000) != 0 || ring_cq_ready(&t) != 1)
+			_exit(1);
+		struct io_uring_cqe c = ring_pop_cqe(&t);
+		if (c.user_data != 91003 || c.res != 4)
+			_exit(2);
+		_exit(ring_wait(&t, 1, 50) == ETIMEDOUT ? 0 : 3);
+	}
+	usleep(100000);
+	assert(write(pp[1], "wake", 4) == 4);
+	assert(xp_child_status(pid) == 0);
+	assert(ring_cq_ready(&t) == 0 && memcmp(pbuf, "wake", 4) == 0);
+
+	/* 3. A request in flight keeps the ring where it is. */
+	xp_prep_read(&t, pp[0], pbuf, 4, 91004);
+	ring_submit(&t);
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0)
+		_exit(xp_child_nop(&t) == EEXIST ? 0 : 1);
+	assert(xp_child_status(pid) == 0);
+	assert(write(pp[1], "busy", 4) == 4);
+	assert(ring_wait(&t, 1, 5000) == 0);
+	expect_cqe(&t, 91004, 4);
+
+	/* So do registered buffers and personalities, until unregistered. */
+	struct iovec iov = { .iov_base = pbuf, .iov_len = sizeof(pbuf) };
+	assert(kqring_register(t.fd, IORING_REGISTER_BUFFERS, &iov, 1) == 0);
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0)
+		_exit(xp_child_nop(&t) == EEXIST ? 0 : 1);
+	assert(xp_child_status(pid) == 0);
+	assert(kqring_register(t.fd, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+	int id = (int)kqring_register(t.fd, IORING_REGISTER_PERSONALITY, NULL,
+	    0);
+	assert(id > 0);
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0)
+		_exit(xp_child_nop(&t) == EEXIST ? 0 : 1);
+	assert(xp_child_status(pid) == 0);
+	assert(kqring_register(t.fd, IORING_UNREGISTER_PERSONALITY, NULL,
+	    (unsigned)id) == 0);
+
+	/*
+	 * 4. The owner exits with a read in flight: the read is cancelled
+	 * (without a CQE), and the ring stays for the parent.
+	 */
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		char cbuf[4];
+
+		xp_resync(&t);
+		xp_prep_read(&t, qp[0], cbuf, sizeof(cbuf), 91005);
+		ring_submit(&t);
+		_exit(ring_cq_ready(&t) == 0 ? 0 : 1);
+	}
+	assert(xp_child_status(pid) == 0);
+	assert(xp_child_nop(&t) == 0);
+	assert(ring_wait(&t, 1, 5000) == 0);
+	expect_cqe(&t, 91900, 0);
+	assert(write(qp[1], "late", 4) == 4);
+	assert(ring_wait(&t, 1, 50) == ETIMEDOUT);
+	assert(read(qp[0], late, 4) == 4);
+
+	/* 5. A SINGLE_ISSUER ring stays with its process. */
+	struct test_ring s;
+	struct io_uring_params sp;
+
+	memset(&sp, 0, sizeof(sp));
+	sp.flags = IORING_SETUP_SINGLE_ISSUER;
+	memset(&s, 0, sizeof(s));
+	s.fd = (int)kqring_setup(SQ_ENTRIES, &sp);
+	assert(s.fd >= 0);
+	ring_map(&s, &sp);
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0)
+		_exit(xp_child_nop(&s) == EEXIST ? 0 : 1);
+	assert(xp_child_status(pid) == 0);
+	munmap(s.ring_map, s.ring_map_len);
+	munmap(s.sqes, s.sqes_len);
+	close(s.fd);
+
+	munmap(t.ring_map, t.ring_map_len);
+	munmap(t.sqes, t.sqes_len);
+	close(t.fd);
+	close(pfd);
+	close(pp[0]);
+	close(pp[1]);
+	close(qp[0]);
+	close(qp[1]);
+	printf("[PASS] Rings across processes: handover when idle, waits "
+	    "from another process, release on exit, what stops a handover\n");
+}
+
 static void
 test_single_issuer_wait(void)
 {
@@ -14137,6 +14370,7 @@ main(int argc, char **argv)
 		test_short_links();
 		test_poll_own_eventfd();
 		test_files_update_refused();
+		test_cross_process_rings();
 		test_single_issuer_wait();
 		test_compat_contracts();
 		test_exec_kthreads();

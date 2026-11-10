@@ -35,9 +35,9 @@ liburing's test suite, run on FreeBSD 15.1 with `kqring.ko` from this tree (Nove
 |---|---|
 | In liburing 2.15 | 258 |
 | Built | 245 |
-| Passed | **210** |
+| Passed | **211** |
 | Skipped | 27 (the test found a feature missing and said so) |
-| Failed | 8, explained below |
+| Failed | 7, explained below |
 | Not built | 9 not portable, 2 BPF, 2 AddressSanitizer only, explained below |
 
 `fixed-buf-merge` and `read-write` register more buffer memory than FreeBSD's default `RLIMIT_MEMLOCK` (64 KiB; Linux uses 8 MiB), so they need it raised: `ulimit -l 65536` as root, or `memorylocked` in `login.conf(5)`.
@@ -58,7 +58,6 @@ These results aren't a compatibility percentage. Some of the tests are adapted, 
 
 | Tests | Why they fail |
 |---|---|
-| `across-fork` | A forked child submits to its parent's ring. kqring rings belong to one process: workers resolve descriptors in the owner's table, so allowing another process could let it reach files it can't see, for example from inside a Capsicum sandbox. The child gets `EEXIST`. |
 | `io_uring_register` | Registers a file-backed buffer and expects a refusal. Linux refuses because it pins the pages for as long as the buffer is registered. kqring goes through the mapping at each I/O, so it has no such problem, and accepts the buffer. |
 
 ### Skipped tests
@@ -105,7 +104,7 @@ The tests that are changed, or that test something else, are:
 | `socket-io-cmd` | Waits 300 ms after sending | FreeBSD counts data as sent until a delayed ACK comes back, so it shows on both ends at first. |
 | `futex` | A wake doesn't change the word, and a cancel expects 0 | See [Differences from Linux](../README.md#differences-from-linux). |
 | `waitid` | Expects `-ETIME` from a link timeout and 0 from a cancel | Linux's 1 for both is what cancelling a `WAITID` returns inside the kernel, not a documented result. |
-| `io-cancel`, `timeout` | Leave out the subtests in which a forked child uses its parent's ring | See `across-fork` above. |
+| `io-cancel`, `timeout` | Leave out three subtests in which a forked child uses its parent's ring | A ring runs one process's requests at a time ([docs/cross-process-rings.md](../docs/cross-process-rings.md)). In `test_cancel_req_across_fork` the child submits while the parent's read is in flight, and gets `EEXIST`. In `test_cancel_inflight_exit` the child exits with requests in flight, which kqring drops without CQEs, where Linux cancels them with `-ECANCELED` and lets a standalone `TIMEOUT` fire. In `test_timeout_link_cancel` the child `exec`s, which closes a ring with requests in flight. |
 | `poll-v-poll`, `epwait` | Take `EOPNOTSUPP` as epoll not being supported, as they do `EINVAL` | FreeBSD has no epoll. `poll-v-poll` polls a kqueue in place of an epoll descriptor. |
 | `cbpf_filter`, `task-restrict` | Take `EOPNOTSUPP` as the feature not being supported, as they do `EINVAL` | kqring refuses these registrations with `EOPNOTSUPP`, where a Linux kernel without them gives `EINVAL`. |
 | `reg-wait` | Gives a signal mask the size of FreeBSD's `sigset_t` (`_NSIG / 8`, 16 bytes) where it expects `EFAULT` from a bad pointer | Linux's is 8 bytes. With 8, kqring fails the size check first, with `EINVAL`. |

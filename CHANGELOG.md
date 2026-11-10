@@ -4,6 +4,7 @@
 
 ### Added
 
+- Rings used by more than one process, as PostgreSQL 18's `io_method=io_uring` uses them. A ring set up without `SINGLE_ISSUER` or `SQPOLL` moves to another process that holds it, such as a forked child, when that process submits or registers while nothing is in flight and the ring has no registered or provided buffers, personalities, polls or kqring extension state; otherwise it still gets `EEXIST`. Any process holding such a ring may wait on it. When the owner exits, the ring stays open for the others instead of closing. PostgreSQL 18.6 with `io_method=io_uring` passes all 231 of its regression tests on kqring, where every backend's first submission used to fail; [`postgresql/`](postgresql/) builds and checks it. liburing's `across-fork` test passes. See [docs/cross-process-rings.md](docs/cross-process-rings.md).
 - `fio/summary.py` turns `fio/bench.sh` and `fio/scale.sh` output into the `fio.csv` that `BENCHMARK.MD` is written from.
 - Signal masks in `kqring_enter()`, plain and in `io_uring_getevents_arg`: as with `ppoll(2)`, the thread waits with the mask, and a signal it lets in ends the wait and is handled with the mask still in place. They were refused with `EINVAL`. The mask is a FreeBSD `sigset_t`, 16 bytes.
 - `IORING_ENTER_ABS_TIMER`: the wait's timeout is a time of the ring's clock, which `IORING_REGISTER_CLOCK` now chooses. On FreeBSD `CLOCK_BOOTTIME` is `CLOCK_MONOTONIC`, so the two give the same deadlines.

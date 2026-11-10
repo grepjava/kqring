@@ -14,7 +14,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 4 | Per-file write ordering | Done |
 | 5 | Worker path scalability | Done |
 | 6 | Performance evidence | Done |
-| 7 | Newer interfaces and real programs | Not started |
+| 7 | Newer interfaces and real programs | In progress |
 
 ## Where kqring stands
 
@@ -22,10 +22,10 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 
 FreeBSD-native extensions add persistent event-driven chains, result and buffer forwarding between steps, native kevent requests and a kqueue bridge. These stay an opt-in interface alongside the Linux-compatible API.
 
-The liburing 2.15 port passes 210 of the 245 tests it builds, with `RLIMIT_MEMLOCK` raised. That isn't a compatibility percentage:
+The liburing 2.15 port passes 211 of the 245 tests it builds, with `RLIMIT_MEMLOCK` raised. That isn't a compatibility percentage:
 
 - 13 more tests can't be built here, each for a recorded reason.
-- The port carries portability shims and adapts some tests, 27 tests skip, and the 8 failures are intentional differences or the platform's.
+- The port carries portability shims and adapts some tests, 27 tests skip, and the 7 failures are intentional differences or the platform's.
 - A test stops at its first failure, so the subtests after it haven't run.
 
 The probe also can't speak for every variant of an operation. `SYNC_FILE_RANGE` syncs the whole file, and `URING_CMD` supports four socket commands only.
@@ -131,6 +131,11 @@ Qualify a newer pinned liburing release, and real applications alongside fio. Au
 
 Evaluate mixed-size SQEs and CQEs, hybrid IOPOLL, SQ rewind, `NOP128`, `URING_CMD128`, newer query and filter registrations and extended buffer registration, according to what programs need and what FreeBSD allows. The upstream development header is something to compare with, not a promise that every deployed Linux kernel has these.
 
+- **liburing:** 2.15 is still the newest release (2.16 isn't tagged; checked 2026-11-10), and the port is on it.
+- **Header audit:** against Linux's UAPI header at `21662435a5ee` (2026-11-04), the only capability added since the 7.3 baseline is `IORING_FEAT_REGBUF_TYPES`, for dma-buf registered buffers, which has no FreeBSD counterpart.
+- **PostgreSQL 18.6:** **Done.** [`postgresql/`](postgresql/) builds it unpatched and runs it with `io_method=io_uring`. It needed rings that move between processes, which kqring now supports ([docs/cross-process-rings.md](docs/cross-process-rings.md)); before that, every backend PANICked on its first submission with `EEXIST`. All 231 regression tests pass, and pgbench runs level with PostgreSQL's own `worker` and `sync` methods. The same change makes liburing's `across-fork` pass.
+- **Newer interfaces, by what liburing's tests need:** mixed-size SQEs and CQEs with `NOP128`, `URING_CMD128` and `CQE_F_SKIP` (7 tests skip without them), then `IORING_REGISTER_QUERY` (2). BPF filters, task restrictions and `SQ_REWIND` are used only by BPF tests. Hybrid IOPOLL doesn't apply, since kqring has no `IOPOLL` on `O_DIRECT` files.
+
 Acceptance: reproducible build and run instructions, and a result per program showing the patches it needs, the configurations supported and what still blocks it. New API additions need semantic tests, not just matching constants.
 
 ## Research
@@ -141,7 +146,7 @@ None of these is planned work. Each needs a design note covering kernel subsyste
 - **Driver commands:** assess a native driver contract if real programs need more than the existing socket commands. A matching opcode doesn't supply NVMe or other driver passthrough semantics.
 - **Registered-buffer mapping independence:** assess using held pages for fixed I/O, including protection, copy-on-write and lifetime implications.
 - **Asynchronous ZFS reads:** ZFS's I/O pipeline is asynchronous below the DMU, which waits for it. A read issued with a parent `zio` and completed from `zio_done` would finish at once on an ARC hit and from ZFS's callback on a miss, with no worker and no guess, as FreeBSD's asynchronous `sendfile(2)` does for the page cache. ZFS has no `VOP_GETPAGES_ASYNC` either, so `sendfile(2)` from ZFS blocks on every ARC miss, and the same work would fix it. [docs/async-zfs-reads.md](docs/async-zfs-reads.md) proposes two steps: a read that fails rather than wait, as Linux's `IOCB_NOWAIT`, then one that completes from ZFS's callback. Both change OpenZFS, so they would go there first.
-- **Cross-process rings and exec survival:** the current restrictions stay until a design preserves credentials, descriptor ownership, Capsicum rights and teardown safety.
+- **Concurrent submitters and exec survival:** a ring now moves to another process when it is idle ([docs/cross-process-rings.md](docs/cross-process-rings.md)), but two processes can't have requests in flight on one ring at once, an owner's exit drops its requests without CQEs, and `exec` closes the ring. Lifting those needs per-process workers, taskwork and pollers for one ring.
 
 Zero-copy `SPLICE` stays unplanned; see [`TODO.MD`](TODO.MD).
 

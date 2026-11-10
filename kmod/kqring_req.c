@@ -2629,6 +2629,13 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 {
 	struct kqring_op *op;
 
+	/*
+	 * Completions copy out to the owner's memory and successors run as
+	 * its requests: only its threads may.  A thread of a process the ring
+	 * has since moved away from, still in a wait, finds nothing to do.
+	 */
+	if (__predict_false(ctx->owner_proc != curproc))
+		return;
 	/* Successors issued below may queue more taskwork; bound the loop. */
 	for (int pass = 0; pass < 64; pass++) {
 		/*

@@ -22,4 +22,5 @@ tests/zfs_dbuf
 # liburing port: fetched release, build output
 liburing/work/
 fio/work/
+postgresql/work/
 journal/

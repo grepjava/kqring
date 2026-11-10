@@ -2210,7 +2210,7 @@ do_chaos(struct fz *f)
 			die("mmap arena: %s", strerror(errno));
 		arena_fill(f);
 		break;
-	case 3: {	/* a child pokes at the ring: EEXIST, mostly */
+	case 3: {	/* a child pokes at the ring: takes it over, or EEXIST */
 		pid_t pid = fork();
 
 		if (pid == 0) {
@@ -2218,8 +2218,9 @@ do_chaos(struct fz *f)
 
 			(void)kqring_enter(f->ring, 1, 0, 0, NULL, 0);
 			/*
-			 * Not the owner, with nothing to submit.  On an SQPOLL
-			 * ring anyone may wait, for as long as it takes.
+			 * Nothing to submit: a wait, which another process
+			 * may make on an SQPOLL ring or one without
+			 * SINGLE_ISSUER, for as long as it takes.
 			 */
 			alarm(1);
 			(void)kqring_enter(f->ring, 0, (unsigned)rn(f, 2),

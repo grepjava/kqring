@@ -10,6 +10,10 @@ Known limits are in [BENCHMARK.MD](BENCHMARK.MD#known-gaps) and [Differences fro
 - **An enter costs about 250 ns more than io_uring's.** On one machine running both, one `NOP` per enter took 438 ns above FreeBSD's system call floor and 178 ns above Linux's ([docs/linux-comparison.md](docs/linux-comparison.md#the-rings-own-costs)); per `NOP` in a batch of 32, kqring is the cheaper. The cost is spread over the enter, the SQE, the request and the CQE.
 - **Cached file reads from several threads trail io_uring.** On tmpfs, 4 jobs at 32 in flight reach 34% of FreeBSD's own `psync`, where io_uring reaches 58% of Linux's: Linux reads a cached page in the submitting thread and only hands a read that would block to a worker. FreeBSD filesystems have no read that fails rather than block.
 
+## Compatibility
+
+- **Requests of an exiting owner end without CQEs.** When the process that owns a shared ring exits, kqring drops its requests in flight, where Linux cancels them with `-ECANCELED` CQEs and lets a standalone `TIMEOUT` fire. Another process still waiting on the ring never hears of them. liburing's `test_cancel_inflight_exit` stays left out for it ([docs/cross-process-rings.md](docs/cross-process-rings.md)).
+
 ## Measurement
 
 - **Run on UFS with a real disk, and on NVMe.** Storage results so far are from a SATA SSD with ZFS, and md(4) disks.

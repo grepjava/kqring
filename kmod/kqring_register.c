@@ -1086,6 +1086,7 @@ kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
 		return (kqring_register_send_msg(ctx, ra));
 	}
 
+relock:
 	mtx_lock(&ctx->mtx);
 	if (ctx->closing) {
 		mtx_unlock(&ctx->mtx);
@@ -1093,8 +1094,15 @@ kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
 	}
 	if (ctx->enabled) {
 		if (!kqring_is_owner(ctx, td)) {
+			/*
+			 * Another thread of a SINGLE_ISSUER ring: EEXIST.
+			 * Another process takes a ring that can move over
+			 * (docs/cross-process-rings.md), or gets EEXIST.
+			 */
 			mtx_unlock(&ctx->mtx);
-			return (EEXIST);	/* SINGLE_ISSUER violation */
+			if ((error = kqring_ctx_takeover(ctx, td)) != 0)
+				return (error);
+			goto relock;
 		}
 	} else {
 		if (ctx->reg_busy) {
@@ -1111,6 +1119,14 @@ kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
 	} else if (ctx->closing) {
 		sx_xunlock(&ctx->sq_sx);
 		error = EBADF;
+	} else if (ctx->enabled && (ctx->handover_td != NULL ||
+	    !kqring_is_owner(ctx, td))) {
+		/* Moved, or moving, since the check above: as in enter. */
+		sx_xunlock(&ctx->sq_sx);
+		if (!kqring_is_owner(ctx, td))
+			error = EEXIST;
+		else if ((error = kqring_handover_wait(ctx, td)) == 0)
+			goto relock;
 	} else {
 		error = kqring_register_op(ctx, ra, td, resp);
 		sx_xunlock(&ctx->sq_sx);

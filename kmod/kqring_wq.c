@@ -1248,7 +1248,8 @@ kqring_kthread_check_suspend(struct kqring_ctx *ctx)
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
 
-	if (ctx->closing)
+	/* Closing, or moving to another process (detaching): exit. */
+	if (ctx->closing || ctx->detaching)
 		return (true);
 	if (!P_SHOULDSTOP(p) && (p->p_flag2 & P2_WEXIT) == 0 &&
 	    !td_ast_pending(td, TDA_SUSPEND))
@@ -1356,7 +1357,8 @@ kqring_sqpoll_thread(void *arg)
 		 */
 		if (sx_xlock_sig(&ctx->sq_sx) != 0)
 			continue;
-		if (ctx->closing) {
+		/* Closing, or the ring changing process: see detaching. */
+		if (ctx->closing || ctx->detaching) {
 			sx_xunlock(&ctx->sq_sx);
 			break;
 		}
@@ -1399,7 +1401,7 @@ kqring_sqpoll_thread(void *arg)
 		}
 
 		mtx_lock(&ctx->mtx);
-		if (ctx->closing) {
+		if (ctx->closing || ctx->detaching) {
 			mtx_unlock(&ctx->mtx);
 			break;
 		}
@@ -1432,7 +1434,7 @@ kqring_sqpoll_thread(void *arg)
 				    shm->sq_head ||
 				    !TAILQ_EMPTY(&ctx->taskwork_ops) ||
 				    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) || ctx->closing ||
-				    kqring_wq_suspend_pending())
+				    ctx->detaching || kqring_wq_suspend_pending())
 					break;
 				for (int s = 0; s < 64; s++)
 					cpu_spinwait();
@@ -1453,7 +1455,8 @@ kqring_sqpoll_thread(void *arg)
 			atomic_set_32(&shm->sq_flags, IORING_SQ_NEED_WAKEUP);
 			if (atomic_load_acq_32(&shm->sq_tail) != shm->sq_head ||
 			    !TAILQ_EMPTY(&ctx->taskwork_ops) ||
-			    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) || ctx->closing) {
+			    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) || ctx->closing ||
+			    ctx->detaching) {
 				atomic_clear_32(&shm->sq_flags,
 				    IORING_SQ_NEED_WAKEUP);
 				mtx_unlock(&ctx->mtx);

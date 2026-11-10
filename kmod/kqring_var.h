@@ -778,6 +778,16 @@ struct kqring_ctx {
 	struct task		cancel_task;	/* kqring_ctx_cancel_task() */
 	bool			in_ctx_list;
 	struct thread		*cancel_td;
+	/*
+	 * The ring is changing process (docs/cross-process-rings.md): its
+	 * kthreads exit as for closing, but the ring stays.  release: the
+	 * owner exited, and the teardown under way leaves the ring unowned
+	 * rather than closed.  handover_td: the thread taking the ring over,
+	 * which the owner's other threads wait for.  All under mtx.
+	 */
+	bool			detaching;
+	bool			release;
+	struct thread		*handover_td;
 	struct proc		*owner_proc;	/* SINGLE_ISSUER process */
 	lwpid_t			owner_tid;	/* SINGLE_ISSUER thread ID */
 	bool			shared;		/* no SINGLE_ISSUER: any thread */
@@ -1467,6 +1477,9 @@ bool	kqring_fp_is_ring(const struct file *fp);
 int	kqring_fp_ctx(struct file *fp, struct kqring_ctx **ctxp);
 void	kqring_ctx_rele(struct kqring_ctx *ctx);
 void	kqring_ctx_cancel_all(struct kqring_ctx *ctx);
+void	kqring_ctx_release(struct kqring_ctx *ctx);
+int	kqring_ctx_takeover(struct kqring_ctx *ctx, struct thread *td);
+int	kqring_handover_wait(struct kqring_ctx *ctx, struct thread *td);
 int	kqring_teardown_sleep(void *chan, struct mtx *mtx, const char *wmesg);
 void	kqring_poll_fallback_locked(struct kqring_ctx *ctx);
 void	kqring_run_checks(struct kqring_ctx *ctx);
