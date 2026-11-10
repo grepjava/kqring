@@ -118,12 +118,12 @@ flowchart LR
         direction TB
         H1["struct kqring_shm_header (64 bytes)<br/>sq_head, sq_tail, cq_head, cq_tail,<br/>masks, entries, flags, overflow counters"]
         SQA["SQ Index Array<br/>uint32_t sq_array[sq_entries]"]
-        CQA["CQ Ring Array<br/>struct io_uring_cqe cqes[cq_entries]<br/>(16B standard or 32B with IORING_SETUP_CQE32)"]
+        CQA["CQ Ring Array<br/>struct io_uring_cqe cqes[cq_entries]<br/>(16B standard or 32B with IORING_SETUP_CQE32;<br/>CQE_MIXED: 16B slots, a 32B CQE takes two)"]
         H1 --> SQA --> CQA
     end
 
     subgraph SHM2["SHM Region 2: IORING_OFF_SQES (ctx->mem.sqes_obj)"]
-        SQES["SQE Array<br/>struct io_uring_sqe sqes[sq_entries]<br/>(64B standard or 128B with IORING_SETUP_SQE128)"]
+        SQES["SQE Array<br/>struct io_uring_sqe sqes[sq_entries]<br/>(64B standard or 128B with IORING_SETUP_SQE128;<br/>SQE_MIXED: 64B slots, a 128B SQE takes two)"]
     end
 
     subgraph SHM3["SHM Region 3: IORING_OFF_PBUF_RING | (bgid << 16) (bg->ring_obj)"]

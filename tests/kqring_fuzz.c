@@ -640,7 +640,9 @@ ring_open(struct fz *f)
 	    IORING_SETUP_SQE128 | IORING_SETUP_CQE32 |
 	    IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
 	    IORING_SETUP_NO_MMAP | IORING_SETUP_NO_SQARRAY |
-	    IORING_SETUP_IOPOLL | IORING_SETUP_ATTACH_WQ;
+	    IORING_SETUP_IOPOLL | IORING_SETUP_ATTACH_WQ |
+	    IORING_SETUP_CQE_MIXED | IORING_SETUP_SQE_MIXED |
+	    IORING_SETUP_SQ_REWIND;
 	struct io_uring_params *p = &f->p;
 	unsigned entries;
 	char *base;
@@ -660,13 +662,21 @@ ring_open(struct fz *f)
 	};
 	static const uint32_t extras = IORING_SETUP_CQSIZE |
 	    IORING_SETUP_SUBMIT_ALL | IORING_SETUP_SQE128 |
-	    IORING_SETUP_CQE32 | IORING_SETUP_NO_SQARRAY;
+	    IORING_SETUP_CQE32 | IORING_SETUP_NO_SQARRAY |
+	    IORING_SETUP_CQE_MIXED | IORING_SETUP_SQE_MIXED;
 
 	memset(p, 0, sizeof(*p));
 	f->valid = chance(f, 60);
 	if (f->valid) {
 		p->flags = templates[rn(f, nitems(templates))] |
 		    ((uint32_t)rnd(f) & extras);
+		if ((p->flags & IORING_SETUP_CQE32) != 0)
+			p->flags &= ~(uint32_t)IORING_SETUP_CQE_MIXED;
+		if ((p->flags & IORING_SETUP_SQE128) != 0)
+			p->flags &= ~(uint32_t)IORING_SETUP_SQE_MIXED;
+		if ((p->flags & IORING_SETUP_SQPOLL) == 0 && chance(f, 10))
+			p->flags |= IORING_SETUP_SQ_REWIND |
+			    IORING_SETUP_NO_SQARRAY;
 		entries = 1U << (1 + rn(f, 8));
 		p->cq_entries = entries * (1U << rn(f, 3));
 	} else {
@@ -1784,7 +1794,37 @@ reap(struct fz *f)
 	for (; head != tail; head++) {
 		struct io_uring_cqe *c = (void *)(cqes +
 		    (size_t)(head & f->cq_mask) * cqe);
-		uint8_t op = f->ops[c->user_data % NOPS].op;
+		uint8_t op;
+
+		/*
+		 * CQE_MIXED: a SKIP pads the last slot; a 32-byte CQE takes
+		 * two, never the last and the first, and is never cut off by
+		 * the tail.
+		 */
+		if ((f->p.flags & IORING_SETUP_CQE_MIXED) != 0) {
+			if ((c->flags & IORING_CQE_F_SKIP) != 0) {
+				if ((head & f->cq_mask) != f->cq_mask ||
+				    (c->flags & IORING_CQE_F_32) != 0) {
+					dprintf(ERR_FD, "kqring_fuzz: thread "
+					    "%d: SKIP CQE at %u (flags %#x)\n",
+					    f->id, head, c->flags);
+					atomic_store(&cq_bad, 1);
+				}
+				continue;
+			}
+			if ((c->flags & IORING_CQE_F_32) != 0) {
+				if ((head & f->cq_mask) == f->cq_mask ||
+				    head + 1 == tail) {
+					dprintf(ERR_FD, "kqring_fuzz: thread "
+					    "%d: 32-byte CQE at %u of %u, tail "
+					    "%u\n", f->id, head & f->cq_mask,
+					    f->p.cq_entries, tail);
+					atomic_store(&cq_bad, 1);
+				} else
+					head++;
+			}
+		}
+		op = f->ops[c->user_data % NOPS].op;
 
 		atomic_fetch_add(&st_cqes, 1);
 		if (op == OP_ECHO && c->res > 0)
@@ -1843,6 +1883,9 @@ do_submit(struct fz *f)
 	unsigned n, room, submit;
 
 	if (f->sqes != NULL && f->sq_ktail != NULL) {
+		/* SQ_REWIND: every enter reads from slot 0. */
+		if ((f->p.flags & IORING_SETUP_SQ_REWIND) != 0)
+			f->sq_tail = 0;
 		room = f->p.sq_entries -
 		    (f->sq_tail - atomic_load(f->sq_khead));
 		/* One draw: MIN() would take a second, past the room. */
@@ -1914,7 +1957,9 @@ do_submit(struct fz *f)
 				f->file_left--;
 			} else if (f->valid && f->tmpl_left == 0 &&
 			    !f->sq_chaos &&
-			    (f->p.flags & IORING_SETUP_IOPOLL) == 0) {
+			    (f->p.flags & (IORING_SETUP_IOPOLL |
+			    IORING_SETUP_SQE_MIXED |
+			    IORING_SETUP_SQ_REWIND)) == 0) {
 				if (f->ord_left == 0 && rn(f, 1000) < 3)
 					f->ord_left = 2 + (unsigned)rn(f, 7);
 				if (f->ord_left > 0) {
@@ -1975,6 +2020,28 @@ do_submit(struct fz *f)
 			}
 			prev = s;
 			f->sq_tail++;
+			/*
+			 * SQE_MIXED: a 128-byte SQE's last 64 bytes are the
+			 * next slot.  A NOP there, for when the kernel reads
+			 * it as an SQE (the first half was in the last slot).
+			 */
+			if ((f->p.flags & IORING_SETUP_SQE_MIXED) != 0 &&
+			    (s->opcode == IORING_OP_NOP128 ||
+			    s->opcode == IORING_OP_URING_CMD128) && i + 1 < n) {
+				unsigned idx2 = f->sq_tail & f->sq_mask;
+				struct io_uring_sqe *s2 = (void *)(f->sqes +
+				    (size_t)idx2 * f->sqe_size);
+
+				if (f->sq_array != NULL)
+					f->sq_array[idx2] = idx2;
+				memset(s2, 0, sizeof(*s2));
+				s2->opcode = IORING_OP_NOP;
+				s2->user_data = f->ud;
+				f->ops[f->ud % NOPS].op = IORING_OP_NOP;
+				f->ud++;
+				f->sq_tail++;
+				i++;
+			}
 		}
 		/* Something for reads, receives and polls to find. */
 		if (f->valid && chance(f, 40)) {

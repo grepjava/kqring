@@ -231,7 +231,8 @@ MALLOC_DECLARE(M_SELFD);
 	IORING_SETUP_SQE128 | IORING_SETUP_CQE32 |			\
 	IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |	\
 	IORING_SETUP_NO_MMAP | IORING_SETUP_REGISTERED_FD_ONLY |	\
-	IORING_SETUP_NO_SQARRAY)
+	IORING_SETUP_NO_SQARRAY | IORING_SETUP_CQE_MIXED |		\
+	IORING_SETUP_SQE_MIXED | IORING_SETUP_SQ_REWIND)
 
 /* mmap(2) offset of a module-allocated IORING_REGISTER_MEM_REGION. */
 #define	KQRING_OFF_PARAM_REGION	0x20000000ULL
@@ -699,6 +700,7 @@ struct kqring_ocqe {
 	STAILQ_ENTRY(kqring_ocqe) link;
 	struct io_uring_cqe	cqe;
 	uint64_t		extra[2];
+	bool			has_extra;	/* extra given: big on CQE_MIXED */
 	bool			tag;	/* counted in nocq_tags */
 };
 
@@ -1196,6 +1198,19 @@ kqring_evfd_signal_locked(struct kqring_ctx *ctx)
  */
 #define	KQRING_STQ_EMPTY_HINT(head)					\
 	(atomic_load_ptr(&(head)->stqh_first) == NULL)
+
+/*
+ * The ring's owner has begun exit(2) (P2_WEXIT is set before exit1()
+ * interrupts its other threads, our workers among them).  Read unlocked:
+ * once set it stays set for the process's life.
+ */
+static inline bool
+kqring_owner_exiting(const struct kqring_ctx *ctx)
+{
+	struct proc *p = ctx->owner_proc;
+
+	return (p != NULL && (atomic_load_int(&p->p_flag2) & P2_WEXIT) != 0);
+}
 
 /* No room for another CQE in the CQ ring (it would overflow). */
 static inline bool

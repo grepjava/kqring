@@ -1058,18 +1058,29 @@ kqring_kq_take(struct kqring_ctx *ctx, struct file *fp)
 	struct timespec zero = { 0, 0 };
 	const struct kqring_shm_header *shm = ctx->shm;
 	register_t saved[2] = { td->td_retval[0], td->td_retval[1] };
-	uint32_t used;
+	uint32_t used, tail, room;
 	int error;
 
 	for (;;) {
-		used = atomic_load_acq_32(&shm->cq_tail) -
-		    atomic_load_acq_32(&shm->cq_head);
-		if (kqring_cq_full(ctx) || used >= ctx->cq_entries)
+		tail = atomic_load_acq_32(&shm->cq_tail);
+		used = tail - atomic_load_acq_32(&shm->cq_head);
+		room = used < ctx->cq_entries ? ctx->cq_entries - used : 0;
+		/*
+		 * CQE_MIXED: each event's CQE takes two slots, and one that
+		 * would wrap a SKIP entry before it.
+		 */
+		if ((ctx->flags & IORING_SETUP_CQE_MIXED) != 0) {
+			uint32_t wrap = ctx->cq_entries - (tail & ctx->cq_mask);
+
+			room = room <= wrap ? room / 2 :
+			    wrap / 2 + (room - wrap) / 2;
+		}
+		if (kqring_cq_full(ctx) || room == 0)
 			return (((struct kqueue *)fp->f_data)->kq_count > 0 ?
 			    -EOVERFLOW : 0);
 		io.kev = kev;
 		io.n = 0;
-		io.max = (int)MIN(nitems(kev), ctx->cq_entries - used);
+		io.max = (int)MIN(nitems(kev), room);
 		error = kern_kevent_fp(td, fp, 0, io.max, &ops, &zero);
 		td->td_retval[0] = saved[0];
 		td->td_retval[1] = saved[1];

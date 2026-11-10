@@ -254,6 +254,43 @@ kqring_free_shm(vm_object_t obj, vm_offset_t kva, size_t alloc_len)
  * ============================================================================
  */
 
+/*
+ * A CQE_MIXED ring's 32-byte CQE (one with extra): two 16-byte slots,
+ * flagged IORING_CQE_F_32.  It never wraps: with one slot left before the
+ * end, that slot gets an IORING_CQE_F_SKIP entry, published even if the
+ * CQE then doesn't fit and overflows, as in io_uring.
+ */
+static bool
+kqring_cq_push_mixed(struct kqring_ctx *ctx, const struct io_uring_cqe *src,
+    const uint64_t *extra)
+{
+	struct kqring_shm_header *shm = ctx->shm;
+	struct io_uring_cqe *dst;
+	uint32_t tail, head;
+
+	head = atomic_load_acq_32(&shm->cq_head);
+	tail = shm->cq_tail;
+	if (tail - head >= ctx->cq_entries)
+		return (false);
+	if ((tail & ctx->cq_mask) == ctx->cq_mask) {
+		dst = &ctx->cqes[tail & ctx->cq_mask];
+		dst->user_data = 0;
+		dst->res = 0;
+		dst->flags = IORING_CQE_F_SKIP;
+		tail++;
+		atomic_store_rel_32(&shm->cq_tail, tail);
+	}
+	if (tail - head + 2 > ctx->cq_entries)
+		return (false);
+	dst = &ctx->cqes[tail & ctx->cq_mask];
+	*dst = *src;
+	dst->flags = (dst->flags & ~IORING_CQE_F_SKIP) | IORING_CQE_F_32;
+	dst->big_cqe[0] = extra[0];
+	dst->big_cqe[1] = extra[1];
+	atomic_store_rel_32(&shm->cq_tail, tail + 2);
+	return (true);
+}
+
 /* Copy one CQE into the CQ ring; false if the ring is full. */
 static bool
 kqring_cq_push(struct kqring_ctx *ctx, const struct io_uring_cqe *src,
@@ -264,6 +301,9 @@ kqring_cq_push(struct kqring_ctx *ctx, const struct io_uring_cqe *src,
 	uint32_t tail, head;
 	size_t shift = (ctx->flags & IORING_SETUP_CQE32) != 0 ? 1 : 0;
 
+	if (__predict_false(extra != NULL &&
+	    (ctx->flags & IORING_SETUP_CQE_MIXED) != 0))
+		return (kqring_cq_push_mixed(ctx, src, extra));
 	head = atomic_load_acq_32(&shm->cq_head);
 	tail = shm->cq_tail;
 	if (tail - head >= ctx->cq_entries)
@@ -271,6 +311,9 @@ kqring_cq_push(struct kqring_ctx *ctx, const struct io_uring_cqe *src,
 
 	dst = &ctx->cqes[(tail & ctx->cq_mask) << shift];
 	*dst = *src;
+	/* Sizes are the kernel's to say (MSG_RING passes flags through). */
+	if (__predict_false((ctx->flags & IORING_SETUP_CQE_MIXED) != 0))
+		dst->flags &= ~(IORING_CQE_F_32 | IORING_CQE_F_SKIP);
 	if (shift != 0) {
 		if (extra != NULL) {
 			dst->big_cqe[0] = extra[0];
@@ -293,7 +336,8 @@ kqring_flush_overflow(struct kqring_ctx *ctx)
 	if (STAILQ_EMPTY(&ctx->ocq))
 		return;
 	while ((ocqe = STAILQ_FIRST(&ctx->ocq)) != NULL) {
-		if (!kqring_cq_push(ctx, &ocqe->cqe, ocqe->extra))
+		if (!kqring_cq_push(ctx, &ocqe->cqe,
+		    ocqe->has_extra ? ocqe->extra : NULL))
 			return;
 		STAILQ_REMOVE_HEAD(&ctx->ocq, link);
 		ctx->nocq--;
@@ -339,6 +383,7 @@ kqring_post_cqe_common(struct kqring_ctx *ctx, uint64_t user_data,
 	if (extra != NULL) {
 		ocqe->extra[0] = extra[0];
 		ocqe->extra[1] = extra[1];
+		ocqe->has_extra = true;
 	}
 	STAILQ_INSERT_TAIL(&ctx->ocq, ocqe, link);
 	ctx->nocq++;
@@ -676,6 +721,11 @@ kqring_exec_sync(struct kqring_ctx *ctx, struct kqring_op *op)
 	case IORING_OP_NOP:
 		res = (sqe->nop_flags & IORING_NOP_INJECT_RESULT) != 0 ?
 		    (int32_t)sqe->len : 0;
+		if ((sqe->nop_flags & IORING_NOP_CQE32) != 0) {
+			op->cqe_has_extra = true;
+			op->cqe_extra[0] = sqe->off;
+			op->cqe_extra[1] = sqe->addr;
+		}
 		break;
 	case IORING_OP_READ:
 	case IORING_OP_READV:
@@ -1447,6 +1497,18 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		return (EINVAL);
 	if (ctx->restricted && !kqring_restriction_ok(ctx, sqe))
 		return (EACCES);
+	/*
+	 * The 128-byte opcodes are NOP and URING_CMD with a 128-byte SQE,
+	 * which kqring_submit_sqes() read whole on an SQE_MIXED ring.
+	 */
+	if (sqe->opcode == IORING_OP_NOP128 ||
+	    sqe->opcode == IORING_OP_URING_CMD128) {
+		if ((ctx->flags & (IORING_SETUP_SQE128 |
+		    IORING_SETUP_SQE_MIXED)) == 0)
+			return (EINVAL);
+		op->sqe.opcode = sqe->opcode == IORING_OP_NOP128 ?
+		    IORING_OP_NOP : IORING_OP_URING_CMD;
+	}
 	if ((ctx->flags & IORING_SETUP_IOPOLL) != 0 &&
 	    !kqring_iopoll_op_ok(sqe->opcode))
 		return (EINVAL);
@@ -1618,7 +1680,12 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 			return (EINVAL);
 		break;
 	case IORING_OP_NOP:
-		if ((sqe->nop_flags & ~IORING_NOP_INJECT_RESULT) != 0)
+		if ((sqe->nop_flags & ~(IORING_NOP_INJECT_RESULT |
+		    IORING_NOP_CQE32)) != 0)
+			return (EINVAL);
+		if ((sqe->nop_flags & IORING_NOP_CQE32) != 0 &&
+		    (ctx->flags & (IORING_SETUP_CQE32 |
+		    IORING_SETUP_CQE_MIXED)) == 0)
 			return (EINVAL);
 		break;
 	case IORING_OP_PIPE:
@@ -2050,11 +2117,16 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 
 	/*
 	 * IOSQE_CQE_SKIP_SUCCESS skips a success, and a LINK_TIMEOUT that
-	 * fired (-ETIME), which io_uring does not count as failing.
+	 * fired (-ETIME), which io_uring does not count as failing.  Once the
+	 * owner has begun exit(2), its requests end without CQEs, as
+	 * kqring_proc_rings_teardown() cancels them: exit interrupts a
+	 * worker's sleep (EINTR) before the teardown runs, and a ring that
+	 * outlives its owner must not show that.
 	 */
-	if ((op->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) == 0 || short_xfer ||
+	if (__predict_true(!kqring_owner_exiting(ctx)) &&
+	    ((op->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) == 0 || short_xfer ||
 	    (res < 0 &&
-	    !(op->sqe.opcode == IORING_OP_LINK_TIMEOUT && res == -ETIME))) {
+	    !(op->sqe.opcode == IORING_OP_LINK_TIMEOUT && res == -ETIME)))) {
 		if (op->sqe.opcode == IORING_OP_TIMEOUT)
 			kqring_post_cqe_uncounted(ctx, op->sqe.user_data, res,
 			    cflags);
@@ -2713,11 +2785,18 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 	uint32_t head, tail, avail, consumed = 0, submitted = 0;
 	struct kqring_op *chain_head = NULL, *chain_tail = NULL;
 	bool chain_failed = false, chain_drop = false;
+	bool rewind = (ctx->flags & IORING_SETUP_SQ_REWIND) != 0;
 
 	kqring_flush_overflow(ctx);
-	head = shm->sq_head;
-	tail = atomic_load_acq_32(&shm->sq_tail);
-	avail = MIN(tail - head, ctx->sq_entries);
+	if (__predict_false(rewind)) {
+		/* Slots 0 to to_submit - 1; the head and tail stay 0. */
+		head = 0;
+		avail = ctx->sq_entries;
+	} else {
+		head = shm->sq_head;
+		tail = atomic_load_acq_32(&shm->sq_tail);
+		avail = MIN(tail - head, ctx->sq_entries);
+	}
 	max_submit = MIN(max_submit, avail);
 	/* Backpressure: see KQRING_OCQ_BUSY. */
 	if (ctx->nocq >= KQRING_OCQ_BUSY)
@@ -2734,6 +2813,30 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 			atomic_add_32(&shm->sq_dropped, 1);
 			continue;
 		}
+		/*
+		 * SQE_MIXED: a 128-byte opcode takes this slot and the next.
+		 * As in io_uring, it fails with EINVAL, taking one slot, if
+		 * to_submit ends first, or it is in the last slot of the SQ
+		 * (before or after the array maps it), where the second half
+		 * would run past the end.
+		 */
+		bool sqe_big = false, sqe_bad = false;
+		uint8_t sqe_opc = 0;
+		if (__predict_false((ctx->flags & IORING_SETUP_SQE_MIXED) != 0)) {
+			sqe_opc = atomic_load_8(&ctx->sqes[sqe_idx].opcode);
+			if (sqe_opc == IORING_OP_NOP128 ||
+			    sqe_opc == IORING_OP_URING_CMD128) {
+				if (consumed >= max_submit ||
+				    sqe_idx == ctx->sq_mask ||
+				    ((head - 1) & ctx->sq_mask) == ctx->sq_mask)
+					sqe_bad = true;
+				else {
+					sqe_big = true;
+					head++;
+					consumed++;
+				}
+			}
+		}
 		if (chain_drop || ctx->nreqs >= KQRING_MAX_REQS) {
 			struct io_uring_sqe sqe;
 			int32_t err = chain_drop ? -ECANCELED : -EBUSY;
@@ -2747,6 +2850,8 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 			} else {
 				sqe = ctx->sqes[sqe_idx];
 			}
+			if (sqe_big)
+				submitted++;
 			if (chain_head != NULL) {
 				kqring_chain_fail(ctx, chain_head, false);
 				chain_head = chain_tail = NULL;
@@ -2758,7 +2863,9 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 				chain_drop = true;
 			} else {
 				chain_drop = false;
-				atomic_store_rel_32(&shm->sq_head, head);
+				if (!rewind)
+					atomic_store_rel_32(&shm->sq_head,
+					    head);
 			}
 			submitted++;
 			continue;
@@ -2773,8 +2880,17 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 			    sizeof(op->sqe_extra));
 		} else {
 			op->sqe = ctx->sqes[sqe_idx];
+			/* The opcode its size was decided on, if it changed. */
+			if (__predict_false((ctx->flags &
+			    IORING_SETUP_SQE_MIXED) != 0))
+				op->sqe.opcode = sqe_opc;
+			if (sqe_big) {
+				memcpy(op->sqe_extra, &ctx->sqes[sqe_idx + 1],
+				    sizeof(op->sqe_extra));
+				submitted++;
+			}
 		}
-		op->prep_err = kqring_req_prep(op, chain_tail);
+		op->prep_err = sqe_bad ? EINVAL : kqring_req_prep(op, chain_tail);
 		if (chain_head == NULL) {
 			chain_head = op;
 			chain_failed = false;
@@ -2790,7 +2906,8 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 		if ((op->sqe.flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK)) == 0) {
 			int err = op->prep_err;
 
-			atomic_store_rel_32(&shm->sq_head, head);
+			if (!rewind)
+				atomic_store_rel_32(&shm->sq_head, head);
 			ctx->submit_more = consumed < max_submit;
 			kqring_chain_submit(ctx, chain_head, chain_failed);
 			chain_head = chain_tail = NULL;
@@ -2807,7 +2924,7 @@ kqring_submit_sqes(struct kqring_ctx *ctx, uint32_t max_submit,
 		}
 		submitted++;
 	}
-	if (shm->sq_head != head)
+	if (!rewind && shm->sq_head != head)
 		atomic_store_rel_32(&shm->sq_head, head);
 	ctx->submit_more = false;
 	if (chain_head != NULL)

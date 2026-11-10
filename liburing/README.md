@@ -35,8 +35,8 @@ liburing's test suite, run on FreeBSD 15.1 with `kqring.ko` from this tree (Nove
 |---|---|
 | In liburing 2.15 | 258 |
 | Built | 245 |
-| Passed | **211** |
-| Skipped | 27 (the test found a feature missing and said so) |
+| Passed | **218** |
+| Skipped | 20 (the test found a feature missing and said so) |
 | Failed | 7, explained below |
 | Not built | 9 not portable, 2 BPF, 2 AddressSanitizer only, explained below |
 
@@ -62,11 +62,10 @@ These results aren't a compatibility percentage. Some of the tests are adapted, 
 
 ### Skipped tests
 
-The 27 skips are tests that check for a feature and report its absence:
+The 20 skips are tests that check for a feature and report its absence:
 
 - **Not implemented in kqring** (see [`COMPATIBILITY.MD`](../COMPATIBILITY.MD)):
   - `IOPOLL` on an `O_DIRECT` file in the test's directory, which completes with `-EOPNOTSUPP` (`500f9fbadef8`).
-  - Mixed-size CQEs and SQEs, `IORING_SETUP_CQE_MIXED` and `IORING_SETUP_SQE_MIXED` (`cq-peek-batch-mixed`, `nop32`, `nop32-overflow`, `sqe-mixed-bad-wrap`, `sqe-mixed-boundary`, `sqe-mixed-nop`). `large-resize` resizes a `CQE32` ring first, which passes, and skips at its `CQE_MIXED` part.
   - `IORING_REGISTER_QUERY` (`ring-query`, and `zcrx`, which also needs zero-copy receive).
   - BPF filters on a ring (`cbpf_filter`) and task restrictions (`task-restrict`), refused with `EOPNOTSUPP`.
 - **`epwait`** needs `IORING_OP_EPOLL_WAIT`, and FreeBSD has no epoll.

@@ -68,7 +68,7 @@ Requests submitted afterwards run with the new process's descriptors, address sp
 
 Today the owner's exit closes the ring for everyone who holds it: it sets `ctx->closing`, as `close(2)` of the last descriptor does. Instead, exit releases the ring:
 
-- It cancels the owner's requests and waits for their workers, as now. As on close, they complete without CQEs.
+- It cancels the owner's requests and waits for their workers, as now. As on close, they complete without CQEs. So does one that finishes first: exit interrupts the process's threads, the ring's workers among them, before the release runs, and a request completing once exit has begun (`P2_WEXIT`) posts nothing.
 - It stops the `kqtask` thread and the poller, and closes the worker pool.
 - It frees the fixed-file and registered-buffer tables, as now. That still breaks a cycle through a ring's own descriptor in its fixed table, and a released ring then meets the handover's conditions.
 - It clears the owner and leaves `closing` unset.

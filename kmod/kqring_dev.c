@@ -397,7 +397,9 @@ kqring_resize_rings(struct kqring_ctx *ctx,
 			return (EINVAL);
 	/* What the rings were made with stays. */
 	p.flags |= ctx->flags & (IORING_SETUP_NO_SQARRAY |
-	    IORING_SETUP_SQE128 | IORING_SETUP_CQE32 | IORING_SETUP_NO_MMAP);
+	    IORING_SETUP_SQE128 | IORING_SETUP_CQE32 | IORING_SETUP_NO_MMAP |
+	    IORING_SETUP_SQE_MIXED | IORING_SETUP_CQE_MIXED |
+	    IORING_SETUP_SQ_REWIND);
 	error = kqring_ring_entries(p.sq_entries, &p, &sq_entries,
 	    &cq_entries);
 	if (error != 0)
@@ -440,6 +442,10 @@ kqring_resize_rings(struct kqring_ctx *ctx,
 	 * array (if any) pointing straight at them; one the old array pointed
 	 * past the SQEs stays an invalid index, to be dropped as before.
 	 */
+	/* SQ_REWIND keeps its SQEs from slot 0, the head and tail at 0. */
+	if ((ctx->flags & IORING_SETUP_SQ_REWIND) != 0)
+		memcpy(nsqes, ctx->sqes,
+		    (size_t)MIN(ctx->sq_entries, sq_entries) * sqe_size);
 	for (uint32_t i = head; i != tail; i++) {
 		uint32_t src = ctx->sq_array != NULL ?
 		    ctx->sq_array[i & ctx->sq_mask] : i & ctx->sq_mask;
@@ -447,14 +453,68 @@ kqring_resize_rings(struct kqring_ctx *ctx,
 
 		if (narray != NULL)
 			narray[dst] = src < ctx->sq_entries ? dst : sq_entries;
-		if (src < ctx->sq_entries)
+		if (src >= ctx->sq_entries)
+			continue;
+		memcpy(nsqes + dst * sqe_size,
+		    (char *)ctx->sqes + src * sqe_size, sqe_size);
+		/* SQE_MIXED: a 128-byte SQE's second half goes with it. */
+		if ((ctx->flags & IORING_SETUP_SQE_MIXED) != 0 &&
+		    i + 1 != tail && src != ctx->sq_mask &&
+		    (ctx->sqes[src].opcode == IORING_OP_NOP128 ||
+		    ctx->sqes[src].opcode == IORING_OP_URING_CMD128)) {
+			i++;
+			dst = i & (sq_entries - 1);
+			if (narray != NULL)
+				narray[dst] = dst;
 			memcpy(nsqes + dst * sqe_size,
-			    (char *)ctx->sqes + src * sqe_size, sqe_size);
+			    (char *)ctx->sqes + (src + 1) * sqe_size, sqe_size);
+		}
 	}
-	for (uint32_t i = chead; i != ctail; i++)
-		memcpy(ncqes + (i & (cq_entries - 1)) * cqe_size,
-		    (char *)ctx->cqes + (i & ctx->cq_mask) * cqe_size,
-		    cqe_size);
+	if ((ctx->flags & IORING_SETUP_CQE_MIXED) != 0) {
+		/*
+		 * Repack: a 32-byte CQE mustn't wrap in the new CQ either, so
+		 * the old SKIP entries go and new ones go where needed.
+		 */
+		uint32_t nt = chead, nmask = cq_entries - 1;
+
+		for (uint32_t i = chead; i != ctail;) {
+			const struct io_uring_cqe *c =
+			    &ctx->cqes[i & ctx->cq_mask];
+			uint32_t n = (c->flags & IORING_CQE_F_32) != 0 ? 2 : 1;
+
+			if ((c->flags & IORING_CQE_F_SKIP) != 0) {
+				i++;
+				continue;
+			}
+			/* Only a head moved into a CQE's second half gets here. */
+			if (ctail - i < n)
+				break;
+			if (n == 2 && (nt & nmask) == nmask) {
+				struct io_uring_cqe *sk = (struct io_uring_cqe *)
+				    (ncqes + (nt & nmask) * cqe_size);
+
+				sk->user_data = 0;
+				sk->res = 0;
+				sk->flags = IORING_CQE_F_SKIP;
+				nt++;
+			}
+			if (nt - chead + n > cq_entries) {
+				mtx_unlock(&ctx->mtx);
+				kqring_rmem_free(&m);
+				return (EOVERFLOW);
+			}
+			memcpy(ncqes + (nt & nmask) * cqe_size, c,
+			    n * cqe_size);
+			nt += n;
+			i += n;
+		}
+		ctail = nt;
+	} else {
+		for (uint32_t i = chead; i != ctail; i++)
+			memcpy(ncqes + (i & (cq_entries - 1)) * cqe_size,
+			    (char *)ctx->cqes + (i & ctx->cq_mask) * cqe_size,
+			    cqe_size);
+	}
 	kqlock = kqring_kp_shm_lock(ctx);
 	if (kqlock != NULL)
 		mtx_lock(kqlock);
@@ -1191,6 +1251,18 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	if ((p.flags & IORING_SETUP_TASKRUN_FLAG) != 0 &&
 	    (p.flags & (IORING_SETUP_COOP_TASKRUN |
 	    IORING_SETUP_DEFER_TASKRUN)) == 0)
+		return (EINVAL);
+	/* One CQE size or both, one SQE size or both. */
+	if ((p.flags & IORING_SETUP_CQE32) != 0 &&
+	    (p.flags & IORING_SETUP_CQE_MIXED) != 0)
+		return (EINVAL);
+	if ((p.flags & IORING_SETUP_SQE128) != 0 &&
+	    (p.flags & IORING_SETUP_SQE_MIXED) != 0)
+		return (EINVAL);
+	/* SQ_REWIND reads SQEs from slot 0, not through the head and array. */
+	if ((p.flags & IORING_SETUP_SQ_REWIND) != 0 &&
+	    ((p.flags & IORING_SETUP_NO_SQARRAY) == 0 ||
+	    (p.flags & IORING_SETUP_SQPOLL) != 0))
 		return (EINVAL);
 	/* A ring with no descriptor has nothing to mmap through. */
 	if ((p.flags & IORING_SETUP_REGISTERED_FD_ONLY) != 0 &&

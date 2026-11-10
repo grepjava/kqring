@@ -2,7 +2,7 @@
 
 This file lists every io_uring capability against one baseline, says how kqring behaves, and points at the code and the test behind that claim. [`tests/compat_check.py`](tests/compat_check.py) checks it against the source, so a capability can't be added or removed without this file changing too.
 
-**Baseline:** Linux 7.3, whose UAPI header (`linux/io_uring.h`, from `linux-libc-dev` 7.3.0-9.9 on Ubuntu 26.10) lists the capabilities and whose running kernel is what [`tests/kqring_diff.c`](tests/kqring_diff.c) compares against, and liburing 2.15. kqring's opcode numbers match that header up to `IORING_OP_PIPE`, and what Linux has after it is refused. kqring 0.3.0 on FreeBSD 15.1-RELEASE, amd64.
+**Baseline:** Linux 7.3, whose UAPI header (`linux/io_uring.h`, from `linux-libc-dev` 7.3.0-9.9 on Ubuntu 26.10) lists the capabilities and whose running kernel is what [`tests/kqring_diff.c`](tests/kqring_diff.c) compares against, and liburing 2.15. kqring's opcode numbers match that header up to `IORING_OP_URING_CMD128`. kqring 0.3.0 on FreeBSD 15.1-RELEASE, amd64.
 
 This matrix records what kqring is designed to do and what its tests check. [Differential conformance](ROADMAP.MD#differential-conformance) compares the behaviour that matters most with a running Linux kernel, case by case; rows outside those cases rest on kqring's own tests and on liburing's.
 
@@ -92,8 +92,8 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_OP_READV_FIXED` | Different | As `READ_FIXED`. Every iovec must be inside the buffer. | `kqring_exec_file_rw` | `test_registered_buffers` |
 | `IORING_OP_WRITEV_FIXED` | Different | As `READV_FIXED`. | `kqring_exec_file_rw` | `test_compat_gaps` |
 | `IORING_OP_PIPE` | Partial | A direct pipe briefly has descriptors in the process. | `kqring_exec_pipe` | `test_direct_descriptors`, `fuzz` |
-| `IORING_OP_NOP128` | Unsupported | `-EINVAL`, even with 128-byte SQEs. | `kqring_req_prep` | `test_compat_contracts` |
-| `IORING_OP_URING_CMD128` | Unsupported | `-EINVAL`, even with 128-byte SQEs. | `kqring_req_prep` | `test_compat_contracts` |
+| `IORING_OP_NOP128` | Equivalent | `NOP` in a 128-byte SQE: on an `SQE128` or `SQE_MIXED` ring, else `-EINVAL`. | `kqring_req_prep`, `kqring_submit_sqes` | `test_mixed_sizes`, `test_compat_contracts`, `liburing/sqe-mixed-nop`, `fuzz` |
+| `IORING_OP_URING_CMD128` | Partial | `URING_CMD` in a 128-byte SQE, as `NOP128` is `NOP`: so only the socket commands, which don't read its second 64 bytes. | `kqring_req_prep`, `kqring_submit_sqes` | `test_mixed_sizes`, `test_compat_contracts` |
 
 ## Setup flags
 
@@ -117,9 +117,9 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_SETUP_REGISTERED_FD_ONLY` | Equivalent | | `kqring_ioc_setup` | `test_no_mmap`, `liburing/reg-fd-only`, `fuzz` |
 | `IORING_SETUP_NO_SQARRAY` | Equivalent | | `kqring_ioc_setup` | `test_no_mmap`, `fuzz` |
 | `IORING_SETUP_HYBRID_IOPOLL` | Unsupported | `EINVAL`. | `kqring_ioc_setup` | `test_compat_contracts` |
-| `IORING_SETUP_CQE_MIXED` | Unsupported | `EINVAL`. | `kqring_ioc_setup` | `test_compat_contracts` |
-| `IORING_SETUP_SQE_MIXED` | Unsupported | `EINVAL`. | `kqring_ioc_setup` | `test_compat_contracts` |
-| `IORING_SETUP_SQ_REWIND` | Unsupported | `EINVAL`. | `kqring_ioc_setup` | `test_compat_contracts` |
+| `IORING_SETUP_CQE_MIXED` | Different | Not with `CQE32`. A CQE with extra words (`IORING_NOP_CQE32`, kevent and kqueue-bridge CQEs) takes two slots and has `IORING_CQE_F_32`; one that would wrap has an `IORING_CQE_F_SKIP` entry before it, also out of the overflow list and after a resize. kqring clears those two flags from the flags a `MSG_RING` passes, so only the kernel sets them. | `kqring_cq_push_mixed`, `kqring_resize_rings` | `test_mixed_sizes`, `liburing/nop32`, `liburing/nop32-overflow`, `liburing/cq-peek-batch-mixed`, `liburing/large-resize`, `fuzz` |
+| `IORING_SETUP_SQE_MIXED` | Equivalent | Not with `SQE128`. `NOP128` and `URING_CMD128` take two slots; in the last slot, before or after the SQ array maps it, or when `to_submit` ends after the first, one fails with `-EINVAL` and takes one. | `kqring_submit_sqes` | `test_mixed_sizes`, `liburing/sqe-mixed-nop`, `liburing/sqe-mixed-bad-wrap`, `liburing/sqe-mixed-boundary`, `fuzz` |
+| `IORING_SETUP_SQ_REWIND` | Equivalent | Needs `NO_SQARRAY`, not with `SQPOLL`. Each enter reads `to_submit` SQEs from slot 0 and leaves the head at 0. | `kqring_submit_sqes` | `test_mixed_sizes`, `liburing/sqe-mixed-nop`, `fuzz` |
 
 ## Enter flags
 
@@ -223,7 +223,8 @@ These are the `IORING_FEAT_*` bits setup returns.
 | Capability | Status | Contract | Source | Tests |
 |---|---|---|---|---|
 | `IORING_NOP_INJECT_RESULT` | Equivalent | | `kqring_exec_sync` | `test_trigger_concurrent` |
-| `IORING_NOP_FILE` | Unsupported | `-EINVAL`, as are `IORING_NOP_FIXED_FILE`, `IORING_NOP_FIXED_BUFFER`, `IORING_NOP_TW` and `IORING_NOP_CQE32`. | `kqring_req_prep` | `test_compat_contracts` |
+| `IORING_NOP_CQE32` | Equivalent | On a `CQE32` or `CQE_MIXED` ring, else `-EINVAL`: `big_cqe` holds `sqe->off` and `sqe->addr`. | `kqring_req_prep`, `kqring_exec_sync` | `test_mixed_sizes`, `test_compat_contracts`, `liburing/nop32` |
+| `IORING_NOP_FILE` | Unsupported | `-EINVAL`, as are `IORING_NOP_FIXED_FILE`, `IORING_NOP_FIXED_BUFFER` and `IORING_NOP_TW`. | `kqring_req_prep` | `test_compat_contracts` |
 | `IORING_FSYNC_DATASYNC` | Equivalent | | `kqring_exec_fsync` | `liburing/fsync` |
 | `IORING_TIMEOUT_ABS` | Equivalent | | `kqring_timeout_rel` | `test_timeouts` |
 | `IORING_TIMEOUT_BOOTTIME` | Partial | Measured on the uptime clock, as the default is. | `kqring_timeout_rel` | `test_timeouts` |
@@ -262,6 +263,8 @@ These are the `IORING_FEAT_*` bits setup returns.
 | `IOU_PBUF_RING_INC` | Equivalent | A read at end of file reports the buffer it didn't use, with `IORING_CQE_F_BUF_MORE`. | `kqring_buf_commit`, `kqring_buf_eof` | `test_buffer_groups`, `liburing/read-inc-file`, `liburing/read-inc-buf-more` |
 | `IORING_CQE_F_SOCK_NONEMPTY` | Equivalent | | `kqring_exec_accept` | `liburing/accept-non-empty` |
 | `IORING_CQE_F_BUF_MORE` | Equivalent | | `kqring_buf_commit` | `test_buffer_groups` |
+| `IORING_CQE_F_32` | Equivalent | Only on `CQE_MIXED` rings. | `kqring_cq_push_mixed` | `test_mixed_sizes`, `liburing/nop32` |
+| `IORING_CQE_F_SKIP` | Equivalent | Only on `CQE_MIXED` rings. | `kqring_cq_push_mixed` | `test_mixed_sizes`, `liburing/nop32-overflow` |
 | `IORING_CQ_EVENTFD_DISABLED` | Equivalent | | `kqring_evfd_signal_locked` | `test_eventfd`, `liburing/eventfd-disable` |
 | `IORING_RSRC_REGISTER_SPARSE` | Equivalent | | `kqring_register_op` | `test_rsrc_tags`, `liburing/rsrc_tags` |
 | `IORING_REGISTER_SRC_REGISTERED` | Equivalent | | `kqring_bufs_clone` | `test_registered_rings` |

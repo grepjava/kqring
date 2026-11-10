@@ -204,6 +204,17 @@ _Static_assert(sizeof(struct io_uring_cqe) == 16, "io_uring_cqe must be 16 bytes
 #define IORING_SETUP_NO_MMAP		(1U << 14)
 #define IORING_SETUP_REGISTERED_FD_ONLY	(1U << 15)
 #define IORING_SETUP_NO_SQARRAY		(1U << 16)
+/*
+ * CQE_MIXED: a CQ of 16-byte slots where a 32-byte CQE (IORING_CQE_F_32)
+ * takes two; one that would wrap is preceded by an IORING_CQE_F_SKIP
+ * entry in the last slot.  SQE_MIXED: an SQ of 64-byte slots where the
+ * 128-byte opcodes (NOP128, URING_CMD128) take two, never across the end.
+ * SQ_REWIND (needs NO_SQARRAY, not SQPOLL): each enter submits to_submit
+ * SQEs from slot 0; the SQ head and tail stay 0.
+ */
+#define IORING_SETUP_CQE_MIXED		(1U << 18)
+#define IORING_SETUP_SQE_MIXED		(1U << 19)
+#define IORING_SETUP_SQ_REWIND		(1U << 20)
 
 /*
  * Opcodes (sqe->opcode)
@@ -272,6 +283,8 @@ enum io_uring_op {
 	IORING_OP_READV_FIXED = 60,
 	IORING_OP_WRITEV_FIXED = 61,
 	IORING_OP_PIPE = 62,
+	IORING_OP_NOP128 = 63,		/* 128-byte SQE: SQE128 or SQE_MIXED */
+	IORING_OP_URING_CMD128 = 64,	/* likewise */
 	IORING_OP_LAST
 };
 
@@ -299,8 +312,13 @@ enum io_uring_op {
 #define KQRING_RWF_SUPPORTED		(KQRING_RWF_HIPRI | KQRING_RWF_DSYNC | \
 	KQRING_RWF_SYNC | KQRING_RWF_NOWAIT)
 
-/* sqe->nop_flags: complete with (int32_t)sqe->len instead of 0. */
+/*
+ * sqe->nop_flags: INJECT_RESULT completes with (int32_t)sqe->len instead
+ * of 0; CQE32 (CQE32 or CQE_MIXED rings) posts a 32-byte CQE whose
+ * big_cqe holds sqe->off and sqe->addr.
+ */
 #define IORING_NOP_INJECT_RESULT	(1U << 0)
+#define IORING_NOP_CQE32		(1U << 5)
 
 /*
  * sqe->ioprio flags for SEND/RECV
@@ -509,7 +527,8 @@ _Static_assert(sizeof(struct statx) == 256, "struct statx must be 256 bytes");
 #define IORING_CQE_F_SOCK_NONEMPTY	(1U << 2)
 #define IORING_CQE_F_NOTIF		(1U << 3)
 #define IORING_CQE_F_BUF_MORE		(1U << 4)	/* IOU_PBUF_RING_INC */
-#define IORING_CQE_F_32			(1U << 5)	/* 32-byte CQE */
+#define IORING_CQE_F_SKIP		(1U << 5)	/* CQE_MIXED padding */
+#define IORING_CQE_F_32			(1U << 15)	/* CQE_MIXED: 32 bytes */
 
 #define IORING_CQE_BUFFER_SHIFT		16
 
@@ -1029,10 +1048,11 @@ struct kqring_ext_setup {
  *   user_data  the event's udata (not the request's)
  *   res        its data, as 0 .. INT32_MAX
  *   flags      IORING_CQE_F_MORE
- *   big_cqe    on a CQE32 ring: [0] ident, [1] KQRING_KQ_FILTER() and
+ *   big_cqe    on a CQE32 ring, or CQE_MIXED, where the CQE has
+ *              IORING_CQE_F_32: [0] ident, [1] KQRING_KQ_FILTER() and
  *              the flags and fflags macros below
  *
- * Without CQE32 only udata and data arrive, so give each event a udata that
+ * Without CQE32 or CQE_MIXED only udata and data arrive, so give each event a udata that
  * says what it is.  An io_uring_enter() with IORING_ENTER_GETEVENTS looks
  * at the kqueue as a kevent(2) call would: an event that is not EV_CLEAR
  * is reported once at each one until its condition ends.  Take events with
@@ -1075,7 +1095,8 @@ struct kqring_ext_setup {
  *                  readable means end of input or an error.  Not a
  *                  trigger source (use KQRING_TRIG_SRC_POLL).
  *
- * With IORING_SETUP_CQE32, big_cqe[0] holds the kevent's data (for
+ * With IORING_SETUP_CQE32 or CQE_MIXED (where these CQEs are 32 bytes),
+ * big_cqe[0] holds the kevent's data (for
  * NOTE_EXIT, the exit status as wait(2) reports it) and big_cqe[1] the
  * fflags that fired.
  */

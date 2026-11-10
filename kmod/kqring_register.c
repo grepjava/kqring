@@ -803,6 +803,8 @@ kqring_register_probe(const struct kqring_register_arg *ra)
 		IORING_OP_PIPE,
 		IORING_OP_SPLICE,
 		IORING_OP_TEE,
+		IORING_OP_NOP128,
+		IORING_OP_URING_CMD128,
 	};
 	struct io_uring_probe hdr;
 	int error;

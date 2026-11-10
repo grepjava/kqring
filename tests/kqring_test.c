@@ -121,12 +121,14 @@ ring_map(struct test_ring *r, const struct io_uring_params *pp)
 	const struct io_uring_params p = *pp;
 
 	r->ring_map_len = p.cq_off.cqes +
-	    p.cq_entries * sizeof(struct io_uring_cqe);
+	    (p.cq_entries * sizeof(struct io_uring_cqe) <<
+	    ((p.flags & IORING_SETUP_CQE32) != 0 ? 1 : 0));
 	r->ring_map = mmap(NULL, r->ring_map_len, PROT_READ | PROT_WRITE,
 	    MAP_SHARED, r->fd, IORING_OFF_SQ_RING);
 	assert(r->ring_map != MAP_FAILED);
 
-	r->sqes_len = p.sq_entries * sizeof(struct io_uring_sqe);
+	r->sqes_len = p.sq_entries * sizeof(struct io_uring_sqe) <<
+	    ((p.flags & IORING_SETUP_SQE128) != 0 ? 1 : 0);
 	r->sqes = mmap(NULL, r->sqes_len, PROT_READ | PROT_WRITE,
 	    MAP_SHARED, r->fd, IORING_OFF_SQES);
 	assert(r->sqes != MAP_FAILED);
@@ -137,8 +139,9 @@ ring_map(struct test_ring *r, const struct io_uring_params *pp)
 	r->sq_kflags = (_Atomic unsigned *)(base + p.sq_off.flags);
 	r->sq_kdropped = (_Atomic unsigned *)(base + p.sq_off.dropped);
 	r->sq_mask = *(unsigned *)(base + p.sq_off.ring_mask);
-	r->sq_array = (unsigned *)(base + p.sq_off.array);
-	for (unsigned i = 0; i < p.sq_entries; i++)
+	r->sq_array = (p.flags & IORING_SETUP_NO_SQARRAY) != 0 ? NULL :
+	    (unsigned *)(base + p.sq_off.array);
+	for (unsigned i = 0; r->sq_array != NULL && i < p.sq_entries; i++)
 		r->sq_array[i] = i;
 
 	r->cq_khead = (_Atomic unsigned *)(base + p.cq_off.head);
@@ -8418,6 +8421,280 @@ test_no_mmap(void)
 	    "after fork), REGISTERED_FD_ONLY\n");
 }
 
+/* An enabled DEFER_TASKRUN ring with these flags, mapped. */
+static void
+mx_ring(struct test_ring *t, uint32_t flags, unsigned sq, unsigned cq)
+{
+	struct io_uring_params p;
+
+	memset(&p, 0, sizeof(p));
+	memset(t, 0, sizeof(*t));
+	p.flags = flags | IORING_SETUP_CQSIZE | IORING_SETUP_SINGLE_ISSUER |
+	    IORING_SETUP_DEFER_TASKRUN;
+	p.cq_entries = cq;
+	t->fd = (int)kqring_setup(sq, &p);
+	assert(t->fd >= 0);
+	ring_map(t, &p);
+}
+
+static void
+mx_close(struct test_ring *t)
+{
+	munmap(t->sqes, t->sqes_len);
+	munmap(t->ring_map, t->ring_map_len);
+	close(t->fd);
+}
+
+/* A NOP in SQ slot i (64-byte slots); big asks for a 32-byte CQE. */
+static void
+mx_nop(struct test_ring *t, unsigned i, uint8_t opcode, uint64_t ud, bool big)
+{
+	struct io_uring_sqe *sqe = &t->sqes[i & t->sq_mask];
+
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->opcode = opcode;
+	sqe->fd = -1;
+	sqe->user_data = ud;
+	if (big) {
+		sqe->nop_flags = IORING_NOP_CQE32;
+		sqe->off = ud + 1000;
+		sqe->addr = ud + 2000;
+	}
+}
+
+/* Check the CQE in CQ slot i (16-byte slots). */
+static void
+mx_cqe(struct test_ring *t, unsigned i, uint64_t ud, uint32_t flags)
+{
+	const struct io_uring_cqe *c = &t->cqes[i & t->cq_mask];
+
+	if (c->user_data != ud || c->res != 0 || c->flags != flags) {
+		fprintf(stderr, "mixed CQ slot %u: ud=%llu res=%d flags=%#x, "
+		    "want ud=%llu flags=%#x\n", i,
+		    (unsigned long long)c->user_data, c->res, c->flags,
+		    (unsigned long long)ud, flags);
+		abort();
+	}
+	if ((flags & IORING_CQE_F_32) != 0)
+		assert(c->big_cqe[0] == ud + 1000 && c->big_cqe[1] == ud + 2000);
+}
+
+/* Move the CQ head to head; the tail must be at tail. */
+static void
+mx_tails(struct test_ring *t, unsigned head, unsigned tail)
+{
+	assert(atomic_load_explicit(t->cq_ktail, memory_order_acquire) ==
+	    tail);
+	atomic_store_explicit(t->cq_khead, head, memory_order_release);
+}
+
+static void
+mx_sq_tail(struct test_ring *t, unsigned tail)
+{
+	atomic_store_explicit(t->sq_ktail, tail, memory_order_release);
+}
+
+/*
+ * IORING_SETUP_CQE_MIXED, SQE_MIXED and SQ_REWIND, as in Linux: a 32-byte
+ * CQE takes two CQ slots and never wraps (a SKIP entry pads the last
+ * slot), also when it comes out of the overflow list or a resize; NOP128
+ * and URING_CMD128 take two SQ slots and fail with EINVAL in the last one
+ * or when to_submit ends after the first; a rewound SQ is read from slot 0
+ * with its head and tail left at 0.
+ */
+static void
+test_mixed_sizes(void)
+{
+	static const uint32_t bad[] = {
+		IORING_SETUP_CQE32 | IORING_SETUP_CQE_MIXED,
+		IORING_SETUP_SQE128 | IORING_SETUP_SQE_MIXED,
+		IORING_SETUP_SQ_REWIND,
+		IORING_SETUP_SQ_REWIND | IORING_SETUP_NO_SQARRAY |
+		    IORING_SETUP_SQPOLL,
+	};
+	struct io_uring_params p;
+	struct test_ring t;
+	int sv[2];
+
+	for (size_t i = 0; i < nitems(bad); i++) {
+		memset(&p, 0, sizeof(p));
+		p.flags = bad[i];
+		assert(kqring_setup(8, &p) == -1 && errno == EINVAL);
+	}
+
+	/* CQE_MIXED: a 16-byte CQE, then a 32-byte one in slots 1 and 2. */
+	mx_ring(&t, IORING_SETUP_CQE_MIXED, 8, 8);
+	mx_nop(&t, 0, IORING_OP_NOP, 1, false);
+	mx_nop(&t, 1, IORING_OP_NOP, 2, true);
+	mx_sq_tail(&t, 2);
+	assert(kqring_enter(t.fd, 2, 0, 0, NULL, 0) == 2);
+	mx_cqe(&t, 0, 1, 0);
+	mx_cqe(&t, 1, 2, IORING_CQE_F_32);
+	mx_tails(&t, 3, 3);
+	/* Four more fill slots 3-6; the next 32-byte one wraps past a SKIP. */
+	for (unsigned i = 0; i < 5; i++)
+		mx_nop(&t, 2 + i, IORING_OP_NOP, 10 + i, i == 4);
+	mx_sq_tail(&t, 7);
+	assert(kqring_enter(t.fd, 5, 0, 0, NULL, 0) == 5);
+	for (unsigned i = 0; i < 4; i++)
+		mx_cqe(&t, 3 + i, 10 + i, 0);
+	assert(t.cqes[7].flags == IORING_CQE_F_SKIP &&
+	    t.cqes[7].user_data == 0);
+	mx_cqe(&t, 8, 14, IORING_CQE_F_32);
+	mx_tails(&t, 10, 10);
+	/*
+	 * Overflow: four 32-byte CQEs fill slots 10-17; a fifth and a
+	 * 16-byte one wait in the kernel and keep their sizes.
+	 */
+	for (unsigned i = 0; i < 6; i++)
+		mx_nop(&t, 7 + i, IORING_OP_NOP, 20 + i, i < 5);
+	mx_sq_tail(&t, 13);
+	assert(kqring_enter(t.fd, 6, 0, 0, NULL, 0) == 6);
+	for (unsigned i = 0; i < 4; i++)
+		mx_cqe(&t, 10 + 2 * i, 20 + i, IORING_CQE_F_32);
+	assert((atomic_load(t.sq_kflags) & IORING_SQ_CQ_OVERFLOW) != 0);
+	mx_tails(&t, 18, 18);
+	assert(kqring_enter(t.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) == 0);
+	mx_cqe(&t, 18, 24, IORING_CQE_F_32);
+	mx_cqe(&t, 20, 25, 0);
+	mx_tails(&t, 21, 21);
+	assert((atomic_load(t.sq_kflags) & IORING_SQ_CQ_OVERFLOW) == 0);
+
+	/*
+	 * Resize to a CQ of 4 with a 32-byte CQE at 27-28: 27 is the new
+	 * CQ's last slot, so a SKIP goes there and the CQE to 28-29.
+	 */
+	for (unsigned i = 0; i < 6; i++)
+		mx_nop(&t, 13 + i, IORING_OP_NOP, 31 + i, false);
+	mx_nop(&t, 19, IORING_OP_NOP, 30, true);
+	mx_sq_tail(&t, 19);
+	assert(kqring_enter(t.fd, 6, 0, 0, NULL, 0) == 6);
+	mx_tails(&t, 27, 27);
+	mx_sq_tail(&t, 20);
+	assert(kqring_enter(t.fd, 1, 0, 0, NULL, 0) == 1);
+	mx_cqe(&t, 27, 30, IORING_CQE_F_32);
+	memset(&p, 0, sizeof(p));
+	p.sq_entries = 4;
+	p.cq_entries = 4;
+	p.flags = IORING_SETUP_CQSIZE;
+	assert(reg(&t, IORING_REGISTER_RESIZE_RINGS, &p, 1) == 0);
+	assert((p.flags & IORING_SETUP_CQE_MIXED) != 0);
+	munmap(t.sqes, t.sqes_len);
+	munmap(t.ring_map, t.ring_map_len);
+	ring_map(&t, &p);
+	assert(atomic_load(t.cq_khead) == 27 && atomic_load(t.cq_ktail) == 30);
+	assert(t.cqes[27 & t.cq_mask].flags == IORING_CQE_F_SKIP);
+	mx_cqe(&t, 28, 30, IORING_CQE_F_32);
+	mx_close(&t);
+
+	/* A MSG_RING can't pass IORING_CQE_F_32 or F_SKIP into a mixed CQ. */
+	mx_ring(&t, IORING_SETUP_CQE_MIXED, 8, 8);
+	{
+		struct io_uring_sqe ms;
+
+		memset(&ms, 0, sizeof(ms));
+		ms.opcode = IORING_OP_MSG_RING;
+		ms.fd = t.fd;
+		ms.addr = IORING_MSG_DATA;
+		ms.off = 39;
+		ms.msg_ring_flags = IORING_MSG_RING_FLAGS_PASS;
+		ms.file_index = IORING_CQE_F_32 | IORING_CQE_F_SKIP |
+		    IORING_CQE_F_MORE;
+		assert(kqring_register(-1, IORING_REGISTER_SEND_MSG_RING, &ms,
+		    1) == 0);
+		assert(kqring_enter(t.fd, 0, 1, IORING_ENTER_GETEVENTS, NULL,
+		    0) == 0);
+		mx_cqe(&t, 0, 39, IORING_CQE_F_MORE);
+		mx_tails(&t, 1, 1);
+	}
+	mx_close(&t);
+
+	/* CQE32: the same NOP fills big_cqe without IORING_CQE_F_32. */
+	mx_ring(&t, IORING_SETUP_CQE32, 8, 8);
+	mx_nop(&t, 0, IORING_OP_NOP, 40, true);
+	mx_sq_tail(&t, 1);
+	assert(kqring_enter(t.fd, 1, 0, 0, NULL, 0) == 1);
+	assert(t.cqes[0].user_data == 40 && t.cqes[0].flags == 0 &&
+	    t.cqes[0].big_cqe[0] == 1040 && t.cqes[0].big_cqe[1] == 2040);
+	mx_close(&t);
+
+	/*
+	 * SQE_MIXED: NOP, NOP128 in slots 1-2 and URING_CMD128 in 3-4 are
+	 * five slots; the second halves are the SQEs' last 64 bytes, not
+	 * SQEs.
+	 */
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	mx_ring(&t, IORING_SETUP_SQE_MIXED, 8, 16);
+	mx_nop(&t, 0, IORING_OP_NOP, 50, false);
+	mx_nop(&t, 1, IORING_OP_NOP128, 51, false);
+	memset(&t.sqes[2], 0xa5, sizeof(t.sqes[2]));
+	mx_nop(&t, 3, IORING_OP_URING_CMD128, 52, false);
+	t.sqes[3].fd = sv[0];
+	t.sqes[3].cmd_op = SOCKET_URING_OP_SIOCINQ;
+	memset(&t.sqes[4], 0x5a, sizeof(t.sqes[4]));
+	mx_sq_tail(&t, 5);
+	assert(kqring_enter(t.fd, 5, 0, 0, NULL, 0) == 5);
+	assert(atomic_load(t.sq_khead) == 5);
+	mx_cqe(&t, 0, 50, 0);
+	mx_cqe(&t, 1, 51, 0);
+	mx_cqe(&t, 2, 52, 0);
+	mx_tails(&t, 3, 3);
+	/*
+	 * NOP128 in the last slot fails, taking one slot, and ends the
+	 * submission (no SUBMIT_ALL); the NOP after it in slot 0 is next.
+	 */
+	mx_nop(&t, 5, IORING_OP_NOP, 53, false);
+	mx_nop(&t, 6, IORING_OP_NOP, 54, false);
+	mx_nop(&t, 7, IORING_OP_NOP128, 55, false);
+	mx_nop(&t, 8, IORING_OP_NOP, 56, false);
+	mx_sq_tail(&t, 9);
+	assert(kqring_enter(t.fd, 4, 0, 0, NULL, 0) == 3);
+	mx_cqe(&t, 3, 53, 0);
+	mx_cqe(&t, 4, 54, 0);
+	assert(t.cqes[5].user_data == 55 && t.cqes[5].res == -EINVAL);
+	mx_tails(&t, 6, 6);
+	assert(kqring_enter(t.fd, 1, 0, 0, NULL, 0) == 1);
+	mx_cqe(&t, 6, 56, 0);
+	/* NOP128 with to_submit 1 fails too; its second slot is read next. */
+	mx_nop(&t, 9, IORING_OP_NOP128, 57, false);
+	mx_nop(&t, 10, IORING_OP_NOP, 58, false);
+	mx_sq_tail(&t, 11);
+	assert(kqring_enter(t.fd, 1, 0, 0, NULL, 0) == 1);
+	assert(t.cqes[7].user_data == 57 && t.cqes[7].res == -EINVAL);
+	assert(kqring_enter(t.fd, 1, 0, 0, NULL, 0) == 1);
+	mx_cqe(&t, 8, 58, 0);
+	mx_tails(&t, 9, 9);
+	mx_close(&t);
+
+	/* SQE128: NOP128 is one slot. */
+	mx_ring(&t, IORING_SETUP_SQE128, 8, 16);
+	memset(t.sqes, 0, 128);
+	t.sqes[0].opcode = IORING_OP_NOP128;
+	t.sqes[0].user_data = 60;
+	mx_sq_tail(&t, 1);
+	assert(kqring_enter(t.fd, 1, 0, 0, NULL, 0) == 1);
+	mx_cqe(&t, 0, 60, 0);
+	mx_close(&t);
+
+	/* SQ_REWIND: each enter reads from slot 0; head and tail stay 0. */
+	mx_ring(&t, IORING_SETUP_SQ_REWIND | IORING_SETUP_NO_SQARRAY |
+	    IORING_SETUP_SQE_MIXED, 8, 16);
+	mx_nop(&t, 0, IORING_OP_NOP, 70, false);
+	mx_nop(&t, 1, IORING_OP_NOP128, 71, false);
+	assert(kqring_enter(t.fd, 3, 0, 0, NULL, 0) == 3);
+	mx_nop(&t, 0, IORING_OP_NOP, 72, false);
+	assert(kqring_enter(t.fd, 1, 0, 0, NULL, 0) == 1);
+	assert(atomic_load(t.sq_khead) == 0 && atomic_load(t.sq_ktail) == 0);
+	mx_cqe(&t, 0, 70, 0);
+	mx_cqe(&t, 1, 71, 0);
+	mx_cqe(&t, 2, 72, 0);
+	mx_close(&t);
+	close(sv[0]);
+	close(sv[1]);
+	printf("[PASS] CQE_MIXED, SQE_MIXED and SQ_REWIND: two-slot CQEs "
+	    "and SQEs, SKIP at the wrap, overflow, resize\n");
+}
+
 /*
  * IORING_REGISTER_RESIZE_RINGS: SQEs not yet submitted and CQEs not yet
  * reaped move to the new rings, which are mapped afresh; the old mapping
@@ -11361,9 +11638,6 @@ test_compat_contracts(void)
 {
 	static const uint32_t bad_setup[] = {
 		1U << 17,	/* IORING_SETUP_HYBRID_IOPOLL */
-		1U << 18,	/* IORING_SETUP_CQE_MIXED */
-		1U << 19,	/* IORING_SETUP_SQE_MIXED */
-		1U << 20,	/* IORING_SETUP_SQ_REWIND */
 		IORING_SETUP_TASKRUN_FLAG,
 		IORING_SETUP_SQPOLL | IORING_SETUP_COOP_TASKRUN,
 		IORING_SETUP_SQPOLL | IORING_SETUP_COOP_TASKRUN |
@@ -11385,7 +11659,7 @@ test_compat_contracts(void)
 		1U << 2,	/* IORING_NOP_FIXED_FILE */
 		1U << 3,	/* IORING_NOP_FIXED_BUFFER */
 		1U << 4,	/* IORING_NOP_TW */
-		1U << 5,	/* IORING_NOP_CQE32 */
+		IORING_NOP_CQE32,	/* without CQE32 or CQE_MIXED */
 	};
 	struct io_uring_params p;
 	struct io_uring_sqe *sqe;
@@ -11432,11 +11706,14 @@ test_compat_contracts(void)
 	ring_push_sqe(&t);
 	assert(submit_one(&t) == -EOPNOTSUPP);
 
-	/* Linux 7.3's opcodes, and IORING_TIMEOUT_IMMEDIATE_ARG. */
-	(void)ring_prep(&t, 63, -1, 78114);	/* IORING_OP_NOP128 */
+	/*
+	 * The 128-byte opcodes without SQE128 or SQE_MIXED, and Linux 7.3's
+	 * IORING_TIMEOUT_IMMEDIATE_ARG.
+	 */
+	(void)ring_prep(&t, IORING_OP_NOP128, -1, 78114);
 	ring_push_sqe(&t);
 	assert(submit_one(&t) == -EINVAL);
-	(void)ring_prep(&t, 64, -1, 78115);	/* IORING_OP_URING_CMD128 */
+	(void)ring_prep(&t, IORING_OP_URING_CMD128, -1, 78115);
 	ring_push_sqe(&t);
 	assert(submit_one(&t) == -EINVAL);
 	sqe = ring_prep(&t, IORING_OP_TIMEOUT, -1, 78116);
@@ -14260,6 +14537,15 @@ main(int argc, char **argv)
 		printf("[OK]: %d failure(s)\n", failures);
 		return (failures != 0);
 	}
+	/* "xp [rounds]": the cross-process test, repeated (exit races). */
+	if (argc >= 2 && strcmp(argv[1], "xp") == 0) {
+		int rounds = argc > 2 ? atoi(argv[2]) : 100;
+
+		for (int i = 0; i < rounds; i++)
+			test_cross_process_rings();
+		printf("[OK]: %d round(s)\n", rounds);
+		return (0);
+	}
 	/* "pollrace [rounds [threads [gap_us]]]": count, for before-and-after runs. */
 	if (argc >= 2 && strcmp(argv[1], "pollrace") == 0) {
 		int rounds = argc > 2 ? atoi(argv[2]) : 200000;
@@ -14363,6 +14649,7 @@ main(int argc, char **argv)
 		test_min_wait();
 		test_no_mmap();
 		test_resize_rings();
+		test_mixed_sizes();
 		test_poll_same_thread();
 		test_poll_before_return();
 		test_taskrun_on_wakeup();
