@@ -916,10 +916,13 @@ bench_file(void)
 static char *send_src;			/* ZC_SLOTS x SEND_MAX */
 static char send_dst[SEND_MAX];
 static bool send_may_copy;		/* AF_UNIX below the threshold */
+static int send_zc_copied;		/* other copies: short remainders */
 
 static void
 send_recv_all(int rx, size_t len)
 {
+	if (rx < 0)		/* the stream group: another thread receives */
+		return;
 	assert(recv(rx, send_dst, len, MSG_WAITALL) == (ssize_t)len);
 }
 
@@ -935,6 +938,11 @@ send_plain(const char *group, int rx, int tx, size_t len, int iters)
 	row(group, "plain_write", now_ns() - t0, (uint64_t)iters);
 }
 
+/*
+ * A send on a stream socket may be short when the receiver is draining it
+ * concurrently (the stream group): without MSG_WAITALL, io_uring reports
+ * what was sent, and the program sends the rest, as here.
+ */
 static void
 send_kqring(const char *group, struct ring *r, int rx, int tx, size_t len,
     int iters)
@@ -942,84 +950,118 @@ send_kqring(const char *group, struct ring *r, int rx, int tx, size_t len,
 	uint64_t t0 = now_ns();
 
 	for (int i = 0; i < iters; i++) {
-		struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_SEND, tx, 1);
+		for (size_t off = 0; off < len;) {
+			struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_SEND,
+			    tx, 1);
+			int32_t res;
 
-		sqe->addr = (uint64_t)(uintptr_t)send_src;
-		sqe->len = (uint32_t)len;
-		ring_enter(r, 1);
-		assert(ring_pop(r).res == (int32_t)len);
+			sqe->addr = (uint64_t)(uintptr_t)(send_src + off);
+			sqe->len = (uint32_t)(len - off);
+			ring_enter(r, 1);
+			res = ring_pop(r).res;
+			assert(res > 0 && (size_t)res <= len - off);
+			off += (size_t)res;
+		}
 		send_recv_all(rx, len);
 	}
 	row(group, "kqring_send", now_ns() - t0, (uint64_t)iters);
 }
 
 /*
- * Reap what is ready.  A send's first CQE carries IORING_CQE_F_MORE; its
- * notification (user_data = slot) frees the slot for reuse.
+ * Reap what is ready.  A send's first CQE carries IORING_CQE_F_MORE and the
+ * bytes sent; its notification (user_data = slot) is one fewer that the
+ * slot waits for before reuse.  Returns whether a send's CQE came, in *res.
  */
-static void
-send_zc_reap(struct ring *r, bool *busy, int *sent, size_t len)
+static bool
+send_zc_reap(struct ring *r, int *busy, int32_t *res)
 {
+	bool got = false;
+
 	while (ring_ready(r) > 0) {
 		struct io_uring_cqe c = ring_pop(r);
 
 		if ((c.flags & IORING_CQE_F_NOTIF) != 0) {
-			/* Zero-copy, unless kqring copies by design here. */
-			assert(c.res == 0 || (send_may_copy &&
-			    c.res == (int32_t)IORING_NOTIF_USAGE_ZC_COPIED));
-			busy[c.user_data] = false;
+			/*
+			 * Zero-copy, unless kqring copies by design here or
+			 * the rest of a short send was below a page.
+			 */
+			assert(c.res == 0 ||
+			    c.res == (int32_t)IORING_NOTIF_USAGE_ZC_COPIED);
+			if (c.res != 0 && !send_may_copy)
+				send_zc_copied++;
+			assert(busy[c.user_data] > 0);
+			busy[c.user_data]--;
 		} else {
-			assert(c.res == (int32_t)len);
+			assert(c.res > 0);
 			assert((c.flags & IORING_CQE_F_MORE) != 0);
-			(*sent)++;
+			*res = c.res;
+			got = true;
 		}
 	}
+	return (got);
 }
 
+/*
+ * With waitall, each SEND_ZC has MSG_WAITALL, and kqring sends the whole
+ * message across as many attempts as the socket needs: one SQE and one CQE
+ * per message.
+ */
 static void
 send_kqring_zc(const char *group, struct ring *r, int rx, int tx, size_t len,
-    int iters, bool fixed)
+    int iters, bool fixed, bool waitall)
 {
-	bool busy[ZC_SLOTS] = { false };
-	int sent = 0;
+	const char *name = waitall ? "kqring_send_zc_fixed_waitall" :
+	    fixed ? "kqring_send_zc_fixed" : "kqring_send_zc";
+	int busy[ZC_SLOTS] = { 0 }, sends = 0;
+	int32_t res = 0;
 	uint64_t t0 = now_ns();
+
+	send_zc_copied = 0;
 
 	for (int i = 0; i < iters; i++) {
 		int slot = i % ZC_SLOTS;
-		struct io_uring_sqe *sqe;
+		char *base = send_src + (size_t)slot * SEND_MAX;
 
-		while (busy[slot]) {
+		while (busy[slot] > 0) {
 			ring_enter(r, 1);
-			send_zc_reap(r, busy, &sent, len);
+			(void)send_zc_reap(r, busy, &res);
 		}
-		sqe = ring_prep(r, IORING_OP_SEND_ZC, tx, (uint64_t)slot);
-		sqe->addr = (uint64_t)(uintptr_t)(send_src +
-		    (size_t)slot * SEND_MAX);
-		sqe->len = (uint32_t)len;
-		sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
-		if (fixed) {
-			sqe->ioprio |= IORING_RECVSEND_FIXED_BUF;
-			sqe->buf_index = (uint16_t)slot;
-		}
-		busy[slot] = true;
-		ring_enter(r, 0);
-		/* The send usually completes inline: reap before waiting. */
-		send_zc_reap(r, busy, &sent, len);
-		while (sent <= i) {
-			ring_enter(r, 1);
-			send_zc_reap(r, busy, &sent, len);
+		for (size_t off = 0; off < len;) {
+			struct io_uring_sqe *sqe = ring_prep(r,
+			    IORING_OP_SEND_ZC, tx, (uint64_t)slot);
+
+			sqe->addr = (uint64_t)(uintptr_t)(base + off);
+			sqe->len = (uint32_t)(len - off);
+			sqe->ioprio = IORING_SEND_ZC_REPORT_USAGE;
+			if (fixed) {
+				sqe->ioprio |= IORING_RECVSEND_FIXED_BUF;
+				sqe->buf_index = (uint16_t)slot;
+			}
+			if (waitall)
+				sqe->msg_flags = MSG_WAITALL;
+			busy[slot]++;
+			sends++;
+			ring_enter(r, 0);
+			/* The send usually completes inline: reap first. */
+			while (!send_zc_reap(r, busy, &res))
+				ring_enter(r, 1);
+			assert((size_t)res <= len - off);
+			assert(!waitall || (size_t)res == len - off);
+			off += (size_t)res;
 		}
 		send_recv_all(rx, len);
-		send_zc_reap(r, busy, &sent, len);
+		(void)send_zc_reap(r, busy, &res);
 	}
 	for (int s = 0; s < ZC_SLOTS; s++) {
-		while (busy[s]) {
+		while (busy[s] > 0) {
 			ring_enter(r, 1);
-			send_zc_reap(r, busy, &sent, len);
+			(void)send_zc_reap(r, busy, &res);
 		}
 	}
-	row(group, fixed ? "kqring_send_zc_fixed" : "kqring_send_zc",
-	    now_ns() - t0, (uint64_t)iters);
+	row(group, name, now_ns() - t0, (uint64_t)iters);
+	if (sends > iters || send_zc_copied > 0)
+		printf("# %s %s: %d sends for %d messages, %d copied\n", group,
+		    name, sends, iters, send_zc_copied);
 }
 
 static void
@@ -1054,8 +1096,10 @@ send_run(const char *transport, int rx, int tx)
 		send_may_copy = strcmp(transport, "unix") == 0;
 		send_plain(group, rx, tx, sizes[i], iters);
 		send_kqring(group, &r, rx, tx, sizes[i], iters);
-		send_kqring_zc(group, &r, rx, tx, sizes[i], iters, true);
-		send_kqring_zc(group, &r, rx, tx, sizes[i], iters, false);
+		send_kqring_zc(group, &r, rx, tx, sizes[i], iters, true,
+		    false);
+		send_kqring_zc(group, &r, rx, tx, sizes[i], iters, false,
+		    false);
 	}
 	ring_fini(&r);
 }
@@ -1425,6 +1469,129 @@ bench_echo(void)
 	echo_run("echo_tcp_64", true, 64);
 }
 
+/* ------------------------------------------------------------------------
+ * stream: the send group's variants with the receiver in its own thread,
+ * draining the connection with recv(2) while the sender sends back to back.
+ * In the send group one thread sends and then reads, so on TCP loopback a
+ * small send mostly measures the hand-off to the netisr thread that
+ * delivers it; here the two sides overlap, as in a real stream.  Per op =
+ * per message, wall clock, from the first send to the last send's
+ * completion (and, for SEND_ZC, every notification).  Also reported per
+ * message: the CPU time of the sending thread (_sender_cpu) and of the
+ * receiving thread (_receiver_cpu).  Copying avoided by SEND_ZC shows in
+ * the sender's CPU even when the receiver's copy limits throughput.
+ * ------------------------------------------------------------------------
+ */
+
+struct stream_rx {
+	int		fd;
+	uint64_t	bytes;		/* to receive */
+	uint64_t	cpu_ns;
+};
+
+static void *
+stream_receiver(void *arg)
+{
+	static char buf[SEND_MAX];
+	struct stream_rx *x = arg;
+	uint64_t cpu0 = thread_cpu_ns(), got = 0;
+
+	while (got < x->bytes) {
+		ssize_t n = recv(x->fd, buf, sizeof(buf), 0);
+
+		assert(n > 0);
+		got += (uint64_t)n;
+	}
+	assert(got == x->bytes);
+	x->cpu_ns = thread_cpu_ns() - cpu0;
+	return (NULL);
+}
+
+static void
+stream_one(const char *group, const char *variant, struct ring *r, int rx,
+    int tx, size_t len, int iters)
+{
+	struct stream_rx x = { .fd = rx, .bytes = (uint64_t)len * iters };
+	char name[64];
+	pthread_t th;
+	uint64_t cpu0;
+
+	assert(pthread_create(&th, NULL, stream_receiver, &x) == 0);
+	cpu0 = thread_cpu_ns();
+	if (strcmp(variant, "plain_write") == 0)
+		send_plain(group, -1, tx, len, iters);
+	else if (strcmp(variant, "kqring_send") == 0)
+		send_kqring(group, r, -1, tx, len, iters);
+	else
+		send_kqring_zc(group, r, -1, tx, len, iters,
+		    strcmp(variant, "kqring_send_zc") != 0,
+		    strcmp(variant, "kqring_send_zc_fixed_waitall") == 0);
+	snprintf(name, sizeof(name), "%s_sender_cpu", variant);
+	row(group, name, thread_cpu_ns() - cpu0, (uint64_t)iters);
+	assert(pthread_join(th, NULL) == 0);
+	snprintf(name, sizeof(name), "%s_receiver_cpu", variant);
+	row(group, name, x.cpu_ns, (uint64_t)iters);
+}
+
+static void
+stream_run(const char *transport, int rx, int tx)
+{
+	static const size_t sizes[] = { 4U << 10, 16U << 10, 64U << 10,
+	    SEND_MAX };
+	static const char *const variants[] = { "plain_write", "kqring_send",
+	    "kqring_send_zc_fixed", "kqring_send_zc",
+	    "kqring_send_zc_fixed_waitall" };
+	int sz = SEND_SOCKBUF;
+	struct iovec iov[ZC_SLOTS];
+	char group[64];
+	struct ring r;
+
+	assert(fcntl(rx, F_SETFL, 0) == 0);
+	assert(fcntl(tx, F_SETFL, 0) == 0);
+	assert(setsockopt(rx, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz)) == 0);
+	assert(setsockopt(tx, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz)) == 0);
+	ring_init(&r);
+	for (int s = 0; s < ZC_SLOTS; s++) {
+		iov[s].iov_base = send_src + (size_t)s * SEND_MAX;
+		iov[s].iov_len = SEND_MAX;
+	}
+	if (kqring_register(r.fd, IORING_REGISTER_BUFFERS, iov,
+	    ZC_SLOTS) != 0) {
+		perror("IORING_REGISTER_BUFFERS (raise ulimit -l to 8192)");
+		exit(1);
+	}
+	send_may_copy = strcmp(transport, "unix") == 0;
+	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+		snprintf(group, sizeof(group), "stream_%s_%zuk", transport,
+		    sizes[i] >> 10);
+		for (size_t v = 0; v < sizeof(variants) / sizeof(variants[0]);
+		    v++)
+			stream_one(group, variants[v], &r, rx, tx, sizes[i],
+			    (int)(SEND_BYTES / sizes[i]));
+	}
+	ring_fini(&r);
+}
+
+static void
+bench_stream(void)
+{
+	int sv[2];
+
+	send_src = mmap(NULL, (size_t)ZC_SLOTS * SEND_MAX,
+	    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(send_src != MAP_FAILED);
+	memset(send_src, 's', (size_t)ZC_SLOTS * SEND_MAX);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	stream_run("unix", sv[0], sv[1]);
+	close(sv[0]);
+	close(sv[1]);
+	tcp_pair(&sv[0], &sv[1]);
+	stream_run("tcp", sv[0], sv[1]);
+	close(sv[0]);
+	close(sv[1]);
+	munmap(send_src, (size_t)ZC_SLOTS * SEND_MAX);
+}
+
 static const struct {
 	const char	*name;
 	void		(*fn)(void);
@@ -1440,6 +1607,7 @@ static const struct {
 	{ "timer",	bench_timer },
 	{ "disk",	bench_disk },
 	{ "echo",	bench_echo },
+	{ "stream",	bench_stream },
 };
 
 int

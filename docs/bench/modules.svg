@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" class="viz" width="760" height="496" viewBox="0 0 760 496" role="img" aria-label="kqring.ko by source file: 19,181 lines">
-<title>kqring.ko by source file: 19,181 lines</title>
+<svg xmlns="http://www.w3.org/2000/svg" class="viz" width="760" height="496" viewBox="0 0 760 496" role="img" aria-label="kqring.ko by source file: 19,290 lines">
+<title>kqring.ko by source file: 19,290 lines</title>
 
 <style>
   .viz { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
@@ -23,7 +23,7 @@
 </style>
 
 <rect width="760" height="496" rx="8" fill="var(--surface)"/>
-<text x="20" y="28" class="title">kqring.ko by source file: 19,181 lines</text>
+<text x="20" y="28" class="title">kqring.ko by source file: 19,290 lines</text>
 <text x="20" y="48" class="sub">Lines per file, including comments</text>
 <line x1="126.0" y1="72" x2="126.0" y2="466" class="grid"/>
 <text x="126.0" y="482" class="tick" text-anchor="middle">0</text>
@@ -39,17 +39,17 @@
 <text x="690.0" y="482" class="tick" text-anchor="middle">3,000</text>
 <text x="740" y="482" class="tick" text-anchor="end">lines</text>
 <text x="116.0" y="89.0" class="lab" text-anchor="end">kqring_req.c</text>
-<path d="M126.0,78.0 H649.0 Q653.0,78.0 653.0,82.0 V88.0 Q653.0,92.0 649.0,92.0 H126.0 Z" fill="var(--s1)"><title>kqring_req.c — lines: 2,803 lines</title></path>
-<text x="658.0" y="89" class="val">2,803</text>
+<path d="M126.0,78.0 H650.3 Q654.3,78.0 654.3,82.0 V88.0 Q654.3,92.0 650.3,92.0 H126.0 Z" fill="var(--s1)"><title>kqring_req.c — lines: 2,810 lines</title></path>
+<text x="659.3" y="89" class="val">2,810</text>
 <text x="116.0" y="121.0" class="lab" text-anchor="end">kqring_dev.c</text>
 <path d="M126.0,110.0 H608.5 Q612.5,110.0 612.5,114.0 V120.0 Q612.5,124.0 608.5,124.0 H126.0 Z" fill="var(--s1)"><title>kqring_dev.c — lines: 2,588 lines</title></path>
 <text x="617.5" y="121" class="val">2,588</text>
 <text x="116.0" y="153.0" class="lab" text-anchor="end">kqring_sock.c</text>
-<path d="M126.0,142.0 H592.8 Q596.8,142.0 596.8,146.0 V152.0 Q596.8,156.0 592.8,156.0 H126.0 Z" fill="var(--s1)"><title>kqring_sock.c — lines: 2,504 lines</title></path>
-<text x="601.8" y="153" class="val">2,504</text>
+<path d="M126.0,142.0 H604.8 Q608.8,142.0 608.8,146.0 V152.0 Q608.8,156.0 604.8,156.0 H126.0 Z" fill="var(--s1)"><title>kqring_sock.c — lines: 2,568 lines</title></path>
+<text x="613.8" y="153" class="val">2,568</text>
 <text x="116.0" y="185.0" class="lab" text-anchor="end">kqring_var.h</text>
-<path d="M126.0,174.0 H488.8 Q492.8,174.0 492.8,178.0 V184.0 Q492.8,188.0 488.8,188.0 H126.0 Z" fill="var(--s1)"><title>kqring_var.h — lines: 1,951 lines</title></path>
-<text x="497.8" y="185" class="val">1,951</text>
+<path d="M126.0,174.0 H489.4 Q493.4,174.0 493.4,178.0 V184.0 Q493.4,188.0 489.4,188.0 H126.0 Z" fill="var(--s1)"><title>kqring_var.h — lines: 1,954 lines</title></path>
+<text x="498.4" y="185" class="val">1,954</text>
 <text x="116.0" y="217.0" class="lab" text-anchor="end">kqring_file.c</text>
 <path d="M126.0,206.0 H474.5 Q478.5,206.0 478.5,210.0 V216.0 Q478.5,220.0 474.5,220.0 H126.0 Z" fill="var(--s1)"><title>kqring_file.c — lines: 1,875 lines</title></path>
 <text x="483.5" y="217" class="val">1,875</text>
@@ -72,7 +72,7 @@
 <path d="M126.0,398.0 H258.5 Q262.5,398.0 262.5,402.0 V408.0 Q262.5,412.0 258.5,412.0 H126.0 Z" fill="var(--s1)"><title>kqring_trig.c — lines: 726 lines</title></path>
 <text x="267.5" y="409" class="val">726</text>
 <text x="116.0" y="441.0" class="lab" text-anchor="end">kqring_zc.c</text>
-<path d="M126.0,430.0 H177.8 Q181.8,430.0 181.8,434.0 V440.0 Q181.8,444.0 177.8,444.0 H126.0 Z" fill="var(--s1)"><title>kqring_zc.c — lines: 297 lines</title></path>
-<text x="186.8" y="441" class="val">297</text>
+<path d="M126.0,430.0 H184.4 Q188.4,430.0 188.4,434.0 V440.0 Q188.4,444.0 184.4,444.0 H126.0 Z" fill="var(--s1)"><title>kqring_zc.c — lines: 332 lines</title></path>
+<text x="193.4" y="441" class="val">332</text>
 <line x1="126.0" y1="72" x2="126.0" y2="466" class="axis"/>
 </svg>

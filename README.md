@@ -165,7 +165,7 @@ These are mostly single-threaded loopback measurements of what each mechanism co
 
 1. **Anything you can batch:** 32 `NOP`s per enter cost 76 ns each, against 104 ns for an empty `kevent(2)`.
 2. **Disks with requests in flight:** batched requests reach the driver together, which one thread calling `pread(2)` can't do.
-3. **Bulk sends:** at 256 KiB, `SEND_ZC` from a registered buffer avoids copying user memory into the kernel and takes 33–54% less time than `write(2)`. At 64 KiB and below it costs more on the Ryzen.
+3. **Streaming bulk data:** `SEND_ZC` from a registered buffer avoids copying user memory into the kernel. With the receiver in its own thread, it takes 37–55% less time than `write(2)` from 16 KiB up, and the sender spends a fraction of the CPU. When one thread sends and then reads back, it pays off only at 256 KiB.
 4. **Timers:** a `TIMEOUT` costs less than an `EVFILT_TIMER` event.
 5. **Event-driven chains:** a [trigger](#kqring-extensions) echo server spends less CPU per message than kqueue, because it never returns to user space between messages.
 6. **Where system calls are expensive** (PTI, or other mitigations that make each kernel entry cost more): servers with many active connections and steady receive, where kqring collects messages that kqueue needs a call each for. On the i5-8250U, fan-in was 18–19% faster than kqueue.

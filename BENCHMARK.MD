@@ -2,7 +2,7 @@
 
 How `kqring` compares with FreeBSD's `kqueue(2)` on the same workloads, and with `aio(4)` and plain system calls on storage. Where kqueue has no role (regular files, disks, bulk sends into a socket with room), the comparison is the plain system call.
 
-Every figure here is from one build, `7641bf4`, on the machine under [Setup](#setup), an 8-thread AMD Ryzen. The raw runs are in [`docs/bench/data/`](docs/bench/data/). Earlier editions were measured on an Intel laptop; how the two machines differ, and why it matters for kqring, is under [Why the results depend on the CPU](#why-the-results-depend-on-the-cpu). For kqring against Linux io_uring on one machine, see [docs/linux-comparison.md](docs/linux-comparison.md).
+Every figure here is from one build, `7641bf4`, on the machine under [Setup](#setup), an 8-thread AMD Ryzen, except the [streaming](#streaming-the-receiver-in-its-own-thread) group's, from `9918fea`. The raw runs are in [`docs/bench/data/`](docs/bench/data/). Earlier editions were measured on an Intel laptop; how the two machines differ, and why it matters for kqring, is under [Why the results depend on the CPU](#why-the-results-depend-on-the-cpu). For kqring against Linux io_uring on one machine, see [docs/linux-comparison.md](docs/linux-comparison.md).
 
 ![kqring vs kqueue: speed-up per operation](docs/bench/summary.svg)
 
@@ -14,7 +14,7 @@ Every figure here is from one build, `7641bf4`, on the machine under [Setup](#se
 - **Disk devices go straight to the driver.** With 32 in flight on an md(4) disk, a 4 KiB read costs 1,463 ns, 57% less than `pread(2)`.
 - **On a real SSD, kqring reaches what the drive can do with less CPU than aio(4):** 84,952 IOPS at 32 in flight on the raw disk at 25% CPU, against 31% for aio.
 - **Rings on several threads scale.** On md(4) disks, 4 jobs reach 2,021,000 IOPS against 601,000 for aio. On a cached ZFS file, kqring reaches 1,502,000 at 8 jobs, ahead of aio; `psync` is ahead from 4 jobs.
-- **Zero-copy send pays off for large messages.** From a registered buffer, `SEND_ZC` takes 54% less time than `write(2)` for 256 KiB on AF_UNIX, and 33% less on TCP loopback. At 64 KiB and below it costs more on this machine.
+- **Zero-copy send pays off for large messages.** From a registered buffer, `SEND_ZC` takes 54% less time than `write(2)` for 256 KiB on AF_UNIX, and 33% less on TCP loopback. When one thread sends and then reads, it costs more at 64 KiB and below; with the receiver in its own thread, it takes 37–55% less time from 16 KiB up ([Streaming](#streaming-the-receiver-in-its-own-thread)).
 - **Cached file reads depend on the filesystem.** On UFS, 32 `READ`s per enter are 1% slower than `pread(2)`, and one per enter is +16%. ZFS has no page-cache read path, so its reads go through a worker or, once the CPUs are taken, run in the enter.
 - **An event-driven chain needs less server CPU than kqueue:** 3–5% per message in an echo server.
 
@@ -42,7 +42,7 @@ The kqueue rows, which are mostly system calls, got much cheaper on the Ryzen; k
 | Memory | 8 GB |
 | Disk | SanDisk SD7TB6S 256 GB SATA SSD |
 | OS | FreeBSD 15.1-RELEASE, `GENERIC` kernel, amd64; root on ZFS (OpenZFS 2.4.2) |
-| kqring | `kqring.ko` from `7641bf4`, entered through its native system calls, with `kern.kqring.zc_local_min_len` at its default of 32 KiB |
+| kqring | `kqring.ko` from `7641bf4` (the stream group from `9918fea`), entered through its native system calls, with `kern.kqring.zc_local_min_len` at its default of 32 KiB |
 | Ring | `SINGLE_ISSUER \| DEFER_TASKRUN`, 1,024 SQ / 8,192 CQ entries, one buffer ring of 4,096 × 4 KiB |
 | Benchmarks | [`tests/kqring_bench.c`](tests/kqring_bench.c), [`tests/kqring_mt_bench.c`](tests/kqring_mt_bench.c) and [`tests/kqring_diskbench.c`](tests/kqring_diskbench.c), built with `cc -O2` |
 | Limits | `ulimit -l 65536` (the FreeBSD default of 64 KiB is too small to register the send buffers) |
@@ -52,7 +52,7 @@ The kqueue rows, which are mostly system calls, got much cheaper on the Ryzen; k
 - Each `kqring_bench` and `kqring_mt_bench` figure is the **median of 5 runs**, and each `kqring_diskbench` figure the median of 3 runs of 10 seconds. The module was unloaded and reloaded before each `kqring_bench` and `kqring_mt_bench` run.
 - A run measures the mean wall-clock time per operation over 20,000–524,288 operations. An operation is one message received or sent, one connection accepted, one read or one timer.
 - `kqring_bench` is **single-threaded on loopback**, and the process isn't pinned to a CPU. The sender and receiver are the same thread, so it measures the per-operation cost of each mechanism, not throughput under load. The echo group uses two threads.
-- 99 of 113 rows vary less than 5% between runs. The exceptions are some sends of 16–64 KiB (up to 20%), AF_UNIX ping-pong at 1 KiB (up to 9%), and the file group's reads in `/tmp`, which is ZFS here and ran in ZFS's slow mode in some runs (see [Pipes and files](#pipes-and-files-inline-or-through-a-worker)).
+- 99 of 113 rows outside the streaming group vary less than 5% between runs. The exceptions are some sends of 16–64 KiB (up to 20%), AF_UNIX ping-pong at 1 KiB (up to 9%), and the file group's reads in `/tmp`, which is ZFS here and ran in ZFS's slow mode in some runs (see [Pipes and files](#pipes-and-files-inline-or-through-a-worker)).
 - The charts are drawn from the raw runs by [`tests/bench_report.py`](tests/bench_report.py), and this document is written from them by [`tests/bench_doc.py`](tests/bench_doc.py).
 
 ## Results
@@ -156,6 +156,47 @@ Throughput in GB/s (higher is better), with the time per message against `write(
 
 - **When kqring sends zero-copy.** A registered buffer's pages are held once, at registration, so a send from one goes zero-copy from one page up. An unregistered buffer has to be pinned and charged to `RLIMIT_MEMLOCK` on every send. On AF_UNIX, where the alternative is a single `memcpy`, that costs more than copying below about 32 KiB. So kqring copies those sends itself and reports `IORING_NOTIF_USAGE_ZC_COPIED`, as io_uring allows. The threshold is `sysctl kern.kqring.zc_local_min_len`, 32 KiB by default. TCP always uses one page.
 - **TCP loopback delivers through another thread.** The loopback interface hands every packet to a netisr thread, so the benchmark's `recv()` right after the send often has to wait for that thread. For small TCP sends that wait dominates, and the results depend on timing.
+
+### Streaming: the receiver in its own thread
+
+`kqring_bench stream`. The send group's variants, with a second thread draining the connection with `recv(2)` while the sender sends back to back. In the send group one thread sends and then reads, so on TCP loopback a small send mostly measures the hand-off to the netisr thread; here the two sides overlap, as in a real stream. This group is from `9918fea`, the build after `7641bf4` that sends `SEND_ZC` with `MSG_WAITALL` zero-copy. The same group without that variant, run on `7641bf4` ([raw runs](docs/bench/data-stream-7641bf4/)), differs from these by a median of 0.8% per row and at most 10%. All but 1 of the rows differ by less than their spread between runs; that one by 0.7%.
+
+Throughput in GB/s, with the time per message against `write(2)`:
+
+**AF_UNIX**
+
+| Variant | 4 KiB | 16 KiB | 64 KiB | 256 KiB |
+|---|---:|---:|---:|---:|
+| `write(2)` | 5.31 | 5.62 | 5.87 | 5.09 |
+| kqring `SEND` | 4.52 (+17%) | 5.29 (+6%) | 5.77 (+2%) | 5.01 (+2%) |
+| kqring `SEND_ZC`, registered buffer | **7.03 (−24%)** | **12.45 (−55%)** | **11.38 (−48%)** | **11.28 (−55%)** |
+| kqring `SEND_ZC`, unregistered buffer | 3.66 (+45%) | 4.25 (+32%) | **12.00 (−51%)** | **11.06 (−54%)** |
+| kqring `SEND_ZC`, registered, `MSG_WAITALL` | **6.92 (−23%)** | **12.27 (−54%)** | **12.31 (−52%)** | **11.71 (−57%)** |
+
+**TCP loopback**
+
+| Variant | 4 KiB | 16 KiB | 64 KiB | 256 KiB |
+|---|---:|---:|---:|---:|
+| `write(2)` | 3.65 | 5.02 | 5.04 | 4.54 |
+| kqring `SEND` | 2.97 (+23%) | 4.38 (+15%) | 4.97 (+1%) | 4.46 (+2%) |
+| kqring `SEND_ZC`, registered buffer | 3.93 (−7%) | **7.98 (−37%)** | **8.04 (−37%)** | **7.98 (−43%)** |
+| kqring `SEND_ZC`, unregistered buffer | 3.41 (+7%) | **7.65 (−34%)** | **8.03 (−37%)** | **7.96 (−43%)** |
+| kqring `SEND_ZC`, registered, `MSG_WAITALL` | 3.95 (−7%) | **8.60 (−42%)** | **8.33 (−40%)** | **8.15 (−44%)** |
+
+The sending thread's CPU time per message, in µs:
+
+| Variant | AF_UNIX 64 KiB | AF_UNIX 256 KiB | TCP 64 KiB | TCP 256 KiB |
+|---|---:|---:|---:|---:|
+| `write(2)` | 11.2 | 51.5 | 13.0 | 57.8 |
+| kqring `SEND` | 11.4 | 52.3 | 13.2 | 58.8 |
+| kqring `SEND_ZC`, registered buffer | 1.6 | 2.8 | 3.7 | 14.6 |
+| kqring `SEND_ZC`, unregistered buffer | 2.0 | 3.9 | 4.1 | 14.7 |
+| kqring `SEND_ZC`, registered, `MSG_WAITALL` | 1.6 | 2.8 | 3.7 | 11.4 |
+
+- **With the receiver on its own thread, zero-copy pays off from small messages.** From a registered buffer, `SEND_ZC` takes 37–55% less time than `write(2)` from 16 KiB up, and 24% less on AF_UNIX and 7% less on TCP at 4 KiB, where in the send group it cost more up to 64 KiB. The receiver's copy then sets the pace: at 256 KiB on AF_UNIX the receiving thread is busy 100% of the time, and the sender spends 2.8 µs of CPU per message, against 51.5 µs for `write(2)`.
+- **An unregistered buffer below 32 KiB on AF_UNIX is copied**, as in the send group, and costs more than `SEND`. From 64 KiB it is pinned and sent zero-copy, as fast as a registered one.
+- **Without `MSG_WAITALL`, a send sends what the socket has room for.** On TCP at 256 KiB, a message took 3.2 `SEND_ZC`s, the program sending the rest each time, and 6% of messages had a remainder below a page, which kqring copies. With `MSG_WAITALL`, kqring sends the whole message from one SQE, zero-copy across as many attempts as the socket needs, with one notification; 6% of notifications reported a part copied. On TCP at 256 KiB it also needs the least of the sender, 11.4 µs per message against 14.6 µs, as it makes one submission per message.
+- Rows vary up to 20% between runs; `write(2)` and `SEND` within 6%.
 
 ### Accept: a TCP loopback connection set up and torn down
 
@@ -352,7 +393,7 @@ make
 sudo kldload ./kmod/kqring.ko
 ulimit -l 65536                   # the send group registers 2 MiB of buffers
 ./tests/kqring_bench > bench.1.out           # all groups
-./tests/kqring_bench fanin send   # selected groups: floor pingpong fanin accept pipe file send timer disk echo
+./tests/kqring_bench fanin send   # selected groups: floor pingpong fanin accept pipe file send timer disk echo stream
 ./tests/kqring_mt_bench 2 > mt.1.out         # several threads, 2 s per run
 sudo kldunload kqring
 ```

@@ -19,7 +19,8 @@ spec = importlib.util.spec_from_file_location('br', R + 'tests/bench_report.py')
 br = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(br)
 D = R + 'docs/bench/data/'
-main = glob.glob(D + 'bench.*.out') + glob.glob(D + 'disk.*.out') + glob.glob(D + 'ufs.*.out')
+main = glob.glob(D + 'bench.*.out') + glob.glob(D + 'disk.*.out') + glob.glob(D + 'ufs.*.out') + \
+    glob.glob(D + 'stream.*.out')
 m = br.load(main)
 mt = br.load_mt(glob.glob(D + 'mt.*.out'))
 iops, p99 = br.load_disk(glob.glob(D + 'diskbench.*'))
@@ -156,6 +157,37 @@ def send(tr, k):
     return " | ".join(cells)
 
 
+def stream(tr, k):
+    cells = []
+    for sz in ('4k', '16k', '64k', '256k'):
+        g = f"stream_{tr}_{sz}"
+        s = f"{gbs(g, k):.2f}"
+        if k != 'plain_write':
+            s = f"{s} ({rel(g, k, 'plain_write')})"
+            if v(g, k) < v(g, 'plain_write') * 0.9:
+                s = f"**{s}**"
+        cells.append(s)
+    return " | ".join(cells)
+
+
+def scpu(k):
+    """The sending thread's CPU per message, in µs, at 64 and 256 KiB."""
+    return " | ".join(f"{v(f'stream_{tr}_{sz}', k + '_sender_cpu') / 1000:.1f}"
+                      for tr in ('unix', 'tcp') for sz in ('64k', '256k'))
+
+
+def stream_sends(g, k):
+    """Median SQEs per message where sends came back short, from the
+    '# <group> <variant>: S sends for M messages, C copied' lines."""
+    r = []
+    for f in glob.glob(D + 'stream.*.out'):
+        for line in open(f, encoding='utf-8'):
+            p = line.split()
+            if line.startswith('# ') and p[1] == g and p[2] == k + ':':
+                r.append((int(p[3]) / int(p[6]), int(p[8]) / int(p[6])))
+    return (statistics.median(x[0] for x in r), statistics.median(x[1] for x in r)) if r else (1.0, 0.0)
+
+
 def echo(k):
     cells = []
     for g in ('echo_unix_64', 'echo_unix_4096', 'echo_tcp_64'):
@@ -209,7 +241,8 @@ wspread = max(fv('zfswritespread', e, q) for e in ('kqring', 'aio', 'psync') for
 rspread = max(fv('zfsreadspread', e, q) for e in ('kqring', 'aio', 'psync') for q in (1, 32))
 dspread = max(iops[(k, 'read')][1] for k in ('md_kqring_32', 'md_aio_32'))
 zr = {k: raw_runs('file_4k', k) for k in ('pread', 'kqring_read', 'kqring_read_batch32')}
-stable = sum(1 for k, x in m.items() if x[1] < 0.05)
+stable = sum(1 for k, x in m.items() if x[1] < 0.05 and not k[0].startswith('stream_'))
+nstable = sum(1 for k in m if not k[0].startswith('stream_'))
 spread_send = max(x[1] for k, x in m.items() if k[0].startswith('send_') and x[1] >= 0.05) * 100
 spread_pp = max(x[1] for k, x in m.items() if k[0].startswith('pingpong_')) * 100
 zfsr = {q: (i0(f'zfs_psync_{q}'), i0(f'zfs_aio_{q}'), i0(f'zfs_kqring_{q}'), lat(f'zfs_kqring_{q}')) for q in (1, 4, 16, 64)}
@@ -221,11 +254,29 @@ md32spread = max((max(x) - min(x)) / min(x) for x in
 zq = [io(f'zfs_kqring_{q}') / io(f'zfs_psync_{q}') - 1 for q in (4, 16, 64)]
 zq1 = io('zfs_kqring_1') / io('zfs_psync_1') - 1
 
+STREAM_BUILD = '9918fea'
+s_old = br.load(glob.glob(R + 'docs/bench/data-stream-7641bf4/stream.*.out'))
+s_diff = [abs(m[k][0] / s_old[k][0] - 1) * 100 for k in s_old if not k[1].endswith('_cpu') and k in m]
+s_med, s_max = statistics.median(s_diff), max(s_diff)
+s_out = [abs(m[k][0] / s_old[k][0] - 1) * 100 for k in s_old if not k[1].endswith('_cpu') and k in m
+         and abs(m[k][0] / s_old[k][0] - 1) > max(m[k][1], s_old[k][1])]
+s_out_text = ("Every row's difference is within its spread between runs." if not s_out else
+              f"All but {len(s_out)} of the rows differ by less than their spread between runs; "
+              f"{'that one' if len(s_out) == 1 else 'those'} by {max(s_out):.1f}%.")
+zc_rel = [1 - v(f'stream_{tr}_{sz}', 'kqring_send_zc_fixed') / v(f'stream_{tr}_{sz}', 'plain_write')
+          for tr in ('unix', 'tcp') for sz in ('16k', '64k', '256k')]
+zc_lo, zc_hi = min(zc_rel) * 100, max(zc_rel) * 100
+rx_busy = v('stream_unix_256k', 'kqring_send_zc_fixed_receiver_cpu') / v('stream_unix_256k', 'kqring_send_zc_fixed') * 100
+tcp_sends, tcp_copied = stream_sends('stream_tcp_256k', 'kqring_send_zc_fixed')
+_, wa_copied = stream_sends('stream_tcp_256k', 'kqring_send_zc_fixed_waitall')
+stream_spread = max(x[1] for k, x in m.items() if k[0].startswith('stream_') and not k[1].endswith('_cpu')) * 100
+stream_spread_plain = max(x[1] for k, x in m.items() if k[0].startswith('stream_') and k[1] in ('plain_write', 'kqring_send')) * 100
+
 doc = f"""# kqring benchmarks
 
 How `kqring` compares with FreeBSD's `kqueue(2)` on the same workloads, and with `aio(4)` and plain system calls on storage. Where kqueue has no role (regular files, disks, bulk sends into a socket with room), the comparison is the plain system call.
 
-Every figure here is from one build, `7641bf4`, on the machine under [Setup](#setup), an 8-thread AMD Ryzen. The raw runs are in [`docs/bench/data/`](docs/bench/data/). Earlier editions were measured on an Intel laptop; how the two machines differ, and why it matters for kqring, is under [Why the results depend on the CPU](#why-the-results-depend-on-the-cpu). For kqring against Linux io_uring on one machine, see [docs/linux-comparison.md](docs/linux-comparison.md).
+Every figure here is from one build, `7641bf4`, on the machine under [Setup](#setup), an 8-thread AMD Ryzen, except the [streaming](#streaming-the-receiver-in-its-own-thread) group's, from `{STREAM_BUILD}`. The raw runs are in [`docs/bench/data/`](docs/bench/data/). Earlier editions were measured on an Intel laptop; how the two machines differ, and why it matters for kqring, is under [Why the results depend on the CPU](#why-the-results-depend-on-the-cpu). For kqring against Linux io_uring on one machine, see [docs/linux-comparison.md](docs/linux-comparison.md).
 
 ![kqring vs kqueue: speed-up per operation](docs/bench/summary.svg)
 
@@ -237,7 +288,7 @@ Every figure here is from one build, `7641bf4`, on the machine under [Setup](#se
 - **Disk devices go straight to the driver.** With 32 in flight on an md(4) disk, a 4 KiB read costs {n('disk_read_4k', 'kqring_read_batch32')} ns, {less(v('disk_read_4k', 'kqring_read_batch32'), v('disk_read_4k', 'pread'))} less than `pread(2)`.
 - **On a real SSD, kqring reaches what the drive can do with less CPU than aio(4):** {f0('raw', 'kqring', 32)} IOPS at 32 in flight on the raw disk at {f0('rawcpu', 'kqring', 32)}% CPU, against {f0('rawcpu', 'aio', 32)}% for aio.
 - **Rings on several threads scale.** On md(4) disks, 4 jobs reach {fv('md', 'kqring', 4) * 1000:,.0f} IOPS against {fv('md', 'aio', 4) * 1000:,.0f} for aio. On a cached ZFS file, kqring reaches {fv('cached', 'kqring', 8) * 1000:,.0f} at 8 jobs, ahead of aio; `psync` is ahead from 4 jobs.
-- **Zero-copy send pays off for large messages.** From a registered buffer, `SEND_ZC` takes {less(v('send_unix_256k', 'kqring_send_zc_fixed'), v('send_unix_256k', 'plain_write'))} less time than `write(2)` for 256 KiB on AF_UNIX, and {less(v('send_tcp_256k', 'kqring_send_zc_fixed'), v('send_tcp_256k', 'plain_write'))} less on TCP loopback. At 64 KiB and below it costs more on this machine.
+- **Zero-copy send pays off for large messages.** From a registered buffer, `SEND_ZC` takes {less(v('send_unix_256k', 'kqring_send_zc_fixed'), v('send_unix_256k', 'plain_write'))} less time than `write(2)` for 256 KiB on AF_UNIX, and {less(v('send_tcp_256k', 'kqring_send_zc_fixed'), v('send_tcp_256k', 'plain_write'))} less on TCP loopback. When one thread sends and then reads, it costs more at 64 KiB and below; with the receiver in its own thread, it takes {zc_lo:.0f}–{zc_hi:.0f}% less time from 16 KiB up ([Streaming](#streaming-the-receiver-in-its-own-thread)).
 - **Cached file reads depend on the filesystem.** On UFS, 32 `READ`s per enter are {faster(v('ufs_file_4k', 'kqring_read_batch32'), v('ufs_file_4k', 'pread'))} than `pread(2)`, and one per enter is {rel('ufs_file_4k', 'kqring_read', 'pread')}. ZFS has no page-cache read path, so its reads go through a worker or, once the CPUs are taken, run in the enter.
 - **An event-driven chain needs less server CPU than kqueue:** {min(trig) * 100:.0f}–{max(trig) * 100:.0f}% per message in an echo server.
 
@@ -265,7 +316,7 @@ The kqueue rows, which are mostly system calls, got much cheaper on the Ryzen; k
 | Memory | 8 GB |
 | Disk | SanDisk SD7TB6S 256 GB SATA SSD |
 | OS | FreeBSD 15.1-RELEASE, `GENERIC` kernel, amd64; root on ZFS (OpenZFS 2.4.2) |
-| kqring | `kqring.ko` from `7641bf4`, entered through its native system calls, with `kern.kqring.zc_local_min_len` at its default of 32 KiB |
+| kqring | `kqring.ko` from `7641bf4` (the stream group from `{STREAM_BUILD}`), entered through its native system calls, with `kern.kqring.zc_local_min_len` at its default of 32 KiB |
 | Ring | `SINGLE_ISSUER \\| DEFER_TASKRUN`, 1,024 SQ / 8,192 CQ entries, one buffer ring of 4,096 × 4 KiB |
 | Benchmarks | [`tests/kqring_bench.c`](tests/kqring_bench.c), [`tests/kqring_mt_bench.c`](tests/kqring_mt_bench.c) and [`tests/kqring_diskbench.c`](tests/kqring_diskbench.c), built with `cc -O2` |
 | Limits | `ulimit -l 65536` (the FreeBSD default of 64 KiB is too small to register the send buffers) |
@@ -275,7 +326,7 @@ The kqueue rows, which are mostly system calls, got much cheaper on the Ryzen; k
 - Each `kqring_bench` and `kqring_mt_bench` figure is the **median of 5 runs**, and each `kqring_diskbench` figure the median of 3 runs of 10 seconds. The module was unloaded and reloaded before each `kqring_bench` and `kqring_mt_bench` run.
 - A run measures the mean wall-clock time per operation over 20,000–524,288 operations. An operation is one message received or sent, one connection accepted, one read or one timer.
 - `kqring_bench` is **single-threaded on loopback**, and the process isn't pinned to a CPU. The sender and receiver are the same thread, so it measures the per-operation cost of each mechanism, not throughput under load. The echo group uses two threads.
-- {stable} of {len(m)} rows vary less than 5% between runs. The exceptions are some sends of 16–64 KiB (up to {spread_send:.0f}%), AF_UNIX ping-pong at 1 KiB (up to {spread_pp:.0f}%), and the file group's reads in `/tmp`, which is ZFS here and ran in ZFS's slow mode in some runs (see [Pipes and files](#pipes-and-files-inline-or-through-a-worker)).
+- {stable} of {nstable} rows outside the streaming group vary less than 5% between runs. The exceptions are some sends of 16–64 KiB (up to {spread_send:.0f}%), AF_UNIX ping-pong at 1 KiB (up to {spread_pp:.0f}%), and the file group's reads in `/tmp`, which is ZFS here and ran in ZFS's slow mode in some runs (see [Pipes and files](#pipes-and-files-inline-or-through-a-worker)).
 - The charts are drawn from the raw runs by [`tests/bench_report.py`](tests/bench_report.py), and this document is written from them by [`tests/bench_doc.py`](tests/bench_doc.py).
 
 ## Results
@@ -379,6 +430,47 @@ Throughput in GB/s (higher is better), with the time per message against `write(
 
 - **When kqring sends zero-copy.** A registered buffer's pages are held once, at registration, so a send from one goes zero-copy from one page up. An unregistered buffer has to be pinned and charged to `RLIMIT_MEMLOCK` on every send. On AF_UNIX, where the alternative is a single `memcpy`, that costs more than copying below about 32 KiB. So kqring copies those sends itself and reports `IORING_NOTIF_USAGE_ZC_COPIED`, as io_uring allows. The threshold is `sysctl kern.kqring.zc_local_min_len`, 32 KiB by default. TCP always uses one page.
 - **TCP loopback delivers through another thread.** The loopback interface hands every packet to a netisr thread, so the benchmark's `recv()` right after the send often has to wait for that thread. For small TCP sends that wait dominates, and the results depend on timing.
+
+### Streaming: the receiver in its own thread
+
+`kqring_bench stream`. The send group's variants, with a second thread draining the connection with `recv(2)` while the sender sends back to back. In the send group one thread sends and then reads, so on TCP loopback a small send mostly measures the hand-off to the netisr thread; here the two sides overlap, as in a real stream. This group is from `{STREAM_BUILD}`, the build after `7641bf4` that sends `SEND_ZC` with `MSG_WAITALL` zero-copy. The same group without that variant, run on `7641bf4` ([raw runs](docs/bench/data-stream-7641bf4/)), differs from these by a median of {s_med:.1f}% per row and at most {s_max:.0f}%. {s_out_text}
+
+Throughput in GB/s, with the time per message against `write(2)`:
+
+**AF_UNIX**
+
+| Variant | 4 KiB | 16 KiB | 64 KiB | 256 KiB |
+|---|---:|---:|---:|---:|
+| `write(2)` | {stream('unix', 'plain_write')} |
+| kqring `SEND` | {stream('unix', 'kqring_send')} |
+| kqring `SEND_ZC`, registered buffer | {stream('unix', 'kqring_send_zc_fixed')} |
+| kqring `SEND_ZC`, unregistered buffer | {stream('unix', 'kqring_send_zc')} |
+| kqring `SEND_ZC`, registered, `MSG_WAITALL` | {stream('unix', 'kqring_send_zc_fixed_waitall')} |
+
+**TCP loopback**
+
+| Variant | 4 KiB | 16 KiB | 64 KiB | 256 KiB |
+|---|---:|---:|---:|---:|
+| `write(2)` | {stream('tcp', 'plain_write')} |
+| kqring `SEND` | {stream('tcp', 'kqring_send')} |
+| kqring `SEND_ZC`, registered buffer | {stream('tcp', 'kqring_send_zc_fixed')} |
+| kqring `SEND_ZC`, unregistered buffer | {stream('tcp', 'kqring_send_zc')} |
+| kqring `SEND_ZC`, registered, `MSG_WAITALL` | {stream('tcp', 'kqring_send_zc_fixed_waitall')} |
+
+The sending thread's CPU time per message, in µs:
+
+| Variant | AF_UNIX 64 KiB | AF_UNIX 256 KiB | TCP 64 KiB | TCP 256 KiB |
+|---|---:|---:|---:|---:|
+| `write(2)` | {scpu('plain_write')} |
+| kqring `SEND` | {scpu('kqring_send')} |
+| kqring `SEND_ZC`, registered buffer | {scpu('kqring_send_zc_fixed')} |
+| kqring `SEND_ZC`, unregistered buffer | {scpu('kqring_send_zc')} |
+| kqring `SEND_ZC`, registered, `MSG_WAITALL` | {scpu('kqring_send_zc_fixed_waitall')} |
+
+- **With the receiver on its own thread, zero-copy pays off from small messages.** From a registered buffer, `SEND_ZC` takes {zc_lo:.0f}–{zc_hi:.0f}% less time than `write(2)` from 16 KiB up, and {less(v('stream_unix_4k', 'kqring_send_zc_fixed'), v('stream_unix_4k', 'plain_write'))} less on AF_UNIX and {less(v('stream_tcp_4k', 'kqring_send_zc_fixed'), v('stream_tcp_4k', 'plain_write'))} less on TCP at 4 KiB, where in the send group it cost more up to 64 KiB. The receiver's copy then sets the pace: at 256 KiB on AF_UNIX the receiving thread is busy {rx_busy:.0f}% of the time, and the sender spends {v('stream_unix_256k', 'kqring_send_zc_fixed_sender_cpu') / 1000:.1f} µs of CPU per message, against {v('stream_unix_256k', 'plain_write_sender_cpu') / 1000:.1f} µs for `write(2)`.
+- **An unregistered buffer below 32 KiB on AF_UNIX is copied**, as in the send group, and costs more than `SEND`. From 64 KiB it is pinned and sent zero-copy, as fast as a registered one.
+- **Without `MSG_WAITALL`, a send sends what the socket has room for.** On TCP at 256 KiB, a message took {tcp_sends:.1f} `SEND_ZC`s, the program sending the rest each time, and {tcp_copied * 100:.0f}% of messages had a remainder below a page, which kqring copies. With `MSG_WAITALL`, kqring sends the whole message from one SQE, zero-copy across as many attempts as the socket needs, with one notification; {wa_copied * 100:.0f}% of notifications reported a part copied. On TCP at 256 KiB it also needs the least of the sender, {v('stream_tcp_256k', 'kqring_send_zc_fixed_waitall_sender_cpu') / 1000:.1f} µs per message against {v('stream_tcp_256k', 'kqring_send_zc_fixed_sender_cpu') / 1000:.1f} µs, as it makes one submission per message.
+- Rows vary up to {stream_spread:.0f}% between runs; `write(2)` and `SEND` within {stream_spread_plain:.0f}%.
 
 ### Accept: a TCP loopback connection set up and torn down
 
@@ -575,7 +667,7 @@ make
 sudo kldload ./kmod/kqring.ko
 ulimit -l 65536                   # the send group registers 2 MiB of buffers
 ./tests/kqring_bench > bench.1.out           # all groups
-./tests/kqring_bench fanin send   # selected groups: floor pingpong fanin accept pipe file send timer disk echo
+./tests/kqring_bench fanin send   # selected groups: floor pingpong fanin accept pipe file send timer disk echo stream
 ./tests/kqring_mt_bench 2 > mt.1.out         # several threads, 2 s per run
 sudo kldunload kqring
 ```

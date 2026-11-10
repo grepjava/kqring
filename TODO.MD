@@ -9,7 +9,6 @@ Known limits are in [BENCHMARK.MD](BENCHMARK.MD#known-gaps) and [Differences fro
 - **Where system calls are cheap, single requests and fan-in trail kqueue.** On the Ryzen, without PTI, an empty `kevent(2)` costs 104 ns and one `NOP` per enter 187 ns; fan-in is 26–66% slower than kqueue and AF_UNIX ping-pong 2–16%, where on the i5-8250U with PTI both were 16–21% faster ([BENCHMARK.MD](BENCHMARK.MD#why-the-results-depend-on-the-cpu)). Cutting kqring's own cost per request, the item below, is what would close it.
 - **An enter costs about 250 ns more than io_uring's.** On one machine running both, one `NOP` per enter took 438 ns above FreeBSD's system call floor and 178 ns above Linux's ([docs/linux-comparison.md](docs/linux-comparison.md#the-rings-own-costs)); per `NOP` in a batch of 32, kqring is the cheaper. The cost is spread over the enter, the SQE, the request and the CQE.
 - **Cached file reads from several threads trail io_uring.** On tmpfs, 4 jobs at 32 in flight reach 34% of FreeBSD's own `psync`, where io_uring reaches 58% of Linux's: Linux reads a cached page in the submitting thread and only hands a read that would block to a worker. FreeBSD filesystems have no read that fails rather than block.
-- **A zero-copy benchmark with the receiver in its own thread.** Loopback delivers through the netisr thread, so a single-threaded send-then-receive mostly measures that hand-off for small sends.
 
 ## Measurement
 
