@@ -51,7 +51,7 @@ kqring_wq_cpus_busy(void)
 bool
 kqring_wq_inline_ok(struct kqring_ctx *ctx)
 {
-	struct kqring_wq *wq = ctx->wq;
+	struct kqring_wq *wq = kqring_tctx_cur(ctx)->wq;
 
 	if (wq == NULL || !atomic_load_bool(&wq->cached))
 		return (false);
@@ -94,22 +94,24 @@ kqring_wq_abort_td(struct thread *wtd)
 bool
 kqring_wq_abort_retired_locked(struct kqring_ctx *ctx)
 {
-	struct kqring_wq *wq = ctx->wq;
 	struct kqring_op *op;
 	bool any_running = false;
 
 	mtx_assert(&ctx->mtx, MA_OWNED);
-	if (wq == NULL || TAILQ_EMPTY(&ctx->retired_ops))
-		return (false);
-	mtx_lock(&wq->mtx);
+	/* Each on its submitter's pool. */
 	TAILQ_FOREACH(op, &ctx->retired_ops, active_link) {
+		struct kqring_wq *wq = op->tctx->wq;
+
+		if (wq == NULL)
+			continue;
+		mtx_lock(&wq->mtx);
 		if (op->wq_running) {
 			any_running = true;
 			wakeup(&op->in_taskwork);
 			kqring_wq_abort_td(op->wq_td);
 		}
+		mtx_unlock(&wq->mtx);
 	}
-	mtx_unlock(&wq->mtx);
 	return (any_running);
 }
 
@@ -417,7 +419,7 @@ kqring_wq_suspend_pending(void)
 bool
 kqring_wq_suspend_point(struct kqring_ctx *ctx)
 {
-	struct kqring_wq *wq = ctx->wq;
+	struct kqring_wq *wq = kqring_tctx_cur(ctx)->wq;
 	bool exiting;
 
 	if (wq == NULL || !kqring_wq_suspend_pending())
@@ -545,7 +547,7 @@ kqring_wq_next_locked(struct kqring_wq *wq, int type)
 bool
 kqring_wq_try_inline(struct kqring_ctx *ctx, struct kqring_op *op)
 {
-	struct kqring_wq *wq = ctx->wq;
+	struct kqring_wq *wq = op->tctx->wq;
 	struct thread *td = curthread;
 	uint64_t t0;
 	long nvcsw;
@@ -710,8 +712,7 @@ kqring_wq_thread(void *arg)
 				/* Only the issuer posts CQEs and releases resources. */
 				if (!op->in_taskwork) {
 					op->in_taskwork = true;
-					TAILQ_INSERT_TAIL(&ctx->taskwork_ops, op,
-					    taskwork_link);
+					kqring_tw_insert_locked(ctx, op);
 				}
 				if (ctx->shm != NULL)
 					atomic_set_32(&ctx->shm->sq_flags,
@@ -902,7 +903,7 @@ kqring_op_wq_order(const struct kqring_op *op, int *hashp, bool *vregp)
 bool
 kqring_op_cancel_busy_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 {
-	struct kqring_wq *wq = ctx->wq;
+	struct kqring_wq *wq = op->tctx->wq;
 	bool busy;
 
 	mtx_assert(&ctx->mtx, MA_OWNED);
@@ -966,7 +967,7 @@ kqring_op_wq_type(const struct kqring_op *op)
 static bool
 kqring_wq_can_wait_op_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 {
-	struct kqring_wq *wq = ctx->wq;
+	struct kqring_wq *wq = op->tctx->wq;
 	bool can_wait = false;
 
 	mtx_assert(&ctx->mtx, MA_OWNED);
@@ -1002,7 +1003,7 @@ bool
 kqring_wq_enqueue(struct kqring_ctx *ctx, struct kqring_op *op, int type)
 {
 	struct thread *td = curthread;
-	struct kqring_wq *wq = ctx->wq;
+	struct kqring_wq *wq = op->tctx->wq;
 	bool need_spawn = false, sync, unordered, vreg;
 	int hash;
 
@@ -1191,7 +1192,7 @@ kqring_arm_nonsock_op(struct kqring_ctx *ctx, struct kqring_op *op)
 void
 kqring_wq_rearm_ready(struct kqring_ctx *ctx, struct kqring_op *op)
 {
-	struct kqring_wq *wq = ctx->wq;
+	struct kqring_wq *wq = op->tctx->wq;
 	bool need_spawn = false;
 
 	mtx_lock(&ctx->mtx);
@@ -1325,7 +1326,9 @@ kqring_kthread_exit(void)
 static void
 kqring_sqpoll_thread(void *arg)
 {
-	struct kqring_ctx *ctx = arg;
+	struct kqring_tctx *tctx = arg;
+	struct kqring_ctx *ctx = tctx->ctx;
+	struct kqring_op_list *tw = &tctx->taskwork;
 	struct kqring_shm_header *shm = ctx->shm;
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
@@ -1410,7 +1413,7 @@ kqring_sqpoll_thread(void *arg)
 		if (!TAILQ_EMPTY(&ctx->retired_ops))
 			(void)kqring_wq_abort_retired_locked(ctx);
 		if ((!taskrun && atomic_load_acq_32(&shm->sq_tail) !=
-		    shm->sq_head) || !TAILQ_EMPTY(&ctx->taskwork_ops) ||
+		    shm->sq_head) || !TAILQ_EMPTY(tw) ||
 		    !KQRING_STQ_EMPTY_HINT(&ctx->rcq)) {
 			mtx_unlock(&ctx->mtx);
 			continue;
@@ -1432,7 +1435,7 @@ kqring_sqpoll_thread(void *arg)
 			    now = getsbinuptime()) {
 				if (atomic_load_acq_32(&shm->sq_tail) !=
 				    shm->sq_head ||
-				    !TAILQ_EMPTY(&ctx->taskwork_ops) ||
+				    !TAILQ_EMPTY(tw) ||
 				    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) || ctx->closing ||
 				    ctx->detaching || kqring_wq_suspend_pending())
 					break;
@@ -1454,7 +1457,7 @@ kqring_sqpoll_thread(void *arg)
 		if (!taskrun) {
 			atomic_set_32(&shm->sq_flags, IORING_SQ_NEED_WAKEUP);
 			if (atomic_load_acq_32(&shm->sq_tail) != shm->sq_head ||
-			    !TAILQ_EMPTY(&ctx->taskwork_ops) ||
+			    !TAILQ_EMPTY(tw) ||
 			    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) || ctx->closing ||
 			    ctx->detaching) {
 				atomic_clear_32(&shm->sq_flags,
@@ -1488,9 +1491,9 @@ kqring_sqpoll_thread(void *arg)
 	}
 
 	mtx_lock(&ctx->mtx);
-	ctx->sqpoll_running = false;
-	ctx->sqpoll_td = NULL;
-	wakeup(&ctx->sqpoll_running);
+	tctx->task_running = false;
+	tctx->task_td = NULL;
+	wakeup(&tctx->task_running);
 	bool finish_cancel = ctx->closing && !ctx->cancelling &&
 	    !ctx->cancelled;
 	mtx_unlock(&ctx->mtx);
@@ -1503,6 +1506,7 @@ kqring_sqpoll_thread(void *arg)
 int
 kqring_sqpoll_start(struct kqring_ctx *ctx, struct thread *td)
 {
+	struct kqring_tctx *tctx = ctx->tctx;
 	int error;
 
 	mtx_lock(&ctx->mtx);
@@ -1510,22 +1514,22 @@ kqring_sqpoll_start(struct kqring_ctx *ctx, struct thread *td)
 		mtx_unlock(&ctx->mtx);
 		return (EBADF);
 	}
-	if (ctx->sqpoll_running) {
+	if (tctx->task_running) {
 		mtx_unlock(&ctx->mtx);
 		return (0);
 	}
-	ctx->sqpoll_running = true;
+	tctx->task_running = true;
 	refcount_acquire(&ctx->refs);
 	mtx_unlock(&ctx->mtx);
 
 	kqring_worker_hold();
-	error = kthread_add(kqring_sqpoll_thread, ctx, td->td_proc,
-	    &ctx->sqpoll_td, 0, 0, ctx->taskrun_only ? "kqtask" : "kqsqp");
+	error = kthread_add(kqring_sqpoll_thread, tctx, td->td_proc,
+	    &tctx->task_td, 0, 0, ctx->taskrun_only ? "kqtask" : "kqsqp");
 	if (error != 0) {
 		kqring_worker_rele();
 		mtx_lock(&ctx->mtx);
-		ctx->sqpoll_running = false;
-		ctx->sqpoll_td = NULL;
+		tctx->task_running = false;
+		tctx->task_td = NULL;
 		mtx_unlock(&ctx->mtx);
 		kqring_ctx_rele(ctx);
 	}
@@ -1566,7 +1570,7 @@ kqring_sqpoll_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		}
 		if (!TAILQ_EMPTY(&ctx->retired_ops))
 			(void)kqring_wq_abort_retired_locked(ctx);
-		if ((!TAILQ_EMPTY(&ctx->taskwork_ops) ||
+		if ((ctx->ntaskwork != 0 ||
 		    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) ||
 		    atomic_load_acq_32(&shm->sq_tail) !=
 		    atomic_load_acq_32(&shm->sq_head)) && ctx->sleeping)

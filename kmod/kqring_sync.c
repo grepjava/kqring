@@ -34,7 +34,7 @@ kqring_timer_stop_locked(struct kqring_op *op)
 		op->timer_pending = false;
 	}
 	if (op->in_taskwork) {
-		TAILQ_REMOVE(&op->ctx->taskwork_ops, op, taskwork_link);
+		kqring_tw_remove_locked(op->ctx, op);
 		op->in_taskwork = false;
 	}
 }
@@ -782,7 +782,7 @@ kqring_cancel_wait(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe,
 			return (ETIME);
 		}
 		/* Woken by the taskwork the worker or the disk queues. */
-		if (TAILQ_EMPTY(&ctx->taskwork_ops)) {
+		if (TAILQ_EMPTY(&kqring_tctx_cur(ctx)->taskwork)) {
 			ctx->sleeping++;
 			error = msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, PCATCH,
 			    "kqscan", MIN(left, SBT_1S), 0, 0);

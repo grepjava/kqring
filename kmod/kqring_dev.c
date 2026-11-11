@@ -559,8 +559,8 @@ kqring_ctx_free_final(struct kqring_ctx *ctx)
 		kqring_req_destroy(ctx, op);
 		mtx_lock(&ctx->mtx);
 	}
-	wq = ctx->wq;
-	ctx->wq = NULL;
+	wq = ctx->tctx->wq;
+	ctx->tctx->wq = NULL;
 	mtx_unlock(&ctx->mtx);
 	callout_drain(&ctx->wq_abort_callout);
 	kqring_wq_rele(wq);
@@ -621,6 +621,9 @@ kqring_ctx_free_final(struct kqring_ctx *ctx)
 	sx_destroy(&ctx->bg_sx);
 	sx_destroy(&ctx->pipe_sx);
 	mtx_destroy(&ctx->mtx);
+	KASSERT(TAILQ_EMPTY(&ctx->tctx->taskwork),
+	    ("kqring: freeing a context with taskwork"));
+	free(ctx->tctx, M_KQRING);
 	free(ctx, M_KQRING);
 }
 
@@ -755,13 +758,13 @@ kqring_ctx_cancel_begin(struct kqring_ctx *ctx, bool nowait, bool release)
 	}
 	if (ctx->sqpoll_waiting)
 		wakeup(&ctx->sqpoll_wait_chan);
-	if (curthread == ctx->sqpoll_td) {
+	if (curthread == ctx->tctx->task_td) {
 		mtx_unlock(&ctx->mtx);
 		return (EALREADY);
 	}
-	while (ctx->sqpoll_running) {
+	while (ctx->tctx->task_running) {
 		error = nowait ? EWOULDBLOCK :
-		    kqring_teardown_sleep(&ctx->sqpoll_running, &ctx->mtx,
+		    kqring_teardown_sleep(&ctx->tctx->task_running, &ctx->mtx,
 		    "kqsqdt");
 		if (error != 0)
 			goto fail;
@@ -892,7 +895,7 @@ kqring_ctx_movable_locked(struct kqring_ctx *ctx)
 		return (false);
 	if (ctx->nreqs != 0 || !TAILQ_EMPTY(&ctx->active_ops) ||
 	    !TAILQ_EMPTY(&ctx->retired_ops) ||
-	    !TAILQ_EMPTY(&ctx->taskwork_ops) || ctx->nbio != 0 ||
+	    ctx->ntaskwork != 0 || ctx->nbio != 0 ||
 	    !TAILQ_EMPTY(&ctx->zc_pending))
 		return (false);
 	if (ctx->bufs != NULL || ctx->ncreds != 0 || ctx->nprovided != 0 ||
@@ -974,17 +977,17 @@ kqring_ctx_takeover(struct kqring_ctx *ctx, struct thread *td)
 	sx_xunlock(&ctx->sq_sx);
 
 	mtx_lock(&ctx->mtx);
-	while (ctx->sqpoll_running) {
+	while (ctx->tctx->task_running) {
 		wakeup(&ctx->wakeup_chan);
-		(void)msleep(&ctx->sqpoll_running, &ctx->mtx, 0, "kqhosq",
+		(void)msleep(&ctx->tctx->task_running, &ctx->mtx, 0, "kqhosq",
 		    hz / 100 + 1);
 	}
 	/* Wakes the poller asleep in kevent, then reports if it still runs. */
 	while (kqring_kpoll_stop(ctx, true) != 0)
 		(void)msleep(&ctx->kp_running, &ctx->mtx, 0, "kqhokp",
 		    hz / 100 + 1);
-	owq = ctx->wq;
-	ctx->wq = nwq;
+	owq = ctx->tctx->wq;
+	ctx->tctx->wq = nwq;
 	mtx_unlock(&ctx->mtx);
 	kqring_kpoll_close(ctx);
 	if (owq != NULL) {
@@ -1049,11 +1052,11 @@ kqring_ctx_cancel_locked(struct kqring_ctx *ctx)
 		kqring_req_destroy(ctx, op);
 		mtx_lock(&ctx->mtx);
 	}
-	wq = ctx->wq;
+	wq = ctx->tctx->wq;
 	/* A released ring gets a new pool from the process taking it over. */
 	release = ctx->release;
 	if (release)
-		ctx->wq = NULL;
+		ctx->tctx->wq = NULL;
 	mtx_unlock(&ctx->mtx);
 	kqring_wq_close(wq);
 	if (release)
@@ -1162,10 +1165,12 @@ kqring_fdopen(struct cdev *dev __unused, int fflags __unused,
 	sx_init(&ctx->pipe_sx, "kqring pipe");
 	sx_init_flags(&ctx->sq_sx, "kqring sq", SX_DUPOK);
 	sx_init(&ctx->kp_sx, "kqring kpoll");
-	ctx->wq = kqring_wq_alloc(td);
+	ctx->tctx = malloc(sizeof(*ctx->tctx), M_KQRING, M_WAITOK | M_ZERO);
+	ctx->tctx->ctx = ctx;
+	ctx->tctx->wq = kqring_wq_alloc(td);
+	TAILQ_INIT(&ctx->tctx->taskwork);
 	TAILQ_INIT(&ctx->retired_ops);
 	TAILQ_INIT(&ctx->active_ops);
-	TAILQ_INIT(&ctx->taskwork_ops);
 	TAILQ_INIT(&ctx->free_ops);
 	TAILQ_INIT(&ctx->ready_q);
 	TAILQ_INIT(&ctx->defer_q);
@@ -1187,7 +1192,8 @@ kqring_fdopen(struct cdev *dev __unused, int fflags __unused,
 	mtx_lock(&kqring_proc_mtx);
 	if (kqring_unloading) {
 		mtx_unlock(&kqring_proc_mtx);
-		kqring_wq_put(ctx->wq);
+		kqring_wq_put(ctx->tctx->wq);
+		free(ctx->tctx, M_KQRING);
 		callout_drain(&ctx->wq_abort_callout);
 		knlist_destroy(&ctx->rsel.si_note);
 		sx_destroy(&ctx->sq_sx);
@@ -1297,13 +1303,14 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 			return (EINVAL);
 		}
 		mtx_lock(&wctx->mtx);
-		if (!wctx->setup_done || wctx->closing || wctx->wq == NULL ||
-		    wctx->wq->proc != td->td_proc) {
+		if (!wctx->setup_done || wctx->closing ||
+		    wctx->tctx->wq == NULL ||
+		    wctx->tctx->wq->proc != td->td_proc) {
 			mtx_unlock(&wctx->mtx);
 			fdrop(wfp, td);
 			return (EINVAL);
 		}
-		attach_wq = wctx->wq;
+		attach_wq = wctx->tctx->wq;
 		mtx_lock(&attach_wq->mtx);
 		if (attach_wq->closing) {
 			mtx_unlock(&attach_wq->mtx);
@@ -1357,8 +1364,8 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 		struct kqring_wq *old_wq;
 
 		mtx_lock(&ctx->mtx);
-		old_wq = ctx->wq;
-		ctx->wq = attach_wq;
+		old_wq = ctx->tctx->wq;
+		ctx->tctx->wq = attach_wq;
 		mtx_unlock(&ctx->mtx);
 		attach_wq = old_wq;
 		wq_swapped = true;
@@ -1370,8 +1377,8 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 			struct kqring_wq *cur_wq;
 
 			mtx_lock(&ctx->mtx);
-			cur_wq = ctx->wq;
-			ctx->wq = attach_wq;
+			cur_wq = ctx->tctx->wq;
+			ctx->tctx->wq = attach_wq;
 			mtx_unlock(&ctx->mtx);
 			attach_wq = cur_wq;
 		}
@@ -1482,7 +1489,7 @@ static inline bool
 kqring_enter_locks(const struct kqring_ctx *ctx, const struct thread *td)
 {
 	return (kqring_has_kthread(ctx) || ctx->shared ||
-	    (ctx->wq != NULL && ctx->wq->proc != td->td_proc));
+	    (ctx->tctx->wq != NULL && ctx->tctx->wq->proc != td->td_proc));
 }
 
 /*
@@ -1913,6 +1920,7 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
     bool has_timeout, sbintime_t sbt, bool lock, bool foreign)
 {
 	struct kqring_shm_header *shm = ctx->shm;
+	struct kqring_op_list *tw = &kqring_tctx_cur(ctx)->taskwork;
 	bool iopoll = (ctx->flags & IORING_SETUP_IOPOLL) != 0;
 	bool may_poll = !foreign, deadline_set = false;
 	sbintime_t spin = foreign ? 0 : ctx->busy_poll_sbt, deadline = 0;
@@ -1960,14 +1968,14 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 				if (atomic_load_acq_32(&shm->cq_tail) -
 				    atomic_load_acq_32(&shm->cq_head) >=
 				    min_complete ||
-				    !TAILQ_EMPTY(&ctx->taskwork_ops) ||
+				    !TAILQ_EMPTY(tw) ||
 				    !KQRING_STQ_EMPTY_HINT(&ctx->rcq))
 					break;
 				cpu_spinwait();
 				now = getsbinuptime();
 			}
 			spin = 0;
-			if (!TAILQ_EMPTY(&ctx->taskwork_ops) ||
+			if (!TAILQ_EMPTY(tw) ||
 			    !KQRING_STQ_EMPTY_HINT(&ctx->rcq))
 				goto drain;
 			continue;
@@ -1988,7 +1996,7 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		}
 		if (!foreign && !TAILQ_EMPTY(&ctx->retired_ops))
 			(void)kqring_wq_abort_retired_locked(ctx);
-		if (!foreign && (!TAILQ_EMPTY(&ctx->taskwork_ops) ||
+		if (!foreign && (!TAILQ_EMPTY(tw) ||
 		    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) ||
 		    atomic_load_acq_int(&ctx->kp_kick) != 0)) {
 			mtx_unlock(&ctx->mtx);
@@ -2026,7 +2034,7 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		/*
 		 * Timeout is sbintime_t, not ticks: use the _sbt variant.  The
 		 * CQEs still wanted let plain completions batch their wake-ups
-		 * (kqring_taskwork_add_lazy_locked()); taskwork_ops is empty.
+		 * (kqring_taskwork_add_lazy_locked()); our taskwork is empty.
 		 */
 		ctx->sleeping++;
 		ctx->cq_sleepers++;
@@ -2189,8 +2197,8 @@ kqring_proc_rings_teardown(struct proc *p, bool exiting)
 				refcount_acquire(&ctx->refs);
 				break;
 			}
-			if (ctx->owner_proc == p ||
-			    (ctx->wq != NULL && ctx->wq->proc == p)) {
+			if (ctx->owner_proc == p || (ctx->tctx->wq != NULL &&
+			    ctx->tctx->wq->proc == p)) {
 				ctx->in_ctx_list = false;
 				LIST_REMOVE(ctx, proc_link);
 				refcount_acquire(&ctx->refs);
@@ -2235,8 +2243,8 @@ kqring_proc_fork(void *arg __unused, struct proc *p1,
 
 	mtx_lock(&kqring_proc_mtx);
 	LIST_FOREACH(ctx, &kqring_ctx_list, proc_link) {
-		if ((ctx->owner_proc == p1 ||
-		    (ctx->wq != NULL && ctx->wq->proc == p1)) &&
+		if ((ctx->owner_proc == p1 || (ctx->tctx->wq != NULL &&
+		    ctx->tctx->wq->proc == p1)) &&
 		    !ctx->closing)
 			atomic_add_int(&ctx->cow_gen, 1);
 	}

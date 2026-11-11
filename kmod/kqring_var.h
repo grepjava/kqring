@@ -333,6 +333,8 @@ struct kqring_op {
 	TAILQ_ENTRY(kqring_op)	q_link;		/* ready_q or defer_q */
 	TAILQ_ENTRY(kqring_op)	wq_link;	/* wq_ops[wq_type] */
 	struct kqring_ctx	*ctx;
+	/* Its submitter's context: the pool and taskwork it runs on. */
+	struct kqring_tctx	*tctx;
 	struct socket		*so;		/* soref'd while armed */
 	int			dirs;		/* KQ_DIR_* upcalls installed */
 	/* The waiter lists op is on: so_rcv (or the listener), so_snd. */
@@ -772,6 +774,24 @@ struct kqring_wq {
 	uint32_t		aff_gen;
 };
 
+/*
+ * A ring's state in one process (docs/concurrent-submitters.md): the worker
+ * pool its requests run on, the taskwork that has to run in it, and the
+ * kthread that runs that taskwork while nobody enters (or, with SQPOLL,
+ * submits).  A request runs in its submitter's context (op->tctx).  For
+ * now a ring has one, ctx->tctx, which moves with the ring.
+ */
+struct kqring_tctx {
+	struct kqring_ctx	*ctx;
+	struct proc		*proc;		/* under ctx->mtx */
+	struct kqring_wq	*wq;		/* its pool, in proc */
+	/* Requests whose next step runs in proc; under ctx->mtx. */
+	struct kqring_op_list	taskwork;
+	/* SQPOLL, or no DEFER_TASKRUN: its kthread; under ctx->mtx. */
+	struct thread		*task_td;
+	bool			task_running;
+};
+
 /* IORING_REGISTER_RESTRICTIONS, in force once the ring is enabled. */
 struct kqring_restrictions {
 	uint64_t	register_op[4];		/* bitmaps over 0..255 */
@@ -835,15 +855,13 @@ struct kqring_ctx {
 	uint32_t		nprovided;	/* PROVIDE_BUFFERS buffers held */
 	size_t			ring_mem;	/* IOU_PBUF_RING_MMAP rings */
 
-	/* In-process worker thread pool (shared with IORING_SETUP_ATTACH_WQ). */
-	struct kqring_wq	*wq;
+	/* The process context (its pool may be shared with ATTACH_WQ). */
+	struct kqring_tctx	*tctx;
 
 	/* IORING_SETUP_SQPOLL kernel thread and submission lock. */
 	struct sx		sq_sx;
-	struct thread		*sqpoll_td;
 	sbintime_t		sqpoll_idle_sbt;
 	uint32_t		sqpoll_cpu;
-	bool			sqpoll_running;
 	bool			sqpoll_waiting;
 	int			sqpoll_wait_chan;
 	/*
@@ -965,7 +983,8 @@ struct kqring_ctx {
 	struct kqring_op_list	retired_ops;	/* canceled workers still live */
 	struct kqring_op_list	active_ops;
 	struct kqring_poll_head	poll_hash[KQRING_POLL_HASH];
-	struct kqring_op_list	taskwork_ops;
+	/* Requests on the contexts' taskwork lists; under mtx. */
+	u_int			ntaskwork;
 	int			nfutex;		/* armed FUTEX_WAIT(V) ops */
 	int			nseqto;		/* armed completion-count TIMEOUTs */
 	int			nwaitid;	/* armed WAITID ops */
@@ -1036,7 +1055,7 @@ struct kqring_ctx {
 	struct kqring_sowatch	*sw_cache[2];
 	/*
 	 * Keeps CQEs in the order of the data for reads of a pipe: a worker
-	 * holds it from its read until the op is on taskwork_ops, as only
+	 * holds it from its read until the op is on its taskwork, as only
 	 * the issuer posts, in that list's order.  See kqring_file_rw().
 	 * Before bg_sx, ctx->mtx and wq->mtx.
 	 */
@@ -1099,6 +1118,7 @@ kqring_set_owner(struct kqring_ctx *ctx, struct thread *td)
 {
 	ctx->owner_proc = td->td_proc;
 	ctx->owner_tid = td->td_tid;
+	ctx->tctx->proc = td->td_proc;
 }
 
 static inline void
@@ -1106,6 +1126,17 @@ kqring_clear_owner(struct kqring_ctx *ctx)
 {
 	ctx->owner_proc = NULL;
 	ctx->owner_tid = 0;
+	ctx->tctx->proc = NULL;
+}
+
+/*
+ * curthread's process's context on ctx.  For now a ring has one context,
+ * which moves with the ring (kqring_ctx_takeover()).
+ */
+static inline struct kqring_tctx *
+kqring_tctx_cur(struct kqring_ctx *ctx)
+{
+	return (ctx->tctx);
 }
 
 /*
@@ -1254,7 +1285,25 @@ kqring_ring_readable(const struct kqring_ctx *ctx)
 		return (false);
 	return (atomic_load_acq_32(&shm->cq_tail) !=
 	    atomic_load_acq_32(&shm->cq_head) || !KQRING_STQ_EMPTY_HINT(&ctx->ocq) ||
-	    !TAILQ_EMPTY(&ctx->taskwork_ops) || !KQRING_STQ_EMPTY_HINT(&ctx->rcq));
+	    atomic_load_int(&ctx->ntaskwork) != 0 ||
+	    !KQRING_STQ_EMPTY_HINT(&ctx->rcq));
+}
+
+/* op's taskwork, on its submitter's context. */
+static inline void
+kqring_tw_insert_locked(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	TAILQ_INSERT_TAIL(&op->tctx->taskwork, op, taskwork_link);
+	ctx->ntaskwork++;
+}
+
+static inline void
+kqring_tw_remove_locked(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	TAILQ_REMOVE(&op->tctx->taskwork, op, taskwork_link);
+	ctx->ntaskwork--;
 }
 
 
@@ -1289,15 +1338,15 @@ kqring_taskwork_add_common(struct kqring_ctx *ctx, struct kqring_op *op,
 	 * the ring has work to run (once, until the owner runs it), unless
 	 * EVENTFD_ASYNC is set and this is the submitting enter itself.
 	 */
-	if (TAILQ_EMPTY(&ctx->taskwork_ops) &&
+	if (ctx->ntaskwork == 0 &&
 	    (!ctx->evfd_async || !ctx->submitting))
 		kqring_evfd_signal_common(ctx, false);
-	TAILQ_INSERT_TAIL(&ctx->taskwork_ops, op, taskwork_link);
+	kqring_tw_insert_locked(ctx, op);
 	if (ctx->shm != NULL)
 		atomic_set_32(&ctx->shm->sq_flags, IORING_SQ_TASKRUN);
 	/*
 	 * ctx->sleeping is only changed under ctx->mtx, and the owner
-	 * re-checks taskwork_ops under ctx->mtx before sleeping, so
+	 * re-checks its taskwork under ctx->mtx before sleeping, so
 	 * skipping wakeup() (sleepq lookup) here cannot lose a wakeup.
 	 */
 	if (ctx->sleeping == 0)
@@ -1961,9 +2010,10 @@ kqring_has_kthread(const struct kqring_ctx *ctx)
 static inline bool
 kqring_bg_locks(const struct kqring_ctx *ctx)
 {
+	const struct kqring_wq *wq = ctx->tctx->wq;
+
 	return (ctx->shared || kqring_has_kthread(ctx) ||
-	    (ctx->wq != NULL &&
-	    (ctx->wq->total[0] != 0 || ctx->wq->total[1] != 0)));
+	    (wq != NULL && (wq->total[0] != 0 || wq->total[1] != 0)));
 }
 
 int	kqring_sqpoll_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,

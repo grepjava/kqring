@@ -444,7 +444,7 @@ void
 kqring_op_disarm_locked(struct kqring_op *op)
 {
 	struct kqring_ctx *ctx = op->ctx;
-	struct kqring_wq *wq = ctx->wq;
+	struct kqring_wq *wq = op->tctx->wq;
 
 	mtx_assert(&ctx->mtx, MA_OWNED);
 	if (op->polled) {
@@ -460,8 +460,7 @@ kqring_op_disarm_locked(struct kqring_op *op)
 			kqring_wq_unqueue_locked(wq, op);
 		if (op->wq_running) {
 			if (op->in_taskwork) {
-				TAILQ_REMOVE(&ctx->taskwork_ops, op,
-				    taskwork_link);
+				kqring_tw_remove_locked(ctx, op);
 				op->in_taskwork = false;
 			}
 			wakeup(&op->in_taskwork);
@@ -611,6 +610,7 @@ kqring_op_alloc(struct kqring_ctx *ctx)
 		op = malloc(sizeof(*op), M_KQRING, M_WAITOK | M_ZERO);
 	}
 	op->ctx = ctx;
+	op->tctx = kqring_tctx_cur(ctx);
 	ctx->nreqs++;
 	return (op);
 }
@@ -2694,6 +2694,8 @@ kqring_post_remote_locked(struct kqring_ctx *ctx)
 void
 kqring_run_taskwork(struct kqring_ctx *ctx)
 {
+	struct kqring_tctx *tctx = kqring_tctx_cur(ctx);
+	struct kqring_op_list *tw = &tctx->taskwork;
 	struct kqring_op *op;
 
 	/*
@@ -2701,7 +2703,7 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 	 * its requests: only its threads may.  A thread of a process the ring
 	 * has since moved away from, still in a wait, finds nothing to do.
 	 */
-	if (__predict_false(ctx->owner_proc != curproc))
+	if (__predict_false(tctx->proc != curproc))
 		return;
 	/* Successors issued below may queue more taskwork; bound the loop. */
 	for (int pass = 0; pass < 64; pass++) {
@@ -2711,7 +2713,7 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 		 * by the wait loop under ctx->mtx before sleeping, or leaves
 		 * IORING_SQ_TASKRUN set for the next enter.
 		 */
-		if (TAILQ_EMPTY(&ctx->taskwork_ops) &&
+		if (TAILQ_EMPTY(tw) &&
 		    (KQRING_STQ_EMPTY_HINT(&ctx->rcq) ||
 		    ctx->nocq >= KQRING_OCQ_BUSY) &&
 		    (ctx->shm == NULL ||
@@ -2721,9 +2723,8 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 
 		mtx_lock(&ctx->mtx);
 		for (;;) {
-			if ((op = TAILQ_FIRST(&ctx->taskwork_ops)) != NULL) {
-				TAILQ_REMOVE(&ctx->taskwork_ops, op,
-				    taskwork_link);
+			if ((op = TAILQ_FIRST(tw)) != NULL) {
+				kqring_tw_remove_locked(ctx, op);
 				op->in_taskwork = false;
 				if (ctx->closing || (op->cancelled &&
 				    !op->wq_retired))
@@ -2758,14 +2759,14 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 				break;
 			kqring_post_remote_locked(ctx);
 		}
-		if (TAILQ_EMPTY(&ctx->taskwork_ops) &&
+		if (ctx->ntaskwork == 0 &&
 		    STAILQ_EMPTY(&ctx->rcq) && ctx->shm != NULL &&
 		    (atomic_load_32(&ctx->shm->sq_flags) &
 		    IORING_SQ_TASKRUN) != 0)
 			atomic_clear_32(&ctx->shm->sq_flags, IORING_SQ_TASKRUN);
 		mtx_unlock(&ctx->mtx);
 		kqring_flush_ready(ctx);
-		if (TAILQ_EMPTY(&ctx->taskwork_ops) &&
+		if (TAILQ_EMPTY(tw) &&
 		    (KQRING_STQ_EMPTY_HINT(&ctx->rcq) || ctx->nocq >= KQRING_OCQ_BUSY))
 			break;
 	}

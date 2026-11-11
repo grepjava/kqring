@@ -658,7 +658,7 @@ static int
 kqring_iowq_aff(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
     bool set)
 {
-	struct kqring_wq *wq = ctx->wq;
+	struct kqring_wq *wq = kqring_tctx_cur(ctx)->wq;
 	cpuset_t mask;
 	size_t len;
 	int error;
@@ -712,7 +712,7 @@ static int
 kqring_iowq_max_workers(struct kqring_ctx *ctx,
     const struct kqring_register_arg *ra)
 {
-	struct kqring_wq *wq = ctx->wq;
+	struct kqring_wq *wq = kqring_tctx_cur(ctx)->wq;
 	uint32_t vals[KQRING_WQ_TYPES];
 	int error;
 

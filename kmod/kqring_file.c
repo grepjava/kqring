@@ -708,7 +708,7 @@ retry:
 	/*
 	 * Reads of a pipe or FIFO post their CQEs in the order they got the
 	 * data, as in io_uring, where the read and the CQE are one step.  A
-	 * worker keeps pipe_sx until its op is on taskwork_ops
+	 * worker keeps pipe_sx until its op is on its taskwork
 	 * (kqring_wq_thread()), so it must not wait for the pipe with it.
 	 * The issuer posts its own CQE before it runs any taskwork, so it
 	 * only has to leave a read to a worker while older ones are still to
@@ -722,13 +722,13 @@ retry:
 			error = EAGAIN;
 			goto read_busy;
 		}
-		if (!TAILQ_EMPTY(&ctx->taskwork_ops)) {
+		if (!TAILQ_EMPTY(&op->tctx->taskwork)) {
 			sx_xunlock(&ctx->pipe_sx);
 			error = EAGAIN;
 			goto read_busy;
 		}
 	} else if (ordered) {
-		/* Through taskwork_ops: the issuer mustn't post it at once. */
+		/* Through taskwork: the issuer mustn't post it at once. */
 		kqring_wq_mark_blocking(ctx, op);
 		sx_xlock(&ctx->pipe_sx);
 	}

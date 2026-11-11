@@ -16,7 +16,7 @@ static int kqring_soupcall(struct socket *so, void *arg, int waitflag);
  * lock) held when data arrives, space opens, a connection is queued, or a
  * peer closes.
  * Never touches user memory: simply moves each waiting op onto its ring's
- * taskwork_ops, sets IORING_SQ_TASKRUN in shm->sq_flags, and wakes the
+ * its context's taskwork, sets IORING_SQ_TASKRUN in shm->sq_flags, and wakes the
  * owner if sleeping.  An op that finds nothing to do when it runs (another
  * waiter took the data or the connection) stays armed.
  */
