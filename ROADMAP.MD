@@ -15,7 +15,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 5 | Worker path scalability | Done |
 | 6 | Performance evidence | Done |
 | 7 | Newer interfaces and real programs | Done |
-| 8 | Several processes submitting to one ring | In progress |
+| 8 | Several processes submitting to one ring | Done |
 
 ## Where kqring stands
 
@@ -153,6 +153,8 @@ A ring moves between processes since phase 7, but only one may have requests in 
 - **Step 4:** **Done.** PostgreSQL 18.6 again: all 231 regression tests pass, and pgbench stays level with its `worker` and `sync` methods ([postgresql/README.md](postgresql/README.md)). Each context now has its own poller, so any process sharing a ring polls pipes and other files that aren't sockets, where only the first could before. `tests/kqring_diff.c` gained `fork_inflight` (two processes' polls in flight, at the same descriptor number, and a `TIMEOUT` outliving its process) and `exit_armed`, and `exec` now shows the CQ the new image sees: `fork`, `fork_inflight` and `exec` match Linux 7.3, where `fork` and `exec` were listed differences. `exit_armed` showed that Linux cancels at exit only requests on io_uring files and ends the rest when they would next run, where kqring cancels them all at once; it is listed. On the Ryzen, alternated five times with the step 3 build, the median row of `kqring_bench` and `kqring_mt_bench` moved by 0.1%.
 
 Acceptance: the tests the design lists, the fuzzer with forked submitters, liburing and PostgreSQL unchanged or better, single-process performance unchanged, and the differences that remain listed in the matrix.
+
+Phase 8 is done: every criterion is met. What still differs is in the [matrix](COMPATIBILITY.MD#boundaries): registered buffers work only in the process that registered them, kqring's extensions keep a ring to one process, a set-ID `exec` closes the rings the process holds, and exit cancels a process's requests sooner than Linux.
 
 ## Research
 
