@@ -16,6 +16,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 6 | Performance evidence | Done |
 | 7 | Newer interfaces and real programs | Done |
 | 8 | Several processes submitting to one ring | Done |
+| 9 | Registered buffers on held pages | In progress |
 
 ## Where kqring stands
 
@@ -156,13 +157,20 @@ Acceptance: the tests the design lists, the fuzzer with forked submitters, libur
 
 Phase 8 is done: every criterion is met. What still differs is in the [matrix](COMPATIBILITY.MD#boundaries): registered buffers work only in the process that registered them, kqring's extensions keep a ring to one process, a set-ID `exec` closes the rings the process holds, and exit cancels a process's requests sooner than Linux.
 
+## Phase 9: Registered buffers on held pages
+
+Registered buffers hold their pages, but only zero-copy sends use them: fixed reads and writes copy through the buffer's user addresses. So a buffer works only in the process that registered it, follows its mapping rather than its pages after `munmap(2)` or a new mapping, splits from the parent's memory after `fork(2)`, may be a shared file mapping, and is at most 16 MiB. Linux pins the pages and does I/O through them.
+
+[docs/held-buffers.md](docs/held-buffers.md) is the design: map each buffer's held pages in kernel address space and do fixed I/O through that mapping, refuse vnode-backed pages, re-hold a forking process's buffers for writing so that the parent keeps them, and give direct disk I/O the held pages. `tests/kqring_diff.c` has `buffer_lifetime`, `buffer_fork` and `buffer_backing` against Linux 7.3.
+
+Acceptance: those three cases match Linux 7.3; liburing's fixed-buffer tests pass as before or better; the unit tests, stress and fuzzer pass, the fuzzer with fixed requests from forked children; single-process performance unchanged, and direct disk reads into fixed buffers faster or level; the differences that remain listed in the matrix.
+
 ## Research
 
 None of these is planned work. Each needs a design note covering kernel subsystem dependencies, lifetime rules, security implications and measurable benefit before it can become a phase.
 
 - **Zero-copy receive:** check FreeBSD network-stack and driver support before committing to `RECV_ZC`. Linux's design depends on NIC queues, header and data splitting, steering and buffer recycling.
 - **Driver commands:** assess a native driver contract if real programs need more than the existing socket commands. A matching opcode doesn't supply NVMe or other driver passthrough semantics.
-- **Registered-buffer mapping independence:** assess using held pages for fixed I/O, including protection, copy-on-write and lifetime implications.
 - **Asynchronous ZFS reads:** ZFS's I/O pipeline is asynchronous below the DMU, which waits for it. A read issued with a parent `zio` and completed from `zio_done` would finish at once on an ARC hit and from ZFS's callback on a miss, with no worker and no guess, as FreeBSD's asynchronous `sendfile(2)` does for the page cache. ZFS has no `VOP_GETPAGES_ASYNC` either, so `sendfile(2)` from ZFS blocks on every ARC miss, and the same work would fix it. [docs/async-zfs-reads.md](docs/async-zfs-reads.md) proposes two steps: a read that fails rather than wait, as Linux's `IOCB_NOWAIT`, then one that completes from ZFS's callback. Both change OpenZFS, so they would go there first.
 
 Zero-copy `SPLICE` stays unplanned; see [`TODO.MD`](TODO.MD).

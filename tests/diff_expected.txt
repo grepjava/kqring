@@ -4,3 +4,5 @@ poll_hup The poll result follows the file: a pipe closed by its writer gives POL
 newer What Linux 7.3 has past IORING_OP_PIPE is refused here (COMPATIBILITY.MD, rows marked Unsupported).
 ext_arg_order kqring checks an enter's wait argument before it submits anything, so a bad one fails the enter; Linux submits first and returns the count (COMPATIBILITY.MD, IORING_ENTER_EXT_ARG).
 exit_armed When a process exits, kqring completes its requests in flight with -ECANCELED at once; Linux cancels at exit only requests on io_uring files and ends the others when they would next run, here when the pipe becomes readable (docs/concurrent-submitters.md, Exit).
+buffer_fork Until phase 9, a registered buffer works only in the process that registered it, as kqring copies through its user addresses (docs/held-buffers.md).
+buffer_backing Until phase 9, kqring accepts a shared file mapping as a registered buffer, which Linux refuses (docs/held-buffers.md).

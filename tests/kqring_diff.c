@@ -1066,6 +1066,166 @@ c_buffer_lifetime(void)
 	ring_free(&r);
 }
 
+/*
+ * A registered buffer across fork(2). The child reads a file into the
+ * parent's buffer, by its own request; then the parent writes to the
+ * buffer's memory and writes the buffer to the file. Each side reports
+ * what its own memory holds.
+ */
+static void
+c_buffer_fork(void)
+{
+	size_t page = (size_t)sysconf(_SC_PAGESIZE);
+	struct io_uring_sqe *s;
+	struct ring r;
+	struct iovec iov;
+	char out[8], view[16];
+	int fd = scratch_file("filedata", 8), p[2], st;
+	pid_t pid;
+	char *m;
+
+	CHECK(ftruncate(fd, (off_t)page) == 0);
+	CHECK(pipe(p) == 0);
+	ring_init(&r, 8, NULL);
+	m = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
+	    -1, 0);
+	CHECK(m != MAP_FAILED);
+	memcpy(m, "parent0!", 8);
+	iov.iov_base = m;
+	iov.iov_len = page;
+	CHECK(ring_sys_register(r.fd, IORING_REGISTER_BUFFERS, &iov, 1) == 0);
+	fflush(stdout);
+	pid = fork();
+	CHECK(pid >= 0);
+	if (pid == 0) {
+		char rep[64];
+		struct io_uring_cqe c;
+		unsigned h;
+
+		s = prep(&r, IORING_OP_READ_FIXED, fd, 1);
+		s->addr = (uint64_t)(uintptr_t)m;
+		s->len = 8;
+		s->buf_index = 0;
+		(void)submit(&r);
+		await(&r, 1, 2000);
+		h = atomic_load(r.cq_head);
+		if (h == atomic_load(r.cq_tail)) {
+			snprintf(rep, sizeof(rep), "none %.8s", m);
+		} else {
+			c = r.cqes[h & r.cq_mask];
+			atomic_store(r.cq_head, h + 1);
+			if (c.res < 0)
+				snprintf(rep, sizeof(rep), "-%s %.8s",
+				    errname(-c.res), m);
+			else
+				snprintf(rep, sizeof(rep), "%d %.8s", c.res, m);
+		}
+		(void)write(p[1], rep, sizeof(rep));
+		_exit(0);
+	}
+	{
+		char rep[64];
+
+		CHECK(read(p[0], rep, sizeof(rep)) == sizeof(rep));
+		CHECK(waitpid(pid, &st, 0) == pid);
+		printf("%s/child_read %s\n", current, rep);
+	}
+	r.tail = atomic_load(r.sq_tail);
+	memcpy(view, m, 8);
+	printf("%s/parent_sees %.8s\n", current, view);
+
+	memcpy(m, "parentB!", 8);
+	s = prep(&r, IORING_OP_WRITE_FIXED, fd, 2);
+	s->addr = (uint64_t)(uintptr_t)m;
+	s->len = 8;
+	s->off = 100;
+	s->buf_index = 0;
+	(void)submit(&r);
+	await(&r, 1, 2000);
+	dump(&r, "parent_write");
+	CHECK(pread(fd, out, 8, 100) == 8);
+	printf("%s/written %.8s\n", current, out);
+
+	munmap(m, page);
+	close(p[0]);
+	close(p[1]);
+	close(fd);
+	ring_free(&r);
+}
+
+/* What kinds of memory may be registered as a buffer. */
+static void
+c_buffer_backing(void)
+{
+	size_t page = (size_t)sysconf(_SC_PAGESIZE);
+	struct ring r;
+	struct iovec iov;
+	int fd = scratch_file("", 0), mfd, rc;
+	char *m;
+
+	CHECK(ftruncate(fd, (off_t)page) == 0);
+	ring_init(&r, 8, NULL);
+	iov.iov_len = page;
+
+	m = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	CHECK(m != MAP_FAILED);
+	iov.iov_base = m;
+	rc = ring_sys_register(r.fd, IORING_REGISTER_BUFFERS, &iov, 1);
+	say_rc("file_shared", rc);
+	if (rc == 0)
+		CHECK(ring_sys_register(r.fd, IORING_UNREGISTER_BUFFERS, NULL,
+		    0) == 0);
+	munmap(m, page);
+
+	m = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+	CHECK(m != MAP_FAILED);
+	iov.iov_base = m;
+	rc = ring_sys_register(r.fd, IORING_REGISTER_BUFFERS, &iov, 1);
+	say_rc("file_private", rc);
+	if (rc == 0)
+		CHECK(ring_sys_register(r.fd, IORING_UNREGISTER_BUFFERS, NULL,
+		    0) == 0);
+	munmap(m, page);
+
+	mfd = memfd_create("kqdiff", 0);
+	CHECK(mfd >= 0);
+	CHECK(ftruncate(mfd, (off_t)page) == 0);
+	m = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+	CHECK(m != MAP_FAILED);
+	iov.iov_base = m;
+	rc = ring_sys_register(r.fd, IORING_REGISTER_BUFFERS, &iov, 1);
+	say_rc("memfd_shared", rc);
+	if (rc == 0)
+		CHECK(ring_sys_register(r.fd, IORING_UNREGISTER_BUFFERS, NULL,
+		    0) == 0);
+	munmap(m, page);
+	close(mfd);
+
+	m = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON,
+	    -1, 0);
+	CHECK(m != MAP_FAILED);
+	iov.iov_base = m;
+	rc = ring_sys_register(r.fd, IORING_REGISTER_BUFFERS, &iov, 1);
+	say_rc("anon_shared", rc);
+	if (rc == 0)
+		CHECK(ring_sys_register(r.fd, IORING_UNREGISTER_BUFFERS, NULL,
+		    0) == 0);
+	munmap(m, page);
+
+	m = mmap(NULL, page, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
+	CHECK(m != MAP_FAILED);
+	iov.iov_base = m;
+	rc = ring_sys_register(r.fd, IORING_REGISTER_BUFFERS, &iov, 1);
+	say_rc("anon_readonly", rc);
+	if (rc == 0)
+		CHECK(ring_sys_register(r.fd, IORING_UNREGISTER_BUFFERS, NULL,
+		    0) == 0);
+	munmap(m, page);
+
+	close(fd);
+	ring_free(&r);
+}
+
 static void
 c_cq_overflow(void)
 {
@@ -1996,6 +2156,8 @@ static const struct {
 	{ "poll_hup", c_poll_hup },
 	{ "provided_buffers", c_provided_buffers },
 	{ "buffer_lifetime", c_buffer_lifetime },
+	{ "buffer_fork", c_buffer_fork },
+	{ "buffer_backing", c_buffer_backing },
 	{ "cq_overflow", c_cq_overflow },
 	{ "fixed_files", c_fixed_files },
 	{ "sockets", c_sockets },
