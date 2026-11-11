@@ -15,6 +15,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 5 | Worker path scalability | Done |
 | 6 | Performance evidence | Done |
 | 7 | Newer interfaces and real programs | Done |
+| 8 | Several processes submitting to one ring | In progress |
 
 ## Where kqring stands
 
@@ -127,7 +128,7 @@ Acceptance: hardware, kernel, filesystem settings, queue depths, batch sizes, CP
 
 ## Phase 7: Newer interfaces and real programs
 
-**Done** (11 November 2026). Two real programs, PostgreSQL and RocksDB, run their io_uring paths on kqring, each with instructions, its patches, its configuration and its tests. The newer interfaces programs and liburing's tests use are in, and liburing 2.15, still the newest release, passes 219 of 245. What still blocks programs is listed under Research: concurrent submitters on one ring, exec survival and zero-copy receive.
+**Done** (11 November 2026). Two real programs, PostgreSQL and RocksDB, run their io_uring paths on kqring, each with instructions, its patches, its configuration and its tests. The newer interfaces programs and liburing's tests use are in, and liburing 2.15, still the newest release, passes 219 of 245. What still differs for programs is phase 8 (several processes submitting to one ring, exit and `exec`) and, under Research, zero-copy receive.
 
 Qualify a newer pinned liburing release, and real applications alongside fio. Audit header layouts, feature bits, probing, unsupported flags and fallback behavior.
 
@@ -142,6 +143,14 @@ Evaluate mixed-size SQEs and CQEs, hybrid IOPOLL, SQ rewind, `NOP128`, `URING_CM
 
 Acceptance: reproducible build and run instructions, and a result per program showing the patches it needs, the configurations supported and what still blocks it. New API additions need semantic tests, not just matching constants.
 
+## Phase 8: Several processes submitting to one ring
+
+A ring moves between processes since phase 7, but only one may have requests in flight, an exiting process's requests end without CQEs, and `exec` closes the ring. Linux runs each task's requests in its own context, posts a CQE for every request at exit and exec, and keeps the ring open.
+
+[docs/concurrent-submitters.md](docs/concurrent-submitters.md) is the design: a context per process on each ring, with its own worker pool, taskwork and poller, while the ring's shared state stays serialized as it is now. Exit and exec complete their process's requests with CQEs, and the ring stays open while a descriptor holds it. Registered buffers and kqring's extensions stay with one process, and a set-ID `exec` still closes the ring.
+
+Acceptance: the tests the design lists, the fuzzer with forked submitters, liburing and PostgreSQL unchanged or better, single-process performance unchanged, and the differences that remain listed in the matrix.
+
 ## Research
 
 None of these is planned work. Each needs a design note covering kernel subsystem dependencies, lifetime rules, security implications and measurable benefit before it can become a phase.
@@ -150,7 +159,6 @@ None of these is planned work. Each needs a design note covering kernel subsyste
 - **Driver commands:** assess a native driver contract if real programs need more than the existing socket commands. A matching opcode doesn't supply NVMe or other driver passthrough semantics.
 - **Registered-buffer mapping independence:** assess using held pages for fixed I/O, including protection, copy-on-write and lifetime implications.
 - **Asynchronous ZFS reads:** ZFS's I/O pipeline is asynchronous below the DMU, which waits for it. A read issued with a parent `zio` and completed from `zio_done` would finish at once on an ARC hit and from ZFS's callback on a miss, with no worker and no guess, as FreeBSD's asynchronous `sendfile(2)` does for the page cache. ZFS has no `VOP_GETPAGES_ASYNC` either, so `sendfile(2)` from ZFS blocks on every ARC miss, and the same work would fix it. [docs/async-zfs-reads.md](docs/async-zfs-reads.md) proposes two steps: a read that fails rather than wait, as Linux's `IOCB_NOWAIT`, then one that completes from ZFS's callback. Both change OpenZFS, so they would go there first.
-- **Concurrent submitters and exec survival:** a ring now moves to another process when it is idle ([docs/cross-process-rings.md](docs/cross-process-rings.md)), but two processes can't have requests in flight on one ring at once, an owner's exit drops its requests without CQEs, and `exec` closes the ring. Lifting those needs per-process workers, taskwork and pollers for one ring.
 
 Zero-copy `SPLICE` stays unplanned; see [`TODO.MD`](TODO.MD).
 
