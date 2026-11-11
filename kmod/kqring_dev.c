@@ -375,7 +375,6 @@ kqring_resize_rings(struct kqring_ctx *ctx,
 	struct io_uring_params p;
 	struct kqring_layout l;
 	struct kqring_rmem m, old;
-	struct mtx *kqlock;
 	uint32_t sq_entries, cq_entries, head, tail, chead, ctail;
 	uint32_t *narray;
 	size_t sqe_size, cqe_size;
@@ -516,9 +515,6 @@ kqring_resize_rings(struct kqring_ctx *ctx,
 			    (char *)ctx->cqes + (i & ctx->cq_mask) * cqe_size,
 			    cqe_size);
 	}
-	kqlock = kqring_kp_shm_lock(ctx);
-	if (kqlock != NULL)
-		mtx_lock(kqlock);
 	nshm->sq_head = head;
 	nshm->sq_tail = tail;
 	nshm->cq_head = chead;
@@ -529,8 +525,13 @@ kqring_resize_rings(struct kqring_ctx *ctx,
 	nshm->cq_overflow = shm->cq_overflow;
 	old = ctx->mem;
 	kqring_ring_install(ctx, &m, &l, sq_entries, cq_entries);
-	if (kqlock != NULL)
-		mtx_unlock(kqlock);
+	/*
+	 * Pollers' kicks (kqring_kp_kick()) may still use the old header:
+	 * wait them out, and keep the IORING_SQ_TASKRUN they set there.
+	 */
+	kqring_kp_shm_barrier(ctx);
+	if ((atomic_load_32(&shm->sq_flags) & IORING_SQ_TASKRUN) != 0)
+		atomic_set_32(&nshm->sq_flags, IORING_SQ_TASKRUN);
 	mtx_unlock(&ctx->mtx);
 	kqring_rmem_free(&old);
 	return (0);
@@ -580,7 +581,7 @@ kqring_ctx_free_final(struct kqring_ctx *ctx)
 	free(ctx->sw_cache[1], M_KQRING);
 
 	/* Every request (and its references) is gone: drop the tables. */
-	kqring_kpoll_close(ctx);
+	kqring_kpoll_close_all(ctx);
 	kqring_files_free(ctx);
 	kqring_bufs_free(ctx);
 	kqring_region_free(ctx);
@@ -615,7 +616,6 @@ kqring_ctx_free_final(struct kqring_ctx *ctx)
 	knlist_destroy(&ctx->rsel.si_note);
 	kqring_rmem_free(&ctx->mem);
 	sx_destroy(&ctx->sq_sx);
-	sx_destroy(&ctx->kp_sx);
 	sx_destroy(&ctx->bg_sx);
 	sx_destroy(&ctx->pipe_sx);
 	mtx_destroy(&ctx->mtx);
@@ -772,7 +772,7 @@ kqring_ctx_cancel_begin(struct kqring_ctx *ctx, bool nowait)
 		if (error != 0)
 			goto fail;
 	}
-	if ((error = kqring_kpoll_stop(ctx, nowait)) != 0)
+	if ((error = kqring_kpoll_stop(ctx, NULL, nowait)) != 0)
 		goto fail;
 	while (!ctx->cancelling) {
 		mtx_unlock(&ctx->mtx);
@@ -879,6 +879,7 @@ kqring_tctx_new(struct kqring_ctx *ctx, struct thread *td, struct kqring_wq *wq)
 	t->proc = td->td_proc;
 	t->wq = wq != NULL ? wq : kqring_wq_alloc(td);
 	TAILQ_INIT(&t->taskwork);
+	sx_init(&t->kp_sx, "kqring kpoll");
 	TIMEOUT_TASK_INIT(kqring_teardown_tq, &t->exit_task, 0,
 	    kqring_tctx_exit_task, t);
 	refcount_init(&t->refs, 1);
@@ -921,7 +922,8 @@ kqring_tctx_rebind(struct kqring_ctx *ctx, struct thread *td)
 	if (ot == NULL || ot->proc == td->td_proc)
 		return;
 	KASSERT(LIST_NEXT(ot, link) == NULL && ot->nops == 0 &&
-	    !ot->task_running, ("kqring: rebinding a used ring"));
+	    !ot->task_running && !ot->kp_running && ot->kp_fp == NULL,
+	    ("kqring: rebinding a used ring"));
 	nt = kqring_tctx_new(ctx, td, NULL);
 	mtx_lock(&ctx->mtx);
 	LIST_REMOVE(ot, link);
@@ -947,7 +949,9 @@ kqring_tctx_rele(struct kqring_tctx *t)
 	if (!refcount_release(&t->refs))
 		return;
 	KASSERT(!t->linked && TAILQ_EMPTY(&t->taskwork) && t->nops == 0 &&
-	    !t->task_running, ("kqring: freeing a live process context"));
+	    !t->task_running && !t->kp_running && t->kp_fp == NULL,
+	    ("kqring: freeing a live process context"));
+	sx_destroy(&t->kp_sx);
 	if (t->wq_closed)
 		kqring_wq_rele(t->wq);
 	else
@@ -1159,19 +1163,13 @@ kqring_tctx_exit_task(void *arg, int pending __unused)
 		if (!kqring_tctx_cancel(ctx, t)) {
 			done = true;
 		} else {
-			/* Its polls are gone: so is the poller in its process. */
+			/* Its polls are gone: so is its poller. */
 			mtx_lock(&ctx->mtx);
-			if (ctx->kp_tctx == t) {
-				while (kqring_kpoll_stop(ctx, true) != 0)
-					(void)msleep(&ctx->kp_running,
-					    &ctx->mtx, 0, "kqtxkp",
-					    hz / 100 + 1);
-				mtx_unlock(&ctx->mtx);
-				kqring_kpoll_close(ctx);
-				mtx_lock(&ctx->mtx);
-				ctx->kp_tctx = NULL;
-			}
+			while (kqring_kpoll_stop(ctx, t, true) != 0)
+				(void)msleep(&t->kp_running, &ctx->mtx, 0,
+				    "kqtxkp", hz / 100 + 1);
 			mtx_unlock(&ctx->mtx);
+			kqring_kpoll_close(t);
 			kqring_tctx_close_wq(t);
 		}
 	} else {
@@ -1223,8 +1221,6 @@ kqring_tctx_exit_locked(struct kqring_ctx *ctx, struct kqring_tctx *t)
 	mtx_assert(&kqring_proc_mtx, MA_OWNED);
 	mtx_assert(&ctx->mtx, MA_OWNED);
 	t->dead = true;
-	if (ctx->kp_tctx == t)
-		ctx->kp_proc = NULL;
 	if (ctx->sleeping)
 		wakeup(&ctx->wakeup_chan);
 	refcount_acquire(&t->refs);
@@ -1299,8 +1295,8 @@ kqring_ctx_cancel_locked(struct kqring_ctx *ctx)
 	mtx_unlock(&ctx->mtx);
 	LIST_FOREACH(t, &ctx->tctxs, link)
 		kqring_tctx_close_wq(t);
-	/* No poll is armed and the poller is gone: close the kqueue. */
-	kqring_kpoll_close(ctx);
+	/* No poll is armed and the pollers are gone: close their kqueues. */
+	kqring_kpoll_close_all(ctx);
 
 	while ((op = TAILQ_FIRST(&ctx->ready_q)) != NULL) {
 		TAILQ_REMOVE(&ctx->ready_q, op, q_link);
@@ -1395,7 +1391,6 @@ kqring_fdopen(struct cdev *dev __unused, int fflags __unused,
 	sx_init(&ctx->bg_sx, "kqring bg");
 	sx_init(&ctx->pipe_sx, "kqring pipe");
 	sx_init_flags(&ctx->sq_sx, "kqring sq", SX_DUPOK);
-	sx_init(&ctx->kp_sx, "kqring kpoll");
 	/* The opener's context; others come with other processes. */
 	LIST_INIT(&ctx->tctxs);
 	t = kqring_tctx_new(ctx, td, NULL);
@@ -1431,7 +1426,6 @@ kqring_fdopen(struct cdev *dev __unused, int fflags __unused,
 		callout_drain(&ctx->wq_abort_callout);
 		knlist_destroy(&ctx->rsel.si_note);
 		sx_destroy(&ctx->sq_sx);
-		sx_destroy(&ctx->kp_sx);
 		sx_destroy(&ctx->bg_sx);
 		sx_destroy(&ctx->pipe_sx);
 		mtx_destroy(&ctx->mtx);
@@ -1669,8 +1663,7 @@ kqring_ioc_setup(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 
 /*
  * Queue polled ops (armed SO_SND on AF_UNIX streams, which get no upcall)
- * whose socket has become writable, or (polled_eof) whose AF_UNIX stream
- * reached the end of input, which gets no upcall either.  Called with ctx->mtx held, so the
+ * whose socket has become writable.  Called with ctx->mtx held, so the
  * socket buffer is read without its lock: a stale value only causes a
  * spurious EAGAIN attempt or a delay until the next 50 us tick.
  */
@@ -1687,11 +1680,9 @@ kqring_poll_fallback_locked(struct kqring_ctx *ctx)
 		if (!op->polled || op->in_taskwork || op->cancelled ||
 		    so == NULL || SOLISTENING(so))
 			continue;
-		if (so->so_error != 0 || (op->polled_eof &&
-		    (so->so_rcv.sb_state & SBS_CANTRCVMORE) != 0) ||
-		    ((op->dirs & KQ_DIR_SND) != 0 &&
-		    (sbspace(&so->so_snd) >= MAX(so->so_snd.sb_lowat, 1) ||
-		    (so->so_snd.sb_state & SBS_CANTSENDMORE) != 0)))
+		if (sbspace(&so->so_snd) >= MAX(so->so_snd.sb_lowat, 1) ||
+		    (so->so_snd.sb_state & SBS_CANTSENDMORE) != 0 ||
+		    so->so_error != 0)
 			kqring_taskwork_add_locked(ctx, op);
 	}
 }
@@ -2159,7 +2150,7 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 	 * foreign waiter, with no context, never looks).  A ring with one
 	 * context needs no lock for it.
 	 */
-	struct kqring_tctx *mine;
+	struct kqring_tctx *mine = NULL;
 	struct kqring_op_list *tw = NULL;
 	bool tw_known = foreign;
 	bool iopoll = (ctx->flags & IORING_SETUP_IOPOLL) != 0;
@@ -2248,7 +2239,8 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 			(void)kqring_wq_abort_retired_locked(ctx);
 		if (!foreign && ((tw != NULL && !TAILQ_EMPTY(tw)) ||
 		    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) ||
-		    atomic_load_acq_int(&ctx->kp_kick) != 0)) {
+		    (mine != NULL &&
+		    atomic_load_acq_int(&mine->kp_kick) != 0))) {
 			mtx_unlock(&ctx->mtx);
 			goto drain;
 		}

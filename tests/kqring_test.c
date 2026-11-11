@@ -779,9 +779,9 @@ test_cross_process_rings(void)
 
 	/*
 	 * The end of input of an AF_UNIX stream runs no socket upcall:
-	 * kqring watches for it on the poller, which the parent's RECV puts
-	 * in the parent.  The child's RECV hears of its peer's shutdown all
-	 * the same.
+	 * kqring watches for it with a knote on the poller of the process the
+	 * RECV runs in: the parent's in the parent, and the child's in the
+	 * child, which hears of its peer's shutdown.
 	 */
 	int su[2], sc[2];
 
@@ -822,6 +822,82 @@ test_cross_process_rings(void)
 	close(su[1]);
 	close(sc[0]);
 	close(sc[1]);
+
+	/*
+	 * Polls of pipes from both processes: each has a poller of its own,
+	 * whose knotes name its own descriptors.  In the child, the number
+	 * the parent polls names another pipe.  A poll the child leaves
+	 * armed when it exits ends with -ECANCELED.
+	 */
+	int pa[2], pb[2], pc[2];
+
+	assert(pipe(pa) == 0);
+	assert(pipe(pb) == 0);
+	assert(pipe(pc) == 0);
+	xp_resync(&t);
+	struct io_uring_sqe *psqe = ring_prep(&t, IORING_OP_POLL_ADD, pa[0],
+	    91050);
+	psqe->poll32_events = POLLIN;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		struct io_uring_sqe *sqe;
+		struct io_uring_cqe c;
+
+		xp_resync(&t);
+		if (dup2(pb[0], pa[0]) != pa[0])
+			_exit(1);
+		sqe = ring_prep(&t, IORING_OP_POLL_ADD, pa[0], 91051);
+		sqe->poll32_events = POLLIN;
+		ring_push_sqe(&t);
+		if (kqring_enter(t.fd, 1, 0, 0, NULL, 0) != 1)
+			_exit(2);
+		if (write(qp[1], "p", 1) != 1)
+			_exit(3);
+		if (ring_wait(&t, 1, 3000) != 0)
+			_exit(4);
+		c = ring_pop_cqe(&t);
+		if (c.user_data != 91051 || (c.res & POLLIN) == 0)
+			_exit(5);
+		sqe = ring_prep(&t, IORING_OP_POLL_ADD, pc[0], 91052);
+		sqe->poll32_events = POLLIN;
+		ring_push_sqe(&t);
+		if (kqring_enter(t.fd, 1, 0, 0, NULL, 0) != 1)
+			_exit(6);
+		_exit(ring_cq_ready(&t) == 0 ? 0 : 7);
+	}
+	assert(read(qp[0], late, 1) == 1);
+	usleep(20000);
+	assert(write(pb[1], "b", 1) == 1);
+	assert(xp_child_status(pid) == 0);
+	xp_resync(&t);
+	assert(ring_cq_ready(&t) <= 1);
+	assert(write(pa[1], "a", 1) == 1);
+	{
+		bool got50 = false, got52 = false;
+
+		for (int i = 0; i < 2; i++) {
+			struct io_uring_cqe c;
+
+			assert(ring_wait(&t, 1, 5000) == 0);
+			c = ring_pop_cqe(&t);
+			if (c.user_data == 91050 && (c.res & POLLIN) != 0 &&
+			    !got50)
+				got50 = true;
+			else if (c.user_data == 91052 &&
+			    c.res == -ECANCELED && !got52)
+				got52 = true;
+			else
+				assert(0 && "unexpected CQE after polls");
+		}
+	}
+	for (int i = 0; i < 2; i++) {
+		close(pa[i]);
+		close(pb[i]);
+		close(pc[i]);
+	}
 
 	/*
 	 * 4. A process exits with a read in flight: the read completes with

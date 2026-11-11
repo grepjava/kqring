@@ -6,7 +6,8 @@
 
 Fails when a capability in <sys/kqring.h> has no row, when a row's status
 disagrees with what the module does, or when a row names a function or test
-that doesn't exist. With --baseline (Linux's io_uring.h) every opcode, flag
+that doesn't exist (a test is a test_ function of tests/kqring_test.c,
+liburing/NAME, diff/NAME for a case of tests/kqring_diff.c, or fuzz). With --baseline (Linux's io_uring.h) every opcode, flag
 and registration in it must have a row; with --liburing (liburing's test/
 directory) the liburing tests named must exist. With --results (the
 check.log of `make check` in liburing/) a test named must have run, and one
@@ -81,6 +82,9 @@ def main():
     funcs |= set(re.findall(r'^#define\s+(\w+)\(', kmod, re.M))
     funcs |= set(re.findall(r'struct fileops (\w+) =', kmod))
     tfuncs = set(re.findall(r'^(test_\w+)\(', tests, re.M))
+    dcases = set(re.findall(r'^\t\{ "(\w+)", c_\w+ \},$',
+                            read(os.path.join(ROOT, 'tests', 'kqring_diff.c')),
+                            re.M))
     probe = re.search(r'supported_ops\[\] = \{(.*?)\};', reg, re.S).group(1)
     probed = set(re.findall(r'IORING_OP_\w+', probe))
     setup = mask(var, 'KQRING_SETUP_FLAGS')
@@ -130,6 +134,9 @@ def main():
                     errors.append('%s: %s did not run' % (name, t))
                 elif res != 'PASS' and r['Status'] == 'Equivalent':
                     errors.append('%s: %s fails' % (name, t))
+            elif t.startswith('diff/'):
+                if t[5:] not in dcases:
+                    errors.append('%s: no differential case %s' % (name, t))
             elif t != 'fuzz':
                 errors.append('%s: unknown test %s' % (name, t))
 

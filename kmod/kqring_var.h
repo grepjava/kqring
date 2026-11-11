@@ -389,11 +389,6 @@ struct kqring_op {
 	bool			tw_issue;
 	bool			cancelled;	/* no longer armed; under mtx */
 	bool			polled;		/* no upcall; see npolled */
-	/*
-	 * Polled for the end of input of an AF_UNIX stream, whose watch is
-	 * on another process's poller (kqring_poll_fallback_locked()).
-	 */
-	bool			polled_eof;
 	bool			armed;		/* on active_ops */
 	bool			drain;		/* chain has IOSQE_IO_DRAIN */
 	bool			timer_init;	/* callout initialized */
@@ -828,6 +823,23 @@ struct kqring_tctx {
 	/* SQPOLL, or no DEFER_TASKRUN: its kthread; under ctx->mtx. */
 	struct thread		*task_td;
 	bool			task_running;
+	/*
+	 * Its poller, for non-socket POLL_ADD (kqring_kpoll.c): a kqueue with
+	 * no descriptor, whose knotes name proc's descriptors, and a kthread
+	 * in proc sleeping on it; under ctx->mtx.  kp_sx makes taking its
+	 * events and recording them one step (kqring_kp_take()); taken
+	 * before ctx->mtx.
+	 */
+	struct file		*kp_fp;
+	struct thread		*kp_td;
+	struct sx		kp_sx;
+	bool			kp_running;
+	/*
+	 * A knote of its kqueue fired: an enter of proc takes the event
+	 * itself rather than wait for the poller (kqring_kpoll_kicked()).
+	 * Set from knote() with no ring lock; atomic.
+	 */
+	u_int			kp_kick;
 };
 
 /* IORING_REGISTER_RESTRICTIONS, in force once the ring is enabled. */
@@ -903,40 +915,25 @@ struct kqring_ctx {
 	 */
 	bool			taskrun_only;
 
-	/*
-	 * Non-socket POLL_ADD (kqring_kpoll.c): a kqueue with no descriptor,
-	 * and a kthread sleeping on it.  kp_sx makes taking its events and
-	 * recording them one step (kqring_kp_take()); taken before ctx->mtx.
-	 */
-	struct file		*kp_fp;
-	struct thread		*kp_td;
-	struct sx		kp_sx;
 	/* Pollers of the ring or its eventfd were woken (a hint, any lock). */
 	bool			woke_pollers;
 	/* A CQE was dropped (KQRING_MAX_OVERFLOW); the issuer reports it. */
 	bool			cq_dropped;
-	bool			kp_running;
 	/*
-	 * The context whose process the poller and its kqueue are in, and
-	 * that process (cleared when it dies, compared only).  Only its
-	 * requests poll files that aren't sockets.
+	 * Non-socket POLL_ADD (kqring_kpoll.c): each context has its own
+	 * poller.  kp_kicks counts contexts with kp_kick set, so that most
+	 * enters skip the lookup; atomic.
 	 */
-	struct kqring_tctx	*kp_tctx;
-	struct proc		*kp_proc;
-	/*
-	 * A knote fired with an enter waiting: that enter takes the event
-	 * itself rather than wait for the poller (kqring_kpoll_kicked()).
-	 * Set from knote() with no ring lock; atomic.
-	 */
-	u_int			kp_kick;
+	u_int			kp_kicks;
 	u_int			kq_bridges;	/* armed KQRING_EXT_KQUEUE */
 	uint64_t		kp_next_id;
 	TAILQ_HEAD(, kqring_op)	kp_ops[KQRING_KP_HASH];
 	/*
-	 * AF_UNIX stream sockets with an end-of-input knote, by descriptor
-	 * (kqring_kpoll_soeof_watch()); a cache, under mtx.
+	 * AF_UNIX stream sockets with an end-of-input knote, by context and
+	 * descriptor (kqring_kpoll_soeof_watch()); a cache, under mtx.
 	 */
 	struct kqring_soeof {
+		uint64_t	tid;		/* kqring_tctx id */
 		int		fd;
 		const struct socket *so;
 		so_gen_t	gen;
@@ -2039,24 +2036,23 @@ void	kqring_worker_rele(void);
 #define	KQRING_KP_WRITE	0x02
 void	kqring_kpoll_run(struct thread *td);
 void	kqring_kpoll_kicked(struct kqring_ctx *ctx);
-void	kqring_kpoll_soeof_watch(struct kqring_ctx *ctx, int fd,
+void	kqring_kpoll_soeof_watch(struct kqring_tctx *t, int fd,
 	    const struct socket *so, so_gen_t gen);
 void	kqring_so_eof_kick(struct thread *td, int fd);
 /* Whether fd already has an end-of-input knote for so; under ctx->mtx. */
 static inline bool
-kqring_soeof_cached_locked(struct kqring_ctx *ctx, int fd,
-    const struct socket *so, so_gen_t gen)
+kqring_soeof_cached_locked(struct kqring_ctx *ctx, const struct kqring_tctx *t,
+    int fd, const struct socket *so, so_gen_t gen)
 {
-	const struct kqring_soeof *c = &ctx->soeof[(u_int)fd %
+	const struct kqring_soeof *c = &ctx->soeof[(u_int)(fd + t->id) %
 	    nitems(ctx->soeof)];
 
 	mtx_assert(&ctx->mtx, MA_OWNED);
-	return (c->fd == fd && c->so == so && c->gen == gen);
+	return (c->tid == t->id && c->fd == fd && c->so == so &&
+	    c->gen == gen);
 }
 /* The udata of end-of-input knotes; a kp_id never reaches it. */
 #define	KQRING_KP_SOEOF		((void *)(uintptr_t)UINT64_MAX)
-/* The udata of the knote that ends the poller's sleep at ring close. */
-#define	KQRING_KP_WAKE		((void *)(uintptr_t)(UINT64_MAX - 1))
 int	kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	    const struct file *fp);
 void	kqring_kpoll_disarm_locked(struct kqring_ctx *ctx,
@@ -2069,9 +2065,11 @@ int	kqring_kq_prep(struct kqring_op *op);
 int	kqring_kq_check(struct kqring_ctx *ctx, const struct kqring_op *op);
 void	kqring_kq_rescan(struct kqring_ctx *ctx);
 void	kqring_kev_issue(struct kqring_ctx *ctx, struct kqring_op *op);
-int	kqring_kpoll_stop(struct kqring_ctx *ctx, bool nowait);
-void	kqring_kpoll_close(struct kqring_ctx *ctx);
-struct mtx *kqring_kp_shm_lock(struct kqring_ctx *ctx);
+int	kqring_kpoll_stop(struct kqring_ctx *ctx, struct kqring_tctx *only,
+	    bool nowait);
+void	kqring_kpoll_close(struct kqring_tctx *t);
+void	kqring_kpoll_close_all(struct kqring_ctx *ctx);
+void	kqring_kp_shm_barrier(struct kqring_ctx *ctx);
 
 /* Whether the ring has a kthread (SQPOLL, or completions only). */
 static inline bool

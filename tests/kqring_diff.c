@@ -1312,6 +1312,8 @@ c_fork(void)
 	await(&r, 0, 0);
 	dump(&r, "parent_cq");
 
+	/* The child's SQE moved the shared tail past this copy's. */
+	r.tail = atomic_load(r.sq_tail);
 	prep(&r, IORING_OP_NOP, -1, 2);
 	(void)submit(&r);
 	await(&r, 1, 2000);
@@ -1322,16 +1324,116 @@ c_fork(void)
 }
 
 /*
+ * Several processes with requests in flight on one ring. The child polls a
+ * pipe of its own at the number the parent polls another pipe at, then
+ * exits with a standalone TIMEOUT in flight, which still fires; the parent's
+ * poll still fires too. With armed, the child also leaves a read of an empty
+ * pipe in flight, and the parent sees when and how it ends.
+ */
+static void
+fork_inflight(bool armed)
+{
+	struct io_uring_sqe *s;
+	struct ring r;
+	int pa[2], pb[2], pc[2], up[2], down[2], rc, st;
+	char c = 0;
+	pid_t pid;
+
+	CHECK(pipe(pa) == 0);
+	CHECK(pipe(pb) == 0);
+	CHECK(pipe(pc) == 0);
+	CHECK(pipe(up) == 0);
+	CHECK(pipe(down) == 0);
+	res_poll_mask = 1ULL << 1 | 1ULL << 2;
+	ring_init(&r, 8, NULL);
+	s = prep(&r, IORING_OP_POLL_ADD, pa[0], 1);
+	s->poll32_events = POLLIN;
+	say_rc("parent_submit", submit(&r));
+	fflush(stdout);
+	pid = fork();
+	CHECK(pid >= 0);
+	if (pid == 0) {
+		static char cbuf[8];
+		static struct __kernel_timespec ts = { 0, 300000000 };
+
+		CHECK(dup2(pb[0], pa[0]) == pa[0]);
+		s = prep(&r, IORING_OP_POLL_ADD, pa[0], 2);
+		s->poll32_events = POLLIN;
+		if (armed) {
+			s = prep(&r, IORING_OP_READ, pc[0], 3);
+			s->addr = (uint64_t)(uintptr_t)cbuf;
+			s->len = sizeof(cbuf);
+		}
+		s = prep(&r, IORING_OP_TIMEOUT, -1, 4);
+		s->addr = (uint64_t)(uintptr_t)&ts;
+		s->len = 1;
+		rc = submit(&r);
+		if (rc < 0)
+			rc = -errno;
+		(void)write(up[1], &rc, sizeof(rc));
+		/* Wait to be told to exit; a CQE's task work may interrupt. */
+		while (read(down[0], &c, 1) != 1 && errno == EINTR)
+			;
+		_exit(0);
+	}
+	CHECK(read(up[0], &rc, sizeof(rc)) == sizeof(rc));
+	if (rc < 0)
+		errno = -rc;
+	say_rc("child_submit", rc < 0 ? -1 : rc);
+	r.tail = atomic_load(r.sq_tail);
+	CHECK(write(pb[1], "b", 1) == 1);
+	await(&r, 1, 2000);
+	dump(&r, "child_poll");
+	CHECK(write(down[1], "x", 1) == 1);
+	CHECK(waitpid(pid, &st, 0) == pid);
+	await(&r, armed ? 2 : 1, 2000);
+	dump_sorted(&r, "child_exit");
+	if (armed) {
+		CHECK(write(pc[1], "c", 1) == 1);
+		await(&r, 1, 500);
+		dump(&r, "child_read_late");
+	}
+	CHECK(write(pa[1], "a", 1) == 1);
+	await(&r, 1, 2000);
+	dump(&r, "parent_poll");
+	prep(&r, IORING_OP_NOP, -1, 5);
+	(void)submit(&r);
+	await(&r, 1, 2000);
+	dump(&r, "parent_after");
+	res_poll_mask = 0;
+	for (int i = 0; i < 2; i++) {
+		close(pa[i]);
+		close(pb[i]);
+		close(pc[i]);
+		close(up[i]);
+		close(down[i]);
+	}
+	ring_free(&r);
+}
+
+static void
+c_fork_inflight(void)
+{
+	fork_inflight(false);
+}
+
+static void
+c_exit_armed(void)
+{
+	fork_inflight(true);
+}
+
+/*
  * The ring after its owner's execve(2), with its descriptor kept open and a
- * poll armed. The process that made the ring has to be the one to exec, as
- * kqring refuses any other first.
+ * poll armed: whether the new image can enter it, and what the poll ends
+ * with. The new image maps the CQ from the offsets passed to it.
  */
 static void
 c_exec(void)
 {
 	struct io_uring_sqe *s;
 	struct ring r;
-	char arg[16], pfd[16];
+	char arg[64], pfd[16];
 	int st, p[2];
 	pid_t pid;
 
@@ -1345,7 +1447,10 @@ c_exec(void)
 		s = prep(&r, IORING_OP_POLL_ADD, p[0], 1);
 		s->poll32_events = POLLIN;
 		CHECK(submit(&r) == 1);
-		snprintf(arg, sizeof(arg), "%d", r.fd);
+		snprintf(arg, sizeof(arg), "%d,%zu,%td,%td,%td,%u", r.fd,
+		    r.map_len, (char *)r.cq_head - (char *)r.map,
+		    (char *)r.cq_tail - (char *)r.map,
+		    (char *)r.cqes - (char *)r.map, r.cq_mask);
 		snprintf(pfd, sizeof(pfd), "%d", p[1]);
 		execl(self, self, "--exec-child", arg, pfd, (char *)NULL);
 		_exit(99);
@@ -1357,11 +1462,28 @@ c_exec(void)
 static int
 exec_child(const char *arg, const char *pfd)
 {
-	int fd = atoi(arg), rc;
+	struct ring r;
+	long head, tail, cqes;
+	int fd, rc;
 
 	current = "exec";
+	memset(&r, 0, sizeof(r));
+	if (sscanf(arg, "%d,%zu,%ld,%ld,%ld,%u", &fd, &r.map_len, &head,
+	    &tail, &cqes, &r.cq_mask) != 6)
+		return (2);
 	rc = ring_sys_enter(fd, 0, 0, 0, NULL, 0);
 	say_rc("enter_after", rc);
+	if (rc >= 0) {
+		r.fd = fd;
+		r.map = mmap(NULL, r.map_len, PROT_READ | PROT_WRITE,
+		    MAP_SHARED, fd, IORING_OFF_SQ_RING);
+		CHECK(r.map != MAP_FAILED);
+		r.cq_head = (_Atomic unsigned *)((char *)r.map + head);
+		r.cq_tail = (_Atomic unsigned *)((char *)r.map + tail);
+		r.cqes = (struct io_uring_cqe *)((char *)r.map + cqes);
+		await(&r, 1, 2000);
+		dump(&r, "cq_after");
+	}
 	(void)pfd;
 	fflush(stdout);
 	return (0);
@@ -1878,6 +2000,8 @@ static const struct {
 	{ "fixed_files", c_fixed_files },
 	{ "sockets", c_sockets },
 	{ "fork", c_fork },
+	{ "fork_inflight", c_fork_inflight },
+	{ "exit_armed", c_exit_armed },
 	{ "exec", c_exec },
 	{ "threads", c_threads },
 	{ "eventfd", c_eventfd },

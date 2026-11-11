@@ -1,7 +1,6 @@
 # Cases that differ from Linux on purpose: name, then why, with a reference.
 buffer_lifetime kqring copies through the user mapping at each I/O, where Linux pins the pages at registration (COMPATIBILITY.MD, IORING_OP_READ_FIXED).
-exec kqring tears a ring down when its owner execs, so the descriptor doesn't survive (COMPATIBILITY.MD, Boundaries).
-fork A ring belongs to one process: a forked child can't submit to it (COMPATIBILITY.MD, Boundaries).
 poll_hup The poll result follows the file: a pipe closed by its writer gives POLLIN|POLLHUP from poll(2) on FreeBSD and POLLHUP on Linux. native_in shows it (Platform).
 newer What Linux 7.3 has past IORING_OP_PIPE is refused here (COMPATIBILITY.MD, rows marked Unsupported).
 ext_arg_order kqring checks an enter's wait argument before it submits anything, so a bad one fails the enter; Linux submits first and returns the count (COMPATIBILITY.MD, IORING_ENTER_EXT_ARG).
+exit_armed When a process exits, kqring completes its requests in flight with -ECANCELED at once; Linux cancels at exit only requests on io_uring files and ends the others when they would next run, here when the pipe becomes readable (docs/concurrent-submitters.md, Exit).

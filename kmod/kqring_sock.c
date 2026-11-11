@@ -15,8 +15,8 @@ static int kqring_soupcall(struct socket *so, void *arg, int waitflag);
  * Runs with the socket buffer lock (or, for listening sockets, the listen
  * lock) held when data arrives, space opens, a connection is queued, or a
  * peer closes.
- * Never touches user memory: simply moves each waiting op onto its ring's
- * its context's taskwork, sets IORING_SQ_TASKRUN in shm->sq_flags, and wakes the
+ * Never touches user memory: simply moves each waiting op onto its
+ * context's taskwork, sets IORING_SQ_TASKRUN in shm->sq_flags, and wakes the
  * owner if sleeping.  An op that finds nothing to do when it runs (another
  * waiter took the data or the connection) stays armed.
  */
@@ -2537,23 +2537,12 @@ armed:
 	if (ready_now)
 		kqring_taskwork_add_locked(ctx, op);
 	if (want_eof)
-		want_eof = !kqring_soeof_cached_locked(ctx, fd, so, gen);
-	/*
-	 * The watch is a knote on the ring's poller, which is in one
-	 * process (kqring_kp_claim()): from any other, poll for the end of
-	 * input instead, as for a send on such a socket.
-	 */
-	if (want_eof && ctx->kp_proc != NULL && ctx->kp_proc != curproc) {
-		want_eof = false;
-		if (!op->polled) {
-			op->polled = true;
-			ctx->npolled++;
-		}
-		op->polled_eof = true;
-	}
+		want_eof = !kqring_soeof_cached_locked(ctx, op->tctx, fd, so,
+		    gen);
 	mtx_unlock(&ctx->mtx);
+	/* On the poller of the process the request runs in. */
 	if (want_eof)
-		kqring_kpoll_soeof_watch(ctx, fd, so, gen);
+		kqring_kpoll_soeof_watch(op->tctx, fd, so, gen);
 	return (true);
 }
 

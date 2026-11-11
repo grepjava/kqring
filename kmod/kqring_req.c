@@ -449,7 +449,6 @@ kqring_op_disarm_locked(struct kqring_op *op)
 	mtx_assert(&ctx->mtx, MA_OWNED);
 	if (op->polled) {
 		op->polled = false;
-		op->polled_eof = false;
 		ctx->npolled--;
 	}
 	if (op->kp_on)

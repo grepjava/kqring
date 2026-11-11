@@ -9,19 +9,20 @@
  * kqueues, devices with a kqfilter, the ring descriptor itself).
  *
  * Each such request is a knote (EVFILT_READ and/or EVFILT_WRITE on its
- * descriptor) on a kqueue the ring owns but that has no descriptor of its
- * own, and one kthread per ring sleeps on it.  As io_uring's
- * poll wait queue entries do, a knote catches every wakeup of the file
- * (counted as it happens, so a write and then a read before the poller
- * looks still counts: see kqring_kp_filt_event()), any number of requests
- * cost no threads, and a multishot request gets a CQE per wakeup.  The
- * poller only records events and queues the request as taskwork;
+ * descriptor) on a kqueue that has no descriptor of its own, and a kthread
+ * sleeps on it: a poller per process context (struct kqring_tctx), in its
+ * process, since knotes name descriptors of one process's table.  As
+ * io_uring's poll wait queue entries do, a knote catches every wakeup of
+ * the file (counted as it happens, so a write and then a read before the
+ * poller looks still counts: see kqring_kp_filt_event()), any number of
+ * requests cost no threads, and a multishot request gets a CQE per wakeup.
+ * The poller only records events and queues the request as taskwork;
  * kqring_kpoll_deliver() posts the CQEs.
  *
  * Enters take events too, so that a poll's CQE is there when the enter that
  * fired it returns (kqring_kpoll_run()).  An event taken from the kqueue and
  * not yet recorded is in neither place, so taking and recording are one step
- * under ctx->kp_sx (kqring_kp_take()), and the poller sleeps without taking
+ * under t->kp_sx (kqring_kp_take()), and the poller sleeps without taking
  * anything (kqring_kp_wait()): an enter that finds the kqueue empty has
  * waited for whatever the poller took.
  *
@@ -38,7 +39,7 @@
 
 #define	KQRING_KP_NEVENTS	32
 
-/* Rings with a poller (kp_running), so that most enters skip the lookup. */
+/* Pollers running (kp_running), so that most enters skip the lookup. */
 static u_int kqring_kp_nrings;
 /* How often the poller looks at ctx->closing while nothing happens. */
 #define	KQRING_KP_IDLE_NS	(50 * 1000 * 1000)
@@ -116,8 +117,8 @@ kqring_kp_copyout(void *arg, struct kevent *kevp, int count)
  * wakeups meant for it.  A scan reports the knote while the file is
  * ready or wakeups came since the last one.
  */
-static struct file *kqring_kp_getfp(struct kqring_ctx *ctx);
-static void kqring_kp_scan(struct kqring_ctx *ctx, struct thread *td);
+static struct file *kqring_kp_getfp(struct kqring_tctx *t);
+static void kqring_kp_scan(struct kqring_tctx *t, struct thread *td);
 
 /*
  * A wakeup from anywhere (another process's write(2), say): wake an enter
@@ -129,16 +130,31 @@ static void kqring_kp_scan(struct kqring_ctx *ctx, struct thread *td);
  * IORING_SQ_TASKRUN is set here too, as io_uring's waker sets it: a program
  * that peeks at the CQ after firing a poll then knows to enter, rather than
  * find nothing until the poller has looked.  The kq lock, which knote()
- * holds, keeps ctx->shm from going away (kqring_kp_shm_lock()).
+ * holds, keeps ctx->shm from going away (kqring_kp_shm_barrier()), and t,
+ * whose kqueue this is, from being freed.
  */
 static inline void
-kqring_kp_kick(struct kqring_ctx *ctx)
+kqring_kp_kick(struct kqring_tctx *t)
 {
+	struct kqring_ctx *ctx = t->ctx;
+
 	if ((ctx->flags & IORING_SETUP_TASKRUN_FLAG) != 0)
 		atomic_set_32(&ctx->shm->sq_flags, IORING_SQ_TASKRUN);
-	atomic_store_rel_int(&ctx->kp_kick, 1);
+	if (atomic_swap_int(&t->kp_kick, 1) == 0)
+		atomic_add_int(&ctx->kp_kicks, 1);
 	if (atomic_load_int(&ctx->cq_sleepers) != 0)
 		wakeup(&ctx->wakeup_chan);
+}
+
+/* Take t's kick, if it has one. */
+static bool
+kqring_kp_unkick(struct kqring_tctx *t)
+{
+	if (atomic_load_acq_int(&t->kp_kick) == 0 ||
+	    atomic_swap_int(&t->kp_kick, 0) == 0)
+		return (false);
+	atomic_subtract_int(&t->ctx->kp_kicks, 1);
+	return (true);
 }
 
 struct kqring_kp_fops {
@@ -176,14 +192,14 @@ kqring_kp_filt_event(struct knote *kn, long hint)
 		last = (uint32_t)MIN(MAX(kn->kn_data, 0), INT32_MAX);
 	prev = (uint32_t)ext[3];
 	if (mtx_owned(&kn->kn_kq->kq_lock)) {
-		struct kqring_ctx *ctx = (struct kqring_ctx *)(uintptr_t)ext[1];
+		struct kqring_tctx *t = (struct kqring_tctx *)(uintptr_t)ext[1];
 
 		ext[3] = (ext[3] & ~(uint64_t)UINT32_MAX) | last;
 		if (!ready || (prev != KQRING_KP_NOTREADY && last <= prev))
 			return (0);
 		ext[2]++;
-		if (ctx != NULL)
-			kqring_kp_kick(ctx);
+		if (t != NULL)
+			kqring_kp_kick(t);
 		return (1);
 	}
 	pending = (uint32_t)ext[2] != (uint32_t)(ext[3] >> 32);
@@ -201,15 +217,15 @@ kqring_kp_eof_event(struct knote *kn, long hint)
 {
 	const struct kqring_kp_fops *w = __containerof(kn->kn_fop,
 	    struct kqring_kp_fops, fo);
-	struct kqring_ctx *ctx;
+	struct kqring_tctx *t;
 
 	if (!w->orig->f_event(kn, hint) ||
 	    ((kn->kn_flags & EV_EOF) == 0 && kn->kn_data > 0))
 		return (0);
 	if (mtx_owned(&kn->kn_kq->kq_lock)) {
-		ctx = (struct kqring_ctx *)(uintptr_t)kn->kn_kevent.ext[1];
-		if (ctx != NULL)
-			kqring_kp_kick(ctx);
+		t = (struct kqring_tctx *)(uintptr_t)kn->kn_kevent.ext[1];
+		if (t != NULL)
+			kqring_kp_kick(t);
 	}
 	return (1);
 }
@@ -280,7 +296,7 @@ kqring_kp_knote(struct kqueue *kq, const struct kevent *kev)
  * filterops and only misses wakeups drained before the poller looks.
  */
 static void
-kqring_kp_wrap(struct kqring_ctx *ctx, const struct kevent *kev, int n,
+kqring_kp_wrap(struct kqring_tctx *t, const struct kevent *kev, int n,
     bool eof)
 {
 	const struct filterops *orig, *fo;
@@ -288,7 +304,7 @@ kqring_kp_wrap(struct kqring_ctx *ctx, const struct kevent *kev, int n,
 	struct knote *kn;
 	struct file *fp;
 
-	if ((fp = kqring_kp_getfp(ctx)) == NULL)
+	if ((fp = kqring_kp_getfp(t)) == NULL)
 		return;
 	kq = fp->f_data;
 	for (int i = 0; i < n; i++) {
@@ -310,11 +326,11 @@ kqring_kp_wrap(struct kqring_ctx *ctx, const struct kevent *kev, int n,
 			}
 			if (kn->kn_influx == 0) {
 				/*
-				 * ext[1] names the ring for the wakeup; the
-				 * ring closes this kqueue (and so its knotes)
-				 * before it is freed.
+				 * ext[1] names the context for the wakeup;
+				 * its kqueue (and so its knotes) is closed
+				 * before the context is freed.
 				 */
-				kn->kn_kevent.ext[1] = (uint64_t)(uintptr_t)ctx;
+				kn->kn_kevent.ext[1] = (uint64_t)(uintptr_t)t;
 				kn->kn_kevent.ext[2] = 0;
 				kn->kn_kevent.ext[3] = KQRING_KP_NOTREADY;
 				kn->kn_fop = fo;
@@ -328,27 +344,27 @@ kqring_kp_wrap(struct kqring_ctx *ctx, const struct kevent *kev, int n,
 	fdrop(fp, curthread);
 }
 
-/* A reference to the ring's kqueue, or NULL once it is closed. */
+/* A reference to t's kqueue, or NULL if it has none. */
 static struct file *
-kqring_kp_getfp(struct kqring_ctx *ctx)
+kqring_kp_getfp(struct kqring_tctx *t)
 {
 	struct file *fp;
 
-	mtx_lock(&ctx->mtx);
-	fp = ctx->kp_fp;
+	mtx_lock(&t->ctx->mtx);
+	fp = t->kp_fp;
 	if (fp != NULL && !fhold(fp))
 		fp = NULL;
-	mtx_unlock(&ctx->mtx);
+	mtx_unlock(&t->ctx->mtx);
 	return (fp);
 }
 
 /*
- * Register (or delete) knotes on the ring's kqueue as curthread.  kevent
- * reports through td_retval, which belongs to the system call curthread
- * is in, so keep it.
+ * Register (or delete) knotes on t's kqueue as curthread, a thread of t's
+ * process.  kevent reports through td_retval, which belongs to the system
+ * call curthread is in, so keep it.
  */
 static int
-kqring_kp_change(struct kqring_ctx *ctx, struct kevent *kev, int n)
+kqring_kp_change(struct kqring_tctx *t, struct kevent *kev, int n)
 {
 	struct thread *td = curthread;
 	struct kqring_kp_io io = { .kev = kev };
@@ -369,7 +385,7 @@ kqring_kp_change(struct kqring_ctx *ctx, struct kevent *kev, int n)
 	 */
 	if (td->td_proc->p_fd == NULL)
 		return (EBADF);
-	if ((fp = kqring_kp_getfp(ctx)) == NULL)
+	if ((fp = kqring_kp_getfp(t)) == NULL)
 		return (EBADF);
 	error = kern_kevent_fp(td, fp, n, 0, &ops, NULL);
 	td->td_retval[0] = saved[0];
@@ -400,8 +416,6 @@ kqring_kp_event(struct kqring_ctx *ctx, const struct kevent *kev)
 	uint64_t id = (uint64_t)(uintptr_t)kev->udata;
 	struct kqring_op *op;
 
-	if (kev->udata == KQRING_KP_WAKE)
-		return;
 	if (kev->udata == KQRING_KP_SOEOF) {
 		kqring_so_eof_kick(curthread, (int)kev->ident);
 		return;
@@ -445,12 +459,13 @@ kqring_kp_event(struct kqring_ctx *ctx, const struct kevent *kev)
 }
 
 /*
- * Take the events waiting on the ring's kqueue (fp) and record them, as one
- * step: see the comment at the top.  No ring lock held.
+ * Take the events waiting on t's kqueue (fp) and record them, as one step:
+ * see the comment at the top.  No ring lock held; td is of t's process.
  */
 static void
-kqring_kp_take(struct kqring_ctx *ctx, struct file *fp, struct thread *td)
+kqring_kp_take(struct kqring_tctx *t, struct file *fp, struct thread *td)
 {
+	struct kqring_ctx *ctx = t->ctx;
 	struct kevent kev[KQRING_KP_NEVENTS];
 	struct kqring_kp_io io;
 	struct kevent_copyops ops = {
@@ -462,7 +477,7 @@ kqring_kp_take(struct kqring_ctx *ctx, struct file *fp, struct thread *td)
 	struct timespec zero = { 0, 0 };
 	register_t saved[2] = { td->td_retval[0], td->td_retval[1] };
 
-	sx_xlock(&ctx->kp_sx);
+	sx_xlock(&t->kp_sx);
 	for (int b = 0; b < KQRING_KP_BATCHES; b++) {
 		io.kev = kev;
 		io.n = 0;
@@ -470,28 +485,36 @@ kqring_kp_take(struct kqring_ctx *ctx, struct file *fp, struct thread *td)
 		(void)kern_kevent_fp(td, fp, 0, nitems(kev), &ops, &zero);
 		td->td_retval[0] = saved[0];
 		td->td_retval[1] = saved[1];
-		if (io.n > 0 && td == ctx->kp_td)
+		if (io.n > 0 && td == t->kp_td)
 			KQRING_KP_TEST_GAP(1);
 		for (int i = 0; i < io.n; i++)
 			kqring_kp_event(ctx, &kev[i]);
 		if (io.n < (int)nitems(kev))
 			break;
 	}
-	sx_xunlock(&ctx->kp_sx);
+	sx_xunlock(&t->kp_sx);
+}
+
+/* The poller is to exit: the ring closes or its process is gone. */
+static inline bool
+kqring_kp_done(const struct kqring_tctx *t)
+{
+	return (t->ctx->closing || t->dead);
 }
 
 /*
  * Sleep until the kqueue has events, as kqueue_scan() does, but leave them
  * there.  True if it has them.  Interruptible: stop and exit requests end
- * it, and the poller then suspends or exits.
+ * it, and the poller then suspends or exits.  kqring_kpoll_stop() wakes it
+ * under the kq lock once kqring_kp_done() is true.
  */
 static bool
-kqring_kp_wait(struct kqueue *kq)
+kqring_kp_wait(struct kqring_tctx *t, struct kqueue *kq)
 {
 	bool ready;
 
 	mtx_lock(&kq->kq_lock);
-	if (kq->kq_count == 0) {
+	if (kq->kq_count == 0 && !kqring_kp_done(t)) {
 		kq->kq_state |= KQ_SLEEP;
 		(void)msleep_sbt(kq, &kq->kq_lock, PSOCK | PCATCH, "kqkpwt",
 		    nstosbt(KQRING_KP_IDLE_NS), 0, 0);
@@ -504,7 +527,8 @@ kqring_kp_wait(struct kqueue *kq)
 static void
 kqring_kp_thread(void *arg)
 {
-	struct kqring_ctx *ctx = arg;
+	struct kqring_tctx *t = arg;
+	struct kqring_ctx *ctx = t->ctx;
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
 
@@ -516,12 +540,13 @@ kqring_kp_thread(void *arg)
 	for (;;) {
 		struct file *fp;
 
-		if (kqring_kthread_check_suspend(ctx))
+		/* After an exec t is dead: the new image gets a new context. */
+		if (kqring_kthread_check_suspend(ctx) || t->dead)
 			break;
-		if ((fp = kqring_kp_getfp(ctx)) == NULL)
+		if ((fp = kqring_kp_getfp(t)) == NULL)
 			break;
-		if (kqring_kp_wait(fp->f_data))
-			kqring_kp_take(ctx, fp, td);
+		if (kqring_kp_wait(t, fp->f_data))
+			kqring_kp_take(t, fp, td);
 		fdrop(fp, td);
 	}
 
@@ -529,70 +554,48 @@ kqring_kp_thread(void *arg)
 	 * The process is exiting or exec'ing, not the ring closing.  The
 	 * kqueue is on the process's descriptor table, which exit frees once
 	 * this thread is gone and which the ring can outlive (its descriptor
-	 * passed to another process), so close it now.  Requests still armed
-	 * on it never fire; they complete when cancelled or the ring closes.
+	 * passed to another process), so close it now.  The process's
+	 * requests are cancelled (kqring_tctx_exit_task()).
 	 */
 	if (!ctx->closing)
-		kqring_kpoll_close(ctx);
+		kqring_kpoll_close(t);
 
 	mtx_lock(&ctx->mtx);
-	ctx->kp_running = false;
-	ctx->kp_td = NULL;
+	t->kp_running = false;
+	t->kp_td = NULL;
 	atomic_subtract_int(&kqring_kp_nrings, 1);
-	wakeup(&ctx->kp_running);
+	wakeup(&t->kp_running);
 	mtx_unlock(&ctx->mtx);
+	kqring_tctx_rele(t);
 	kqring_ctx_rele(ctx);
 	kqring_kthread_exit();
 }
 
 /*
- * The ring's kqueue and poller, made on first use by a thread of the
- * owner process.  kern_kqueue() installs a descriptor; it is closed again
- * at once (a process closing descriptors it did not open could race this,
- * as with any descriptor).  The kqueue, on the process's descriptor
- * table, is closed in ring teardown, which runs before the table is freed
- * at exit and exec.
+ * t's kqueue and poller, made on first use by a thread of t's process.
+ * kern_kqueue() installs a descriptor; it is closed again at once (a
+ * process closing descriptors it did not open could race this, as with
+ * any descriptor).  The kqueue, on the process's descriptor table, is
+ * closed when the process exits or execs (kqring_tctx_exit_task()), or the
+ * ring closes, before the table is freed.
  */
-/*
- * Whether curthread's process may use the ring's poller, claiming it if
- * no process has (docs/concurrent-submitters.md): the poller thread and
- * its kqueue are in one process, whose descriptors the knotes name, so
- * only that process's requests poll files that aren't sockets.  The claim
- * ends with that process (kqring_tctx_exit_task()).
- */
-static bool
-kqring_kp_claim(struct kqring_ctx *ctx)
-{
-	struct kqring_tctx *t;
-	bool ok;
-
-	mtx_lock(&ctx->mtx);
-	t = kqring_tctx_cur(ctx);
-	if (t != NULL && ctx->kp_tctx == NULL) {
-		ctx->kp_tctx = t;
-		ctx->kp_proc = t->proc;
-	}
-	ok = t != NULL && ctx->kp_tctx == t;
-	mtx_unlock(&ctx->mtx);
-	return (ok);
-}
-
 static int
-kqring_kp_start(struct kqring_ctx *ctx)
+kqring_kp_start(struct kqring_tctx *t)
 {
+	struct kqring_ctx *ctx = t->ctx;
 	struct thread *td = curthread;
 	register_t saved[2] = { td->td_retval[0], td->td_retval[1] };
-	struct kevent wake;
 	struct file *fp;
 	int error, fd;
 	bool need;
 
-	if (!kqring_kp_claim(ctx))
+	/* A new image after exec has the same proc and a new context. */
+	if (t->proc != td->td_proc || t->dead)
 		return (EOPNOTSUPP);
-	if (ctx->kp_running)
+	if (t->kp_running)
 		return (0);
 	mtx_lock(&ctx->mtx);
-	need = ctx->kp_fp == NULL;
+	need = t->kp_fp == NULL;
 	mtx_unlock(&ctx->mtx);
 	if (need) {
 		error = kern_kqueue(td, O_CLOEXEC, false, NULL);
@@ -612,41 +615,40 @@ kqring_kp_start(struct kqring_ctx *ctx)
 		if (error != 0)
 			return (error);
 		mtx_lock(&ctx->mtx);
-		if (ctx->kp_fp == NULL && !ctx->closing) {
-			ctx->kp_fp = fp;
+		if (t->kp_fp == NULL && !kqring_kp_done(t)) {
+			t->kp_fp = fp;
 			fp = NULL;
 		}
 		mtx_unlock(&ctx->mtx);
 		if (fp != NULL)
 			fdrop(fp, td);
-		/* If this fails, closing waits for the poller's next wakeup. */
-		EV_SET(&wake, 0, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0,
-		    KQRING_KP_WAKE);
-		(void)kqring_kp_change(ctx, &wake, 1);
 	}
 
 	mtx_lock(&ctx->mtx);
-	if (ctx->kp_running || ctx->closing) {
-		error = ctx->closing ? EBADF : 0;
+	if (t->kp_running || kqring_kp_done(t) || t->kp_fp == NULL) {
+		error = t->kp_running ? 0 : EBADF;
 		mtx_unlock(&ctx->mtx);
 		return (error);
 	}
-	ctx->kp_running = true;
+	t->kp_running = true;
 	atomic_add_int(&kqring_kp_nrings, 1);
 	refcount_acquire(&ctx->refs);
+	refcount_acquire(&t->refs);
 	mtx_unlock(&ctx->mtx);
 	kqring_worker_hold();
-	error = kthread_add(kqring_kp_thread, ctx, td->td_proc, &ctx->kp_td,
+	error = kthread_add(kqring_kp_thread, t, td->td_proc, &t->kp_td,
 	    0, 0, "kqpoll");
 	if (error != 0) {
 		kqring_worker_rele();
 		mtx_lock(&ctx->mtx);
-		ctx->kp_running = false;
-		ctx->kp_td = NULL;
+		t->kp_running = false;
+		t->kp_td = NULL;
 		atomic_subtract_int(&kqring_kp_nrings, 1);
+		wakeup(&t->kp_running);
 		mtx_unlock(&ctx->mtx);
 		/* As the poller would on exit: see kqring_kp_thread(). */
-		kqring_kpoll_close(ctx);
+		kqring_kpoll_close(t);
+		kqring_tctx_rele(t);
 		kqring_ctx_rele(ctx);
 	}
 	return (error);
@@ -670,9 +672,10 @@ kqring_kp_start(struct kqring_ctx *ctx)
  * is replaced.
  */
 void
-kqring_kpoll_soeof_watch(struct kqring_ctx *ctx, int fd,
+kqring_kpoll_soeof_watch(struct kqring_tctx *t, int fd,
     const struct socket *so, so_gen_t gen)
 {
+	struct kqring_ctx *ctx = t->ctx;
 	struct kqring_soeof *c;
 	struct kevent kev;
 	struct file *fp;
@@ -680,11 +683,11 @@ kqring_kpoll_soeof_watch(struct kqring_ctx *ctx, int fd,
 	bool have;
 
 	/* The caller found fd missing from ctx->soeof[]. */
-	if (fd < 0 || kqring_kp_start(ctx) != 0)
+	if (fd < 0 || kqring_kp_start(t) != 0)
 		return;
-	c = &ctx->soeof[(u_int)fd % nitems(ctx->soeof)];
+	c = &ctx->soeof[(u_int)(fd + t->id) % nitems(ctx->soeof)];
 	EV_SET(&kev, fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, KQRING_KP_SOEOF);
-	if ((fp = kqring_kp_getfp(ctx)) == NULL)
+	if ((fp = kqring_kp_getfp(t)) == NULL)
 		return;
 	mtx_lock(&((struct kqueue *)fp->f_data)->kq_lock);
 	kn = kqring_kp_knote(fp->f_data, &kev);
@@ -693,11 +696,12 @@ kqring_kpoll_soeof_watch(struct kqring_ctx *ctx, int fd,
 	mtx_unlock(&((struct kqueue *)fp->f_data)->kq_lock);
 	fdrop(fp, curthread);
 	if (!have) {
-		if (kqring_kp_change(ctx, &kev, 1) != 0)
+		if (kqring_kp_change(t, &kev, 1) != 0)
 			return;
-		kqring_kp_wrap(ctx, &kev, 1, true);
+		kqring_kp_wrap(t, &kev, 1, true);
 	}
 	mtx_lock(&ctx->mtx);
+	c->tid = t->id;
 	c->fd = fd;
 	c->so = so;
 	c->gen = gen;
@@ -738,6 +742,7 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	uint32_t events = sqe->poll32_events ? sqe->poll32_events :
 	    sqe->poll_events;
 	bool multi = (sqe->len & IORING_POLL_ADD_MULTI) != 0;
+	struct kqring_tctx *t = op->tctx;
 	struct kevent kev[2];
 	struct kqring_op *o;
 	uint8_t filters = 0;
@@ -752,13 +757,15 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 		filters |= KQRING_KP_WRITE;
 	if ((events & ~(uint32_t)(POLLOUT | POLLWRNORM)) != 0 || filters == 0)
 		filters |= KQRING_KP_READ;
-	error = kqring_kp_start(ctx);
+	error = kqring_kp_start(t);
 	if (error != 0)
 		return (EOPNOTSUPP);
 
 	mtx_lock(&ctx->mtx);
+	/* A kqueue holds one knote per descriptor and filter. */
 	TAILQ_FOREACH(o, KQRING_KP_BUCKET(ctx, sqe->fd), kp_link) {
-		if (o->kp_fd == sqe->fd && (o->kp_filters & filters) != 0)
+		if (o->tctx == t && o->kp_fd == sqe->fd &&
+		    (o->kp_filters & filters) != 0)
 			break;
 	}
 	if (o != NULL) {
@@ -787,7 +794,7 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 	 */
 	n = kqring_kp_kevents(op, kev, EV_ADD | (!multi ? EV_ONESHOT : 0) |
 	    EV_CLEAR);
-	error = kqring_kp_change(ctx, kev, n);
+	error = kqring_kp_change(t, kev, n);
 	if (error == 0) {
 		/*
 		 * Not a bridge's: the counting filter drops a wakeup that shows
@@ -795,7 +802,7 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 		 * no filter that the count fell.
 		 */
 		if (!op->kq_bridge)
-			kqring_kp_wrap(ctx, kev, n, false);
+			kqring_kp_wrap(t, kev, n, false);
 		return (0);
 	}
 	mtx_lock(&ctx->mtx);
@@ -810,11 +817,11 @@ kqring_kpoll_arm(struct kqring_ctx *ctx, struct kqring_op *op,
 }
 
 /*
- * Take op off the ring's knotes (from kqring_op_disarm_locked(); drops and
+ * Take op off its knotes (from kqring_op_disarm_locked(); drops and
  * retakes ctx->mtx).  The knotes are deleted by descriptor, so only a
- * thread of the owner process can; elsewhere (teardown from another
- * process) they stay until the kqueue is closed, and events for them find
- * no request.
+ * thread of op's process can; elsewhere (teardown from another process)
+ * they stay until the kqueue is closed, and events for them find no
+ * request.
  */
 void
 kqring_kpoll_disarm_locked(struct kqring_ctx *ctx, struct kqring_op *op)
@@ -829,19 +836,19 @@ kqring_kpoll_disarm_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 	if (op->kq_bridge)
 		ctx->kq_bridges--;
 	TAILQ_REMOVE(KQRING_KP_BUCKET(ctx, op->kp_fd), op, kp_link);
-	if (curthread->td_proc != ctx->kp_proc)
+	if (curthread->td_proc != op->tctx->proc || op->tctx->dead)
 		return;
 	n = kqring_kp_kevents(op, kev, EV_DELETE);
 	mtx_unlock(&ctx->mtx);
 	/* One at a time: a ONESHOT knote that fired is gone (ENOENT). */
 	for (int i = 0; i < n; i++)
-		(void)kqring_kp_change(ctx, &kev[i], 1);
+		(void)kqring_kp_change(op->tctx, &kev[i], 1);
 	mtx_lock(&ctx->mtx);
 }
 
 /* ------------------------------------------------------------------------
  * KQRING_EXT_KEVENT: a kqueue event as a request (include/sys/kqring.h).
- * The kevent is registered on the ring's kqueue with the request's kp_id
+ * The kevent is registered on its process's kqueue with the request's kp_id
  * as udata, like a non-socket POLL_ADD's knotes, and the poller records
  * what fires (kqring_kp_event()); taskwork posts it.
  * ------------------------------------------------------------------------
@@ -935,16 +942,12 @@ kqring_kev_issue(struct kqring_ctx *ctx, struct kqring_op *op)
 {
 	const struct kevent *k = op->args;
 	bool multi = (op->sqe.rw_flags & KQRING_KEV_MULTISHOT) != 0;
+	struct kqring_tctx *t = op->tctx;
 	struct kevent kev;
 	struct kqring_op *o;
 	int error;
 
-	/* The kqueue and its descriptors are the poller process's. */
-	if (!kqring_kp_claim(ctx)) {
-		kqring_req_complete(ctx, op, -EOPNOTSUPP, 0);
-		return;
-	}
-	error = kqring_kp_start(ctx);
+	error = kqring_kp_start(t);
 	if (error != 0) {
 		kqring_req_complete(ctx, op, -error, 0);
 		return;
@@ -952,7 +955,7 @@ kqring_kev_issue(struct kqring_ctx *ctx, struct kqring_op *op)
 	mtx_lock(&ctx->mtx);
 	/* A kqueue holds one knote per ident and filter. */
 	TAILQ_FOREACH(o, KQRING_KP_BUCKET(ctx, (int)k->ident), kp_link) {
-		if (o->kp_kev && o->kp_fd == (int)k->ident &&
+		if (o->tctx == t && o->kp_kev && o->kp_fd == (int)k->ident &&
 		    ((const struct kevent *)o->args)->filter == k->filter)
 			break;
 	}
@@ -976,7 +979,7 @@ kqring_kev_issue(struct kqring_ctx *ctx, struct kqring_op *op)
 
 	(void)kqring_kp_kevents(op, &kev, EV_ADD | (multi ? EV_CLEAR :
 	    EV_ONESHOT));
-	error = kqring_kp_change(ctx, &kev, 1);
+	error = kqring_kp_change(t, &kev, 1);
 	if (error == 0)
 		return;
 	mtx_lock(&ctx->mtx);
@@ -1149,8 +1152,6 @@ kqring_kq_check(struct kqring_ctx *ctx, const struct kqring_op *op)
 	struct file *fp;
 	int error;
 
-	if (!kqring_kp_claim(ctx))
-		return (EOPNOTSUPP);
 	error = fget(td, op->sqe.fd,
 	    cap_rights_init_one(&rights, CAP_KQUEUE_EVENT), &fp);
 	if (error != 0)
@@ -1170,10 +1171,10 @@ kqring_kq_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 	int32_t res;
 
 	/*
-	 * Another process sharing the ring has none of the poller
-	 * process's descriptors, and that process's next enter looks anyway.
+	 * Another process sharing the ring has none of op's process's
+	 * descriptors, and that process's next enter looks anyway.
 	 */
-	if (td->td_proc != ctx->kp_proc)
+	if (td->td_proc != op->tctx->proc || op->tctx->dead)
 		return;
 	if (fget(td, op->kp_fd, cap_rights_init_one(&rights, CAP_KQUEUE_EVENT),
 	    &fp) != 0)
@@ -1193,7 +1194,7 @@ kqring_kq_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 }
 
 /*
- * An enter by the owner: its attached kqueues are looked at, as taskwork.
+ * An enter: its process's attached kqueues are looked at, as taskwork.
  * What the poller hasn't taken yet is taken first, so that a wakeup from
  * before this enter (one at attach, say, for the events already queued)
  * joins this look instead of taking the kqueue again in the same enter,
@@ -1202,16 +1203,20 @@ kqring_kq_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 void
 kqring_kq_rescan(struct kqring_ctx *ctx)
 {
+	struct kqring_tctx *t;
 	struct kqring_op *op;
 
-	if (atomic_load_int(&ctx->kq_bridges) == 0 ||
-	    ctx->kp_proc != curproc)
+	if (atomic_load_int(&ctx->kq_bridges) == 0)
 		return;
-	kqring_kp_scan(ctx, curthread);
+	t = ctx->shared ? kqring_tctx_cur_unlocked(ctx) : kqring_tctx_cur(ctx);
+	if (t == NULL || t->kp_fp == NULL)
+		return;
+	kqring_kp_scan(t, curthread);
 	mtx_lock(&ctx->mtx);
 	for (int i = 0; i < KQRING_KP_HASH; i++) {
 		TAILQ_FOREACH(op, &ctx->kp_ops[i], kp_link) {
-			if (!op->kq_bridge || !op->kp_on || op->cancelled)
+			if (op->tctx != t || !op->kq_bridge || !op->kp_on ||
+			    op->cancelled)
 				continue;
 			op->kp_revents |= POLLIN;
 			op->kp_nev++;
@@ -1301,32 +1306,36 @@ last:
 }
 
 /*
- * The events on ctx's kqueue, taken now, as the poller would take them,
+ * The events on t's kqueue, taken now, as the poller would take them,
  * and any it has taken and not yet recorded waited for.
  */
 static void
-kqring_kp_scan(struct kqring_ctx *ctx, struct thread *td)
+kqring_kp_scan(struct kqring_tctx *t, struct thread *td)
 {
 	struct file *fp;
 
-	if ((fp = kqring_kp_getfp(ctx)) == NULL)
+	if ((fp = kqring_kp_getfp(t)) == NULL)
 		return;
-	kqring_kp_take(ctx, fp, td);
+	kqring_kp_take(t, fp, td);
 	fdrop(fp, td);
 }
 
 /*
- * An enter woken by kqring_kp_filt_event(): take the ring's events now, as
- * the poller would, so that their requests are taskwork for this enter.
+ * An enter woken by kqring_kp_filt_event(): take its process's events now,
+ * as the poller would, so that their requests are taskwork for this enter.
+ * Another process's events are that process's, and its poller takes them.
  * Called with no ring lock held.
  */
 void
 kqring_kpoll_kicked(struct kqring_ctx *ctx)
 {
-	if (atomic_load_acq_int(&ctx->kp_kick) == 0 ||
-	    atomic_swap_int(&ctx->kp_kick, 0) == 0)
+	struct kqring_tctx *t;
+
+	if (atomic_load_acq_int(&ctx->kp_kicks) == 0)
 		return;
-	kqring_kp_scan(ctx, curthread);
+	t = ctx->shared ? kqring_tctx_cur_unlocked(ctx) : kqring_tctx_cur(ctx);
+	if (t != NULL && kqring_kp_unkick(t))
+		kqring_kp_scan(t, curthread);
 }
 
 /*
@@ -1343,7 +1352,12 @@ kqring_kpoll_kicked(struct kqring_ctx *ctx)
 void
 kqring_kpoll_run(struct thread *td)
 {
-	struct kqring_ctx *few[8], **rings = few, *ctx;
+	struct kqring_kp_ring {
+		struct kqring_ctx	*ctx;
+		struct kqring_tctx	*t;
+	} few[8], *rings = few;
+	struct kqring_ctx *ctx;
+	struct kqring_tctx *t;
 	u_int max, n = 0;
 
 	if ((max = atomic_load_int(&kqring_kp_nrings)) == 0)
@@ -1358,17 +1372,27 @@ kqring_kpoll_run(struct thread *td)
 	LIST_FOREACH(ctx, &kqring_ctx_list, proc_link) {
 		if (n == max)
 			break;
-		if (ctx->kp_proc == td->td_proc && ctx->kp_running &&
-		    !ctx->closing) {
-			refcount_acquire(&ctx->refs);
-			rings[n++] = ctx;
+		if (ctx->closing)
+			continue;
+		mtx_lock(&ctx->mtx);
+		LIST_FOREACH(t, &ctx->tctxs, link) {
+			if (t->proc == td->td_proc && !t->dead &&
+			    t->kp_running)
+				break;
 		}
+		if (t != NULL) {
+			refcount_acquire(&ctx->refs);
+			refcount_acquire(&t->refs);
+			rings[n].ctx = ctx;
+			rings[n++].t = t;
+		}
+		mtx_unlock(&ctx->mtx);
 	}
 	mtx_unlock(&kqring_proc_mtx);
 
 	for (u_int i = 0; i < n; i++) {
-		ctx = rings[i];
-		kqring_kp_scan(ctx, td);
+		ctx = rings[i].ctx;
+		kqring_kp_scan(rings[i].t, td);
 		/*
 		 * Wait for sq_sx: its holder may be the ring's kthread, part
 		 * way through the taskwork that posts this CQE.  Interrupted,
@@ -1388,6 +1412,7 @@ kqring_kpoll_run(struct thread *td)
 				wakeup(&ctx->wakeup_chan);
 			mtx_unlock(&ctx->mtx);
 		}
+		kqring_tctx_rele(rings[i].t);
 		kqring_ctx_rele(ctx);
 	}
 	if (rings != few)
@@ -1395,55 +1420,110 @@ kqring_kpoll_run(struct thread *td)
 }
 
 /*
- * Ring teardown: wait for the poller to see ctx->closing and exit.  As
- * kqring_teardown_sleep(): EINTR to defer, or with nowait EWOULDBLOCK.
+ * Wake t's poller, which then sees kqring_kp_done() and exits.  Under the
+ * kq lock, under which it looks: see kqring_kp_wait().
  */
-int
-kqring_kpoll_stop(struct kqring_ctx *ctx, bool nowait)
+static void
+kqring_kp_wake_locked(struct kqring_tctx *t)
 {
-	mtx_assert(&ctx->mtx, MA_OWNED);
-	/* It may be asleep in kevent: don't wait out KQRING_KP_IDLE_NS. */
-	if (ctx->kp_running && curthread != ctx->kp_td) {
-		struct kevent wake;
+	struct kqueue *kq;
 
-		mtx_unlock(&ctx->mtx);
-		EV_SET(&wake, 0, EVFILT_USER, 0, NOTE_TRIGGER, 0,
-		    KQRING_KP_WAKE);
-		(void)kqring_kp_change(ctx, &wake, 1);
-		mtx_lock(&ctx->mtx);
-	}
-	while (ctx->kp_running && curthread != ctx->kp_td) {
-		if (nowait)
-			return (EWOULDBLOCK);
-		if (kqring_teardown_sleep(&ctx->kp_running, &ctx->mtx,
-		    "kqkpdt") != 0)
-			return (EINTR);
-	}
-	return (0);
+	mtx_assert(&t->ctx->mtx, MA_OWNED);
+	if (t->kp_fp == NULL)
+		return;
+	kq = t->kp_fp->f_data;
+	mtx_lock(&kq->kq_lock);
+	wakeup(kq);
+	mtx_unlock(&kq->kq_lock);
 }
 
 /*
- * The lock to hold, inside ctx->mtx, while replacing ctx->shm: the kq lock,
- * under which kqring_kp_kick() uses it.  NULL if the ring has no kqueue.
+ * Wait for pollers to see kqring_kp_done() and exit: only's, or with only
+ * NULL every context's (ring teardown).  As kqring_teardown_sleep(): EINTR
+ * to defer, or with nowait EWOULDBLOCK.  With ctx->mtx, which a wait drops.
  */
-struct mtx *
-kqring_kp_shm_lock(struct kqring_ctx *ctx)
+int
+kqring_kpoll_stop(struct kqring_ctx *ctx, struct kqring_tctx *only,
+    bool nowait)
 {
+	struct kqring_tctx *t;
+
 	mtx_assert(&ctx->mtx, MA_OWNED);
-	return (ctx->kp_fp != NULL ?
-	    &((struct kqueue *)ctx->kp_fp->f_data)->kq_lock : NULL);
+	for (;;) {
+		if (only != NULL) {
+			t = only->kp_running && curthread != only->kp_td ?
+			    only : NULL;
+		} else {
+			LIST_FOREACH(t, &ctx->tctxs, link) {
+				if (t->kp_running && curthread != t->kp_td)
+					break;
+			}
+		}
+		if (t == NULL)
+			return (0);
+		/* It may be asleep: don't wait out KQRING_KP_IDLE_NS. */
+		kqring_kp_wake_locked(t);
+		if (nowait)
+			return (EWOULDBLOCK);
+		/* t may be gone after the sleep: look again. */
+		if (kqring_teardown_sleep(&t->kp_running, &ctx->mtx,
+		    "kqkpdt") != 0)
+			return (EINTR);
+	}
 }
 
-/* Close the ring's kqueue (its knotes go with it). */
+/*
+ * Replacing ctx->shm, with ctx->mtx held: once this returns, no
+ * kqring_kp_kick() still uses the old one, as each runs under its
+ * kqueue's lock.
+ */
 void
-kqring_kpoll_close(struct kqring_ctx *ctx)
+kqring_kp_shm_barrier(struct kqring_ctx *ctx)
 {
+	struct kqring_tctx *t;
+	struct kqueue *kq;
+
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	LIST_FOREACH(t, &ctx->tctxs, link) {
+		if (t->kp_fp == NULL)
+			continue;
+		kq = t->kp_fp->f_data;
+		mtx_lock(&kq->kq_lock);
+		mtx_unlock(&kq->kq_lock);
+	}
+}
+
+/* Close t's kqueue (its knotes go with it); its poller has exited. */
+void
+kqring_kpoll_close(struct kqring_tctx *t)
+{
+	struct kqring_ctx *ctx = t->ctx;
 	struct file *fp;
 
 	mtx_lock(&ctx->mtx);
-	fp = ctx->kp_fp;
-	ctx->kp_fp = NULL;
+	fp = t->kp_fp;
+	t->kp_fp = NULL;
 	mtx_unlock(&ctx->mtx);
 	if (fp != NULL)
 		fdrop(fp, curthread);
+	(void)kqring_kp_unkick(t);
+}
+
+/* Close every context's kqueue: the ring is closing. */
+void
+kqring_kpoll_close_all(struct kqring_ctx *ctx)
+{
+	struct kqring_tctx *t;
+
+	for (;;) {
+		mtx_lock(&ctx->mtx);
+		LIST_FOREACH(t, &ctx->tctxs, link) {
+			if (t->kp_fp != NULL || t->kp_kick != 0)
+				break;
+		}
+		mtx_unlock(&ctx->mtx);
+		if (t == NULL)
+			return;
+		kqring_kpoll_close(t);
+	}
 }
