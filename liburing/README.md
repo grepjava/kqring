@@ -35,8 +35,8 @@ liburing's test suite, run on FreeBSD 15.1 with `kqring.ko` from this tree (Nove
 |---|---|
 | In liburing 2.15 | 258 |
 | Built | 245 |
-| Passed | **218** |
-| Skipped | 20 (the test found a feature missing and said so) |
+| Passed | **219** |
+| Skipped | 19 (the test found a feature missing and said so) |
 | Failed | 7, explained below |
 | Not built | 9 not portable, 2 BPF, 2 AddressSanitizer only, explained below |
 
@@ -62,11 +62,11 @@ These results aren't a compatibility percentage. Some of the tests are adapted, 
 
 ### Skipped tests
 
-The 20 skips are tests that check for a feature and report its absence:
+The 19 skips are tests that check for a feature and report its absence:
 
 - **Not implemented in kqring** (see [`COMPATIBILITY.MD`](../COMPATIBILITY.MD)):
   - `IOPOLL` on an `O_DIRECT` file in the test's directory, which completes with `-EOPNOTSUPP` (`500f9fbadef8`).
-  - `IORING_REGISTER_QUERY` (`ring-query`, and `zcrx`, which also needs zero-copy receive).
+  - Zero-copy receive (`zcrx`), which `IORING_REGISTER_QUERY` reports missing.
   - BPF filters on a ring (`cbpf_filter`) and task restrictions (`task-restrict`), refused with `EOPNOTSUPP`.
 - **`epwait`** needs `IORING_OP_EPOLL_WAIT`, and FreeBSD has no epoll.
 - **Linux-only facilities:** fault injection (`fc2a85cb02ef`), fsnotify (`fsnotify`), ublk (`uring_cmd_ublk`), the kernel's io_uring mock files (`mock_file`), requested huge pages (`fixed-hugepage`), and `/proc` (`wq-aff`, `io-wq-unused-exit`, `resize-mmap-fail`). `iowait` runs its waits with and without `IORING_ENTER_NO_IOWAIT`, then skips where it would read the time spent waiting for I/O from `/proc/stat`: FreeBSD doesn't count that time apart.

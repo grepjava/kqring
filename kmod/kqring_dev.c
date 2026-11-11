@@ -1342,15 +1342,7 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	if (ctx->enabled)
 		kqring_set_owner(ctx, td);
 
-	p.features = IORING_FEAT_SINGLE_MMAP | IORING_FEAT_NODROP |
-	    IORING_FEAT_SUBMIT_STABLE | IORING_FEAT_RW_CUR_POS |
-	    IORING_FEAT_EXT_ARG | IORING_FEAT_FAST_POLL |
-	    IORING_FEAT_POLL_32BITS | IORING_FEAT_SQPOLL_NONFIXED |
-	    IORING_FEAT_CQE_SKIP | IORING_FEAT_LINKED_FILE |
-	    IORING_FEAT_NATIVE_WORKERS | IORING_FEAT_CUR_PERSONALITY |
-	    IORING_FEAT_RSRC_TAGS | IORING_FEAT_REG_REG_RING |
-	    IORING_FEAT_RECVSEND_BUNDLE | IORING_FEAT_MIN_TIMEOUT |
-	    IORING_FEAT_NO_IOWAIT;
+	p.features = KQRING_FEATURES;
 
 	kqring_ring_offsets(p.flags, sq_entries, cq_entries, &l, &p);
 

@@ -1040,9 +1040,104 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 	return (0);
 }
 
+/* A chain of queries ends here, as in io_uring: a cycle can't run on. */
+#define	KQRING_QUERY_MAX	1000
+
+/*
+ * One IORING_REGISTER_QUERY header at uhdr.  As io_uring's: an unknown
+ * query_op (and ZCRX, which kqring lacks) gives result -EOPNOTSUPP;
+ * reserved fields, a result already set or a size of 0, -EINVAL.  The
+ * answer is cut to the caller's size, which is written back as the bytes
+ * given; the rest of the caller's size is zeroed.  Faults fail the call.
+ */
+static int
+kqring_query_entry(void *uhdr, uint64_t *next)
+{
+	static const char zeros[256];
+	union {
+		struct io_uring_query_opcode op;
+		struct io_uring_query_scq scq;
+	} d;
+	struct io_uring_query_hdr hdr;
+	char *udata;
+	size_t usize, n, res = 0;
+	int32_t result = -EINVAL;
+	int error;
+
+	if ((error = copyin(uhdr, &hdr, sizeof(hdr))) != 0)
+		return (error);
+	usize = hdr.size;
+	udata = (char *)(uintptr_t)hdr.query_data;
+	memset(&d, 0, sizeof(d));
+	if (hdr.query_op >= __IO_URING_QUERY_MAX ||
+	    hdr.query_op == IO_URING_QUERY_ZCRX) {
+		result = -EOPNOTSUPP;
+	} else if (hdr.__resv[0] == 0 && hdr.__resv[1] == 0 &&
+	    hdr.__resv[2] == 0 && hdr.result == 0 && usize != 0) {
+		error = copyin(udata, &d, MIN(usize, sizeof(d)));
+		if (error != 0)
+			return (error);
+		memset(&d, 0, sizeof(d));
+		if (hdr.query_op == IO_URING_QUERY_OPCODES) {
+			d.op.nr_request_opcodes = IORING_OP_LAST;
+			d.op.nr_register_opcodes = IORING_REGISTER_LAST;
+			d.op.feature_flags = KQRING_FEATURES;
+			d.op.ring_setup_flags = KQRING_SETUP_FLAGS;
+			d.op.enter_flags = KQRING_ENTER_FLAGS;
+			d.op.sqe_flags = KQRING_SQE_FLAGS;
+			d.op.nr_query_opcodes = __IO_URING_QUERY_MAX;
+			res = sizeof(d.op);
+		} else {
+			d.scq.hdr_size = sizeof(struct kqring_shm_header);
+			d.scq.hdr_alignment = CACHE_LINE_SIZE;
+			res = sizeof(d.scq);
+		}
+		result = 0;
+	}
+	n = MIN(usize, res);
+	if (n != 0 && (error = copyout(&d, udata, n)) != 0)
+		return (error);
+	for (size_t off = n; off < usize;) {
+		size_t chunk = MIN(usize - off, sizeof(zeros));
+
+		if ((error = copyout(zeros, udata + off, chunk)) != 0)
+			return (error);
+		off += chunk;
+	}
+	hdr.result = result;
+	hdr.size = (uint32_t)n;
+	if ((error = copyout(&hdr, uhdr, sizeof(hdr))) != 0)
+		return (error);
+	*next = hdr.next_entry;
+	return (0);
+}
+
+/*
+ * IORING_REGISTER_QUERY: what this kqring implements, with or without a
+ * ring.  ERANGE for a chain longer than KQRING_QUERY_MAX.
+ */
+static int
+kqring_register_query(const struct kqring_register_arg *ra)
+{
+	void *uhdr = ra->arg;
+	uint64_t next;
+	int error;
+
+	if (ra->nr_args != 0)
+		return (EINVAL);
+	for (int nr = 0; uhdr != NULL; nr++) {
+		if (nr == KQRING_QUERY_MAX)
+			return (ERANGE);
+		if ((error = kqring_query_entry(uhdr, &next)) != 0)
+			return (error);
+		uhdr = (void *)(uintptr_t)next;
+	}
+	return (0);
+}
+
 /*
  * A registration with no ring (descriptor -1), as io_uring_register(2)
- * takes for these opcodes since Linux 6.13.  Only SEND_MSG_RING is
+ * takes for these opcodes since Linux 6.13.  SEND_MSG_RING and QUERY are
  * implemented; the others exist, so they fail as unsupported.
  */
 int
@@ -1051,7 +1146,8 @@ kqring_register_blind(struct kqring_register_arg *ra)
 	switch (ra->opcode) {
 	case IORING_REGISTER_SEND_MSG_RING:
 		return (kqring_register_send_msg(NULL, ra));
-	case 35:	/* IORING_REGISTER_QUERY */
+	case IORING_REGISTER_QUERY:
+		return (kqring_register_query(ra));
 	case IORING_REGISTER_RESTRICTIONS:
 	case 37:	/* IORING_REGISTER_BPF_FILTER */
 		return (EOPNOTSUPP);
@@ -1084,6 +1180,8 @@ kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
 	switch (ra->opcode) {
 	case IORING_REGISTER_PROBE:
 		return (kqring_register_probe(ra));
+	case IORING_REGISTER_QUERY:
+		return (kqring_register_query(ra));
 	case IORING_REGISTER_SEND_MSG_RING:
 		return (kqring_register_send_msg(ctx, ra));
 	}

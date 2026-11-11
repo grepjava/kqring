@@ -11628,6 +11628,147 @@ test_compat_gaps(void)
 	    "ACCEPT_POLL_FIRST, OFF_CQ_RING, SUBMIT_ALL\n");
 }
 
+/* One IORING_REGISTER_QUERY on ring fd (or -1); the call's errno or 0. */
+static int
+query(int fd, struct io_uring_query_hdr *h, unsigned nr)
+{
+	return (kqring_register(fd, IORING_REGISTER_QUERY, h, nr) == 0 ? 0 :
+	    errno);
+}
+
+static struct io_uring_query_hdr
+query_hdr(uint32_t op, void *data, uint32_t size)
+{
+	struct io_uring_query_hdr h;
+
+	memset(&h, 0, sizeof(h));
+	h.query_op = op;
+	h.query_data = (uint64_t)(uintptr_t)data;
+	h.size = size;
+	return (h);
+}
+
+/*
+ * IORING_REGISTER_QUERY, with or without a ring, as Linux 6.19 has it:
+ * what kqring implements (the masks setup and enter check, setup's
+ * features), cut to the caller's size and zeroed past it; -EOPNOTSUPP in
+ * result for an unknown query or ZCRX; -EINVAL for reserved fields, a set
+ * result or size 0; EFAULT for a bad header or buffer, ERANGE for a
+ * chain that loops, EINVAL for nr_args.
+ */
+static void
+test_register_query(void)
+{
+	struct io_uring_query_opcode op, op2, op3;
+	struct io_uring_query_scq scq;
+	struct io_uring_query_hdr h, h2, h3;
+	struct io_uring_params p;
+	unsigned char big[96];
+	int fd;
+
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_NO_SQARRAY;
+	fd = (int)kqring_setup(8, &p);
+	assert(fd >= 0);
+
+	memset(&op, 0xff, sizeof(op));
+	h = query_hdr(IO_URING_QUERY_OPCODES, &op, sizeof(op));
+	assert(query(-1, &h, 0) == 0);
+	assert(h.result == 0 && h.size == sizeof(op));
+	assert(op.nr_request_opcodes == IORING_OP_LAST);
+	assert(op.nr_register_opcodes == IORING_REGISTER_LAST &&
+	    op.nr_register_opcodes > IORING_REGISTER_QUERY);
+	assert(op.feature_flags == p.features);
+	assert((op.ring_setup_flags & (IORING_SETUP_CQE_MIXED |
+	    IORING_SETUP_SQ_REWIND | IORING_SETUP_DEFER_TASKRUN)) ==
+	    (IORING_SETUP_CQE_MIXED | IORING_SETUP_SQ_REWIND |
+	    IORING_SETUP_DEFER_TASKRUN));
+	assert((op.ring_setup_flags & (1U << 17)) == 0);	/* HYBRID_IOPOLL */
+	assert((op.enter_flags & IORING_ENTER_GETEVENTS) != 0);
+	assert(op.sqe_flags == (IOSQE_FIXED_FILE | IOSQE_IO_DRAIN |
+	    IOSQE_IO_LINK | IOSQE_IO_HARDLINK | IOSQE_ASYNC |
+	    IOSQE_BUFFER_SELECT | IOSQE_CQE_SKIP_SUCCESS));
+	assert(op.nr_query_opcodes == __IO_URING_QUERY_MAX && op.__pad == 0);
+
+	/* The same through a ring. */
+	memset(&op2, 0, sizeof(op2));
+	h = query_hdr(IO_URING_QUERY_OPCODES, &op2, sizeof(op2));
+	assert(query(fd, &h, 0) == 0 && h.result == 0);
+	assert(memcmp(&op, &op2, sizeof(op)) == 0);
+
+	/* Shorter: cut.  Longer: what there is, the rest zeroed. */
+	memset(big, 0xff, sizeof(big));
+	h = query_hdr(IO_URING_QUERY_OPCODES, big, 8);
+	assert(query(-1, &h, 0) == 0 && h.result == 0 && h.size == 8);
+	assert(memcmp(big, &op, 8) == 0 && big[8] == 0xff);
+	memset(big, 0xff, sizeof(big));
+	h = query_hdr(IO_URING_QUERY_OPCODES, big, sizeof(big));
+	assert(query(-1, &h, 0) == 0 && h.result == 0 &&
+	    h.size == sizeof(op));
+	assert(memcmp(big, &op, sizeof(op)) == 0);
+	for (size_t i = sizeof(op); i < sizeof(big); i++)
+		assert(big[i] == 0);
+
+	/* The rings' header: where a NO_SQARRAY ring's CQEs start. */
+	h = query_hdr(IO_URING_QUERY_SCQ, &scq, sizeof(scq));
+	assert(query(-1, &h, 0) == 0 && h.result == 0 &&
+	    h.size == sizeof(scq));
+	assert(scq.hdr_size == p.cq_off.cqes && scq.hdr_alignment != 0 &&
+	    (scq.hdr_alignment & (scq.hdr_alignment - 1)) == 0);
+
+	/* Unknown, and ZCRX: -EOPNOTSUPP, the buffer zeroed. */
+	memset(big, 0xff, sizeof(big));
+	h = query_hdr(77, big, 16);
+	assert(query(-1, &h, 0) == 0 && h.result == -EOPNOTSUPP &&
+	    h.size == 0 && big[0] == 0 && big[15] == 0 && big[16] == 0xff);
+	h = query_hdr(IO_URING_QUERY_ZCRX, big, 16);
+	assert(query(-1, &h, 0) == 0 && h.result == -EOPNOTSUPP);
+	/* Reserved fields, a result already set, size 0: -EINVAL. */
+	h = query_hdr(IO_URING_QUERY_OPCODES, &op2, sizeof(op2));
+	h.__resv[1] = 1;
+	assert(query(-1, &h, 0) == 0 && h.result == -EINVAL);
+	h = query_hdr(IO_URING_QUERY_OPCODES, &op2, sizeof(op2));
+	h.result = 5;
+	assert(query(-1, &h, 0) == 0 && h.result == -EINVAL);
+	h = query_hdr(IO_URING_QUERY_OPCODES, &op2, 0);
+	assert(query(-1, &h, 0) == 0 && h.result == -EINVAL);
+	/* Faults, nr_args. */
+	h = query_hdr(IO_URING_QUERY_OPCODES, (void *)(uintptr_t)0xdeadbeef,
+	    sizeof(op2));
+	assert(query(-1, &h, 0) == EFAULT);
+	h = query_hdr(IO_URING_QUERY_OPCODES, &op2, sizeof(op2));
+	h.next_entry = 0xdeadbeef;
+	assert(query(-1, &h, 0) == EFAULT && h.result == 0);
+	assert(query(-1, (void *)(uintptr_t)0xdeadbeef, 0) == EFAULT);
+	h = query_hdr(IO_URING_QUERY_OPCODES, &op2, sizeof(op2));
+	assert(query(-1, &h, 1) == EINVAL);
+	assert(query(-1, NULL, 0) == 0);
+
+	/* A chain of three, and two that loop. */
+	memset(&op2, 0, sizeof(op2));
+	memset(&op3, 0, sizeof(op3));
+	h3 = query_hdr(IO_URING_QUERY_SCQ, &scq, sizeof(scq));
+	h2 = query_hdr(IO_URING_QUERY_OPCODES, &op3, sizeof(op3));
+	h2.next_entry = (uint64_t)(uintptr_t)&h3;
+	h = query_hdr(IO_URING_QUERY_OPCODES, &op2, sizeof(op2));
+	h.next_entry = (uint64_t)(uintptr_t)&h2;
+	assert(query(-1, &h, 0) == 0);
+	assert(h.result == 0 && h2.result == 0 && h3.result == 0);
+	assert(memcmp(&op2, &op, sizeof(op)) == 0 &&
+	    memcmp(&op3, &op, sizeof(op)) == 0);
+	h = query_hdr(IO_URING_QUERY_OPCODES, &op2, sizeof(op2));
+	h2 = query_hdr(IO_URING_QUERY_OPCODES, &op3, sizeof(op3));
+	h.next_entry = (uint64_t)(uintptr_t)&h2;
+	h2.next_entry = (uint64_t)(uintptr_t)&h;
+	assert(query(-1, &h, 0) == ERANGE);
+	h.next_entry = (uint64_t)(uintptr_t)&h;
+	assert(query(fd, &h, 0) == ERANGE);
+
+	close(fd);
+	printf("[PASS] IORING_REGISTER_QUERY: opcodes, flags and features, "
+	    "short and long answers, errors, chains\n");
+}
+
 /*
  * The rest of COMPATIBILITY.MD: what is refused, ignored or kept. The
  * refused values are Linux 7.3's, which <sys/kqring.h> leaves out; when one
@@ -11650,7 +11791,6 @@ test_compat_contracts(void)
 	};
 	static const uint32_t bad_reg[] = {
 		32,		/* IORING_REGISTER_ZCRX_IFQ */
-		35,		/* IORING_REGISTER_QUERY */
 		36,		/* IORING_REGISTER_ZCRX_CTRL */
 		37,		/* IORING_REGISTER_BPF_FILTER */
 	};
@@ -11727,8 +11867,6 @@ test_compat_contracts(void)
 	assert(kqring_register(-1, IORING_REGISTER_RESTRICTIONS, NULL, 0) ==
 	    -1 && errno == EOPNOTSUPP);
 	assert(kqring_register(-1, 37, NULL, 0) == -1 && errno == EOPNOTSUPP);
-	assert(kqring_register(-1, 35 /* QUERY */, NULL, 0) == -1 &&
-	    errno == EOPNOTSUPP);
 	assert(kqring_register(-1, IORING_REGISTER_PROBE, NULL, 0) == -1 &&
 	    errno == EINVAL);
 	{
@@ -14660,6 +14798,7 @@ main(int argc, char **argv)
 		test_cross_process_rings();
 		test_single_issuer_wait();
 		test_compat_contracts();
+		test_register_query();
 		test_exec_kthreads();
 		test_cq_backpressure();
 		test_sync_cancel_worker();

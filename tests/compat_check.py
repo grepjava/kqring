@@ -85,9 +85,7 @@ def main():
     probed = set(re.findall(r'IORING_OP_\w+', probe))
     setup = mask(var, 'KQRING_SETUP_FLAGS')
     enter = mask(var, 'KQRING_ENTER_FLAGS')
-    feats = set(re.findall(
-        r'IORING_FEAT_\w+',
-        re.search(r'p\.features = (.*?);', dev, re.S).group(1)))
+    feats = mask(var, 'KQRING_FEATURES')
 
     results = {}
     if args.results:

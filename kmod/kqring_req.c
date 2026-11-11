@@ -1345,11 +1345,6 @@ kqring_prep_futex_wait(struct kqring_op *op)
 	return (0);
 }
 
-#define	KQRING_SQE_FLAGS						\
-	(IOSQE_FIXED_FILE | IOSQE_IO_DRAIN | IOSQE_IO_LINK |		\
-	IOSQE_IO_HARDLINK | IOSQE_ASYNC | IOSQE_BUFFER_SELECT |		\
-	IOSQE_CQE_SKIP_SUCCESS)
-
 /* Opcodes working on sqe->fd, which IOSQE_FIXED_FILE makes a fixed slot. */
 static bool
 kqring_op_takes_file(uint8_t opcode)

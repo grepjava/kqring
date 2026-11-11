@@ -626,6 +626,7 @@ enum {
 	IORING_REGISTER_SEND_MSG_RING		= 31,
 	IORING_REGISTER_RESIZE_RINGS		= 33,
 	IORING_REGISTER_MEM_REGION		= 34,
+	IORING_REGISTER_QUERY			= 35,	/* with or without a ring */
 	IORING_REGISTER_LAST
 };
 
@@ -850,6 +851,47 @@ struct io_uring_buf_status {
 	__u32	buf_group;	/* in */
 	__u32	head;		/* out */
 	__u32	resv[8];
+};
+
+/*
+ * IORING_REGISTER_QUERY (nr_args 0, arg the first header): a chain of
+ * queries, through next_entry, of at most 1000.  Each takes query_data,
+ * size bytes; the result is in result (0, or -EOPNOTSUPP for an unknown
+ * or unsupported query_op), size becomes the bytes written, and the rest
+ * of the caller's size is zeroed.
+ */
+struct io_uring_query_hdr {
+	__u64	next_entry;
+	__u64	query_data;
+	__u32	query_op;
+	__u32	size;
+	__s32	result;
+	__u32	__resv[3];
+};
+
+enum {
+	IO_URING_QUERY_OPCODES	= 0,
+	IO_URING_QUERY_ZCRX	= 1,	/* -EOPNOTSUPP: no zero-copy receive */
+	IO_URING_QUERY_SCQ	= 2,
+	__IO_URING_QUERY_MAX,
+};
+
+/* IO_URING_QUERY_OPCODES: what kqring implements. */
+struct io_uring_query_opcode {
+	__u32	nr_request_opcodes;	/* IORING_OP_LAST */
+	__u32	nr_register_opcodes;	/* IORING_REGISTER_LAST */
+	__u64	feature_flags;		/* IORING_FEAT_* setup reports */
+	__u64	ring_setup_flags;	/* IORING_SETUP_* accepted */
+	__u64	enter_flags;		/* IORING_ENTER_* accepted */
+	__u64	sqe_flags;		/* IOSQE_* accepted */
+	__u32	nr_query_opcodes;	/* __IO_URING_QUERY_MAX */
+	__u32	__pad;
+};
+
+/* IO_URING_QUERY_SCQ: the rings' header, before the SQ array or CQEs. */
+struct io_uring_query_scq {
+	__u64	hdr_size;
+	__u64	hdr_alignment;
 };
 
 /*

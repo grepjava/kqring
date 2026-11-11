@@ -187,7 +187,7 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_REGISTER_USE_REGISTERED_RING` | Equivalent | | `kqring_register_op` | `test_registered_rings`, `liburing/reg-reg-ring` |
 | `IORING_REGISTER_ZCRX_IFQ` | Unsupported | `EOPNOTSUPP`. **Platform:** needs driver support FreeBSD lacks. | `kqring_register_op` | `test_compat_contracts` |
 | `IORING_REGISTER_MEM_REGION` | Equivalent | One region per ring, the caller's pages (held, so they must be mapped writable) or the module's, mapped at the offset it returns. With `IORING_MEM_REGION_REG_WAIT_ARG` it holds registered waits, and needs a ring still disabled. The module's memory counts against `kern.kqring.user_ring_mem` (see Resource limits). | `kqring_register_mem_region` | `test_reg_wait`, `liburing/reg-wait`, `fuzz` |
-| `IORING_REGISTER_QUERY` | Unsupported | `EOPNOTSUPP`. | `kqring_register_op` | `test_compat_contracts` |
+| `IORING_REGISTER_QUERY` | Partial | With or without a ring. `IO_URING_QUERY_OPCODES` reports kqring's own counts, flags and features; `IO_URING_QUERY_SCQ` its 64-byte ring header. `IO_URING_QUERY_ZCRX` gives `-EOPNOTSUPP`, as kqring has no zero-copy receive. | `kqring_register_query` | `test_register_query`, `liburing/ring-query`, `fuzz` |
 | `IORING_REGISTER_ZCRX_CTRL` | Unsupported | `EOPNOTSUPP`. **Platform:** needs driver support FreeBSD lacks. | `kqring_register_op` | `test_compat_contracts` |
 | `IORING_REGISTER_BPF_FILTER` | Unsupported | `EOPNOTSUPP`. | `kqring_register_op` | `test_compat_contracts` |
 | `io_uring_task_restriction` | Unsupported | `EOPNOTSUPP`: restrictions apply to one ring. | `kqring_register_blind` | `test_compat_contracts` |

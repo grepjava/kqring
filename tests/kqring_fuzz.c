@@ -2183,6 +2183,31 @@ do_register(struct fz *f)
 	if (op == IORING_REGISTER_ENABLE_RINGS || op == IORING_REGISTER_PROBE ||
 	    chance(f, 5))
 		nr = op == IORING_REGISTER_PROBE ? (unsigned)rn(f, 300) : 0;
+	/*
+	 * A query chain in the arena, mostly well formed: 1 to 3 headers,
+	 * any query_op, sizes up to past the answer, sometimes a loop.
+	 */
+	if (op == IORING_REGISTER_QUERY && chance(f, 70)) {
+		struct io_uring_query_hdr *qh = (void *)(f->arena +
+		    rn(f, ARENA_SIZE / 512) * 256);
+		unsigned nq = 1 + (unsigned)rn(f, 3);
+
+		for (unsigned i = 0; i < nq; i++) {
+			memset(&qh[i], 0, sizeof(qh[i]));
+			qh[i].query_op = (uint32_t)rn(f, 5);
+			qh[i].query_data = chance(f, 90) ?
+			    (uint64_t)(uintptr_t)(f->arena + rn(f,
+			    ARENA_SIZE / 8 - 16) * 8) : gen_ptr(f);
+			qh[i].size = (uint32_t)rn(f, 128);
+			if (chance(f, 5))
+				qh[i].result = 1;
+			qh[i].next_entry = i + 1 < nq ?
+			    (uint64_t)(uintptr_t)&qh[i + 1] :
+			    chance(f, 5) ? (uint64_t)(uintptr_t)qh : 0;
+		}
+		arg = qh;
+		nr = chance(f, 95) ? 0 : 1;
+	}
 	/* A resize that can work, under whatever the ring has in flight. */
 	if ((f->p.flags & IORING_SETUP_DEFER_TASKRUN) != 0 && chance(f, 10)) {
 		memset(&rp, 0, sizeof(rp));
