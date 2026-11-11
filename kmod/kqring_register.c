@@ -881,6 +881,10 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 	case IORING_REGISTER_ENABLE_RINGS:
 		if (ra->arg != NULL || ra->nr_args != 0)
 			return (EINVAL);
+		if (ctx->enabled)
+			return (EINVAL);
+		/* Enabled by another process: its requests run there. */
+		kqring_tctx_rebind(ctx, td);
 		mtx_lock(&ctx->mtx);
 		if (ctx->enabled) {
 			mtx_unlock(&ctx->mtx);
@@ -891,7 +895,9 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 		ctx->restricted = ctx->rst.registered;
 		mtx_unlock(&ctx->mtx);
 		if (kqring_has_kthread(ctx)) {
-			error = kqring_sqpoll_start(ctx, td);
+			/* A disabled ring has only its setup context. */
+			error = kqring_sqpoll_start(ctx,
+			    LIST_FIRST(&ctx->tctxs), td);
 			if (error != 0) {
 				mtx_lock(&ctx->mtx);
 				ctx->enabled = false;
@@ -1186,7 +1192,6 @@ kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
 		return (kqring_register_send_msg(ctx, ra));
 	}
 
-relock:
 	mtx_lock(&ctx->mtx);
 	if (ctx->closing) {
 		mtx_unlock(&ctx->mtx);
@@ -1196,13 +1201,17 @@ relock:
 		if (!kqring_is_owner(ctx, td)) {
 			/*
 			 * Another thread of a SINGLE_ISSUER ring: EEXIST.
-			 * Another process takes a ring that can move over
-			 * (docs/cross-process-rings.md), or gets EEXIST.
+			 * Another process gets a context on a ring others may
+			 * use (docs/concurrent-submitters.md), or EEXIST.
 			 */
+			struct kqring_tctx *t;
+
 			mtx_unlock(&ctx->mtx);
-			if ((error = kqring_ctx_takeover(ctx, td)) != 0)
+			if (!ctx->shared)
+				return (EEXIST);
+			if ((error = kqring_tctx_attach(ctx, td, &t)) != 0)
 				return (error);
-			goto relock;
+			mtx_lock(&ctx->mtx);
 		}
 	} else {
 		if (ctx->reg_busy) {
@@ -1219,14 +1228,6 @@ relock:
 	} else if (ctx->closing) {
 		sx_xunlock(&ctx->sq_sx);
 		error = EBADF;
-	} else if (ctx->enabled && (ctx->handover_td != NULL ||
-	    !kqring_is_owner(ctx, td))) {
-		/* Moved, or moving, since the check above: as in enter. */
-		sx_xunlock(&ctx->sq_sx);
-		if (!kqring_is_owner(ctx, td))
-			error = EEXIST;
-		else if ((error = kqring_handover_wait(ctx, td)) == 0)
-			goto relock;
 	} else {
 		error = kqring_register_op(ctx, ra, td, resp);
 		sx_xunlock(&ctx->sq_sx);

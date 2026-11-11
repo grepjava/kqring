@@ -1870,7 +1870,7 @@ kqring_wq_wait_taskwork(struct kqring_ctx *ctx, struct kqring_op *op,
 	    !ctx->closing) {
 		if (kqring_wq_suspend_pending()) {
 			mtx_unlock(&ctx->mtx);
-			exiting = kqring_wq_suspend_point(ctx);
+			exiting = kqring_wq_suspend_point(op);
 			mtx_lock(&ctx->mtx);
 			if (exiting)
 				break;
@@ -1954,7 +1954,7 @@ kqring_wq_poll_wait(struct kqring_ctx *ctx, struct kqring_op *op)
 		kqring_seltd_clear(stp);
 		if (error == EINTR || error == ERESTART) {
 			/* Signals are masked: a stop or exit request. */
-			if (kqring_wq_suspend_point(ctx))
+			if (kqring_wq_suspend_point(op))
 				break;
 			continue;
 		}
@@ -2538,6 +2538,19 @@ armed:
 		kqring_taskwork_add_locked(ctx, op);
 	if (want_eof)
 		want_eof = !kqring_soeof_cached_locked(ctx, fd, so, gen);
+	/*
+	 * The watch is a knote on the ring's poller, which is in one
+	 * process (kqring_kp_claim()): from any other, poll for the end of
+	 * input instead, as for a send on such a socket.
+	 */
+	if (want_eof && ctx->kp_proc != NULL && ctx->kp_proc != curproc) {
+		want_eof = false;
+		if (!op->polled) {
+			op->polled = true;
+			ctx->npolled++;
+		}
+		op->polled_eof = true;
+	}
 	mtx_unlock(&ctx->mtx);
 	if (want_eof)
 		kqring_kpoll_soeof_watch(ctx, fd, so, gen);

@@ -175,21 +175,6 @@
  			fprintf(stdout, "epoll not supported, skipping\n");
  			return 0;
  		} else if (ret < 0) {
---- test/timeout.c
-+++ test/timeout.c
-@@ -1966,11 +1966,7 @@
- 		return ret;
- 	}
- 
--	ret = test_timeout_link_cancel();
--	if (ret) {
--		fprintf(stderr, "test_timeout_link_cancel failed\n");
--		return ret;
--	}
-+	/* test_timeout_link_cancel(): exec closes a ring with requests. */
- 
- 	ret = test_not_failing_links();
- 	if (ret) {
 --- test/waitid.c
 +++ test/waitid.c
 @@ -89,7 +89,8 @@
@@ -212,28 +197,6 @@
  			fprintf(stderr, "cqe res: %d\n", cqe->res);
  			return T_EXIT_FAIL;
  		}
---- test/io-cancel.c
-+++ test/io-cancel.c
-@@ -497,15 +497,10 @@
- 		return T_EXIT_FAIL;
- 	}
- 
--	if (test_cancel_req_across_fork()) {
--		fprintf(stderr, "test_cancel_req_across_fork() failed\n");
--		return T_EXIT_FAIL;
--	}
--
--	if (test_cancel_inflight_exit()) {
--		fprintf(stderr, "test_cancel_inflight_exit() failed\n");
--		return T_EXIT_FAIL;
--	}
-+	/*
-+	 * test_cancel_req_across_fork(): one submitting process at a time.
-+	 * test_cancel_inflight_exit(): an owner's exit drops its requests.
-+	 */
- 
- 	if (test_sqpoll_cancel_iowq_requests()) {
- 		fprintf(stderr, "test_sqpoll_cancel_iowq_requests() failed\n");
 --- test/epwait.c
 +++ test/epwait.c
 @@ -44,7 +44,7 @@

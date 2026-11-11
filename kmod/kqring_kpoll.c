@@ -362,6 +362,13 @@ kqring_kp_change(struct kqring_ctx *ctx, struct kevent *kev, int n)
 	struct file *fp;
 	int error;
 
+	/*
+	 * Knotes name descriptors, which kevent looks up in td's table: a
+	 * process whose table exit has freed (a ring closed by fdescfree())
+	 * has none to change.  Closing the kqueue drops them anyway.
+	 */
+	if (td->td_proc->p_fd == NULL)
+		return (EBADF);
 	if ((fp = kqring_kp_getfp(ctx)) == NULL)
 		return (EBADF);
 	error = kern_kevent_fp(td, fp, n, 0, &ops, NULL);
@@ -546,6 +553,30 @@ kqring_kp_thread(void *arg)
  * table, is closed in ring teardown, which runs before the table is freed
  * at exit and exec.
  */
+/*
+ * Whether curthread's process may use the ring's poller, claiming it if
+ * no process has (docs/concurrent-submitters.md): the poller thread and
+ * its kqueue are in one process, whose descriptors the knotes name, so
+ * only that process's requests poll files that aren't sockets.  The claim
+ * ends with that process (kqring_tctx_exit_task()).
+ */
+static bool
+kqring_kp_claim(struct kqring_ctx *ctx)
+{
+	struct kqring_tctx *t;
+	bool ok;
+
+	mtx_lock(&ctx->mtx);
+	t = kqring_tctx_cur(ctx);
+	if (t != NULL && ctx->kp_tctx == NULL) {
+		ctx->kp_tctx = t;
+		ctx->kp_proc = t->proc;
+	}
+	ok = t != NULL && ctx->kp_tctx == t;
+	mtx_unlock(&ctx->mtx);
+	return (ok);
+}
+
 static int
 kqring_kp_start(struct kqring_ctx *ctx)
 {
@@ -556,10 +587,10 @@ kqring_kp_start(struct kqring_ctx *ctx)
 	int error, fd;
 	bool need;
 
+	if (!kqring_kp_claim(ctx))
+		return (EOPNOTSUPP);
 	if (ctx->kp_running)
 		return (0);
-	if (ctx->owner_proc != td->td_proc)
-		return (EOPNOTSUPP);
 	mtx_lock(&ctx->mtx);
 	need = ctx->kp_fp == NULL;
 	mtx_unlock(&ctx->mtx);
@@ -649,8 +680,7 @@ kqring_kpoll_soeof_watch(struct kqring_ctx *ctx, int fd,
 	bool have;
 
 	/* The caller found fd missing from ctx->soeof[]. */
-	if (fd < 0 || ctx->owner_proc != curproc ||
-	    kqring_kp_start(ctx) != 0)
+	if (fd < 0 || kqring_kp_start(ctx) != 0)
 		return;
 	c = &ctx->soeof[(u_int)fd % nitems(ctx->soeof)];
 	EV_SET(&kev, fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, KQRING_KP_SOEOF);
@@ -799,7 +829,7 @@ kqring_kpoll_disarm_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 	if (op->kq_bridge)
 		ctx->kq_bridges--;
 	TAILQ_REMOVE(KQRING_KP_BUCKET(ctx, op->kp_fd), op, kp_link);
-	if (curthread->td_proc != ctx->owner_proc)
+	if (curthread->td_proc != ctx->kp_proc)
 		return;
 	n = kqring_kp_kevents(op, kev, EV_DELETE);
 	mtx_unlock(&ctx->mtx);
@@ -909,8 +939,8 @@ kqring_kev_issue(struct kqring_ctx *ctx, struct kqring_op *op)
 	struct kqring_op *o;
 	int error;
 
-	/* The kqueue and its descriptors are the owner process's. */
-	if (ctx->owner_proc != curproc) {
+	/* The kqueue and its descriptors are the poller process's. */
+	if (!kqring_kp_claim(ctx)) {
 		kqring_req_complete(ctx, op, -EOPNOTSUPP, 0);
 		return;
 	}
@@ -1119,7 +1149,7 @@ kqring_kq_check(struct kqring_ctx *ctx, const struct kqring_op *op)
 	struct file *fp;
 	int error;
 
-	if (ctx->owner_proc != td->td_proc)
+	if (!kqring_kp_claim(ctx))
 		return (EOPNOTSUPP);
 	error = fget(td, op->sqe.fd,
 	    cap_rights_init_one(&rights, CAP_KQUEUE_EVENT), &fp);
@@ -1140,10 +1170,10 @@ kqring_kq_deliver(struct kqring_ctx *ctx, struct kqring_op *op)
 	int32_t res;
 
 	/*
-	 * Another process sharing the ring has none of the owner's
-	 * descriptors, and the owner's next enter looks anyway.
+	 * Another process sharing the ring has none of the poller
+	 * process's descriptors, and that process's next enter looks anyway.
 	 */
-	if (td->td_proc != ctx->owner_proc)
+	if (td->td_proc != ctx->kp_proc)
 		return;
 	if (fget(td, op->kp_fd, cap_rights_init_one(&rights, CAP_KQUEUE_EVENT),
 	    &fp) != 0)
@@ -1175,7 +1205,7 @@ kqring_kq_rescan(struct kqring_ctx *ctx)
 	struct kqring_op *op;
 
 	if (atomic_load_int(&ctx->kq_bridges) == 0 ||
-	    ctx->owner_proc != curproc)
+	    ctx->kp_proc != curproc)
 		return;
 	kqring_kp_scan(ctx, curthread);
 	mtx_lock(&ctx->mtx);
@@ -1328,7 +1358,7 @@ kqring_kpoll_run(struct thread *td)
 	LIST_FOREACH(ctx, &kqring_ctx_list, proc_link) {
 		if (n == max)
 			break;
-		if (ctx->owner_proc == td->td_proc && ctx->kp_running &&
+		if (ctx->kp_proc == td->td_proc && ctx->kp_running &&
 		    !ctx->closing) {
 			refcount_acquire(&ctx->refs);
 			rings[n++] = ctx;

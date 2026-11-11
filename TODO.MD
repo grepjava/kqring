@@ -12,7 +12,8 @@ Known limits are in [BENCHMARK.MD](BENCHMARK.MD#known-gaps) and [Differences fro
 
 ## Compatibility
 
-- **Requests of an exiting owner end without CQEs.** When the process that owns a shared ring exits, kqring drops its requests in flight, where Linux cancels them with `-ECANCELED` CQEs and lets a standalone `TIMEOUT` fire. Another process still waiting on the ring never hears of them. liburing's `test_cancel_inflight_exit` stays left out for it ([docs/cross-process-rings.md](docs/cross-process-rings.md)).
+- **Non-socket polls from more than one process.** A ring's poller, the kernel thread and kqueue behind `POLL_ADD` on files that aren't sockets, is in the first process that polls through it, whose descriptors its knotes name. Such a poll from another process fails with `-EOPNOTSUPP`, and that process's AF_UNIX receives poll for the end of input every 50 µs while armed. A poller per process would lift both ([docs/concurrent-submitters.md](docs/concurrent-submitters.md#what-the-implementation-changed)).
+- **Registered buffers from other processes.** A request from a process other than the one that registered the buffer fails with `-EFAULT`: kqring reads registered buffers through their addresses, not held pages (see Research in the roadmap).
 
 ## Measurement
 

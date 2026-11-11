@@ -51,7 +51,8 @@ kqring_wq_cpus_busy(void)
 bool
 kqring_wq_inline_ok(struct kqring_ctx *ctx)
 {
-	struct kqring_wq *wq = kqring_tctx_cur(ctx)->wq;
+	struct kqring_tctx *t = kqring_tctx_cur(ctx);
+	struct kqring_wq *wq = t != NULL ? t->wq : NULL;
 
 	if (wq == NULL || !atomic_load_bool(&wq->cached))
 		return (false);
@@ -417,9 +418,9 @@ kqring_wq_suspend_pending(void)
  * stops waiting, and the worker exits at the top of its loop.
  */
 bool
-kqring_wq_suspend_point(struct kqring_ctx *ctx)
+kqring_wq_suspend_point(struct kqring_op *op)
 {
-	struct kqring_wq *wq = kqring_tctx_cur(ctx)->wq;
+	struct kqring_wq *wq = op->tctx->wq;
 	bool exiting;
 
 	if (wq == NULL || !kqring_wq_suspend_pending())
@@ -1249,8 +1250,7 @@ kqring_kthread_check_suspend(struct kqring_ctx *ctx)
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
 
-	/* Closing, or moving to another process (detaching): exit. */
-	if (ctx->closing || ctx->detaching)
+	if (ctx->closing)
 		return (true);
 	if (!P_SHOULDSTOP(p) && (p->p_flag2 & P2_WEXIT) == 0 &&
 	    !td_ast_pending(td, TDA_SUSPEND))
@@ -1360,8 +1360,8 @@ kqring_sqpoll_thread(void *arg)
 		 */
 		if (sx_xlock_sig(&ctx->sq_sx) != 0)
 			continue;
-		/* Closing, or the ring changing process: see detaching. */
-		if (ctx->closing || ctx->detaching) {
+		/* Closing, or its process exited (or exits). */
+		if (ctx->closing || tctx->dead) {
 			sx_xunlock(&ctx->sq_sx);
 			break;
 		}
@@ -1404,7 +1404,7 @@ kqring_sqpoll_thread(void *arg)
 		}
 
 		mtx_lock(&ctx->mtx);
-		if (ctx->closing || ctx->detaching) {
+		if (ctx->closing || tctx->dead) {
 			mtx_unlock(&ctx->mtx);
 			break;
 		}
@@ -1437,7 +1437,7 @@ kqring_sqpoll_thread(void *arg)
 				    shm->sq_head ||
 				    !TAILQ_EMPTY(tw) ||
 				    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) || ctx->closing ||
-				    ctx->detaching || kqring_wq_suspend_pending())
+				    tctx->dead || kqring_wq_suspend_pending())
 					break;
 				for (int s = 0; s < 64; s++)
 					cpu_spinwait();
@@ -1459,7 +1459,7 @@ kqring_sqpoll_thread(void *arg)
 			if (atomic_load_acq_32(&shm->sq_tail) != shm->sq_head ||
 			    !TAILQ_EMPTY(tw) ||
 			    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) || ctx->closing ||
-			    ctx->detaching) {
+			    tctx->dead) {
 				atomic_clear_32(&shm->sq_flags,
 				    IORING_SQ_NEED_WAKEUP);
 				mtx_unlock(&ctx->mtx);
@@ -1499,14 +1499,15 @@ kqring_sqpoll_thread(void *arg)
 	mtx_unlock(&ctx->mtx);
 	if (finish_cancel)
 		kqring_ctx_cancel_all(ctx);
+	kqring_tctx_rele(tctx);
 	kqring_ctx_rele(ctx);
 	kqring_kthread_exit();
 }
 
 int
-kqring_sqpoll_start(struct kqring_ctx *ctx, struct thread *td)
+kqring_sqpoll_start(struct kqring_ctx *ctx, struct kqring_tctx *tctx,
+    struct thread *td)
 {
-	struct kqring_tctx *tctx = ctx->tctx;
 	int error;
 
 	mtx_lock(&ctx->mtx);
@@ -1520,6 +1521,7 @@ kqring_sqpoll_start(struct kqring_ctx *ctx, struct thread *td)
 	}
 	tctx->task_running = true;
 	refcount_acquire(&ctx->refs);
+	refcount_acquire(&tctx->refs);
 	mtx_unlock(&ctx->mtx);
 
 	kqring_worker_hold();
@@ -1531,6 +1533,7 @@ kqring_sqpoll_start(struct kqring_ctx *ctx, struct thread *td)
 		tctx->task_running = false;
 		tctx->task_td = NULL;
 		mtx_unlock(&ctx->mtx);
+		kqring_tctx_rele(tctx);
 		kqring_ctx_rele(ctx);
 	}
 	return (error);

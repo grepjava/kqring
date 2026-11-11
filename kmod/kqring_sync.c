@@ -843,7 +843,7 @@ kqring_poll_remove(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe)
 /*
  * Complete armed FUTEX_WAIT(V) ops one of whose words no longer holds the
  * expected value (or can no longer be read), with that word's index.
- * Only the owner thread (this one) modifies active_ops, so it is walked
+ * Only the issuer (this thread, with sq_sx) modifies active_ops, so it is walked
  * without ctx->mtx, which must not be held across copyin().
  */
 void
@@ -858,7 +858,9 @@ kqring_check_futexes(struct kqring_ctx *ctx)
 	if (ctx->nfutex == 0)
 		return;
 	TAILQ_FOREACH_SAFE(op, &ctx->active_ops, active_link, tmp) {
-		if (op->nfwait == 0 || op->cancelled)
+		/* The words are in its submitter's memory. */
+		if (op->nfwait == 0 || op->cancelled ||
+		    op->tctx->proc != curproc)
 			continue;
 		fw = op->args;
 		for (i = 0; i < op->nfwait; i++) {
@@ -891,7 +893,9 @@ kqring_check_waitids(struct kqring_ctx *ctx)
 	if (ctx->nwaitid == 0)
 		return;
 	TAILQ_FOREACH_SAFE(op, &ctx->active_ops, active_link, tmp) {
+		/* Its submitter's children. */
 		if (op->sqe.opcode != IORING_OP_WAITID || op->cancelled ||
+		    op->tctx->proc != curproc ||
 		    op->wq_queued || op->wq_running || op->wq_done ||
 		    kqring_exec_waitid(op, true) == EAGAIN)
 			continue;

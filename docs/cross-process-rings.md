@@ -1,6 +1,6 @@
 # Rings used by more than one process
 
-Status: implemented, November 2026. The roadmap's Research list asks for this note before kqring relaxes "one process per ring".
+Status: implemented, November 2026, and superseded the same month by [concurrent-submitters.md](concurrent-submitters.md): processes no longer take turns on a ring, and the handover described here is gone. This note is kept for the reasoning about PostgreSQL's use of rings.
 
 ## Why
 

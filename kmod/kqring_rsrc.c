@@ -654,6 +654,8 @@ kqring_bufs_set(struct kqring_ctx *ctx, uint32_t slot,
 		r->len = iov->iov_len;
 		r->zbuf = zb;
 		r->cow_gen = atomic_load_int(&ctx->cow_gen);
+		/* Registration runs with sq_sx, in a process with a context. */
+		r->owner_id = kqring_tctx_cur(ctx)->id;
 	}
 	ctx->bufs[slot] = r;
 	if (old != NULL)
@@ -1086,8 +1088,10 @@ kqring_bufs_clone(struct kqring_ctx *ctx, const struct kqring_register_arg *ra)
 	struct io_uring_clone_buffers cb;
 	struct kqring_rsrc **tab, *r, *s, *old;
 	struct kqring_ctx *sctx;
+	struct kqring_tctx *st, *dt;
 	struct file *fp;
 	cap_rights_t rights;
+	uint64_t sown, down;
 	uint32_t n, nr;
 	int error;
 
@@ -1136,6 +1140,11 @@ kqring_bufs_clone(struct kqring_ctx *ctx, const struct kqring_register_arg *ra)
 		error = ENXIO;
 	if (error != 0)
 		goto out_unlock;
+	/* Both rings' sq_sx are held: their contexts stay put. */
+	st = kqring_tctx_cur(sctx);
+	dt = kqring_tctx_cur(ctx);
+	sown = st != NULL ? st->id : 0;
+	down = dt != NULL ? dt->id : 0;
 	nr = cb.nr != 0 ? cb.nr : sctx->nbufs;
 	if (cb.src_off > sctx->nbufs || nr > sctx->nbufs - cb.src_off ||
 	    cb.dst_off > KQRING_MAX_BUFS || nr > KQRING_MAX_BUFS - cb.dst_off) {
@@ -1158,6 +1167,11 @@ kqring_bufs_clone(struct kqring_ctx *ctx, const struct kqring_register_arg *ra)
 			r->addr = s->addr;
 			r->len = s->len;
 			r->cow_gen = s->cow_gen;
+			/*
+			 * The caller's own buffers are its on this ring too;
+			 * another process's stay unusable here.
+			 */
+			r->owner_id = s->owner_id == sown ? down : s->owner_id;
 			if (s->zbuf != NULL) {
 				refcount_acquire(&s->zbuf->refs);
 				r->zbuf = s->zbuf;

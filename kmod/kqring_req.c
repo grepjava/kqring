@@ -449,6 +449,7 @@ kqring_op_disarm_locked(struct kqring_op *op)
 	mtx_assert(&ctx->mtx, MA_OWNED);
 	if (op->polled) {
 		op->polled = false;
+		op->polled_eof = false;
 		ctx->npolled--;
 	}
 	if (op->kp_on)
@@ -569,6 +570,13 @@ kqring_req_resources(struct kqring_ctx *ctx, struct kqring_op *op)
 		if (ctx->bufs == NULL || idx >= ctx->nbufs ||
 		    (r = ctx->bufs[idx]) == NULL)
 			return (EFAULT);
+		/*
+		 * Its addresses are in the registering process's address
+		 * space: another process can't use it, until registered
+		 * buffers hold their pages (docs/concurrent-submitters.md).
+		 */
+		if (r->owner_id != op->tctx->id)
+			return (EFAULT);
 		r->refs++;
 		op->fbuf = r;
 	}
@@ -610,7 +618,14 @@ kqring_op_alloc(struct kqring_ctx *ctx)
 		op = malloc(sizeof(*op), M_KQRING, M_WAITOK | M_ZERO);
 	}
 	op->ctx = ctx;
+	/*
+	 * Its submitter's: sq_sx (or a ring with one context) holds it, and
+	 * it stays while it has requests (kqring_tctx_cancel() waits).
+	 */
 	op->tctx = kqring_tctx_cur(ctx);
+	KASSERT(op->tctx != NULL, ("kqring: request from a process without "
+	    "a context"));
+	op->tctx->nops++;
 	ctx->nreqs++;
 	return (op);
 }
@@ -633,6 +648,9 @@ kqring_op_free(struct kqring_op *op)
 		kqring_trig_waiter_event(ctx, op, -ECANCELED, false);
 	op->trun = NULL;
 	ctx->nreqs--;
+	/* As nreqs; an exited process's end waits for the last. */
+	op->tctx->nops--;
+	op->tctx = NULL;
 	/*
 	 * The callout was stopped under ctx->mtx, so its function will not
 	 * run; drain anyway so that softclock is done with the structure
@@ -2072,6 +2090,13 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 		mtx_unlock(&ctx->mtx);
 	}
 	KASSERT(!op->armed, ("kqring: completing an armed op"));
+	/*
+	 * Once the submitter has begun exit(2), a request its worker was
+	 * running when exit interrupted it (EINTR) was cancelled by the exit,
+	 * as kqring_tctx_exit() cancels the rest, and says so.
+	 */
+	if (__predict_false(res == -EINTR) && kqring_op_proc_exiting(op))
+		res = -ECANCELED;
 	/* A trigger's poll reports to its trigger, not to the CQ. */
 	if (__predict_false(op->trig_wait != NULL)) {
 		kqring_trig_waiter_event(ctx, op, res, false);
@@ -2112,14 +2137,9 @@ kqring_req_complete(struct kqring_ctx *ctx, struct kqring_op *op, int32_t res,
 
 	/*
 	 * IOSQE_CQE_SKIP_SUCCESS skips a success, and a LINK_TIMEOUT that
-	 * fired (-ETIME), which io_uring does not count as failing.  Once the
-	 * owner has begun exit(2), its requests end without CQEs, as
-	 * kqring_proc_rings_teardown() cancels them: exit interrupts a
-	 * worker's sleep (EINTR) before the teardown runs, and a ring that
-	 * outlives its owner must not show that.
+	 * fired (-ETIME), which io_uring does not count as failing.
 	 */
-	if (__predict_true(!kqring_owner_exiting(ctx)) &&
-	    ((op->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) == 0 || short_xfer ||
+	if (((op->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) == 0 || short_xfer ||
 	    (res < 0 &&
 	    !(op->sqe.opcode == IORING_OP_LINK_TIMEOUT && res == -ETIME)))) {
 		if (op->sqe.opcode == IORING_OP_TIMEOUT)
@@ -2481,7 +2501,10 @@ kqring_flush_ready(struct kqring_ctx *ctx)
 	for (;;) {
 		if ((op = TAILQ_FIRST(&ctx->ready_q)) != NULL) {
 			TAILQ_REMOVE(&ctx->ready_q, op, q_link);
-			kqring_req_issue(ctx, op);
+			if (__predict_false(op->tctx->proc != curproc))
+				kqring_issue_elsewhere(ctx, op);
+			else
+				kqring_req_issue(ctx, op);
 			continue;
 		}
 		/* Triggers to re-arm or run: they queue on ready_q. */
@@ -2502,6 +2525,26 @@ kqring_flush_ready(struct kqring_ctx *ctx)
 			ctx->drain_barrier = true;
 		TAILQ_INSERT_TAIL(&ctx->ready_q, op, q_link);
 	}
+}
+
+/*
+ * A request another process submitted, now ready (a link successor, or a
+ * chain a drain held back): it runs with that process's descriptors and
+ * memory, so it is issued there, from its taskwork, as Linux queues it as
+ * its task's task_work.  If that process has exited, it is cancelled.
+ */
+void
+kqring_issue_elsewhere(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	mtx_lock(&ctx->mtx);
+	if (!op->tctx->dead && !ctx->closing) {
+		op->tw_issue = true;
+		kqring_taskwork_add_locked(ctx, op);
+		mtx_unlock(&ctx->mtx);
+		return;
+	}
+	mtx_unlock(&ctx->mtx);
+	kqring_req_complete(ctx, op, -ECANCELED, 0);
 }
 
 /* Submit a complete chain (a lone request is a chain of one). */
@@ -2573,9 +2616,18 @@ kqring_req_destroy(struct kqring_ctx *ctx, struct kqring_op *op)
  * Run one queued taskwork item: a worker completion, a socket that became
  * ready, a woken futex, or an expired timer.
  */
-static void
+void
 kqring_taskwork_run_one(struct kqring_ctx *ctx, struct kqring_op *op)
 {
+	/* Ready while another process ran the ring: kqring_issue_elsewhere(). */
+	if (__predict_false(op->tw_issue)) {
+		op->tw_issue = false;
+		if (op->tctx->dead)
+			kqring_req_complete(ctx, op, -ECANCELED, 0);
+		else
+			kqring_req_issue(ctx, op);
+		return;
+	}
 	if (op->wq_retired) {
 		kqring_req_complete(ctx, op, op->wq_cancel_res,
 		    op->wq_cancel_flags);
@@ -2695,16 +2747,17 @@ void
 kqring_run_taskwork(struct kqring_ctx *ctx)
 {
 	struct kqring_tctx *tctx = kqring_tctx_cur(ctx);
-	struct kqring_op_list *tw = &tctx->taskwork;
+	struct kqring_op_list *tw;
 	struct kqring_op *op;
 
 	/*
-	 * Completions copy out to the owner's memory and successors run as
-	 * its requests: only its threads may.  A thread of a process the ring
-	 * has since moved away from, still in a wait, finds nothing to do.
+	 * Completions copy out to the submitter's memory and successors run
+	 * as its requests: each process runs its own context's taskwork.  A
+	 * process with none (one that only waits) has none to run.
 	 */
-	if (__predict_false(tctx->proc != curproc))
+	if (__predict_false(tctx == NULL))
 		return;
+	tw = &tctx->taskwork;
 	/* Successors issued below may queue more taskwork; bound the loop. */
 	for (int pass = 0; pass < 64; pass++) {
 		/*

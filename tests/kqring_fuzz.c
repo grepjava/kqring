@@ -10,8 +10,8 @@
  * cancellations between them), enters with random flags and arguments,
  * makes random io_uring_register() calls, and now and then closes
  * descriptors under its requests, replaces them with dup2(2), forks a
- * child that pokes at the ring, or closes the ring with requests in
- * flight.
+ * child that submits requests of its own to the ring and exits with them
+ * in flight, or closes the ring with requests in flight.
  *
  * Most random requests fail their checks early, so about 60% of rings
  * are set up from known-good templates instead, with a fixed-file table,
@@ -130,6 +130,12 @@ static _Atomic uint64_t	st_piperd, st_piperd_data;
 static _Atomic uint64_t	st_fileread;
 /* Pipe slots opened as FIFOs. */
 static _Atomic uint64_t	st_fifo;
+/*
+ * Requests a forked child submits to its parent's ring (do_chaos()): their
+ * user_data has CHILD_UD set, and the parent reaps their CQEs.
+ */
+#define	CHILD_UD	(1ULL << 63)
+static _Atomic uint64_t	st_child_cqes;
 static _Atomic int	cq_bad, nfinished;
 
 struct fz {
@@ -1824,9 +1830,17 @@ reap(struct fz *f)
 					head++;
 			}
 		}
+		atomic_fetch_add(&st_cqes, 1);
+		/*
+		 * A child's request ran in the child: its descriptors and
+		 * memory are the child's, so nothing of it is the parent's.
+		 */
+		if ((c->user_data & CHILD_UD) != 0) {
+			atomic_fetch_add(&st_child_cqes, 1);
+			continue;
+		}
 		op = f->ops[c->user_data % NOPS].op;
 
-		atomic_fetch_add(&st_cqes, 1);
 		if (op == OP_ECHO && c->res > 0)
 			atomic_fetch_add(&st_echo_sent, 1);
 		if (op == OP_PIPERD && c->res > 0)
@@ -2272,6 +2286,8 @@ do_register(struct fz *f)
 		ring_close(f);
 }
 
+static void child_submit(struct fz *f);
+
 static void
 do_chaos(struct fz *f)
 {
@@ -2302,13 +2318,32 @@ do_chaos(struct fz *f)
 			die("mmap arena: %s", strerror(errno));
 		arena_fill(f);
 		break;
-	case 3: {	/* a child pokes at the ring: takes it over, or EEXIST */
+	case 3: {	/* a child uses the ring too, and exits */
+		/*
+		 * Its own requests, run in the child (docs/concurrent-
+		 * submitters.md), while the parent's are in flight: with the
+		 * SQ empty, and this thread waiting until they are in, so the
+		 * two never write it at once.
+		 */
+		int sync[2];
+		bool own = f->sqes != NULL && f->sq_ktail != NULL &&
+		    (f->p.flags & (IORING_SETUP_SQPOLL |
+		    IORING_SETUP_SQ_REWIND | IORING_SETUP_SQE_MIXED |
+		    IORING_SETUP_SINGLE_ISSUER)) == 0 &&
+		    atomic_load(f->sq_khead) == f->sq_tail &&
+		    atomic_load(f->sq_ktail) == f->sq_tail && chance(f, 50) &&
+		    pipe(sync) == 0;
 		pid_t pid = fork();
 
 		if (pid == 0) {
 			struct io_uring_params p;
 
-			(void)kqring_enter(f->ring, 1, 0, 0, NULL, 0);
+			if (own) {
+				child_submit(f);
+				(void)write(sync[1], "x", 1);
+			}
+			/* None of the parent's queued SQEs, if any. */
+			(void)kqring_enter(f->ring, 0, 0, 0, NULL, 0);
 			/*
 			 * Nothing to submit: a wait, which another process
 			 * may make on an SQPOLL ring or one without
@@ -2332,11 +2367,70 @@ do_chaos(struct fz *f)
 		}
 		if (pid > 0)
 			atomic_fetch_add(&st_forks, 1);
+		if (own) {
+			char c;
+
+			close(sync[1]);
+			if (pid > 0)
+				(void)read(sync[0], &c, 1);
+			close(sync[0]);
+			f->sq_tail = atomic_load(f->sq_ktail);
+		}
 		break;
 	}
 	default:	/* the arena changes under requests in flight */
 		arena_fill(f);
 	}
+}
+
+/*
+ * In a forked child: one to three requests of its own on the parent's
+ * ring (do_chaos()), tagged CHILD_UD.  A NOP; a read of a pool file into
+ * the child's copy of the arena; a standalone TIMEOUT, which fires after
+ * the child is gone; or a pipe read that most likely waits, and ends
+ * with -ECANCELED when the child exits.
+ */
+static void
+child_submit(struct fz *f)
+{
+	static const struct __kernel_timespec ts = { 0, 2000000 };
+	unsigned n = 1 + (unsigned)rn(f, 3), tail = f->sq_tail;
+
+	for (unsigned i = 0; i < n; i++) {
+		unsigned idx = tail & f->sq_mask;
+		struct io_uring_sqe *s = (void *)(f->sqes +
+		    (size_t)idx * f->sqe_size);
+
+		memset(s, 0, f->sqe_size);
+		s->user_data = CHILD_UD | rnd(f);
+		switch (rn(f, 4)) {
+		case 0:
+			s->opcode = IORING_OP_NOP;
+			break;
+		case 1:
+			s->opcode = IORING_OP_READ;
+			s->fd = f->pool[4];
+			s->addr = (uint64_t)(uintptr_t)f->arena;
+			s->len = 512;
+			break;
+		case 2:
+			s->opcode = IORING_OP_TIMEOUT;
+			s->addr = (uint64_t)(uintptr_t)&ts;
+			s->len = 1;
+			break;
+		default:
+			s->opcode = IORING_OP_READ;
+			s->fd = pool_fd(f, 1);
+			s->addr = (uint64_t)(uintptr_t)f->arena;
+			s->len = 64;
+			s->off = (uint64_t)-1;
+		}
+		if (f->sq_array != NULL)
+			f->sq_array[idx] = idx;
+		tail++;
+	}
+	atomic_store_explicit(f->sq_ktail, tail, memory_order_release);
+	(void)kqring_enter(f->ring, n, 0, 0, NULL, 0);
 }
 
 static void *
@@ -2795,6 +2889,8 @@ main(int argc, char **argv)
 	printf("kqring_fuzz: pipe burst reads %ju, with data %ju, FIFOs %ju\n",
 	    (uintmax_t)st_piperd, (uintmax_t)st_piperd_data,
 	    (uintmax_t)st_fifo);
+	printf("kqring_fuzz: CQEs of children's own requests %ju\n",
+	    (uintmax_t)st_child_cqes);
 	printf("kqring_fuzz: file run reads %ju, reads run inline %ju\n",
 	    (uintmax_t)st_fileread,
 	    (uintmax_t)(sysctl_num("kern.kqring.wq_inline") - inline0));

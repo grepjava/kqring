@@ -149,6 +149,9 @@ A ring moves between processes since phase 7, but only one may have requests in 
 
 [docs/concurrent-submitters.md](docs/concurrent-submitters.md) is the design: a context per process on each ring, with its own worker pool, taskwork and poller, while the ring's shared state stays serialized as it is now. Exit and exec complete their process's requests with CQEs, and the ring stays open while a descriptor holds it. Registered buffers and kqring's extensions stay with one process, and a set-ID `exec` still closes the ring.
 
+- **Steps 1 to 3:** **Done.** Each ring keeps a context per process, with its own worker pool, taskwork and kernel thread; any process holding a shared ring submits to it whatever the others have in flight; exit and `exec` complete a process's requests with CQEs and leave the ring open. [What the implementation changed](docs/concurrent-submitters.md#what-the-implementation-changed) from the design: exit and exec finish on a kernel task, standalone `TIMEOUT`s outlive their process, and the poller is still in one process. liburing's three subtests in which a forked child uses its parent's ring run again, and the suite stays at 219. The fuzzer's forked children submit requests of their own and exit with them in flight. On the Ryzen, `kqring_bench` and `kqring_mt_bench` alternated five times with the build before: the median row moved by 0.5%, a lone `NOP` by 1%, within the runs' spread, and `NOP`s in batches of 32 are 2% (2 ns) slower.
+- **Step 4:** PostgreSQL again, a poller per process, and differential cases against Linux 7.3.
+
 Acceptance: the tests the design lists, the fuzzer with forked submitters, liburing and PostgreSQL unchanged or better, single-process performance unchanged, and the differences that remain listed in the matrix.
 
 ## Research

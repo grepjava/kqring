@@ -63,6 +63,13 @@ kqring_ext_setup(struct kqring_ctx *ctx, struct kqring_ext_setup *es)
 	else if (ctx->ext_on)
 		/* Once per ring: stored templates name the escape opcode. */
 		error = EBUSY;
+	else if (kqring_tctx_cur(ctx) == NULL ||
+	    LIST_NEXT(LIST_FIRST(&ctx->tctxs), link) != NULL)
+		/*
+		 * The extensions keep a ring to one process: not on a ring
+		 * other processes use (docs/concurrent-submitters.md).
+		 */
+		error = EEXIST;
 	else {
 		ctx->ext_opcode = opcode;
 		ctx->ext_on = true;

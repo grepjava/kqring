@@ -649,7 +649,7 @@ again:
 		    (bg = kqring_bgroup_find(ctx, sqe->buf_group)) != NULL &&
 		    bg->busy) {
 			sx_xunlock(&ctx->bg_sx);
-			if (kqring_wq_suspend_point(ctx)) {
+			if (kqring_wq_suspend_point(op)) {
 				fdrop(fp, td);
 				return (kqring_done(op, -ECANCELED, 0));
 			}

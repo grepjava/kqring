@@ -1,6 +1,6 @@
 # Several processes submitting to one ring
 
-Status: design, November 2026. Roadmap phase 8. It follows [cross-process-rings.md](cross-process-rings.md), which let a ring move between processes, and lifts the limits that note left.
+Status: implemented, November 2026, with the changes in [What the implementation changed](#what-the-implementation-changed). Roadmap phase 8. It follows [cross-process-rings.md](cross-process-rings.md), which let a ring move between processes, and lifts the limits that note left.
 
 ## What is still different
 
@@ -89,9 +89,19 @@ The `process_exec` handler runs before `vmspace_exec()` replaces the address spa
 
 The last `close(2)` cancels every context's requests, as it cancels the owner's now: without CQEs, since nobody can reap them. It closes the worker pools of every context. A pool in another process is closed the way a pool shared through `IORING_SETUP_ATTACH_WQ` with an exited process is closed now. `ATTACH_WQ` shares a pool between rings of one process, so it applies to the creating process's context only.
 
+## What the implementation changed
+
+Writing and testing it changed five things in the design above:
+
+- **Exit and exec finish on a kernel task.** During `execve(2)` the process's other threads, kqring's workers and taskwork thread among them, are parked rather than gone when the `process_exec` handler runs, and leave only after it returns, so the handler can't wait for them. Both handlers therefore only mark the process's context dead: its threads find no context from then on, and a new image that keeps the ring gets a fresh one. The rest runs on kqring's teardown taskqueue once those threads are gone. It needs nothing of the process: a request a worker or the disk finished completes with its result, and the rest with `-ECANCELED`. The CQEs come a moment after the process is gone.
+- **Standalone `TIMEOUT`s outlive their process,** as on Linux, where liburing's `test_cancel_inflight_exit` expects one to fire after its submitter exits. The context stays, dead, until the last of them has posted its CQE; the teardown task looks every 100 ms.
+- **The poller is in one process.** A context's own poller (section 1) is not built yet. The ring's poller, its thread and kqueue, belongs to the first process whose request needs it, and a non-socket `POLL_ADD` from another process fails with `-EOPNOTSUPP`. The end of input on an AF_UNIX stream, which runs no socket upcall and which the poller watches for, is polled every 50 µs instead while such a receive from another process is armed. The poller goes with its process, and the next process that polls gets it.
+- **A ring set up or enabled by another process** than the one that opened it (a descriptor inherited across `fork(2)`, as in liburing's `single-issuer` test) gets its first context in that process, since nothing has used it yet. Before, such a ring's workers ran in the opener's process.
+- **Registered buffers belong to a context,** by a number never reused, rather than a process: `IORING_REGISTER_CLONE_BUFFERS` re-tags the caller's own buffers for the ring they are cloned to.
+
 ## Costs
 
-- **A `kqtask` thread per process per ring** without `DEFER_TASKRUN`, where there is one per ring now. It is created on the context's first request that needs taskwork, not on the context's creation, so a process that only waits creates none.
+- **A `kqtask` thread per process per ring** without `DEFER_TASKRUN`, where there was one per ring. It starts with the context, when the process first submits or registers; a process that only waits creates neither.
 - **A context lookup per enter** from a process other than the setup process: the ring's list is short, and a one-entry cache (the last process seen) keeps the common case to a pointer comparison.
 - **Single-process rings** run as now, with `op->tctx` one indirection away. `kqring_bench` before and after has to show no change beyond noise.
 

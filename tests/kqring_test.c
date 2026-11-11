@@ -530,10 +530,11 @@ test_single_issuer(struct test_ring *r)
  * another thread, so a wait the CQ can't satisfy fails rather than hang.
  */
 /*
- * Rings used by more than one process (docs/cross-process-rings.md), as
- * PostgreSQL uses them: a ring set up without SINGLE_ISSUER moves to a
- * process that submits to it while it is idle, another process may wait on
- * it, and its owner's exit leaves it to the others.
+ * Rings used by more than one process (docs/concurrent-submitters.md): on
+ * a ring set up without SINGLE_ISSUER each process that submits has its
+ * requests run in its own context, whatever the others have in flight,
+ * another process may wait on it, and a process's exit completes its
+ * requests with CQEs and leaves the ring to the others.
  */
 
 /* A ring as io_uring_queue_init(n, &ring, 0) makes it. */
@@ -677,41 +678,154 @@ test_cross_process_rings(void)
 	assert(xp_child_status(pid) == 0);
 	assert(ring_cq_ready(&t) == 0 && memcmp(pbuf, "wake", 4) == 0);
 
-	/* 3. A request in flight keeps the ring where it is. */
+	/*
+	 * 3. Requests of two processes in flight at once: the parent's read
+	 * waits on a pipe while the child's runs and lands in its memory.
+	 */
 	xp_prep_read(&t, pp[0], pbuf, 4, 91004);
 	ring_submit(&t);
 	pid = fork();
 	assert(pid >= 0);
-	if (pid == 0)
-		_exit(xp_child_nop(&t) == EEXIST ? 0 : 1);
+	if (pid == 0) {
+		char cbuf[16];
+		int cfd = xp_file("child-data");
+
+		xp_resync(&t);
+		memset(cbuf, 0, sizeof(cbuf));
+		xp_prep_read(&t, cfd, cbuf, sizeof(cbuf), 91010);
+		if (ring_wait(&t, 1, 5000) != 0 || ring_cq_ready(&t) != 1)
+			_exit(1);
+		struct io_uring_cqe c = ring_pop_cqe(&t);
+		_exit(c.user_data == 91010 && c.res == 10 &&
+		    memcmp(cbuf, "child-data", 10) == 0 ? 0 : 2);
+	}
 	assert(xp_child_status(pid) == 0);
+	assert(ring_cq_ready(&t) == 0);
 	assert(write(pp[1], "busy", 4) == 4);
 	assert(ring_wait(&t, 1, 5000) == 0);
 	expect_cqe(&t, 91004, 4);
 
-	/* So do registered buffers and personalities, until unregistered. */
-	struct iovec iov = { .iov_base = pbuf, .iov_len = sizeof(pbuf) };
-	assert(kqring_register(t.fd, IORING_REGISTER_BUFFERS, &iov, 1) == 0);
+	/*
+	 * A drained request of the child's, held behind the parent's read,
+	 * is released by the parent's completion and issued in the child.
+	 */
+	xp_resync(&t);
+	xp_prep_read(&t, pp[0], pbuf, 4, 91020);
+	ring_submit(&t);
 	pid = fork();
 	assert(pid >= 0);
-	if (pid == 0)
-		_exit(xp_child_nop(&t) == EEXIST ? 0 : 1);
+	if (pid == 0) {
+		struct io_uring_sqe *sqe;
+
+		xp_resync(&t);
+		sqe = ring_prep(&t, IORING_OP_NOP, -1, 91021);
+		sqe->flags |= IOSQE_IO_DRAIN;
+		ring_push_sqe(&t);
+		if (kqring_enter(t.fd, 1, 0, 0, NULL, 0) != 1)
+			_exit(1);
+		if (write(qp[1], "s", 1) != 1)
+			_exit(2);
+		/* Leave both CQEs to the parent; stay until they are posted. */
+		_exit(ring_wait(&t, 2, 5000) == 0 ? 0 : 3);
+	}
+	assert(read(qp[0], late, 1) == 1);
+	usleep(50000);
+	assert(ring_cq_ready(&t) == 0);
+	assert(write(pp[1], "drn!", 4) == 4);
 	assert(xp_child_status(pid) == 0);
-	assert(kqring_register(t.fd, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+	expect_cqe(&t, 91020, 4);
+	expect_cqe(&t, 91021, 0);
+
+	/*
+	 * Registered buffers are addresses in the registering process: the
+	 * child's READ_FIXED fails with -EFAULT.  Personalities work from
+	 * any process holding the ring, as on Linux.
+	 */
+	struct iovec iov = { .iov_base = pbuf, .iov_len = sizeof(pbuf) };
+	assert(kqring_register(t.fd, IORING_REGISTER_BUFFERS, &iov, 1) == 0);
 	int id = (int)kqring_register(t.fd, IORING_REGISTER_PERSONALITY, NULL,
 	    0);
 	assert(id > 0);
 	pid = fork();
 	assert(pid >= 0);
-	if (pid == 0)
-		_exit(xp_child_nop(&t) == EEXIST ? 0 : 1);
+	if (pid == 0) {
+		struct io_uring_sqe *sqe;
+		struct io_uring_cqe c;
+
+		xp_resync(&t);
+		sqe = ring_prep(&t, IORING_OP_READ_FIXED, pfd, 91030);
+		sqe->addr = (uint64_t)(uintptr_t)pbuf;
+		sqe->len = 4;
+		sqe->buf_index = 0;
+		ring_push_sqe(&t);
+		if (ring_wait(&t, 1, 5000) != 0)
+			_exit(1);
+		c = ring_pop_cqe(&t);
+		if (c.user_data != 91030 || c.res != -EFAULT)
+			_exit(2);
+		sqe = ring_prep(&t, IORING_OP_NOP, -1, 91031);
+		sqe->personality = (uint16_t)id;
+		ring_push_sqe(&t);
+		if (ring_wait(&t, 1, 5000) != 0)
+			_exit(3);
+		c = ring_pop_cqe(&t);
+		_exit(c.user_data == 91031 && c.res == 0 ? 0 : 4);
+	}
 	assert(xp_child_status(pid) == 0);
+	xp_resync(&t);
+	assert(kqring_register(t.fd, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
 	assert(kqring_register(t.fd, IORING_UNREGISTER_PERSONALITY, NULL,
 	    (unsigned)id) == 0);
 
 	/*
-	 * 4. The owner exits with a read in flight: the read is cancelled
-	 * (without a CQE), and the ring stays for the parent.
+	 * The end of input of an AF_UNIX stream runs no socket upcall:
+	 * kqring watches for it on the poller, which the parent's RECV puts
+	 * in the parent.  The child's RECV hears of its peer's shutdown all
+	 * the same.
+	 */
+	int su[2], sc[2];
+
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, su) == 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sc) == 0);
+	xp_resync(&t);
+	xp_prep_read(&t, su[0], pbuf, 4, 91040);
+	ring_submit(&t);
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		char cbuf[4];
+		struct io_uring_cqe c;
+
+		xp_resync(&t);
+		struct io_uring_sqe *sqe = ring_prep(&t, IORING_OP_RECV,
+		    sc[0], 91041);
+		sqe->addr = (uint64_t)(uintptr_t)cbuf;
+		sqe->len = sizeof(cbuf);
+		ring_push_sqe(&t);
+		if (kqring_enter(t.fd, 1, 0, 0, NULL, 0) != 1)
+			_exit(1);
+		if (write(qp[1], "s", 1) != 1)
+			_exit(2);
+		if (ring_wait(&t, 1, 3000) != 0)
+			_exit(3);
+		c = ring_pop_cqe(&t);
+		_exit(c.user_data == 91041 && c.res == 0 ? 0 : 4);
+	}
+	assert(read(qp[0], late, 1) == 1);
+	usleep(20000);
+	assert(shutdown(sc[1], SHUT_WR) == 0);
+	assert(xp_child_status(pid) == 0);
+	assert(write(su[1], "unix", 4) == 4);
+	assert(ring_wait(&t, 1, 5000) == 0);
+	expect_cqe(&t, 91040, 4);
+	close(su[0]);
+	close(su[1]);
+	close(sc[0]);
+	close(sc[1]);
+
+	/*
+	 * 4. A process exits with a read in flight: the read completes with
+	 * -ECANCELED, and the ring stays for the parent.
 	 */
 	pid = fork();
 	assert(pid >= 0);
@@ -724,10 +838,12 @@ test_cross_process_rings(void)
 		_exit(ring_cq_ready(&t) == 0 ? 0 : 1);
 	}
 	assert(xp_child_status(pid) == 0);
+	assert(ring_wait(&t, 1, 5000) == 0);
+	expect_cqe(&t, 91005, -ECANCELED);
+	assert(write(qp[1], "late", 4) == 4);
 	assert(xp_child_nop(&t) == 0);
 	assert(ring_wait(&t, 1, 5000) == 0);
 	expect_cqe(&t, 91900, 0);
-	assert(write(qp[1], "late", 4) == 4);
 	assert(ring_wait(&t, 1, 50) == ETIMEDOUT);
 	assert(read(qp[0], late, 4) == 4);
 
@@ -758,8 +874,8 @@ test_cross_process_rings(void)
 	close(pp[1]);
 	close(qp[0]);
 	close(qp[1]);
-	printf("[PASS] Rings across processes: handover when idle, waits "
-	    "from another process, release on exit, what stops a handover\n");
+	printf("[PASS] Rings across processes: concurrent submitters, a "
+	    "drain across processes, waits, CQEs at exit\n");
 }
 
 static void
@@ -12071,7 +12187,9 @@ exec_with_ring(int kind)
 	} else {
 		assert(fcntl(t.fd, F_SETFD, 0) == 0);
 		snprintf(arg, sizeof(arg), "%d", t.fd);
-		execl(test_argv0, test_argv0, "--exec-after", arg, (char *)NULL);
+		execl(test_argv0, test_argv0, "--exec-after", arg,
+		    kind == EXEC_COMPLETIONS || kind == EXEC_WAITER ? "open" :
+		    "closed", (char *)NULL);
 	}
 	_exit(127);
 }
@@ -12079,7 +12197,10 @@ exec_with_ring(int kind)
 /*
  * execve(2) by a ring's owner. It parks the process's other threads until
  * the new image is in place, so waiting for the ring's kernel threads in the
- * exec hung. The new image finds the ring gone (--exec-after, in main()).
+ * exec hung.  The new image (--exec-after, in main()) finds a ring with one
+ * process (DEFER_TASKRUN, SQPOLL) gone, and a shared ring still open, with
+ * a CQE for the poll the old image left armed, cancelled by the exec
+ * (docs/concurrent-submitters.md).
  */
 static void
 test_exec_kthreads(void)
@@ -14663,9 +14784,14 @@ main(int argc, char **argv)
 	struct test_ring r;
 
 	/* The new image of test_exec_kthreads(). */
-	if (argc == 3 && strcmp(argv[1], "--exec-after") == 0)
-		return (kqring_enter(atoi(argv[2]), 0, 0, 0, NULL, 0) == -1 &&
-		    errno == EBADF ? 0 : 1);
+	if (argc == 4 && strcmp(argv[1], "--exec-after") == 0) {
+		if (strcmp(argv[3], "closed") == 0)
+			return (kqring_enter(atoi(argv[2]), 0, 0, 0, NULL, 0) ==
+			    -1 && errno == EBADF ? 0 : 1);
+		/* A waiter with no context of its own: the CQE comes anyway. */
+		return (kqring_enter(atoi(argv[2]), 0, 1,
+		    IORING_ENTER_GETEVENTS, NULL, 0) == 0 ? 0 : 1);
+	}
 	test_argv0 = argv[0];
 	ring_init(&r);
 	/* "trig": only the event-driven chain tests. */
