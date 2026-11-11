@@ -1,6 +1,6 @@
 # Registered buffers on held pages
 
-Status: design, November 2026. Roadmap phase 9. It turns the roadmap's research item "registered-buffer mapping independence" into a plan, and lifts the limit [concurrent-submitters.md](concurrent-submitters.md) left on registered buffers.
+Status: implemented, November 2026, with the changes in [What the implementation changed](#what-the-implementation-changed). Roadmap phase 9. It turns the roadmap's research item "registered-buffer mapping independence" into a plan, and lifts the limit [concurrent-submitters.md](concurrent-submitters.md) left on registered buffers.
 
 ## What is still different
 
@@ -60,6 +60,11 @@ What this doesn't match: a fixed read in flight while its process forks complete
 ### 5. Exit and exec
 
 The pages stay held until the buffer is unregistered or the ring closes, whatever happens to the process that registered them, as on Linux. Exit and exec only clear the page set's `vmspace`, so that a later fork can't match it.
+
+## What the implementation changed
+
+- **A new mapping over a buffer can share its pages.** Section 3 has a new mapping over a buffer's range change nothing. FreeBSD keeps a wired page in its memory object when the range is unmapped, marked invalid and clean (`vm_object_page_remove()`), and an anonymous mapping that extends that object over the same offsets faults the same page in again, zero-filled. After `munmap(2)` alone the buffer is its pages, as on Linux. After a new anonymous mapping at the address, the buffer and that mapping can be one memory, where Linux keeps them apart (`buffer_lifetime` in `tests/kqring_diff.c`, listed). Matching Linux would need the VM to let go of held pages when their range is unmapped.
+- **Disk requests came with step 1.** A direct request on a disk with a fixed buffer gives the bio the buffer's held pages (`kqring_file_bio()`), so routing fixed requests through the kernel mapping and dropping the per-request hold were one change.
 
 ## Costs
 

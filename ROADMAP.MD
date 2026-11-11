@@ -24,10 +24,10 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 
 FreeBSD-native extensions add persistent event-driven chains, result and buffer forwarding between steps, native kevent requests and a kqueue bridge. These stay an opt-in interface alongside the Linux-compatible API.
 
-The liburing 2.15 port passes 219 of the 245 tests it builds, with `RLIMIT_MEMLOCK` raised. That isn't a compatibility percentage:
+The liburing 2.15 port passes 220 of the 245 tests it builds, with `RLIMIT_MEMLOCK` raised. That isn't a compatibility percentage:
 
 - 13 more tests can't be built here, each for a recorded reason.
-- The port carries portability shims and adapts some tests, 27 tests skip, and the 7 failures are intentional differences or the platform's.
+- The port carries portability shims and adapts some tests, 27 tests skip, and the 6 failures are intentional differences or the platform's.
 - A test stops at its first failure, so the subtests after it haven't run.
 
 The probe also can't speak for every variant of an operation. `SYNC_FILE_RANGE` syncs the whole file, and `URING_CMD` supports four socket commands only.
@@ -164,6 +164,13 @@ Registered buffers hold their pages, but only zero-copy sends use them: fixed re
 [docs/held-buffers.md](docs/held-buffers.md) is the design: map each buffer's held pages in kernel address space and do fixed I/O through that mapping, refuse vnode-backed pages, re-hold a forking process's buffers for writing so that the parent keeps them, and give direct disk I/O the held pages. `tests/kqring_diff.c` has `buffer_lifetime`, `buffer_fork` and `buffer_backing` against Linux 7.3.
 
 Acceptance: those three cases match Linux 7.3; liburing's fixed-buffer tests pass as before or better; the unit tests, stress and fuzzer pass, the fuzzer with fixed requests from forked children; single-process performance unchanged, and direct disk reads into fixed buffers faster or level; the differences that remain listed in the matrix.
+
+Progress (12 November 2026): implemented, with the order of work's steps 1 and 3 as one change, and the acceptance met on the Ryzen host:
+
+- `buffer_backing` and `buffer_fork` match Linux 7.3, and `buffer_lifetime` matches after `munmap(2)`. A new anonymous mapping over the unmapped range can share the buffer's pages, which is listed with its reason, as is the read in flight during a fork. The diff has 29 cases and no problems.
+- liburing passes 220 of 245 (was 219). `io_uring_register` passes, since a shared file mapping is now refused. `send-zerocopy` passes now that its 32 MiB buffer registers. Its UDP cases found a bug: a `SEND` that the protocol refused after copying the datagram completed with the full length. That is fixed, and the test skips the two UDP cases FreeBSD refuses.
+- The unit tests (144, plus the held-buffer test with a 20 MiB buffer), the cross-process test, stress, and the fuzzer (seeds 7301 and 7302, with fixed reads and writes from forked children) pass.
+- Direct reads from an md(4) disk with `--fixedbufs` are 0.5% faster at 4 KiB and 1.4% at 64 KiB (fio, median of three); without fixed buffers they're level. `kqring_bench` and `kqring_mt_bench` are level (median +0.2% over five alternated rounds).
 
 ## Research
 

@@ -35,12 +35,12 @@ liburing's test suite, run on FreeBSD 15.1 with `kqring.ko` from this tree (Nove
 |---|---|
 | In liburing 2.15 | 258 |
 | Built | 245 |
-| Passed | **219** |
+| Passed | **220** |
 | Skipped | 19 (the test found a feature missing and said so) |
-| Failed | 7, explained below |
+| Failed | 6, explained below |
 | Not built | 9 not portable, 2 BPF, 2 AddressSanitizer only, explained below |
 
-`fixed-buf-merge` and `read-write` register more buffer memory than FreeBSD's default `RLIMIT_MEMLOCK` (64 KiB; Linux uses 8 MiB), so they need it raised: `ulimit -l 65536` as root, or `memorylocked` in `login.conf(5)`.
+`fixed-buf-merge`, `read-write` and `send-zerocopy` register more buffer memory than FreeBSD's default `RLIMIT_MEMLOCK` (64 KiB; Linux uses 8 MiB), so they need it raised: `ulimit -l 65536` as root, or `memorylocked` in `login.conf(5)`. With it raised, `send-zerocopy` sends and checks a 32 MiB buffer in every configuration, which takes two to three minutes, so `make check` gives it 300 seconds where the other tests get 30.
 
 These results aren't a compatibility percentage. Some of the tests are adapted, as listed below, and a test stops at its first failure, so the subtests after it haven't run. That applies to `pipe-reuse` and `splice` in particular, which stop early. Without procfs, `fdinfo-sqpoll` passes without reading what it tests: its reader thread can't open `/proc/self/fdinfo`, and the test only creates and tears down `SQPOLL` rings while it is killed. With `SIGINT` ignored, as in a backgrounded job, it hangs.
 
@@ -53,12 +53,6 @@ These results aren't a compatibility percentage. Some of the tests are adapted, 
 | `recv-bundle-short-ooo` | Writes 1 MiB to a TCP socket before reading any of it. FreeBSD takes about 48 KiB on an unread loopback socket, so the write blocks. |
 | `vec-regbuf` | Expects a 49,185-byte zero-copy send on a new TCP socket to complete in full. A new FreeBSD TCP socket's send buffer takes 48,972 bytes, and a plain non-blocking `send(2)` stops there too. |
 | `iopoll-sync` | Compares a socket option with 1. FreeBSD's `getsockopt(2)` returns the option's bit. |
-
-### Differences in kqring
-
-| Tests | Why they fail |
-|---|---|
-| `io_uring_register` | Registers a file-backed buffer and expects a refusal. Linux refuses because it pins the pages for as long as the buffer is registered. kqring goes through the mapping at each I/O, so it has no such problem, and accepts the buffer. |
 
 ### Skipped tests
 
@@ -112,6 +106,7 @@ The tests that are changed, or that test something else, are:
 | `232c93d07b74`, `accept-test` | Socket paths in `/tmp` | FreeBSD has no abstract AF_UNIX addresses. |
 | `across-fork` | `mmap(2)` with a descriptor of -1 | FreeBSD refuses descriptor 0 for an anonymous mapping. |
 | `recv-multishot` | An `int` for a one-byte `bool` passed to `setsockopt(2)` | FreeBSD refuses the `bool` with `EINVAL`. |
+| `send-zerocopy` | Skips corked UDP sends, and UDP sends with a destination on a connected socket | FreeBSD has no `MSG_MORE`, so a UDP send isn't corked, and it refuses a destination on a connected UDP socket with `EISCONN`, where Linux sends there. |
 | `truncate` | `mkstemp(3)` for `mkostemp(3)` | The test passes flags that FreeBSD's `mkostemp(3)` refuses. |
 
 To run a single test: `cd work/out/test && ./<name>.t` (exit 0 = pass, 77 = skip).

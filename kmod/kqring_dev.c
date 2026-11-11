@@ -2522,23 +2522,58 @@ kqring_proc_exec(void *arg __unused, struct proc *p,
 	kqring_proc_rings_teardown(p, imgp->credential_setid);
 }
 
+/*
+ * p1 forked p2, in p1, after copying its address space and before p2
+ * runs.  Pinned user memory p1 shares with its rings (provided buffer
+ * rings, the registered wait region) is held again on next use
+ * (ctx->cow_gen).  Registered buffers p1 registered are held again now
+ * (kqring_bufs_fork()), unless p2 shares the address space (vfork(2)).
+ */
 static void
 kqring_proc_fork(void *arg __unused, struct proc *p1,
-    struct proc *p2 __unused, int flags __unused)
+    struct proc *p2, int flags __unused)
 {
+	struct kqring_fork_ring {
+		struct kqring_ctx	*ctx;
+		uint64_t		tid;
+	} *v = NULL;
 	struct kqring_ctx *ctx;
+	struct kqring_tctx *t;
+	bool rehold = curproc == p1 && p2->p_vmspace != p1->p_vmspace;
+	u_int max = 0, n = 0;
 
-	mtx_lock(&kqring_proc_mtx);
-	LIST_FOREACH(ctx, &kqring_ctx_list, proc_link) {
-		if (ctx->closing)
-			continue;
-		mtx_lock(&ctx->mtx);
-		if (kqring_tctx_find(ctx, p1) != NULL ||
-		    kqring_ctx_runs_in(ctx, p1))
-			atomic_add_int(&ctx->cow_gen, 1);
-		mtx_unlock(&ctx->mtx);
+	for (int pass = 0; pass < 2; pass++) {
+		mtx_lock(&kqring_proc_mtx);
+		LIST_FOREACH(ctx, &kqring_ctx_list, proc_link) {
+			if (ctx->closing)
+				continue;
+			mtx_lock(&ctx->mtx);
+			t = kqring_tctx_find(ctx, p1);
+			if (pass == 0 && (t != NULL ||
+			    kqring_ctx_runs_in(ctx, p1)))
+				atomic_add_int(&ctx->cow_gen, 1);
+			if (rehold && t != NULL && ctx->bufs != NULL) {
+				if (pass == 0) {
+					max++;
+				} else if (n < max) {
+					refcount_acquire(&ctx->refs);
+					v[n].ctx = ctx;
+					v[n++].tid = t->id;
+				}
+			}
+			mtx_unlock(&ctx->mtx);
+		}
+		mtx_unlock(&kqring_proc_mtx);
+		if (max == 0)
+			return;
+		if (pass == 0)
+			v = malloc(max * sizeof(*v), M_KQRING, M_WAITOK);
 	}
-	mtx_unlock(&kqring_proc_mtx);
+	for (u_int i = 0; i < n; i++) {
+		kqring_bufs_fork(v[i].ctx, v[i].tid, curthread);
+		kqring_ctx_rele(v[i].ctx);
+	}
+	free(v, M_KQRING);
 }
 
 

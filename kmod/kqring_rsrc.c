@@ -642,9 +642,8 @@ kqring_bufs_set(struct kqring_ctx *ctx, uint32_t slot,
 		    atomic_load_int(&old->zbuf->refs) == 1 &&
 		    old->zbuf->acct->uip == td->td_ucred->cr_ruidinfo)
 			discount_pages = (size_t)old->zbuf->npages;
-		error = kqring_zc_buf_alloc(td, (vm_offset_t)iov->iov_base,
-		    iov->iov_len, VM_PROT_READ | VM_PROT_WRITE, discount_pages,
-		    &zb);
+		error = kqring_rbuf_alloc(td, (vm_offset_t)iov->iov_base,
+		    iov->iov_len, discount_pages, &zb);
 		if (error != 0)
 			return (error);
 		r = malloc(sizeof(*r), M_KQRING, M_WAITOK | M_ZERO);
@@ -653,7 +652,6 @@ kqring_bufs_set(struct kqring_ctx *ctx, uint32_t slot,
 		r->addr = (uintptr_t)iov->iov_base;
 		r->len = iov->iov_len;
 		r->zbuf = zb;
-		r->cow_gen = atomic_load_int(&ctx->cow_gen);
 		/* Registration runs with sq_sx, in a process with a context. */
 		r->owner_id = kqring_tctx_cur(ctx)->id;
 	}
@@ -661,6 +659,41 @@ kqring_bufs_set(struct kqring_ctx *ctx, uint32_t slot,
 	if (old != NULL)
 		kqring_rsrc_put(ctx, old);
 	return (0);
+}
+
+/*
+ * td's process forked, which made the pages it shares with the child
+ * copy-on-write: hold again, for writing, the buffers on ctx registered
+ * from its address space (context tid).  The write fault gives the parent
+ * its own copy of each page now, which the buffer then holds, so that the
+ * buffer stays the parent's memory and the child keeps the old pages, as
+ * Linux copies pinned pages to the child (docs/held-buffers.md).  A buffer
+ * that can't be held again (unmapped or made read-only since) keeps its
+ * pages, which the parent no longer writes.  Requests in flight keep the
+ * pages they took (op->fzb).
+ */
+void
+kqring_bufs_fork(struct kqring_ctx *ctx, uint64_t tid, struct thread *td)
+{
+	sx_xlock(&ctx->sq_sx);
+	for (uint32_t i = 0; !ctx->closing && ctx->bufs != NULL &&
+	    i < ctx->nbufs; i++) {
+		struct kqring_rsrc *r = ctx->bufs[i];
+		struct kqring_zc_buf *zb, *old;
+		size_t discount;
+
+		if (r == NULL || r->owner_id != tid || (old = r->zbuf) == NULL)
+			continue;
+		/* The same range again: count it once against the limit. */
+		discount = old->acct->uip == td->td_ucred->cr_ruidinfo ?
+		    (size_t)old->npages : 0;
+		if (kqring_rbuf_alloc(td, (vm_offset_t)r->addr, r->len,
+		    discount, &zb) != 0)
+			continue;
+		r->zbuf = zb;
+		kqring_zc_buf_rele(old);
+	}
+	sx_xunlock(&ctx->sq_sx);
 }
 
 /* Whether [addr, addr + len) lies inside registered buffer r. */
@@ -1166,10 +1199,9 @@ kqring_bufs_clone(struct kqring_ctx *ctx, const struct kqring_register_arg *ra)
 			r->refs = 1;
 			r->addr = s->addr;
 			r->len = s->len;
-			r->cow_gen = s->cow_gen;
 			/*
-			 * The caller's own buffers are its on this ring too;
-			 * another process's stay unusable here.
+			 * The caller's own buffers are its on this ring too,
+			 * held again when it forks; another process's aren't.
 			 */
 			r->owner_id = s->owner_id == sown ? down : s->owner_id;
 			if (s->zbuf != NULL) {

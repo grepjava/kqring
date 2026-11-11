@@ -2386,9 +2386,10 @@ do_chaos(struct fz *f)
 /*
  * In a forked child: one to three requests of its own on the parent's
  * ring (do_chaos()), tagged CHILD_UD.  A NOP; a read of a pool file into
- * the child's copy of the arena; a standalone TIMEOUT, which fires after
- * the child is gone; or a pipe read that most likely waits, and ends
- * with -ECANCELED when the child exits.
+ * the child's copy of the arena; a fixed read or write of a pool file,
+ * whose registered buffer is the parent's memory; a standalone TIMEOUT,
+ * which fires after the child is gone; or a pipe read that most likely
+ * waits, and ends with -ECANCELED when the child exits.
  */
 static void
 child_submit(struct fz *f)
@@ -2403,9 +2404,27 @@ child_submit(struct fz *f)
 
 		memset(s, 0, f->sqe_size);
 		s->user_data = CHILD_UD | rnd(f);
-		switch (rn(f, 4)) {
+		switch (rn(f, 5)) {
 		case 0:
 			s->opcode = IORING_OP_NOP;
+			break;
+		case 4:
+			/*
+			 * A fixed read or write: the buffer's pages are the
+			 * parent's, held at the fork (docs/held-buffers.md).
+			 */
+			if (f->nbufs == 0) {
+				s->opcode = IORING_OP_NOP;
+				break;
+			}
+			s->opcode = chance(f, 50) ? IORING_OP_READ_FIXED :
+			    IORING_OP_WRITE_FIXED;
+			s->buf_index = (uint16_t)rn(f, f->nbufs);
+			s->fd = f->pool[4];
+			s->addr = (uint64_t)(uintptr_t)f->arena + REGBUF_OFF +
+			    s->buf_index * 8192 + rn(f, 2048);
+			s->len = (uint32_t)rn(f, 2049);
+			s->off = rn(f, 65536);
 			break;
 		case 1:
 			s->opcode = IORING_OP_READ;

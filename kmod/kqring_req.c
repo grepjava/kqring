@@ -533,7 +533,8 @@ static int
 kqring_req_resources(struct kqring_ctx *ctx, struct kqring_op *op)
 {
 	const struct io_uring_sqe *sqe = &op->sqe;
-	const struct iovec *iov = op->args;
+	struct iovec *iov = op->args;
+	struct kqring_zc_buf *zb;
 	struct kqring_rsrc *r;
 	uint32_t idx = sqe->buf_index;
 	int error;
@@ -565,41 +566,55 @@ kqring_req_resources(struct kqring_ctx *ctx, struct kqring_op *op)
 	default:
 		return (0);
 	}
-	if (op->fbuf == NULL) {
-		if (ctx->bufs == NULL || idx >= ctx->nbufs ||
-		    (r = ctx->bufs[idx]) == NULL)
-			return (EFAULT);
-		/*
-		 * Its addresses are in the registering process's address
-		 * space: another process can't use it, until registered
-		 * buffers hold their pages (docs/concurrent-submitters.md).
-		 */
-		if (r->owner_id != op->tctx->id)
-			return (EFAULT);
-		r->refs++;
-		op->fbuf = r;
-	}
+	/* Taken already: its addresses are the kernel's now. */
+	if (op->fbuf != NULL)
+		return (0);
+	if (ctx->bufs == NULL || idx >= ctx->nbufs ||
+	    (r = ctx->bufs[idx]) == NULL)
+		return (EFAULT);
+	/*
+	 * The request names its buffer by user address, which must lie
+	 * inside the registered range, whatever the submitter has mapped
+	 * there: it is only an offset into the held pages, mapped in the
+	 * kernel at zb->kva, which the request uses from here on, from any
+	 * process (docs/held-buffers.md).
+	 */
+	zb = r->zbuf;
+#define	KQRING_KADDR(u)	((u) - zb->page_base + zb->kva)
 	if (sqe->opcode == IORING_OP_SENDMSG_ZC) {
-		const struct kqring_msg_args *ma = op->args;
+		struct kqring_msg_args *ma = op->args;
 
 		for (int i = 0; i < ma->msg.msg_iovlen; i++) {
-			if (!kqring_buf_within(op->fbuf,
+			if (!kqring_buf_within(r,
 			    (uintptr_t)ma->msg.msg_iov[i].iov_base,
 			    ma->msg.msg_iov[i].iov_len))
 				return (EFAULT);
 		}
-		return (0);
-	}
-	if (kqring_op_readv(sqe->opcode) || kqring_op_writev(sqe->opcode)) {
+		for (int i = 0; i < ma->msg.msg_iovlen; i++)
+			ma->msg.msg_iov[i].iov_base = (void *)KQRING_KADDR(
+			    (uintptr_t)ma->msg.msg_iov[i].iov_base);
+	} else if (kqring_op_readv(sqe->opcode) ||
+	    kqring_op_writev(sqe->opcode)) {
 		for (uint32_t i = 0; i < sqe->len; i++) {
-			if (!kqring_buf_within(op->fbuf,
-			    (uintptr_t)iov[i].iov_base, iov[i].iov_len))
+			if (!kqring_buf_within(r, (uintptr_t)iov[i].iov_base,
+			    iov[i].iov_len))
 				return (EFAULT);
 		}
-		return (0);
+		for (uint32_t i = 0; i < sqe->len; i++)
+			iov[i].iov_base = (void *)KQRING_KADDR(
+			    (uintptr_t)iov[i].iov_base);
+	} else {
+		if (!kqring_buf_within(r, sqe->addr, sqe->len))
+			return (EFAULT);
+		op->sqe.addr = KQRING_KADDR(sqe->addr);
 	}
-	return (kqring_buf_within(op->fbuf, sqe->addr, sqe->len) ? 0 :
-	    EFAULT);
+#undef	KQRING_KADDR
+	r->refs++;
+	op->fbuf = r;
+	refcount_acquire(&zb->refs);
+	op->fzb = zb;
+	op->kbuf = true;
+	return (0);
 }
 
 
@@ -697,6 +712,11 @@ kqring_op_free(struct kqring_op *op)
 	if (op->fbuf != NULL) {
 		kqring_rsrc_put(ctx, op->fbuf);
 		op->fbuf = NULL;
+	}
+	if (op->fzb != NULL) {
+		kqring_zc_buf_rele(op->fzb);
+		op->fzb = NULL;
+		op->kbuf = false;
 	}
 	if (op->zc_notif != NULL) {
 		kqring_zc_abort(op->zc_notif);

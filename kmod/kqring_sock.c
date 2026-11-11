@@ -315,13 +315,14 @@ kqring_iov_len(const struct iovec *iov, u_int iovcnt)
 
 void
 kqring_uio_init(struct uio *auio, struct iovec *iov, u_int iovcnt,
-    enum uio_rw rw)
+    enum uio_rw rw, bool kern)
 {
 	auio->uio_iov = iov;
 	auio->uio_iovcnt = iovcnt;
 	auio->uio_offset = 0;
 	auio->uio_resid = kqring_iov_len(iov, iovcnt);
-	auio->uio_segflg = UIO_USERSPACE;
+	/* kern: a registered buffer's kernel mapping (op->kbuf). */
+	auio->uio_segflg = kern ? UIO_SYSSPACE : UIO_USERSPACE;
 	auio->uio_rw = rw;
 	auio->uio_td = curthread;
 }
@@ -461,7 +462,7 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 		aiov.iov_base = (char *)(uintptr_t)sqe->addr + op->done_io;
 		aiov.iov_len = sqe->len - op->done_io;
 	}
-	kqring_uio_init(&auio, iov, iovcnt, UIO_READ);
+	kqring_uio_init(&auio, iov, iovcnt, UIO_READ, op->kbuf);
 	ssize_t want = auio.uio_resid;
 
 	flags = MSG_DONTWAIT;
@@ -575,12 +576,10 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 		return (EOPNOTSUPP);
 
 	if (fixed) {
-		if (op->fbuf == NULL || op->fbuf->zbuf == NULL)
+		/* Its addresses are in zbuf->kva (op->kbuf). */
+		if (op->fzb == NULL || !op->kbuf)
 			return (EOPNOTSUPP);
-		error = kqring_zc_refresh_cow(ctx, op->fbuf, td);
-		if (error != 0)
-			return (error);
-		zbuf = op->fbuf->zbuf;
+		zbuf = op->fzb;
 	}
 
 	if (retry)
@@ -792,7 +791,8 @@ kqring_send_zc_iov(struct kqring_ctx *ctx, struct kqring_op *op,
 		k++;
 		cur = (vm_offset_t)iov[i].iov_base;
 		while (seg_rem > 0) {
-			size_t pg_idx = (cur - seg_zb->page_base) >> PAGE_SHIFT;
+			size_t pg_idx = (cur - (fixed ? seg_zb->kva :
+			    seg_zb->page_base)) >> PAGE_SHIFT;
 			size_t pg_off = cur & PAGE_MASK;
 			size_t chunk = MIN((size_t)PAGE_SIZE - pg_off, seg_rem);
 			struct sf_buf *sf;
@@ -985,7 +985,7 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 		aiov.iov_base = (char *)(uintptr_t)sqe->addr + op->done_io;
 		aiov.iov_len = sqe->len - op->done_io;
 	}
-	kqring_uio_init(&auio, iov, iovcnt, UIO_WRITE);
+	kqring_uio_init(&auio, iov, iovcnt, UIO_WRITE, op->kbuf);
 	ssize_t want = auio.uio_resid;
 
 	waitall = (flags & MSG_WAITALL) != 0 && !buf_select &&
@@ -1016,6 +1016,14 @@ kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
 	}
 	error = sosend(so, to, &auio, NULL, NULL, flags, td);
 	n = (size_t)(want - auio.uio_resid);
+	/*
+	 * A datagram is copied into an mbuf before the protocol can refuse
+	 * it (EISCONN from an addressed send on a connected socket, ENOBUFS),
+	 * so the uio is used up: an error means nothing was sent, as
+	 * sendto(2) reports it.
+	 */
+	if (error != 0 && (so->so_proto->pr_flags & PR_ATOMIC) != 0)
+		n = 0;
 	/* The notification says so if any part of a SEND_ZC was copied. */
 	if (sqe->opcode == IORING_OP_SEND_ZC && n > 0)
 		op->zc_copied = true;
@@ -1130,7 +1138,7 @@ kqring_recvit(struct thread *td, struct socket *so, struct msghdr *mp,
 	if (error != 0)
 		return (error);
 #endif
-	kqring_uio_init(&auio, mp->msg_iov, mp->msg_iovlen, UIO_READ);
+	kqring_uio_init(&auio, mp->msg_iov, mp->msg_iovlen, UIO_READ, false);
 	len = auio.uio_resid;
 	error = soreceive(so, &fromsa, &auio, NULL,
 	    (mp->msg_control != NULL || controlp != NULL) ? &control : NULL,
@@ -1381,11 +1389,12 @@ kqring_exec_recvmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 
 /*
  * kern_sendit() on a socket rather than a descriptor (see kqring_recvit()).
- * Consumes `control`.  The byte count goes to *np.
+ * Consumes `control`.  The byte count goes to *np.  With kern, the iovecs
+ * are a registered buffer's kernel addresses (op->kbuf).
  */
 static int
 kqring_sendit(struct thread *td, struct socket *so, struct msghdr *mp,
-    int flags, struct mbuf *control, size_t *np)
+    int flags, struct mbuf *control, bool kern, size_t *np)
 {
 	struct uio auio;
 	ssize_t len;
@@ -1404,7 +1413,7 @@ kqring_sendit(struct thread *td, struct socket *so, struct msghdr *mp,
 		return (error);
 	}
 #endif
-	kqring_uio_init(&auio, mp->msg_iov, mp->msg_iovlen, UIO_WRITE);
+	kqring_uio_init(&auio, mp->msg_iov, mp->msg_iovlen, UIO_WRITE, kern);
 	len = auio.uio_resid;
 	error = sousrsend(so, mp->msg_name, &auio, control, flags, NULL);
 	if (error == 0)
@@ -1486,7 +1495,7 @@ kqring_exec_sendmsg(struct kqring_ctx *ctx, struct kqring_op *op,
 		bcopy(msg.msg_control, mtod(control, void *),
 		    msg.msg_controllen);
 	}
-	error = kqring_sendit(td, so, &msg, flags, control, &n);
+	error = kqring_sendit(td, so, &msg, flags, control, op->kbuf, &n);
 	if (sqe->opcode == IORING_OP_SENDMSG_ZC && n > 0)
 		op->zc_copied = true;
 

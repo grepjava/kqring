@@ -180,7 +180,6 @@ MALLOC_DECLARE(M_SELFD);
 /* The longest busy-wait IORING_REGISTER_NAPI sets (microseconds). */
 #define KQRING_MAX_BUSY_POLL_US	100000
 #define KQRING_BIO_MAX_HELD	(64UL * 1024 * 1024)
-#define KQRING_MAX_ZC_PAGES	16384U
 #define KQRING_MAX_PERSONALITIES 1024U
 /* Buffers handed over with PROVIDE_BUFFERS and not yet used, per group. */
 #define KQRING_MAX_GROUP_BUFS	65536U
@@ -449,6 +448,13 @@ struct kqring_op {
 	struct kqring_rsrc	*ffile;
 	struct kqring_rsrc	*ffile_in;
 	struct kqring_rsrc	*fbuf;
+	/*
+	 * fbuf's held pages, as they were at issue; with kbuf set, the
+	 * request's buffer addresses (sqe->addr, its iovecs) are kernel
+	 * addresses in fzb->kva.
+	 */
+	struct kqring_zc_buf	*fzb;
+	bool			kbuf;
 	struct kqring_zc_notif	*zc_notif;
 	struct ucred		*cred;
 	struct file		*sock_fp;	/* socket held while retried */
@@ -593,7 +599,9 @@ struct kqring_pin_acct {
 struct kqring_zc_buf {
 	volatile u_int		refs;
 	int			npages;
-	vm_offset_t		page_base;
+	vm_offset_t		page_base;	/* user address of pages[0] */
+	/* A registered buffer's pages, mapped in the kernel; or 0. */
+	vm_offset_t		kva;
 	struct kqring_pin_acct	*acct;
 	vm_page_t		pages[];
 };
@@ -630,12 +638,15 @@ struct kqring_rsrc {
 	struct filecaps		caps;		/* its Capsicum rights */
 	uint64_t		addr;		/* buffer slot */
 	uint64_t		len;
-	struct kqring_zc_buf	*zbuf;		/* held pages for SEND_ZC */
-	uint32_t		cow_gen;	/* ctx->cow_gen at hold */
 	/*
-	 * A buffer slot's addresses are in the address space of the context
-	 * that registered it (kqring_tctx.id): requests of other processes
-	 * can't use it (docs/concurrent-submitters.md).
+	 * A buffer slot's held pages, mapped in the kernel: fixed requests
+	 * do their I/O through them (docs/held-buffers.md).
+	 */
+	struct kqring_zc_buf	*zbuf;
+	/*
+	 * The context whose address space the buffer was registered from
+	 * (kqring_tctx.id): when its process forks, the buffer is held again
+	 * so that it stays the parent's memory (kqring_bufs_fork()).
 	 */
 	uint64_t		owner_id;
 };
@@ -1880,7 +1891,7 @@ void	kqring_sowatch_free(struct kqring_ctx *ctx, struct kqring_sowatch *sw);
 void	kqring_sb_disarm(struct kqring_op *op, struct socket *so, int which);
 void	kqring_listen_disarm(struct kqring_op *op, struct socket *so);
 void	kqring_uio_init(struct uio *auio, struct iovec *iov, u_int iovcnt,
-	    enum uio_rw rw);
+	    enum uio_rw rw, bool kern);
 int	kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	    struct socket *expect, bool *more_out);
 int	kqring_exec_send(struct kqring_ctx *ctx, struct kqring_op *op,
@@ -2107,7 +2118,9 @@ void	kqring_zc_buf_rele(struct kqring_zc_buf *zb);
 void	kqring_zc_notif_free_bufs(struct kqring_zc_notif *zc);
 void	kqring_zc_notif_merge(struct kqring_zc_notif *zc,
 	    struct kqring_zc_notif *from);
-int	kqring_zc_refresh_cow(struct kqring_ctx *ctx, struct kqring_rsrc *r,
+int	kqring_rbuf_alloc(struct thread *td, vm_offset_t start, size_t len,
+	    size_t discount_pages, struct kqring_zc_buf **zbp);
+void	kqring_bufs_fork(struct kqring_ctx *ctx, uint64_t tid,
 	    struct thread *td);
 void	kqring_zc_rele(struct kqring_zc_notif *zc, bool in_issuer);
 void	kqring_zc_abort(struct kqring_zc_notif *zc);

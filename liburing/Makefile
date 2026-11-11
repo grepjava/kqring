@@ -95,10 +95,13 @@ tests: lib
 	    "$$(wc -l < ${OUT}/test.unbuilt) not (see ${OUT}/test.unbuilt)"
 
 # liburing's convention: exit 0 pass, 77 skip, anything else fail.
+# send-zerocopy sends and checks a 32 MiB buffer in every configuration
+# once it can register it (RLIMIT_MEMLOCK raised), which takes minutes.
 check: tests
 	@mkdir -p ${OUT}/logs && cd ${OUT}/test && : > ../check.log && \
 	pass=0; skip=0; fail=0; for t in *.t; do \
-	    rc=0; timeout 30 ./$$t > ../logs/$${t%.t}.log 2>&1 || rc=$$?; \
+	    to=30; case $$t in send-zerocopy.t) to=300;; esac; \
+	    rc=0; timeout $$to ./$$t > ../logs/$${t%.t}.log 2>&1 || rc=$$?; \
 	    case $$rc in 0) pass=$$((pass+1)); r=PASS;; \
 	    77) skip=$$((skip+1)); r=SKIP;; \
 	    *) fail=$$((fail+1)); r="FAIL($$rc)";; esac; \

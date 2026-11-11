@@ -24,7 +24,7 @@ static void kqring_zc_rele_hold(void);
 
 static int
 kqring_pin_charge(struct thread *td, size_t npages, size_t discount_pages,
-    struct kqring_pin_acct **acctp)
+    size_t max_pages, struct kqring_pin_acct **acctp)
 {
 	struct uidinfo *uip = td->td_ucred->cr_ruidinfo;
 	struct kqring_pin_acct *acct, *alloc_acct;
@@ -34,7 +34,7 @@ kqring_pin_charge(struct thread *td, size_t npages, size_t discount_pages,
 	rlim_t cur_bytes;
 	u_long wired, max_wired;
 
-	if (npages == 0 || npages > KQRING_MAX_ZC_PAGES)
+	if (npages == 0 || npages > max_pages)
 		return (ENOMEM);
 	alloc_acct = malloc(sizeof(*alloc_acct), M_KQRING, M_WAITOK | M_ZERO);
 	mtx_lock(&kqring_zc_mtx);
@@ -105,9 +105,19 @@ kqring_pin_uncharge(struct kqring_pin_acct *acct, size_t npages)
 	}
 }
 
-int
-kqring_zc_buf_alloc(struct thread *td, vm_offset_t start, size_t len,
-    vm_prot_t prot, size_t discount_pages, struct kqring_zc_buf **zbp)
+/*
+ * Hold the pages of [start, start + len) in td's address space, charged to
+ * its user.  With kmap (a registered buffer, docs/held-buffers.md), also
+ * map them contiguously in kernel address space (zb->kva), and refuse a
+ * vnode's pages: a shared file mapping, whose writes through the hold the
+ * filesystem couldn't see, as Linux refuses it.  Holding for writing has
+ * dirtied the pages (vm_fault_hold_pages()), and a held page isn't
+ * laundered, so what is written through the kernel mapping stays.
+ */
+static int
+kqring_pages_hold(struct thread *td, vm_offset_t start, size_t len,
+    vm_prot_t prot, size_t discount_pages, size_t max_len, bool kmap,
+    struct kqring_zc_buf **zbp)
 {
 	vm_map_t map = &td->td_proc->p_vmspace->vm_map;
 	struct kqring_pin_acct *acct;
@@ -119,12 +129,13 @@ kqring_zc_buf_alloc(struct thread *td, vm_offset_t start, size_t len,
 	if (start == 0 || len == 0 || start + len < start ||
 	    start + len > vm_map_max(map))
 		return (EFAULT);
-	if (len > KQRING_MAX_ZC_BUF_LEN)
+	if (len > max_len)
 		return (ENOMEM);
 	page_base = trunc_page(start);
 	page_end = round_page(start + len);
 	npages = atop(page_end - page_base);
-	error = kqring_pin_charge(td, npages, discount_pages, &acct);
+	error = kqring_pin_charge(td, npages, discount_pages,
+	    atop(max_len) + 1, &acct);
 	if (error != 0)
 		return (error);
 	zb = malloc(sizeof(*zb) + npages * sizeof(vm_page_t), M_KQRING,
@@ -140,8 +151,47 @@ kqring_zc_buf_alloc(struct thread *td, vm_offset_t start, size_t len,
 	zb->npages = held;
 	zb->page_base = page_base;
 	zb->acct = acct;
+	if (kmap) {
+		for (int i = 0; i < held; i++) {
+			vm_object_t obj = atomic_load_ptr(&zb->pages[i]->object);
+
+			if (obj != NULL && obj->type == OBJT_VNODE) {
+				kqring_zc_buf_rele(zb);
+				return (EFAULT);
+			}
+		}
+		zb->kva = kva_alloc(ptoa((vm_size_t)held));
+		if (zb->kva == 0) {
+			kqring_zc_buf_rele(zb);
+			return (ENOMEM);
+		}
+		pmap_qenter(zb->kva, zb->pages, held);
+	}
 	*zbp = zb;
 	return (0);
+}
+
+/* The pages of an unregistered zero-copy send, for as long as it lasts. */
+int
+kqring_zc_buf_alloc(struct thread *td, vm_offset_t start, size_t len,
+    vm_prot_t prot, size_t discount_pages, struct kqring_zc_buf **zbp)
+{
+	return (kqring_pages_hold(td, start, len, prot, discount_pages,
+	    KQRING_MAX_ZC_BUF_LEN, false, zbp));
+}
+
+/*
+ * A registered buffer's pages, held for writing and mapped in kernel
+ * address space: fixed requests do I/O through zb->kva, from any process
+ * (docs/held-buffers.md).
+ */
+int
+kqring_rbuf_alloc(struct thread *td, vm_offset_t start, size_t len,
+    size_t discount_pages, struct kqring_zc_buf **zbp)
+{
+	return (kqring_pages_hold(td, start, len,
+	    VM_PROT_READ | VM_PROT_WRITE, discount_pages, KQRING_MAX_BUF_LEN,
+	    true, zbp));
 }
 
 void
@@ -150,6 +200,10 @@ kqring_zc_buf_rele(struct kqring_zc_buf *zb)
 	if (zb == NULL)
 		return;
 	if (refcount_release(&zb->refs)) {
+		if (zb->kva != 0) {
+			pmap_qremove(zb->kva, zb->npages);
+			kva_free(zb->kva, ptoa((vm_size_t)zb->npages));
+		}
 		vm_page_unhold_pages(zb->pages, zb->npages);
 		kqring_pin_uncharge(zb->acct, (size_t)zb->npages);
 		free(zb, M_KQRING);
@@ -207,30 +261,6 @@ kqring_zc_notif_merge(struct kqring_zc_notif *zc, struct kqring_zc_notif *from)
 	from->zbuf = NULL;
 	from->zbufs = NULL;
 	from->nzbufs = 0;
-}
-
-int
-kqring_zc_refresh_cow(struct kqring_ctx *ctx, struct kqring_rsrc *r,
-    struct thread *td)
-{
-	struct kqring_zc_buf *old_zb = r->zbuf, *new_zb;
-	uint32_t cg = atomic_load_int(&ctx->cow_gen);
-	size_t discount_pages = 0;
-	int error;
-
-	if (old_zb == NULL || r->cow_gen == cg)
-		return (0);
-	if (atomic_load_int(&old_zb->refs) == 1 &&
-	    old_zb->acct->uip == td->td_ucred->cr_ruidinfo)
-		discount_pages = (size_t)old_zb->npages;
-	error = kqring_zc_buf_alloc(td, (vm_offset_t)r->addr, r->len,
-	    VM_PROT_READ | VM_PROT_WRITE, discount_pages, &new_zb);
-	if (error != 0)
-		return (error == ENOMEM ? EOPNOTSUPP : error);
-	r->zbuf = new_zb;
-	r->cow_gen = cg;
-	kqring_zc_buf_rele(old_zb);
-	return (0);
 }
 
 void

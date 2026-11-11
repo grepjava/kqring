@@ -298,3 +298,18 @@
  	iowait_pre = get_iowait(cpu);
  	ret = io_uring_wait_cqe_timeout(ring, &cqe, &ts);
  	if (ret != -ETIME) {
+--- test/send-zerocopy.c
++++ test/send-zerocopy.c
+@@ -575,6 +575,12 @@
+ 			}
+ 			if (tcp && (conf.cork || conf.addr))
+ 				continue;
++			/*
++			 * FreeBSD has no MSG_MORE, so UDP sends are not corked,
++			 * and refuses an addressed send on a connected socket.
++			 */
++			if (!tcp && (conf.cork || (client_connect && conf.addr)))
++				continue;
+ 			if (conf.mix_register && (!conf.cork || conf.fixed_buf))
+ 				continue;
+ 			if (!client_connect && conf.addr == NULL)

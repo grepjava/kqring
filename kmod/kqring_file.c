@@ -179,8 +179,11 @@ again:
 static void
 kqring_bio_pages_free(struct bio *bp)
 {
-	vm_page_unhold_pages(bp->bio_ma, bp->bio_ma_n);
-	free(bp->bio_ma, M_KQRING);
+	/* bio_caller2: the pages were held for this bio, not registered. */
+	if (bp->bio_caller2 != NULL) {
+		vm_page_unhold_pages(bp->bio_ma, bp->bio_ma_n);
+		free(bp->bio_ma, M_KQRING);
+	}
 	g_destroy_bio(bp);
 }
 
@@ -290,13 +293,24 @@ kqring_file_bio(struct kqring_ctx *ctx, struct kqring_op *op,
 		vm_page_t *pages;
 		int npages;
 
-		pages = malloc(sizeof(*pages) * maxpages, M_KQRING, M_WAITOK);
-		npages = vm_fault_quick_hold_pages(
-		    &curproc->p_vmspace->vm_map, va, len, prot, pages,
-		    maxpages);
-		if (npages < 0) {
-			free(pages, M_KQRING);
-			break;
+		if (op->kbuf) {
+			/*
+			 * A registered buffer: its pages are held already
+			 * (op->fzb), and va is in their kernel mapping.
+			 */
+			pages = &op->fzb->pages[(va - op->fzb->kva) >>
+			    PAGE_SHIFT];
+			npages = (int)atop(round_page((va & PAGE_MASK) + len));
+		} else {
+			pages = malloc(sizeof(*pages) * maxpages, M_KQRING,
+			    M_WAITOK);
+			npages = vm_fault_quick_hold_pages(
+			    &curproc->p_vmspace->vm_map, va, len, prot, pages,
+			    maxpages);
+			if (npages < 0) {
+				free(pages, M_KQRING);
+				break;
+			}
 		}
 		bp = g_alloc_bio();
 		bp->bio_cmd = is_write ? BIO_WRITE : BIO_READ;
@@ -306,6 +320,7 @@ kqring_file_bio(struct kqring_ctx *ctx, struct kqring_op *op,
 		bp->bio_dev = dev;
 		bp->bio_done = kqring_bio_done;
 		bp->bio_caller1 = op;
+		bp->bio_caller2 = op->kbuf ? NULL : pages;
 		bp->bio_ma = pages;
 		bp->bio_ma_n = npages;
 		bp->bio_ma_offset = va & PAGE_MASK;
@@ -465,7 +480,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 		aiov.iov_base = (void *)(uintptr_t)sqe->addr;
 		aiov.iov_len = sqe->len;
 	}
-	kqring_uio_init(&auio, iov, iovcnt, UIO_READ);
+	kqring_uio_init(&auio, iov, iovcnt, UIO_READ, op->kbuf);
 	auio.uio_offset = (off_t)sqe->off;
 	want = auio.uio_resid;
 	if (want == 0 || auio.uio_offset > OFF_MAX - want) {
@@ -681,7 +696,8 @@ again:
 		aiov.iov_base = (char *)(uintptr_t)sqe->addr + op->done_io;
 		aiov.iov_len = sqe->len - op->done_io;
 	}
-	kqring_uio_init(&auio, iov, iovcnt, is_write ? UIO_WRITE : UIO_READ);
+	kqring_uio_init(&auio, iov, iovcnt, is_write ? UIO_WRITE : UIO_READ,
+	    op->kbuf);
 	ssize_t want = auio.uio_resid;
 	auio.uio_offset = offset;
 
@@ -882,7 +898,7 @@ kqring_exec_read_multishot(struct kqring_ctx *ctx, struct kqring_op *op,
 	}
 	sel.bg->busy = true;
 	sx_xunlock(&ctx->bg_sx);
-	kqring_uio_init(&auio, &aiov, 1, UIO_READ);
+	kqring_uio_init(&auio, &aiov, 1, UIO_READ, false);
 	want = auio.uio_resid;
 	/*
 	 * Never blocking: another reader can drain the pipe since it was
@@ -1112,6 +1128,10 @@ kqring_exec_splice(struct kqring_ctx *ctx, struct kqring_op *op)
 				kqring_wq_mark_blocking(ctx, op);
 			error = sosend(so_out, NULL, &auio, NULL, NULL,
 			    sflags, td);
+			/* A refused datagram used up the uio, unsent. */
+			if (error != 0 &&
+			    (so_out->so_proto->pr_flags & PR_ATOMIC) != 0)
+				auio.uio_resid = (ssize_t)rem;
 		} else {
 			if (kqring_pipe_will_block(fp_out, true, rem))
 				kqring_wq_mark_blocking(ctx, op);

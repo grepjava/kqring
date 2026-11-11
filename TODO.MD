@@ -12,7 +12,8 @@ Known limits are in [BENCHMARK.MD](BENCHMARK.MD#known-gaps) and [Differences fro
 
 ## Compatibility
 
-- **Registered buffers from other processes.** A request from a process other than the one that registered the buffer fails with `-EFAULT`: kqring reads registered buffers through their addresses, not held pages (see Research in the roadmap).
+- **A new mapping over a registered buffer.** FreeBSD keeps a held page in its memory object when its range is unmapped, and an anonymous mapping that extends the object over the same offsets maps the page again, zeroed, so the buffer and the new memory can be one. Linux keeps them apart. It would take the VM letting go of held pages at unmap ([docs/held-buffers.md](docs/held-buffers.md#what-the-implementation-changed)).
+- **A fixed read in flight during `fork(2)`** lands in the child's copy of the buffer, as the parent's buffer is held again at the fork; on Linux it lands in the parent's.
 
 ## Measurement
 

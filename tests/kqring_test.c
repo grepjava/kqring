@@ -737,10 +737,13 @@ test_cross_process_rings(void)
 	expect_cqe(&t, 91021, 0);
 
 	/*
-	 * Registered buffers are addresses in the registering process: the
-	 * child's READ_FIXED fails with -EFAULT.  Personalities work from
-	 * any process holding the ring, as on Linux.
+	 * Registered buffers are the registering process's held pages: the
+	 * child's READ_FIXED lands in the parent's memory, while the child's
+	 * copy of it, made at the fork, stays as it was, as on Linux
+	 * (docs/held-buffers.md).  Personalities work from any process
+	 * holding the ring.
 	 */
+	memset(pbuf, '.', sizeof(pbuf));
 	struct iovec iov = { .iov_base = pbuf, .iov_len = sizeof(pbuf) };
 	assert(kqring_register(t.fd, IORING_REGISTER_BUFFERS, &iov, 1) == 0);
 	int id = (int)kqring_register(t.fd, IORING_REGISTER_PERSONALITY, NULL,
@@ -761,7 +764,8 @@ test_cross_process_rings(void)
 		if (ring_wait(&t, 1, 5000) != 0)
 			_exit(1);
 		c = ring_pop_cqe(&t);
-		if (c.user_data != 91030 || c.res != -EFAULT)
+		if (c.user_data != 91030 || c.res != 4 ||
+		    memcmp(pbuf, "....", 4) != 0)
 			_exit(2);
 		sqe = ring_prep(&t, IORING_OP_NOP, -1, 91031);
 		sqe->personality = (uint16_t)id;
@@ -772,6 +776,7 @@ test_cross_process_rings(void)
 		_exit(c.user_data == 91031 && c.res == 0 ? 0 : 4);
 	}
 	assert(xp_child_status(pid) == 0);
+	assert(memcmp(pbuf, "pare", 4) == 0);
 	xp_resync(&t);
 	assert(kqring_register(t.fd, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
 	assert(kqring_register(t.fd, IORING_UNREGISTER_PERSONALITY, NULL,
@@ -3704,6 +3709,20 @@ test_send_zc(struct test_ring *r)
 	assert(submit_one(r) == 5);
 	wait_readable(ua);
 	assert(recv(ua, buf, sizeof(buf), 0) == 5);
+	/*
+	 * On a connected UDP socket FreeBSD refuses a destination with
+	 * EISCONN, after the datagram was copied into an mbuf: the CQE must
+	 * say so, not report the bytes as sent.
+	 */
+	assert(connect(ub, (struct sockaddr *)&aaddr, sizeof(aaddr)) == 0);
+	sqe = ring_prep(r, IORING_OP_SEND, ub, 30519);
+	sqe->addr = (uint64_t)(uintptr_t)"dgram";
+	sqe->len = 5;
+	sqe->addr2 = (uint64_t)(uintptr_t)&aaddr;
+	sqe->addr_len = sizeof(aaddr);
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EISCONN);
+	assert(recv(ua, buf, sizeof(buf), MSG_DONTWAIT) == -1 && errno == EAGAIN);
 	close(ua);
 	close(ub);
 
@@ -5885,6 +5904,138 @@ test_registered_buffers(void)
 	rmdir(dir);
 	printf("[PASS] Registered buffers: READ/WRITE(V)_FIXED bounds, SEND_ZC "
 	    "FIXED_BUF, update checks, CLONE_BUFFERS\n");
+}
+
+/*
+ * Registered buffers are their held pages (docs/held-buffers.md): a
+ * buffer works after munmap(2); after fork(2) it stays the parent's
+ * memory, which the parent goes on writing; a shared file mapping is
+ * refused, as on Linux; and a buffer may be up to 1 GiB, where the
+ * memory-lock limit allows.
+ */
+static void
+test_held_buffers(void)
+{
+	long page = sysconf(_SC_PAGESIZE);
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	struct iovec iov;
+	struct rlimit rl;
+	char dir[64], path[96], out[8];
+	int fd, st;
+	pid_t pid;
+	char *m;
+
+	ring_init(&t);
+	make_tmpdir(dir, sizeof(dir));
+	snprintf(path, sizeof(path), "%s/h", dir);
+	fd = open(path, O_RDWR | O_CREAT, 0600);
+	assert(fd >= 0 && ftruncate(fd, page) == 0);
+
+	/* Unmapped, the buffer is still its pages. */
+	m = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(m != MAP_FAILED);
+	memcpy(m, "kept-pg", 7);
+	iov.iov_base = m;
+	iov.iov_len = (size_t)page;
+	assert(reg(&t, IORING_REGISTER_BUFFERS, &iov, 1) == 0);
+	assert(munmap(m, (size_t)page) == 0);
+	sqe = ring_prep(&t, IORING_OP_WRITE_FIXED, fd, 46001);
+	sqe->addr = (uint64_t)(uintptr_t)m;
+	sqe->len = 7;
+	sqe->buf_index = 0;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 7);
+	assert(pread(fd, out, 7, 0) == 7 && memcmp(out, "kept-pg", 7) == 0);
+	sqe = ring_prep(&t, IORING_OP_READ_FIXED, fd, 46002);
+	sqe->addr = (uint64_t)(uintptr_t)m + 8;
+	sqe->len = 7;
+	sqe->buf_index = 0;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 7);
+	assert(reg(&t, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+
+	/*
+	 * After a fork the buffer is the parent's memory: what the parent
+	 * writes there afterwards is what WRITE_FIXED writes, and the child's
+	 * copy is its own.
+	 */
+	m = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	assert(m != MAP_FAILED);
+	memcpy(m, "before!", 7);
+	iov.iov_base = m;
+	assert(reg(&t, IORING_REGISTER_BUFFERS, &iov, 1) == 0);
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		usleep(50000);
+		_exit(memcmp(m, "before!", 7) == 0 ? 0 : 1);
+	}
+	memcpy(m, "parent!", 7);
+	sqe = ring_prep(&t, IORING_OP_WRITE_FIXED, fd, 46003);
+	sqe->addr = (uint64_t)(uintptr_t)m;
+	sqe->len = 7;
+	sqe->off = 16;
+	sqe->buf_index = 0;
+	ring_push_sqe(&t);
+	assert(submit_one(&t) == 7);
+	assert(pread(fd, out, 7, 16) == 7 && memcmp(out, "parent!", 7) == 0);
+	assert(waitpid(pid, &st, 0) == pid && WIFEXITED(st) &&
+	    WEXITSTATUS(st) == 0);
+	assert(reg(&t, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+	munmap(m, (size_t)page);
+
+	/* A shared file mapping isn't a buffer; a private one is. */
+	m = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	assert(m != MAP_FAILED);
+	iov.iov_base = m;
+	assert(reg(&t, IORING_REGISTER_BUFFERS, &iov, 1) == -EFAULT);
+	munmap(m, (size_t)page);
+	m = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+	assert(m != MAP_FAILED);
+	iov.iov_base = m;
+	assert(reg(&t, IORING_REGISTER_BUFFERS, &iov, 1) == 0);
+	assert(reg(&t, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+	munmap(m, (size_t)page);
+
+	/* Past the old 16 MiB, if this user may lock that much. */
+	size_t big = 20U << 20;
+	bool big_done = false;
+
+	assert(getrlimit(RLIMIT_MEMLOCK, &rl) == 0);
+	if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < (rlim_t)big)
+		printf("  20 MiB buffer not tried: RLIMIT_MEMLOCK %ju\n",
+		    (uintmax_t)rl.rlim_cur);
+	else {
+		m = mmap(NULL, big, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANON, -1, 0);
+		assert(m != MAP_FAILED);
+		memcpy(m + big - 7, "the-end", 7);
+		iov.iov_base = m;
+		iov.iov_len = big;
+		assert(reg(&t, IORING_REGISTER_BUFFERS, &iov, 1) == 0);
+		sqe = ring_prep(&t, IORING_OP_WRITE_FIXED, fd, 46004);
+		sqe->addr = (uint64_t)(uintptr_t)(m + big - 7);
+		sqe->len = 7;
+		sqe->off = 32;
+		sqe->buf_index = 0;
+		ring_push_sqe(&t);
+		assert(submit_one(&t) == 7);
+		assert(pread(fd, out, 7, 32) == 7 &&
+		    memcmp(out, "the-end", 7) == 0);
+		assert(reg(&t, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+		munmap(m, big);
+		big_done = true;
+	}
+
+	close(fd);
+	close(t.fd);
+	unlink(path);
+	rmdir(dir);
+	printf("[PASS] Held buffers: after munmap, across fork, no shared file "
+	    "mappings%s\n", big_done ? ", past 16 MiB" : "");
 }
 
 /* A RECV of up to `len` bytes from a provided buffer of group bgid. */
@@ -14962,6 +15113,7 @@ main(int argc, char **argv)
 		test_direct_descriptors();
 		test_rsrc_tags();
 		test_registered_buffers();
+		test_held_buffers();
 		test_buffer_groups();
 		test_eventfd();
 		test_personality();
