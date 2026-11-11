@@ -38,6 +38,12 @@ __kqring_test_mmap(void *addr, size_t len, int prot, int flags, int fd,
  */
 #include <sys/socket.h>
 #include <errno.h>
+/*
+ * The socket tests use struct sockaddr_in and INADDR_ANY without
+ * <netinet/in.h>, which glibc's headers bring with <sys/socket.h>.
+ */
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 static inline ssize_t
 __kqring_test_sendmsg(int s, const struct msghdr *msg, int flags)

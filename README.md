@@ -4,7 +4,7 @@
   <img src="docs/kqring-hero.jpg" alt="BSD daemon as Sméagol with the Ring of Power" width="100%">
 </p>
 
-`kqring` brings Linux's [`io_uring`](https://kernel.dk/io_uring.pdf) asynchronous I/O interface to FreeBSD, as a loadable kernel module (`kqring.ko`) for FreeBSD 15.1 (amd64). Programs written for io_uring build against it with three system call wrappers changed, [liburing](liburing/) and [fio](fio/) run on it, and it adds operations of its own that io_uring doesn't have.
+`kqring` brings Linux's [`io_uring`](https://kernel.dk/io_uring.pdf) asynchronous I/O interface to FreeBSD, as a loadable kernel module (`kqring.ko`) for FreeBSD 15.1 (amd64). Programs written for io_uring build against it with three system call wrappers changed, [liburing](liburing/), [fio](fio/), [PostgreSQL](postgresql/) and [RocksDB](rocksdb/) run on it, and it adds operations of its own that io_uring doesn't have.
 
 > **Experimental preview, for test systems only.** kqring is an out-of-tree kernel module, and a bug in it can crash the machine. It has **not** had an independent security audit. See [Should you use it?](#should-you-use-it)
 

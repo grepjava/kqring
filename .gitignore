@@ -23,4 +23,5 @@ tests/zfs_dbuf
 liburing/work/
 fio/work/
 postgresql/work/
+rocksdb/work/
 journal/

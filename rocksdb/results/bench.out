@@ -1,0 +1,509 @@
+# 2026-11-11 12:11:03 15.1-RELEASE AMD Ryzen 3 PRO 4350G with Radeon Graphics
+# zroot/kqring-rocksbench: recordsize 4K, primarycache metadata, compression off
+RocksDB:    version 11.13.2
+Date:       Wed Nov 11 12:11:03 2026
+CPU:        8 * amd64
+... finished 100 ops                              ... finished 200 ops                              ... finished 300 ops                              ... finished 400 ops                              ... finished 500 ops                              ... finished 600 ops                              ... finished 700 ops                              ... finished 800 ops                              ... finished 900 ops                              ... finished 1000 ops                              ... finished 1500 ops                              ... finished 2000 ops                              ... finished 2500 ops                              ... finished 3000 ops                              ... finished 3500 ops                              ... finished 4000 ops                              ... finished 4500 ops                              ... finished 5000 ops                              ... finished 6000 ops                              ... finished 7000 ops                              ... finished 8000 ops                              ... finished 9000 ops                              ... finished 10000 ops                              ... finished 15000 ops                              ... finished 20000 ops                              ... finished 25000 ops                              ... finished 30000 ops                              ... finished 35000 ops                              ... finished 40000 ops                              ... finished 45000 ops                              ... finished 50000 ops                              ... finished 60000 ops                              ... finished 70000 ops                              ... finished 80000 ops                              ... finished 90000 ops                              ... finished 100000 ops                              long op: 1569839 micros                              ... finished 150000 ops                              long op: 1476389 micros                              ... finished 200000 ops                              ... finished 250000 ops                              ... finished 300000 ops                              ... finished 350000 ops                              long op: 1116116 micros                              ... finished 400000 ops                              long op: 1084558 micros                              ... finished 450000 ops                              ... finished 500000 ops                              long op: 2718360 micros                              ... finished 600000 ops                              long op: 2003491 micros                              ... finished 700000 ops                              ... finished 800000 ops                              long op: 2021678 micros                              ... finished 900000 ops                              long op: 2022063 micros                              ... finished 1000000 ops                              long op: 2829448 micros                              long op: 1584925 micros                              ... finished 1100000 ops                              long op: 2271443 micros                              ... finished 1200000 ops                              long op: 2509462 micros                              long op: 1185893 micros                              ... finished 1300000 ops                              long op: 1672061 micros                              ... finished 1400000 ops                              ... finished 1500000 ops                              long op: 1758144 micros                              long op: 1976709 micros                              ... finished 1600000 ops                              ... finished 1700000 ops                              ... finished 1800000 ops                              ... finished 1900000 ops                              long op: 2561044 micros                              long op: 1646857 micros                              ... finished 2000000 ops                              long op: 1681268 micros                              ... finished 2100000 ops                              long op: 2728194 micros                              long op: 2759875 micros                              ... finished 2200000 ops                              long op: 1487173 micros                              ... finished 2300000 ops                              ... finished 2400000 ops                              long op: 2277502 micros                              long op: 1781139 micros                              ... finished 2500000 ops                              long op: 2057936 micros                              ... finished 2600000 ops                              long op: 2579440 micros                              long op: 2135402 micros                              ... finished 2700000 ops                              long op: 1518075 micros                              ... finished 2800000 ops                              long op: 7202161 micros                              ... finished 2900000 ops                              long op: 1130642 micros                              ... finished 3000000 ops                              long op: 1671047 micros                              long op: 1045334 micros                              ... finished 3100000 ops                              long op: 3359407 micros                              ... finished 3200000 ops                              ... finished 3300000 ops                              long op: 2701472 micros                              long op: 3741217 micros                              ... finished 3400000 ops                              long op: 3230889 micros                              ... finished 3500000 ops                              long op: 2717248 micros                              long op: 2430446 micros                              ... finished 3600000 ops                              long op: 2841194 micros                              ... finished 3700000 ops                              long op: 2639858 micros                              long op: 2419769 micros                              ... finished 3800000 ops                              ... finished 3900000 ops                              long op: 2194456 micros                              long op: 1699050 micros                              ... finished 4000000 ops                              Set seed to 1794370263614244 because --seed was 0
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+Keys:       16 bytes each (+ 0 bytes user-defined timestamp)
+Values:     1000 bytes each (1000 bytes after compression)
+Entries:    4000000
+Prefix:    0 bytes
+Keys per prefix:    0
+RawSize:    3875.7 MB (estimated)
+FileSize:   3875.7 MB (estimated)
+Write rate: 0 bytes/second
+Read rate: 0 ops/second
+Compression: NoCompression
+Compression sampling rate: 0
+Memtablerep: SkipListFactory
+Perf Level: 1
+------------------------------------------------
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+DB path: [/mnt/rocksbench/db]
+fillrandom   :      75.831 micros/op 13187 ops/sec 303.322 seconds 4000000 operations;   12.8 MB/s
+Microseconds per write:
+Count: 4000000 Average: 75.8306  StdDev: 8114.08
+Min: 3  Median: 5.4765  Max: 7202161
+Percentiles: P50: 5.48 P75: 7.38 P99: 2412.60 P99.9: 2852.49 P99.99: 2896.48
+------------------------------------------------------
+(       2,       3 ]       89   0.002%   0.002% 
+(       3,       4 ]   371445   9.286%   9.288% ##
+(       4,       6 ]  2205915  55.148%  64.436% ###########
+(       6,      10 ]  1228804  30.720%  95.156% ######
+(      10,      15 ]    86931   2.173%  97.330% 
+(      15,      22 ]    10741   0.269%  97.598% 
+(      22,      34 ]     1956   0.049%  97.647% 
+(      34,      51 ]      589   0.015%  97.662% 
+(      51,      76 ]      716   0.018%  97.680% 
+(      76,     110 ]      207   0.005%  97.685% 
+(     110,     170 ]       38   0.001%  97.686% 
+(     170,     250 ]        9   0.000%  97.686% 
+(     380,     580 ]        3   0.000%  97.686% 
+(     580,     870 ]        5   0.000%  97.686% 
+(     870,    1300 ]    10594   0.265%  97.951% 
+(    1300,    1900 ]        8   0.000%  97.951% 
+(    1900,    2900 ]    81838   2.046%  99.997% 
+(    2900,    4400 ]       60   0.002%  99.999% 
+(  170000,  250000 ]        1   0.000%  99.999% 
+(  380000,  570000 ]        1   0.000%  99.999% 
+(  570000,  860000 ]        2   0.000%  99.999% 
+(  860000, 1200000 ]       10   0.000%  99.999% 
+( 1200000, 1900000 ]       12   0.000%  99.999% 
+( 1900000, 2900000 ]       22   0.001% 100.000% 
+( 2900000, 4300000 ]        3   0.000% 100.000% 
+( 6500000, 9800000 ]        1   0.000% 100.000% 
+
+DB path: [/mnt/rocksbench/db]
+compact      : 220786394.000 micros/op 0 ops/sec 220.786 seconds 1 operations;
+# database 2.5G
+## round 1 threads 1 io_uring true
+RocksDB:    version 11.13.2
+Date:       Wed Nov 11 12:19:47 2026
+CPU:        8 * amd64
+entries_per_batch = 32
+... finished 128 ops                              ... finished 224 ops                              ... finished 320 ops                              ... finished 416 ops                              ... finished 512 ops                              ... finished 608 ops                              ... finished 704 ops                              ... finished 800 ops                              ... finished 928 ops                              ... finished 1024 ops                              ... finished 1504 ops                              ... finished 2016 ops                              ... finished 2528 ops                              ... finished 3008 ops                              ... finished 3520 ops                              ... finished 4000 ops                              ... finished 4512 ops                              ... finished 5024 ops                              ... finished 6016 ops                              ... finished 7008 ops                              ... finished 8000 ops                              ... finished 9024 ops                              ... finished 10016 ops                              ... finished 15008 ops                              ... finished 20000 ops                              ... finished 25024 ops                              ... finished 30016 ops                              ... finished 35008 ops                              ... finished 40000 ops                              ... finished 45024 ops                              ... finished 50016 ops                              ... finished 60000 ops                              ... finished 70016 ops                              ... finished 80000 ops                              ... finished 90016 ops                              ... finished 100000 ops                              ... finished 150016 ops                              ... finished 200000 ops                              ... finished 250016 ops                              ... finished 300000 ops                              ... finished 350016 ops                              ... finished 400000 ops                              ... finished 450016 ops                              Set seed to 1794370787907225 because --seed was 0
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+Keys:       16 bytes each (+ 0 bytes user-defined timestamp)
+Values:     1000 bytes each (1000 bytes after compression)
+Entries:    4000000
+Prefix:    0 bytes
+Keys per prefix:    0
+RawSize:    3875.7 MB (estimated)
+FileSize:   3875.7 MB (estimated)
+Write rate: 0 bytes/second
+Read rate: 0 ops/second
+Compression: NoCompression
+Compression sampling rate: 0
+Memtablerep: SkipListFactory
+Perf Level: 1
+------------------------------------------------
+DB path: [/mnt/rocksbench/db]
+multireadrandom :     121.270 micros/op 8246 ops/sec 60.026 seconds 494976 operations;    5.0 MB/s (312465 of 494976 found)
+Microseconds per read:
+Count: 15468 Average: 3880.6437  StdDev: 620.75
+Min: 2821  Median: 3672.2248  Max: 30317
+Percentiles: P50: 3672.22 P75: 4058.49 P99: 5962.48 P99.9: 15266.00 P99.99: 24492.60
+------------------------------------------------------
+(    1900,    2900 ]        3   0.019%   0.019% 
+(    2900,    4400 ]    15017  97.084%  97.104% ###################
+(    4400,    6600 ]      413   2.670%  99.774% #
+(    6600,    9900 ]        4   0.026%  99.800% 
+(    9900,   14000 ]       13   0.084%  99.884% 
+(   14000,   22000 ]       16   0.103%  99.987% 
+(   22000,   33000 ]        2   0.013% 100.000% 
+
+## round 1 threads 1 io_uring false
+RocksDB:    version 11.13.2
+Date:       Wed Nov 11 12:20:48 2026
+CPU:        8 * amd64
+entries_per_batch = 32
+... finished 128 ops                              ... finished 224 ops                              ... finished 320 ops                              ... finished 416 ops                              ... finished 512 ops                              ... finished 608 ops                              ... finished 704 ops                              ... finished 800 ops                              ... finished 928 ops                              ... finished 1024 ops                              ... finished 1504 ops                              ... finished 2016 ops                              ... finished 2528 ops                              ... finished 3008 ops                              ... finished 3520 ops                              ... finished 4000 ops                              ... finished 4512 ops                              ... finished 5024 ops                              ... finished 6016 ops                              ... finished 7008 ops                              ... finished 8000 ops                              ... finished 9024 ops                              ... finished 10016 ops                              ... finished 15008 ops                              ... finished 20000 ops                              ... finished 25024 ops                              ... finished 30016 ops                              ... finished 35008 ops                              ... finished 40000 ops                              ... finished 45024 ops                              ... finished 50016 ops                              ... finished 60000 ops                              ... finished 70016 ops                              ... finished 80000 ops                              ... finished 90016 ops                              ... finished 100000 ops                              ... finished 150016 ops                              ... finished 200000 ops                              ... finished 250016 ops                              ... finished 300000 ops                              ... finished 350016 ops                              Set seed to 1794370848012964 because --seed was 0
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+Keys:       16 bytes each (+ 0 bytes user-defined timestamp)
+Values:     1000 bytes each (1000 bytes after compression)
+Entries:    4000000
+Prefix:    0 bytes
+Keys per prefix:    0
+RawSize:    3875.7 MB (estimated)
+FileSize:   3875.7 MB (estimated)
+Write rate: 0 bytes/second
+Read rate: 0 ops/second
+Compression: NoCompression
+Compression sampling rate: 0
+Memtablerep: SkipListFactory
+Perf Level: 1
+------------------------------------------------
+DB path: [/mnt/rocksbench/db]
+multireadrandom :     155.597 micros/op 6426 ops/sec 60.058 seconds 385984 operations;    3.9 MB/s (244210 of 385984 found)
+Microseconds per read:
+Count: 12062 Average: 4979.1188  StdDev: 579.33
+Min: 4239  Median: 5502.8443  Max: 36054
+Percentiles: P50: 5502.84 P75: 6056.19 P99: 6587.41 P99.9: 12206.54 P99.99: 30731.80
+------------------------------------------------------
+(    2900,    4400 ]       21   0.174%   0.174% 
+(    4400,    6600 ]    11989  99.395%  99.569% ####################
+(    6600,    9900 ]       36   0.298%  99.867% 
+(    9900,   14000 ]        7   0.058%  99.925% 
+(   14000,   22000 ]        7   0.058%  99.983% 
+(   22000,   33000 ]        1   0.008%  99.992% 
+(   33000,   50000 ]        1   0.008% 100.000% 
+
+## round 1 threads 4 io_uring true
+RocksDB:    version 11.13.2
+Date:       Wed Nov 11 12:21:48 2026
+CPU:        8 * amd64
+entries_per_batch = 32
+... finished 128 ops                              ... finished 128 ops                              ... finished 128 ops                              ... finished 128 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 350016 ops                              ... finished 350016 ops                              ... finished 350016 ops                              ... finished 350016 ops                              Set seed to 1794370908138451 because --seed was 0
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+Keys:       16 bytes each (+ 0 bytes user-defined timestamp)
+Values:     1000 bytes each (1000 bytes after compression)
+Entries:    4000000
+Prefix:    0 bytes
+Keys per prefix:    0
+RawSize:    3875.7 MB (estimated)
+FileSize:   3875.7 MB (estimated)
+Write rate: 0 bytes/second
+Read rate: 0 ops/second
+Compression: NoCompression
+Compression sampling rate: 0
+Memtablerep: SkipListFactory
+Perf Level: 1
+------------------------------------------------
+DB path: [/mnt/rocksbench/db]
+multireadrandom :     166.406 micros/op 24017 ops/sec 60.122 seconds 1443968 operations;   14.7 MB/s (228648 of 360992 found)
+Microseconds per read:
+Count: 45124 Average: 5325.0008  StdDev: 746.43
+Min: 3411  Median: 5491.8928  Max: 29811
+Percentiles: P50: 5491.89 P75: 6058.20 P99: 6951.62 P99.9: 13615.66 P99.99: 29454.54
+------------------------------------------------------
+(    2900,    4400 ]      811   1.797%   1.797% 
+(    4400,    6600 ]    43825  97.121%  98.919% ###################
+(    6600,    9900 ]      345   0.765%  99.683% 
+(    9900,   14000 ]      108   0.239%  99.922% 
+(   14000,   22000 ]       21   0.047%  99.969% 
+(   22000,   33000 ]       14   0.031% 100.000% 
+
+## round 1 threads 4 io_uring false
+RocksDB:    version 11.13.2
+Date:       Wed Nov 11 12:22:48 2026
+CPU:        8 * amd64
+entries_per_batch = 32
+... finished 128 ops                              ... finished 128 ops                              ... finished 128 ops                              ... finished 128 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 300000 ops                              Set seed to 1794370968327582 because --seed was 0
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+Keys:       16 bytes each (+ 0 bytes user-defined timestamp)
+Values:     1000 bytes each (1000 bytes after compression)
+Entries:    4000000
+Prefix:    0 bytes
+Keys per prefix:    0
+RawSize:    3875.7 MB (estimated)
+FileSize:   3875.7 MB (estimated)
+Write rate: 0 bytes/second
+Read rate: 0 ops/second
+Compression: NoCompression
+Compression sampling rate: 0
+Memtablerep: SkipListFactory
+Perf Level: 1
+------------------------------------------------
+DB path: [/mnt/rocksbench/db]
+multireadrandom :     195.800 micros/op 20425 ops/sec 60.115 seconds 1227904 operations;   12.5 MB/s (194129 of 306976 found)
+Microseconds per read:
+Count: 38372 Average: 6265.5960  StdDev: 706.41
+Min: 4734  Median: 5539.4034  Max: 44472
+Percentiles: P50: 5539.40 P75: 6109.11 P99: 9262.81 P99.9: 16976.76 P99.99: 33691.90
+------------------------------------------------------
+(    4400,    6600 ]    37045  96.542%  96.542% ###################
+(    6600,    9900 ]     1169   3.046%  99.588% #
+(    9900,   14000 ]      104   0.271%  99.859% 
+(   14000,   22000 ]       42   0.109%  99.969% 
+(   22000,   33000 ]        8   0.021%  99.990% 
+(   33000,   50000 ]        4   0.010% 100.000% 
+
+## round 2 threads 1 io_uring true
+RocksDB:    version 11.13.2
+Date:       Wed Nov 11 12:23:48 2026
+CPU:        8 * amd64
+entries_per_batch = 32
+... finished 128 ops                              ... finished 224 ops                              ... finished 320 ops                              ... finished 416 ops                              ... finished 512 ops                              ... finished 608 ops                              ... finished 704 ops                              ... finished 800 ops                              ... finished 928 ops                              ... finished 1024 ops                              ... finished 1504 ops                              ... finished 2016 ops                              ... finished 2528 ops                              ... finished 3008 ops                              ... finished 3520 ops                              ... finished 4000 ops                              ... finished 4512 ops                              ... finished 5024 ops                              ... finished 6016 ops                              ... finished 7008 ops                              ... finished 8000 ops                              ... finished 9024 ops                              ... finished 10016 ops                              ... finished 15008 ops                              ... finished 20000 ops                              ... finished 25024 ops                              ... finished 30016 ops                              ... finished 35008 ops                              ... finished 40000 ops                              ... finished 45024 ops                              ... finished 50016 ops                              ... finished 60000 ops                              ... finished 70016 ops                              ... finished 80000 ops                              ... finished 90016 ops                              ... finished 100000 ops                              ... finished 150016 ops                              ... finished 200000 ops                              ... finished 250016 ops                              ... finished 300000 ops                              ... finished 350016 ops                              ... finished 400000 ops                              ... finished 450016 ops                              Set seed to 1794371028512663 because --seed was 0
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+Keys:       16 bytes each (+ 0 bytes user-defined timestamp)
+Values:     1000 bytes each (1000 bytes after compression)
+Entries:    4000000
+Prefix:    0 bytes
+Keys per prefix:    0
+RawSize:    3875.7 MB (estimated)
+FileSize:   3875.7 MB (estimated)
+Write rate: 0 bytes/second
+Read rate: 0 ops/second
+Compression: NoCompression
+Compression sampling rate: 0
+Memtablerep: SkipListFactory
+Perf Level: 1
+------------------------------------------------
+DB path: [/mnt/rocksbench/db]
+multireadrandom :     121.508 micros/op 8229 ops/sec 60.023 seconds 493984 operations;    5.0 MB/s (312333 of 493984 found)
+Microseconds per read:
+Count: 15437 Average: 3888.2478  StdDev: 638.59
+Min: 2715  Median: 3673.4579  Max: 32130
+Percentiles: P50: 3673.46 P75: 4060.34 P99: 6066.47 P99.9: 13705.42 P99.99: 24509.65
+------------------------------------------------------
+(    1900,    2900 ]        3   0.019%   0.019% 
+(    2900,    4400 ]    14963  96.929%  96.949% ###################
+(    4400,    6600 ]      418   2.708%  99.657% #
+(    6600,    9900 ]       19   0.123%  99.780% 
+(    9900,   14000 ]       20   0.130%  99.909% 
+(   14000,   22000 ]       12   0.078%  99.987% 
+(   22000,   33000 ]        2   0.013% 100.000% 
+
+## round 2 threads 1 io_uring false
+RocksDB:    version 11.13.2
+Date:       Wed Nov 11 12:24:48 2026
+CPU:        8 * amd64
+entries_per_batch = 32
+... finished 128 ops                              ... finished 224 ops                              ... finished 320 ops                              ... finished 416 ops                              ... finished 512 ops                              ... finished 608 ops                              ... finished 704 ops                              ... finished 800 ops                              ... finished 928 ops                              ... finished 1024 ops                              ... finished 1504 ops                              ... finished 2016 ops                              ... finished 2528 ops                              ... finished 3008 ops                              ... finished 3520 ops                              ... finished 4000 ops                              ... finished 4512 ops                              ... finished 5024 ops                              ... finished 6016 ops                              ... finished 7008 ops                              ... finished 8000 ops                              ... finished 9024 ops                              ... finished 10016 ops                              ... finished 15008 ops                              ... finished 20000 ops                              ... finished 25024 ops                              ... finished 30016 ops                              ... finished 35008 ops                              ... finished 40000 ops                              ... finished 45024 ops                              ... finished 50016 ops                              ... finished 60000 ops                              ... finished 70016 ops                              ... finished 80000 ops                              ... finished 90016 ops                              ... finished 100000 ops                              ... finished 150016 ops                              ... finished 200000 ops                              ... finished 250016 ops                              ... finished 300000 ops                              ... finished 350016 ops                              Set seed to 1794371088603504 because --seed was 0
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+Keys:       16 bytes each (+ 0 bytes user-defined timestamp)
+Values:     1000 bytes each (1000 bytes after compression)
+Entries:    4000000
+Prefix:    0 bytes
+Keys per prefix:    0
+RawSize:    3875.7 MB (estimated)
+FileSize:   3875.7 MB (estimated)
+Write rate: 0 bytes/second
+Read rate: 0 ops/second
+Compression: NoCompression
+Compression sampling rate: 0
+Memtablerep: SkipListFactory
+Perf Level: 1
+------------------------------------------------
+DB path: [/mnt/rocksbench/db]
+multireadrandom :     155.648 micros/op 6424 ops/sec 60.078 seconds 385984 operations;    3.9 MB/s (243212 of 385984 found)
+Microseconds per read:
+Count: 12062 Average: 4980.7288  StdDev: 551.69
+Min: 4052  Median: 5503.0303  Max: 22279
+Percentiles: P50: 5503.03 P75: 6056.84 P99: 6588.50 P99.9: 15192.62 P99.99: 21873.11
+------------------------------------------------------
+(    2900,    4400 ]       25   0.207%   0.207% 
+(    4400,    6600 ]    11979  99.312%  99.519% ####################
+(    6600,    9900 ]       26   0.216%  99.735% 
+(    9900,   14000 ]       18   0.149%  99.884% 
+(   14000,   22000 ]       13   0.108%  99.992% 
+(   22000,   33000 ]        1   0.008% 100.000% 
+
+## round 2 threads 4 io_uring true
+RocksDB:    version 11.13.2
+Date:       Wed Nov 11 12:25:48 2026
+CPU:        8 * amd64
+entries_per_batch = 32
+... finished 128 ops                              ... finished 128 ops                              ... finished 128 ops                              ... finished 128 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 350016 ops                              ... finished 350016 ops                              ... finished 350016 ops                              ... finished 350016 ops                              Set seed to 1794371148746676 because --seed was 0
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+Keys:       16 bytes each (+ 0 bytes user-defined timestamp)
+Values:     1000 bytes each (1000 bytes after compression)
+Entries:    4000000
+Prefix:    0 bytes
+Keys per prefix:    0
+RawSize:    3875.7 MB (estimated)
+FileSize:   3875.7 MB (estimated)
+Write rate: 0 bytes/second
+Read rate: 0 ops/second
+Compression: NoCompression
+Compression sampling rate: 0
+Memtablerep: SkipListFactory
+Perf Level: 1
+------------------------------------------------
+DB path: [/mnt/rocksbench/db]
+multireadrandom :     166.392 micros/op 24024 ops/sec 60.105 seconds 1443968 operations;   14.7 MB/s (228167 of 360992 found)
+Microseconds per read:
+Count: 45124 Average: 5324.5470  StdDev: 722.75
+Min: 3498  Median: 5489.9179  Max: 35558
+Percentiles: P50: 5489.92 P75: 6054.37 P99: 6596.24 P99.9: 13860.78 P99.99: 30236.36
+------------------------------------------------------
+(    2900,    4400 ]      779   1.726%   1.726% 
+(    4400,    6600 ]    43969  97.440%  99.167% ###################
+(    6600,    9900 ]      242   0.536%  99.703% 
+(    9900,   14000 ]       92   0.204%  99.907% 
+(   14000,   22000 ]       30   0.066%  99.973% 
+(   22000,   33000 ]       10   0.022%  99.996% 
+(   33000,   50000 ]        2   0.004% 100.000% 
+
+## round 2 threads 4 io_uring false
+RocksDB:    version 11.13.2
+Date:       Wed Nov 11 12:26:48 2026
+CPU:        8 * amd64
+entries_per_batch = 32
+... finished 128 ops                              ... finished 128 ops                              ... finished 128 ops                              ... finished 128 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 300000 ops                              Set seed to 1794371208919659 because --seed was 0
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+Keys:       16 bytes each (+ 0 bytes user-defined timestamp)
+Values:     1000 bytes each (1000 bytes after compression)
+Entries:    4000000
+Prefix:    0 bytes
+Keys per prefix:    0
+RawSize:    3875.7 MB (estimated)
+FileSize:   3875.7 MB (estimated)
+Write rate: 0 bytes/second
+Read rate: 0 ops/second
+Compression: NoCompression
+Compression sampling rate: 0
+Memtablerep: SkipListFactory
+Perf Level: 1
+------------------------------------------------
+DB path: [/mnt/rocksbench/db]
+multireadrandom :     194.784 micros/op 20535 ops/sec 60.188 seconds 1235968 operations;   12.6 MB/s (195781 of 308992 found)
+Microseconds per read:
+Count: 38624 Average: 6233.1001  StdDev: 279.65
+Min: 5418  Median: 5532.8800  Max: 23043
+Percentiles: P50: 5532.88 P75: 6099.32 P99: 8820.43 P99.9: 9870.92 P99.99: 15100.80
+------------------------------------------------------
+(    4400,    6600 ]    37503  97.098%  97.098% ###################
+(    6600,    9900 ]     1092   2.827%  99.925% #
+(    9900,   14000 ]       25   0.065%  99.990% 
+(   14000,   22000 ]        1   0.003%  99.992% 
+(   22000,   33000 ]        3   0.008% 100.000% 
+
+## round 3 threads 1 io_uring true
+RocksDB:    version 11.13.2
+Date:       Wed Nov 11 12:27:49 2026
+CPU:        8 * amd64
+entries_per_batch = 32
+... finished 128 ops                              ... finished 224 ops                              ... finished 320 ops                              ... finished 416 ops                              ... finished 512 ops                              ... finished 608 ops                              ... finished 704 ops                              ... finished 800 ops                              ... finished 928 ops                              ... finished 1024 ops                              ... finished 1504 ops                              ... finished 2016 ops                              ... finished 2528 ops                              ... finished 3008 ops                              ... finished 3520 ops                              ... finished 4000 ops                              ... finished 4512 ops                              ... finished 5024 ops                              ... finished 6016 ops                              ... finished 7008 ops                              ... finished 8000 ops                              ... finished 9024 ops                              ... finished 10016 ops                              ... finished 15008 ops                              ... finished 20000 ops                              ... finished 25024 ops                              ... finished 30016 ops                              ... finished 35008 ops                              ... finished 40000 ops                              ... finished 45024 ops                              ... finished 50016 ops                              ... finished 60000 ops                              ... finished 70016 ops                              ... finished 80000 ops                              ... finished 90016 ops                              ... finished 100000 ops                              ... finished 150016 ops                              ... finished 200000 ops                              ... finished 250016 ops                              ... finished 300000 ops                              ... finished 350016 ops                              ... finished 400000 ops                              ... finished 450016 ops                              Set seed to 1794371269173177 because --seed was 0
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+Keys:       16 bytes each (+ 0 bytes user-defined timestamp)
+Values:     1000 bytes each (1000 bytes after compression)
+Entries:    4000000
+Prefix:    0 bytes
+Keys per prefix:    0
+RawSize:    3875.7 MB (estimated)
+FileSize:   3875.7 MB (estimated)
+Write rate: 0 bytes/second
+Read rate: 0 ops/second
+Compression: NoCompression
+Compression sampling rate: 0
+Memtablerep: SkipListFactory
+Perf Level: 1
+------------------------------------------------
+DB path: [/mnt/rocksbench/db]
+multireadrandom :     120.677 micros/op 8286 ops/sec 60.095 seconds 497984 operations;    5.1 MB/s (314580 of 497984 found)
+Microseconds per read:
+Count: 15562 Average: 3861.6538  StdDev: 428.41
+Min: 2757  Median: 3670.6049  Max: 25422
+Percentiles: P50: 3670.60 P75: 4056.01 P99: 5818.27 P99.9: 6575.34 P99.99: 24440.90
+------------------------------------------------------
+(    1900,    2900 ]        2   0.013%   0.013% 
+(    2900,    4400 ]    15142  97.301%  97.314% ###################
+(    4400,    6600 ]      407   2.615%  99.929% #
+(    6600,    9900 ]        6   0.039%  99.968% 
+(   14000,   22000 ]        3   0.019%  99.987% 
+(   22000,   33000 ]        2   0.013% 100.000% 
+
+## round 3 threads 1 io_uring false
+RocksDB:    version 11.13.2
+Date:       Wed Nov 11 12:28:49 2026
+CPU:        8 * amd64
+entries_per_batch = 32
+... finished 128 ops                              ... finished 224 ops                              ... finished 320 ops                              ... finished 416 ops                              ... finished 512 ops                              ... finished 608 ops                              ... finished 704 ops                              ... finished 800 ops                              ... finished 928 ops                              ... finished 1024 ops                              ... finished 1504 ops                              ... finished 2016 ops                              ... finished 2528 ops                              ... finished 3008 ops                              ... finished 3520 ops                              ... finished 4000 ops                              ... finished 4512 ops                              ... finished 5024 ops                              ... finished 6016 ops                              ... finished 7008 ops                              ... finished 8000 ops                              ... finished 9024 ops                              ... finished 10016 ops                              ... finished 15008 ops                              ... finished 20000 ops                              ... finished 25024 ops                              ... finished 30016 ops                              ... finished 35008 ops                              ... finished 40000 ops                              ... finished 45024 ops                              ... finished 50016 ops                              ... finished 60000 ops                              ... finished 70016 ops                              ... finished 80000 ops                              ... finished 90016 ops                              ... finished 100000 ops                              ... finished 150016 ops                              ... finished 200000 ops                              ... finished 250016 ops                              ... finished 300000 ops                              ... finished 350016 ops                              Set seed to 1794371329341819 because --seed was 0
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+Keys:       16 bytes each (+ 0 bytes user-defined timestamp)
+Values:     1000 bytes each (1000 bytes after compression)
+Entries:    4000000
+Prefix:    0 bytes
+Keys per prefix:    0
+RawSize:    3875.7 MB (estimated)
+FileSize:   3875.7 MB (estimated)
+Write rate: 0 bytes/second
+Read rate: 0 ops/second
+Compression: NoCompression
+Compression sampling rate: 0
+Memtablerep: SkipListFactory
+Perf Level: 1
+------------------------------------------------
+DB path: [/mnt/rocksbench/db]
+multireadrandom :     155.191 micros/op 6443 ops/sec 60.055 seconds 386976 operations;    3.9 MB/s (244800 of 386976 found)
+Microseconds per read:
+Count: 12093 Average: 4966.1025  StdDev: 446.85
+Min: 4232  Median: 5500.0000  Max: 28719
+Percentiles: P50: 5500.00 P75: 6052.10 P99: 6582.12 P99.9: 8717.24 P99.99: 26348.85
+------------------------------------------------------
+(    2900,    4400 ]       23   0.190%   0.190% 
+(    4400,    6600 ]    12047  99.620%  99.810% ####################
+(    6600,    9900 ]       17   0.141%  99.950% 
+(   14000,   22000 ]        4   0.033%  99.983% 
+(   22000,   33000 ]        2   0.017% 100.000% 
+
+## round 3 threads 4 io_uring true
+RocksDB:    version 11.13.2
+Date:       Wed Nov 11 12:29:49 2026
+CPU:        8 * amd64
+entries_per_batch = 32
+... finished 128 ops                              ... finished 128 ops                              ... finished 128 ops                              ... finished 128 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 350016 ops                              ... finished 350016 ops                              ... finished 350016 ops                              ... finished 350016 ops                              Set seed to 1794371389463384 because --seed was 0
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+Keys:       16 bytes each (+ 0 bytes user-defined timestamp)
+Values:     1000 bytes each (1000 bytes after compression)
+Entries:    4000000
+Prefix:    0 bytes
+Keys per prefix:    0
+RawSize:    3875.7 MB (estimated)
+FileSize:   3875.7 MB (estimated)
+Write rate: 0 bytes/second
+Read rate: 0 ops/second
+Compression: NoCompression
+Compression sampling rate: 0
+Memtablerep: SkipListFactory
+Perf Level: 1
+------------------------------------------------
+DB path: [/mnt/rocksbench/db]
+multireadrandom :     165.686 micros/op 24130 ops/sec 60.128 seconds 1450912 operations;   14.8 MB/s (229720 of 362976 found)
+Microseconds per read:
+Count: 45341 Average: 5301.9456  StdDev: 636.49
+Min: 3505  Median: 5484.0590  Max: 30894
+Percentiles: P50: 5484.06 P75: 6046.10 P99: 6585.65 P99.9: 9683.27 P99.99: 29674.99
+------------------------------------------------------
+(    2900,    4400 ]      807   1.780%   1.780% 
+(    4400,    6600 ]    44370  97.858%  99.638% ####################
+(    6600,    9900 ]      127   0.280%  99.918% 
+(    9900,   14000 ]        5   0.011%  99.929% 
+(   14000,   22000 ]       17   0.037%  99.967% 
+(   22000,   33000 ]       15   0.033% 100.000% 
+
+## round 3 threads 4 io_uring false
+RocksDB:    version 11.13.2
+Date:       Wed Nov 11 12:30:49 2026
+CPU:        8 * amd64
+entries_per_batch = 32
+... finished 128 ops                              ... finished 128 ops                              ... finished 128 ops                              ... finished 128 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 224 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 320 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 416 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 512 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 608 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 704 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 800 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 928 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1024 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 1504 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2016 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 2528 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3008 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 3520 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4000 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 4512 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 5024 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 6016 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 7008 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 8000 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 9024 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 10016 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 15008 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 20000 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 25024 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 30016 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 35008 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 40000 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 45024 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 50016 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 60000 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 70016 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 80000 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 90016 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 100000 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 150016 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 200000 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 250016 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 300000 ops                              ... finished 300000 ops                              Set seed to 1794371449681518 because --seed was 0
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+Keys:       16 bytes each (+ 0 bytes user-defined timestamp)
+Values:     1000 bytes each (1000 bytes after compression)
+Entries:    4000000
+Prefix:    0 bytes
+Keys per prefix:    0
+RawSize:    3875.7 MB (estimated)
+FileSize:   3875.7 MB (estimated)
+Write rate: 0 bytes/second
+Read rate: 0 ops/second
+Compression: NoCompression
+Compression sampling rate: 0
+Memtablerep: SkipListFactory
+Perf Level: 1
+------------------------------------------------
+DB path: [/mnt/rocksbench/db]
+multireadrandom :     195.101 micros/op 20500 ops/sec 60.089 seconds 1231872 operations;   12.6 MB/s (194184 of 307968 found)
+Microseconds per read:
+Count: 38496 Average: 6243.2472  StdDev: 516.98
+Min: 5018  Median: 5532.5987  Max: 27771
+Percentiles: P50: 5532.60 P75: 6098.90 P99: 8842.51 P99.9: 12407.38 P99.99: 27771.00
+------------------------------------------------------
+(    4400,    6600 ]    37388  97.122%  97.122% ###################
+(    6600,    9900 ]     1064   2.764%  99.886% #
+(    9900,   14000 ]        9   0.023%  99.909% 
+(   14000,   22000 ]       15   0.039%  99.948% 
+(   22000,   33000 ]       20   0.052% 100.000% 
+
+corruption or I/O errors: 0

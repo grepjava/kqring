@@ -1,0 +1,33 @@
+--- a/env/fs_posix.cc
++++ b/env/fs_posix.cc
+@@ -1405,7 +1405,7 @@
+           fprintf(stdout,
+                   "SupportedOps: failed to init io_uring, disabling async IO "
+                   "support on thread %lu\n",
+-                  static_cast<unsigned long>(pthread_self()));
++                  (unsigned long)(uintptr_t)pthread_self());
+         }
+         io_uring_init_attempted = true;
+       }
+--- a/env/io_posix.h
++++ b/env/io_posix.h
+@@ -404,7 +404,7 @@
+   if (ret) {
+     fprintf(stdout, "CreateIOUring failed: %s (errno=%d), thread=%lu\n",
+             errnoStr(-ret).c_str(), -ret,
+-            static_cast<unsigned long>(pthread_self()));
++            (unsigned long)(uintptr_t)pthread_self());
+     delete new_io_uring;
+     new_io_uring = nullptr;
+   } else {
+--- a/env/env_test.cc
++++ b/env/env_test.cc
+@@ -59,7 +59,7 @@
+ #include "env/env_chroot.h"
+ #include "env/env_encryption_ctr.h"
+ #include "env/fs_readonly.h"
+-#ifdef OS_LINUX
++#if defined(OS_LINUX) || defined(ROCKSDB_IOURING_PRESENT)
+ #include "env/io_posix.h"
+ #endif
+ #include "env/mock_env.h"
