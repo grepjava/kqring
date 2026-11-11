@@ -14,7 +14,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 4 | Per-file write ordering | Done |
 | 5 | Worker path scalability | Done |
 | 6 | Performance evidence | Done |
-| 7 | Newer interfaces and real programs | In progress |
+| 7 | Newer interfaces and real programs | Done |
 
 ## Where kqring stands
 
@@ -126,6 +126,8 @@ Acceptance: a profile that names the limit, then either a measured improvement o
 Acceptance: hardware, kernel, filesystem settings, queue depths, batch sizes, CPU use, latency distributions and raw repeated runs are published. Device saturation, filesystem costs and ring or worker overhead are told apart.
 
 ## Phase 7: Newer interfaces and real programs
+
+**Done** (11 November 2026). Two real programs, PostgreSQL and RocksDB, run their io_uring paths on kqring, each with instructions, its patches, its configuration and its tests. The newer interfaces programs and liburing's tests use are in, and liburing 2.15, still the newest release, passes 219 of 245. What still blocks programs is listed under Research: concurrent submitters on one ring, exec survival and zero-copy receive.
 
 Qualify a newer pinned liburing release, and real applications alongside fio. Audit header layouts, feature bits, probing, unsupported flags and fallback behavior.
 
