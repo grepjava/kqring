@@ -627,7 +627,9 @@ kqring_op_alloc(struct kqring_ctx *ctx)
 	if (op != NULL) {
 		TAILQ_REMOVE(&ctx->free_ops, op, active_link);
 		ctx->nfree--;
-		bzero(op, offsetof(struct kqring_op, callout));
+		/* Inline stores: rep stos costs more to start than this. */
+		__builtin_memset_inline(op, 0,
+		    offsetof(struct kqring_op, active_link));
 	} else {
 		op = malloc(sizeof(*op), M_KQRING, M_WAITOK | M_ZERO);
 	}

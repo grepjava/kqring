@@ -327,10 +327,6 @@ struct kqring_rmem {
  * soupcall with SBS_CANTRCVMORE.
  */
 struct kqring_op {
-	TAILQ_ENTRY(kqring_op)	active_link;	/* active_ops or free_ops */
-	TAILQ_ENTRY(kqring_op)	taskwork_link;
-	TAILQ_ENTRY(kqring_op)	q_link;		/* ready_q or defer_q */
-	TAILQ_ENTRY(kqring_op)	wq_link;	/* wq_ops[wq_type] */
 	struct kqring_ctx	*ctx;
 	/* Its submitter's context: the pool and taskwork it runs on. */
 	struct kqring_tctx	*tctx;
@@ -339,15 +335,11 @@ struct kqring_op {
 	/* The waiter lists op is on: so_rcv (or the listener), so_snd. */
 	struct kqring_sowatch	*sw[2];
 	struct kqring_sowatch	*reap_sw;	/* empty sw detached in upcall */
-	TAILQ_ENTRY(kqring_op)	sw_link[2];
 	/*
 	 * POLL_ADD on a non-socket file, as knotes on the ring's kqueue
-	 * (kqring_kpoll.c): in ctx->kp_ops[] by fd while kp_on, with the events
-	 * the poller saw since the last delivery (under ctx->mtx).
+	 * (kqring_kpoll.c): in ctx->kp_ops[] by fd while kp_on (kp_link), with
+	 * the events the poller saw since the last delivery (under ctx->mtx).
 	 */
-	TAILQ_ENTRY(kqring_op)	kp_link;
-	/* An armed POLL_ADD: in ctx->poll_hash[] by user_data. */
-	LIST_ENTRY(kqring_op)	poll_hlink;
 	uint64_t		kp_id;		/* knotes' udata */
 	int			kp_fd;		/* their ident */
 	uint8_t			kp_filters;	/* KQRING_KP_READ / _WRITE */
@@ -366,8 +358,7 @@ struct kqring_op {
 	uint32_t		kp_kfflags;
 	int64_t			kp_kdata;
 	/* Set for a final CQE that carries big_cqe words (CQE32). */
-	bool			cqe_has_extra;
-	uint64_t		cqe_extra[2];
+	bool			cqe_has_extra;	/* in cqe_extra */
 	/*
 	 * An EVFILT_READ / EVFILT_WRITE kevent request, run as a POLL_ADD
 	 * whose res becomes the byte count (kqring_kev_count()).
@@ -394,8 +385,7 @@ struct kqring_op {
 	bool			timer_pending;	/* callout scheduled; under mtx */
 	/* In-process worker thread state (under ctx->mtx). */
 	struct thread		*wq_td;		/* worker executing this op */
-	struct file		*wq_fp;		/* direct OPENAT(2) file */
-	struct filecaps		wq_caps;	/* and its Capsicum rights */
+	struct file		*wq_fp;		/* direct OPENAT(2) file, wq_caps */
 	uint8_t			wq_type;	/* IO_WQ_BOUND / IO_WQ_UNBOUND */
 	int8_t			wq_hash;	/* bucket of an ordered write, -1 */
 	bool			wq_vreg;	/* a regular file's read or write */
@@ -417,8 +407,7 @@ struct kqring_op {
 	struct kqring_op	*link;		/* next request in the chain */
 	struct kqring_op	*ltimeout;	/* LINK_TIMEOUT guarding this */
 	struct kqring_op	*ltarget;	/* LINK_TIMEOUT: request guarded */
-	/* TIMEOUT / LINK_TIMEOUT state (and callout below) */
-	struct timespec		ts;
+	/* TIMEOUT / LINK_TIMEOUT state (and ts, callout below) */
 	/* Completion-count TIMEOUT: done once cq_seq - seq_start >= count. */
 	uint32_t		seq_start;
 	uint32_t		seq_count;
@@ -493,10 +482,26 @@ struct kqring_op {
 	}			tsel, tbuf;
 	bool			multishot;	/* prep: a multishot request */
 	/*
-	 * Not cleared when the op is reused (kqring_op_alloc()): the
-	 * callout is initialized once timer_init is set, and the SQE copied
-	 * in at submission (sqe_extra only on IORING_SETUP_SQE128 rings).
+	 * Not cleared when the op is reused (kqring_op_alloc()), from here
+	 * on: list linkage, set on insertion (what a request is on is in the
+	 * flags above, never read from its links); values always written
+	 * before they are read (wq_caps with wq_fp, ts by a timeout's prep,
+	 * cqe_extra with cqe_has_extra); the callout, initialized once
+	 * timer_init is set; and the SQE copied in at submission (sqe_extra
+	 * only on IORING_SETUP_SQE128 rings).  Clearing all of the op cost
+	 * every request about 25 ns.
 	 */
+	TAILQ_ENTRY(kqring_op)	active_link;	/* active_ops or free_ops */
+	TAILQ_ENTRY(kqring_op)	taskwork_link;
+	TAILQ_ENTRY(kqring_op)	q_link;		/* ready_q or defer_q */
+	TAILQ_ENTRY(kqring_op)	wq_link;	/* wq_ops[wq_type] */
+	TAILQ_ENTRY(kqring_op)	sw_link[2];	/* on sw[0], sw[1] */
+	TAILQ_ENTRY(kqring_op)	kp_link;	/* ctx->kp_ops[] */
+	/* An armed POLL_ADD: in ctx->poll_hash[] by user_data. */
+	LIST_ENTRY(kqring_op)	poll_hlink;
+	struct filecaps		wq_caps;
+	struct timespec		ts;
+	uint64_t		cqe_extra[2];
 	struct callout		callout;	/* uses ctx->mtx */
 	struct io_uring_sqe	sqe;
 	uint8_t			sqe_extra[64];

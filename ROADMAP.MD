@@ -17,6 +17,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 7 | Newer interfaces and real programs | Done |
 | 8 | Several processes submitting to one ring | Done |
 | 9 | Registered buffers on held pages | Done |
+| 10 | The cost of an enter | In progress |
 
 ## Where kqring stands
 
@@ -173,6 +174,19 @@ Progress (12 November 2026): implemented, with the order of work's steps 1 and 3
 - Direct reads from an md(4) disk with `--fixedbufs` are 0.5% faster at 4 KiB and 1.4% at 64 KiB (fio, median of three); without fixed buffers they're level. `kqring_bench` and `kqring_mt_bench` are level (median +0.2% over five alternated rounds).
 
 Phase 9 is done: every criterion is met. What still differs is in the [matrix](COMPATIBILITY.MD#boundaries): a new anonymous mapping over an unmapped buffer can share its pages, and a fixed read in flight during `fork(2)` lands in the child's copy.
+
+## Phase 10: The cost of an enter
+
+One `NOP` per enter cost kqring 438 ns above FreeBSD's system call floor on the laptop that ran both systems, and io_uring 178 ns above Linux's ([docs/linux-comparison.md](docs/linux-comparison.md#the-rings-own-costs)). That cost is paid by every request a program submits on its own, and it is why single requests and fan-in trail kqueue on the Ryzen ([BENCHMARK.MD](BENCHMARK.MD#why-the-results-depend-on-the-cpu)).
+
+[docs/per-request-cost.md](docs/per-request-cost.md) profiles the enter and records what each change gained.
+
+Acceptance: one `NOP` per enter costs no more above FreeBSD's floor than io_uring above Linux's on the same machine; the unit tests, the cross-process test, stress, the fuzzer, liburing and the comparison with Linux 7.3 pass as before; `kqring_bench`, `kqring_mt_bench` and fio are level or better.
+
+Progress (12 November 2026), on the Ryzen:
+
+- Every enter that completed something woke the ring's idle kernel thread, which then contended for `sq_sx`. Now only threads waiting for CQEs are woken: one `NOP` per enter went from 387 to 217 ns, a pipe `READ` from 629 to 505 ns, an AF_UNIX `RECV` from 755 to 595 ns.
+- Each request cleared 680 bytes with `rep stos`; it now clears 456 bytes with stores: one `NOP` per enter 218 to 200 ns, 32 per enter 83.4 to 71.6 ns per `NOP`.
 
 ## Research
 

@@ -9,7 +9,9 @@
  *   FreeBSD: make -C tests kqring_xbench
  *   Linux:   cc -O2 -pthread -o kqring_xbench tests/kqring_xbench.c
  *
- *   kqring_xbench [reps]	(default 5)
+ *   kqring_xbench [reps [case]]	(default 5 reps, every case)
+ *
+ * Naming a case runs only that one, which gives a profiler a steady loop.
  *
  * Each case runs for about a second after a warm-up, reps times; the
  * output is one line per case with the median and the range, in
@@ -249,6 +251,8 @@ int
 main(int argc, char **argv)
 {
 	int reps = argc > 1 ? atoi(argv[1]) : 5;
+	const char *only = argc > 2 ? argv[2] : NULL;
+	int found = 0;
 	struct utsname u;
 	double v[64];
 
@@ -259,6 +263,9 @@ main(int argc, char **argv)
 	CHECK(pipe(pfd) == 0);
 	CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sfd) == 0);
 	for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+		if (only != NULL && strcmp(only, cases[c].name) != 0)
+			continue;
+		found = 1;
 		(void)run(cases[c].op, 200000000ULL);
 		for (int i = 0; i < reps; i++)
 			v[i] = run(cases[c].op, 1000000000ULL);
@@ -266,6 +273,10 @@ main(int argc, char **argv)
 		printf("%-18s %8.1f ns  (%.1f-%.1f)  %s\n", cases[c].name,
 		    v[reps / 2], v[0], v[reps - 1], cases[c].what);
 		fflush(stdout);
+	}
+	if (!found) {
+		fprintf(stderr, "no case %s\n", only);
+		return (1);
 	}
 	return (0);
 }
