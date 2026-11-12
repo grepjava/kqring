@@ -17,7 +17,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 7 | Newer interfaces and real programs | Done |
 | 8 | Several processes submitting to one ring | Done |
 | 9 | Registered buffers on held pages | Done |
-| 10 | The cost of an enter | In progress |
+| 10 | The cost of an enter | Done |
 
 ## Where kqring stands
 
@@ -190,6 +190,8 @@ Progress (12 November 2026), on the Ryzen:
 - An enter on a ring without `SINGLE_ISSUER` no longer takes `ctx->mtx` to find its process's context when that process has the ring's only one, nor to signal completions when nothing waits or polls; and three calls that usually had nothing to do are checked inline first. One `NOP` per enter: 200.9 to 193.7 ns on the Ryzen.
 - Acceptance met. Against the phase 9 build on the Ryzen, `kqring_bench` is 1.0% faster (median row) and `kqring_mt_bench` level, with no row more than 5% slower; fio's direct reads are level; the unit tests, cross-process test, stress, fuzzer, liburing (220 of 245) and the diff with Linux 7.3 pass.
 - On the i5-8250U laptop, booting each system in turn: one `NOP` per enter costs kqring 165 ns above FreeBSD's system call floor, where it cost 622 ns with the phase 9 build, and io_uring 173 ns above Linux 7.3's. A pipe `READ` costs 255 ns above `read(2)` (Linux: 266), an AF_UNIX `RECV` 181 ns above `recv(2)` (Linux: 328).
+
+Phase 10 is done: every criterion is met. What is left of an enter's cost is spread thinly, and fan-in and single requests still trail kqueue on the Ryzen (see [`TODO.MD`](TODO.MD)).
 
 ## Research
 
