@@ -297,6 +297,23 @@ kqring_evfd_flush(struct kqring_ctx *ctx)
 	    (ctx->evfd == NULL && !ctx->pollers && !waiters))
 		return;
 	ctx->evfd_cqes = 0;
+	/*
+	 * No eventfd, no pollers and nobody waiting for CQEs: nothing to do
+	 * under ctx->mtx.  A waiter or poller counts itself (cq_sleepers,
+	 * pollers) before it looks at the CQ, with a fence between, and the
+	 * CQEs were posted before the fence here: either it sees them or
+	 * this sees it.  An eventfd registered meanwhile misses these CQEs,
+	 * as one registered just after them would.  A ring with waiters
+	 * already takes the lock without the fence, which would only add to
+	 * its cost (fio lost 1% to it).
+	 */
+	if (atomic_load_ptr(&ctx->evfd) == NULL &&
+	    atomic_load_int(&ctx->cq_sleepers) == 0) {
+		atomic_thread_fence_seq_cst();
+		if (!atomic_load_bool(&ctx->pollers) &&
+		    atomic_load_int(&ctx->cq_sleepers) == 0)
+			return;
+	}
 	mtx_lock(&ctx->mtx);
 	kqring_evfd_signal_locked(ctx);
 	if (waiters && ctx->cq_sleepers != 0)

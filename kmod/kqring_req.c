@@ -329,12 +329,10 @@ kqring_cq_push(struct kqring_ctx *ctx, const struct io_uring_cqe *src,
 
 /* Move overflowed CQEs into the CQ ring as userspace frees up space. */
 void
-kqring_flush_overflow(struct kqring_ctx *ctx)
+kqring_flush_overflow_slow(struct kqring_ctx *ctx)
 {
 	struct kqring_ocqe *ocqe;
 
-	if (STAILQ_EMPTY(&ctx->ocq))
-		return;
 	while ((ocqe = STAILQ_FIRST(&ctx->ocq)) != NULL) {
 		if (!kqring_cq_push(ctx, &ocqe->cqe,
 		    ocqe->has_extra ? ocqe->extra : NULL))

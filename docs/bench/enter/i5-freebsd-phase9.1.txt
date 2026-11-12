@@ -1,0 +1,8 @@
+# FreeBSD 15.1-RELEASE amd64
+getppid               192.5 ns  (192.4-192.5)  getppid(2): the system call floor
+nop1                  793.5 ns  (788.8-814.4)  1 NOP per enter, waited for
+nop32                  77.9 ns  (76.9-79.3)  32 NOPs per enter, waited for, per NOP
+pipe_read_syscall     610.4 ns  (610.3-610.4)  write(2) 64 B then read(2) it from a pipe
+pipe_read_ring       1130.7 ns  (1129.3-1140.1)  write(2) 64 B then READ it from a pipe
+unix_recv_syscall     721.3 ns  (721.3-721.4)  write(2) 64 B then recv(2) it, AF_UNIX stream
+unix_recv_ring       1184.0 ns  (1182.0-1186.5)  write(2) 64 B then RECV it, AF_UNIX stream

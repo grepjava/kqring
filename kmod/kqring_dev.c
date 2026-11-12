@@ -84,15 +84,22 @@ kqring_poll(struct file *fp, int events, struct ucred *active_cred __unused,
 		mtx_unlock(&ctx->mtx);
 		return (POLLHUP);
 	}
+	/*
+	 * Counted as a poller before looking at the CQ, as a waiter is in
+	 * kqring_wait_cqes(): kqring_evfd_flush() skips ctx->mtx when it
+	 * sees no pollers after posting.
+	 */
+	if ((events & (POLLIN | POLLRDNORM)) != 0 && !ctx->pollers) {
+		ctx->pollers = true;
+		atomic_thread_fence_seq_cst();
+	}
 	if (kqring_ring_readable(ctx))
 		revents |= events & (POLLIN | POLLRDNORM);
 	if (atomic_load_acq_32(&ctx->shm->sq_tail) -
 	    atomic_load_acq_32(&ctx->shm->sq_head) < ctx->sq_entries)
 		revents |= events & (POLLOUT | POLLWRNORM);
-	if (revents == 0 && (events & (POLLIN | POLLRDNORM)) != 0) {
-		ctx->pollers = true;
+	if (revents == 0 && (events & (POLLIN | POLLRDNORM)) != 0)
 		selrecord(td, &ctx->rsel);
-	}
 	mtx_unlock(&ctx->mtx);
 	return (revents);
 }
@@ -135,6 +142,8 @@ kqring_kqfilter(struct file *fp, struct knote *kn)
 	kn->kn_hook = ctx;
 	mtx_lock(&ctx->mtx);
 	ctx->pollers = true;
+	/* Before kevent's first look at the CQ: see kqring_poll(). */
+	atomic_thread_fence_seq_cst();
 	mtx_unlock(&ctx->mtx);
 	knlist_add(&ctx->rsel.si_note, kn, 0);
 	return (0);
@@ -887,6 +896,18 @@ kqring_tctx_new(struct kqring_ctx *ctx, struct thread *td, struct kqring_wq *wq)
 	return (t);
 }
 
+/* ctx->solo_proc, after the list or a context's dead changed. */
+static void
+kqring_tctx_solo_locked(struct kqring_ctx *ctx)
+{
+	struct kqring_tctx *t = LIST_FIRST(&ctx->tctxs);
+
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	atomic_store_rel_ptr((volatile uintptr_t *)&ctx->solo_proc,
+	    (uintptr_t)(t != NULL && LIST_NEXT(t, link) == NULL && !t->dead ?
+	    t->proc : NULL));
+}
+
 /* Put t on ctx's list: ctx->mtx, and sq_sx unless nobody else has ctx. */
 void
 kqring_tctx_link_locked(struct kqring_ctx *ctx, struct kqring_tctx *t)
@@ -894,6 +915,7 @@ kqring_tctx_link_locked(struct kqring_ctx *ctx, struct kqring_tctx *t)
 	mtx_assert(&ctx->mtx, MA_OWNED);
 	LIST_INSERT_HEAD(&ctx->tctxs, t, link);
 	t->linked = true;
+	kqring_tctx_solo_locked(ctx);
 }
 
 static void
@@ -903,6 +925,7 @@ kqring_tctx_unlink(struct kqring_ctx *ctx, struct kqring_tctx *t)
 	if (t->linked) {
 		LIST_REMOVE(t, link);
 		t->linked = false;
+		kqring_tctx_solo_locked(ctx);
 	}
 	mtx_unlock(&ctx->mtx);
 }
@@ -1221,6 +1244,7 @@ kqring_tctx_exit_locked(struct kqring_ctx *ctx, struct kqring_tctx *t)
 	mtx_assert(&kqring_proc_mtx, MA_OWNED);
 	mtx_assert(&ctx->mtx, MA_OWNED);
 	t->dead = true;
+	kqring_tctx_solo_locked(ctx);
 	if (ctx->sleeping)
 		wakeup(&ctx->wakeup_chan);
 	refcount_acquire(&t->refs);
@@ -1920,9 +1944,14 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	if (sqpoll) {
 		owner = true;
 	} else if (ctx->shared) {
-		mtx_lock(&ctx->mtx);
-		owner = kqring_tctx_cur(ctx) != NULL;
-		mtx_unlock(&ctx->mtx);
+		/* Its only context, as usual, without ctx->mtx. */
+		owner = (struct proc *)atomic_load_acq_ptr(
+		    (volatile uintptr_t *)&ctx->solo_proc) == td->td_proc;
+		if (!owner) {
+			mtx_lock(&ctx->mtx);
+			owner = kqring_tctx_cur(ctx) != NULL;
+			mtx_unlock(&ctx->mtx);
+		}
 	} else {
 		owner = kqring_is_owner(ctx, td);
 	}
@@ -1955,7 +1984,8 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 		}
 	}
 	/* Waiting for events is when kevent(2) would look at a kqueue. */
-	if (!foreign && (ea->flags & IORING_ENTER_GETEVENTS) != 0)
+	if (!foreign && (ea->flags & IORING_ENTER_GETEVENTS) != 0 &&
+	    atomic_load_int(&ctx->kq_bridges) != 0)
 		kqring_kq_rescan(ctx);
 
 	/*
@@ -2067,7 +2097,8 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	 * that an enter made on seeing IORING_SQ_TASKRUN finds what it was
 	 * set for, whether or not it goes on to wait.
 	 */
-	if ((ea->flags & IORING_ENTER_GETEVENTS) != 0)
+	if ((ea->flags & IORING_ENTER_GETEVENTS) != 0 &&
+	    atomic_load_acq_int(&ctx->kp_kicks) != 0)
 		kqring_kpoll_kicked(ctx);
 
 	/*
@@ -2081,10 +2112,13 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 		return (EBADF);
 	}
 	if (ea->to_submit > 0) {
-		/* Cached file reads run here: kqring_wq_try_inline(). */
-		ctx->submit_inline = kqring_wq_inline_ok(ctx);
+		/*
+		 * Cached file reads may run here (kqring_wq_try_inline()),
+		 * decided at the first.
+		 */
+		ctx->submit_inline = -1;
 		kqring_submit_sqes(ctx, ea->to_submit, &submitted);
-		ctx->submit_inline = false;
+		ctx->submit_inline = 0;
 		ea->SUBMITTED_out = submitted;
 	} else {
 		kqring_flush_overflow(ctx);
@@ -2245,17 +2279,20 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 			goto drain;
 		}
 		/*
-		 * A ring's kthread may have posted CQEs since the check above;
-		 * it wakes waiters only under mtx, so look again here.
+		 * Another thread may have posted CQEs since the check above:
+		 * look again, counted as a waiter first.  kqring_evfd_flush()
+		 * wakes waiters without ctx->mtx only if it sees none after
+		 * posting, so with the fences either it sees us or we see its
+		 * CQEs.  mtx is held from here until the sleep.
 		 */
+		ctx->cq_sleepers++;
+		atomic_thread_fence_seq_cst();
 		cq_count = atomic_load_acq_32(&shm->cq_tail) -
 		    atomic_load_acq_32(&shm->cq_head);
 		if (cq_count >= min_complete || !KQRING_STQ_EMPTY_HINT(&ctx->ocq) ||
-		    atomic_load_acq_32(&ctx->cq_timeouts) != timeouts) {
-			mtx_unlock(&ctx->mtx);
-			return (0);
-		}
-		if (iopoll && ctx->nreqs == ctx->ndeferred) {
+		    atomic_load_acq_32(&ctx->cq_timeouts) != timeouts ||
+		    (iopoll && ctx->nreqs == ctx->ndeferred)) {
+			ctx->cq_sleepers--;
 			mtx_unlock(&ctx->mtx);
 			return (0);
 		}
@@ -2279,7 +2316,6 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		 * (kqring_taskwork_add_lazy_locked()); our taskwork is empty.
 		 */
 		ctx->sleeping++;
-		ctx->cq_sleepers++;
 		ctx->cq_wait_nr = min_complete - cq_count;
 		ctx->tw_lazy = 0;
 		/* As precise as the io_uring_enter(2) timeout (an hrtimer). */

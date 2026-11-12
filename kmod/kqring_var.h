@@ -917,6 +917,14 @@ struct kqring_ctx {
 	 * registered.  See struct kqring_tctx for the locking.
 	 */
 	LIST_HEAD(, kqring_tctx) tctxs;
+	/*
+	 * The process of the only context, while there is one and it isn't
+	 * dead; else NULL.  Written under ctx->mtx with the list
+	 * (kqring_tctx_solo_locked()), read without it by enter: a process
+	 * that finds itself here has a context for as long as its thread is
+	 * in the enter, since only its exit or exec ends the context.
+	 */
+	struct proc		*solo_proc;
 
 	/* IORING_SETUP_SQPOLL kernel thread and submission lock. */
 	struct sx		sq_sx;
@@ -988,8 +996,12 @@ struct kqring_ctx {
 	bool			evfd_async;
 	bool			submitting;
 	bool			submit_more;
-	/* An enter's own submission, running cached reads: kqring_wq_try_inline(). */
-	bool			submit_inline;
+	/*
+	 * An enter's own submission, which may run cached reads
+	 * (kqring_wq_try_inline()): -1 until its first read asks
+	 * kqring_wq_inline_ok(), then whether it does; 0 elsewhere.
+	 */
+	int8_t			submit_inline;
 	int			inline_until;	/* ticks; kqring_wq_inline_ok() */
 	uint32_t		evfd_cqes;
 	uint32_t		evfd_signals;	/* times signalled, under mtx */
@@ -1675,7 +1687,15 @@ int	kqring_pin_shm(struct thread *td, uint64_t uaddr, size_t bytes,
 	    bool share_on_fork, vm_offset_t *kva_out, size_t *alloc_len_out,
 	    vm_page_t **pages_out);
 void	kqring_unpin_shm(vm_offset_t kva, size_t alloc_len, vm_page_t *pages);
-void	kqring_flush_overflow(struct kqring_ctx *ctx);
+void	kqring_flush_overflow_slow(struct kqring_ctx *ctx);
+
+/* Move overflowed CQEs into the CQ as room allows; usually there are none. */
+static inline void
+kqring_flush_overflow(struct kqring_ctx *ctx)
+{
+	if (__predict_false(!STAILQ_EMPTY(&ctx->ocq)))
+		kqring_flush_overflow_slow(ctx);
+}
 void	kqring_post_cqe_extra(struct kqring_ctx *ctx, uint64_t user_data,
 	    int32_t res, uint32_t flags, const uint64_t *extra);
 

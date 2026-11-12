@@ -554,7 +554,9 @@ kqring_wq_try_inline(struct kqring_ctx *ctx, struct kqring_op *op)
 	long nvcsw;
 	bool punt, slept, switched;
 
-	if (!ctx->submit_inline || wq == NULL ||
+	if (ctx->submit_inline < 0)
+		ctx->submit_inline = kqring_wq_inline_ok(ctx) ? 1 : 0;
+	if (ctx->submit_inline == 0 || wq == NULL ||
 	    !atomic_load_bool(&wq->cached))
 		return (false);
 	nvcsw = td->td_ru.ru_nvcsw;
