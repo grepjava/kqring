@@ -16,7 +16,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 6 | Performance evidence | Done |
 | 7 | Newer interfaces and real programs | Done |
 | 8 | Several processes submitting to one ring | Done |
-| 9 | Registered buffers on held pages | In progress |
+| 9 | Registered buffers on held pages | Done |
 
 ## Where kqring stands
 
@@ -171,6 +171,8 @@ Progress (12 November 2026): implemented, with the order of work's steps 1 and 3
 - liburing passes 220 of 245 (was 219). `io_uring_register` passes, since a shared file mapping is now refused. `send-zerocopy` passes now that its 32 MiB buffer registers. Its UDP cases found a bug: a `SEND` that the protocol refused after copying the datagram completed with the full length. That is fixed, and the test skips the two UDP cases FreeBSD refuses.
 - The unit tests (144, plus the held-buffer test with a 20 MiB buffer), the cross-process test, stress, and the fuzzer (seeds 7301 and 7302, with fixed reads and writes from forked children) pass.
 - Direct reads from an md(4) disk with `--fixedbufs` are 0.5% faster at 4 KiB and 1.4% at 64 KiB (fio, median of three); without fixed buffers they're level. `kqring_bench` and `kqring_mt_bench` are level (median +0.2% over five alternated rounds).
+
+Phase 9 is done: every criterion is met. What still differs is in the [matrix](COMPATIBILITY.MD#boundaries): a new anonymous mapping over an unmapped buffer can share its pages, and a fixed read in flight during `fork(2)` lands in the child's copy.
 
 ## Research
 
