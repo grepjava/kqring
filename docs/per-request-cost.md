@@ -29,13 +29,17 @@ A ring without `IORING_SETUP_DEFER_TASKRUN` or `SQPOLL`, the default, has a kern
 
 Threads waiting for CQEs count themselves in `ctx->cq_sleepers` as well, and only they need waking for a CQE: the other sleepers on the channel, the kernel thread among them, wait for taskwork, which wakes them when it is queued. `kqring_evfd_flush()` now wakes the channel only when `cq_sleepers` isn't 0. One `NOP` per enter went from 387 to 217 ns, a pipe `READ` from 629 to 505, an AF_UNIX `RECV` from 755 to 595; a batch of 32 was level.
 
-This was every default ring's cost, whatever its requests: one wake-up of a kernel thread per enter that completed something inline, and a second CPU kept busy.
+This was every default ring's cost, whatever its requests: one wake-up of a kernel thread per enter that completed something inline, and a second CPU kept busy. liburing's `io_uring_queue_init()` makes such a ring. Rings with `DEFER_TASKRUN`, as `kqring_bench` sets up, have no such thread and weren't affected.
 
 ### Clearing the request
 
 After that, 13% of the kernel samples were `memset_std`: each request clears its `struct kqring_op`, 872 bytes, up to the callout, 680 bytes, with `rep stos`. In user space on the same CPU, `rep stosq` takes 27 ns for 680 bytes and 20 ns for 456, and 8-byte stores 21 and 14 ns: the string instruction costs more to start than it saves at this size.
 
 Of the 680 bytes, the request lists' linkage (128 bytes) never needs clearing, as what a request is on is kept in its flags and never read from its links, and three fields are always written before they are read: `wq_caps` with `wq_fp`, a timeout's `ts` by its prep, `cqe_extra` with `cqe_has_extra`. They now follow the cleared part, which `__builtin_memset_inline()` clears with stores: 456 bytes. One `NOP` per enter went from 218 to 200 ns, a batch of 32 from 83.4 to 71.6 ns per `NOP`.
+
+### Against the phase 9 build
+
+Both changes together (`d648c02`), alternated five times with the phase 9 build: `kqring_bench` and `kqring_mt_bench` are level over all their rows (median −0.1% and −0.02%), and their `NOP` rows, on `DEFER_TASKRUN` rings, gain from the smaller clear alone: one per enter 202 to 186 ns, 32 per enter 83.4 to 71.3 ns each. The rows that moved more than 5% either way are the zero-copy sends, which swing from round to round in both builds, and kqueue's own. fio's direct 4 KiB reads from an md(4) disk are level: 222,146 to 223,952 IOPS at one in flight, 693,838 to 691,521 at 32 (medians of three).
 
 ### What is left
 
@@ -49,7 +53,7 @@ The rest is spread out. For one `NOP` per enter, of the kernel's samples:
 | The ring's descriptor (`fget`) | 4% |
 | `sq_sx` | 2% |
 
-- **`ctx->mtx` twice per enter.** A ring without `SINGLE_ISSUER` (`shared`) takes it to find the caller's process context, and `kqring_evfd_flush()` takes it to signal the eventfd and pollers and wake waiters. Skipping the second without losing a wake-up needs the waiters and `poll(2)` to announce themselves before they look at the CQ, with a fence on both sides. The first needs a lookup that can't read a context another process is freeing.
+- **`ctx->mtx` twice per enter.** A ring without `SINGLE_ISSUER` (`shared`) takes it to find the caller's process context, and `kqring_evfd_flush()` takes it to signal the eventfd and pollers and wake waiters. Skipping the second when there is no eventfd, poller or waiter was tried: waiters and `poll(2)` counted themselves before looking at the CQ, and the flush looked for them after a full fence instead of the lock. It gained nothing (one `NOP` per enter 201.0 against 201.6 ns, medians of three alternated runs): on this CPU the fence costs what the uncontended lock did. The first needs a lookup that can't read a context another process is freeing; the list is stable under `sq_sx`, which the enter takes later.
 - **`sq_sx` on every enter** of a ring with a kernel thread or more than one submitter, which serializes them.
 
 ## Acceptance
