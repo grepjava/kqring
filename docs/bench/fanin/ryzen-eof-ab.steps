@@ -1,0 +1,8 @@
+20:57:35 A=af005b4f B=6c44d463 R=3
+20:57:57 r1 A: 512/kevent=434.9 512/ring_multishot=404.8 1024/kevent=512.1 1024/ring_multishot=602.6 2048/kevent=1090.0 2048/ring_multishot=1371.0
+20:58:20 r1 B: 512/kevent=438.9 512/ring_multishot=401.7 1024/kevent=655.9 1024/ring_multishot=695.7 2048/kevent=1139.5 2048/ring_multishot=1349.0
+20:58:43 r2 A: 512/kevent=431.7 512/ring_multishot=402.4 1024/kevent=564.3 1024/ring_multishot=616.0 2048/kevent=1102.5 2048/ring_multishot=1398.1
+20:59:06 r2 B: 512/kevent=430.9 512/ring_multishot=399.7 1024/kevent=512.8 1024/ring_multishot=600.1 2048/kevent=1099.0 2048/ring_multishot=1306.7
+20:59:28 r3 A: 512/kevent=442.4 512/ring_multishot=406.6 1024/kevent=499.9 1024/ring_multishot=596.0 2048/kevent=1113.2 2048/ring_multishot=1372.3
+20:59:51 r3 B: 512/kevent=435.9 512/ring_multishot=396.1 1024/kevent=520.9 1024/ring_multishot=568.3 2048/kevent=1094.4 2048/ring_multishot=1328.7
+20:59:51 ALLDONE vmcores=3

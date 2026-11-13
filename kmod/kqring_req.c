@@ -633,7 +633,7 @@ kqring_op_alloc(struct kqring_ctx *ctx)
 		__builtin_memset_inline(op, 0,
 		    offsetof(struct kqring_op, taskwork_link));
 	} else {
-		op = malloc(sizeof(*op), M_KQRING, M_WAITOK | M_ZERO);
+		op = uma_zalloc(kqring_op_zone, M_WAITOK | M_ZERO);
 	}
 	op->ctx = ctx;
 	/*
@@ -743,7 +743,7 @@ kqring_op_free(struct kqring_op *op)
 		ctx->nfree++;
 		return;
 	}
-	free(op, M_KQRING);
+	uma_zfree(kqring_op_zone, op);
 }
 
 /*

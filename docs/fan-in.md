@@ -60,6 +60,33 @@ Alternated three times with the build before:
 
 Every other row moved less than 2%. The default ring at 16 and 256 connections, where the writer and the ring's kernel thread work on the same requests from two CPUs, lost in all three rounds: the fields both write are closer together now. It is still ahead of kqueue there.
 
+### Where the requests lie
+
+After that change multishot still brought about 3.7 times as many lines from memory per message as kqueue at 1,024 connections, on fewer instructions. Sampling those fills (`pmcstat -S ls_refills_from_sys.ls_mabresp_lcl_dram`, one sample per 500, summed per function; [bench/fanin/ryzen-dram-samples.txt](bench/fanin/ryzen-dram-samples.txt)) shows where they land:
+
+| DRAM-fill samples | kqueue | multishot |
+|---|---:|---:|
+| all | 4,633 | 19,091 |
+| `uipc_sosend_stream_or_seqpacket()` | 523 | 4,129 |
+| `uipc_lock_peer()` | 276 | 1,533 |
+| `fget_unlocked_flags()` | 56 | 779 |
+| kqring's functions, together | | about 1,700 |
+
+Most of the extra misses are in the writer's `write(2)`, on the sending socket, its file and its peer, which the kqueue case touches as well; kqring's own code takes under a tenth. At 1,024 connections the working set has outgrown the 4 MiB L3, and the lines that miss are the ones longest unused, whoever added the lines that pushed them out. The gap grows with N (raw outputs `ryzen-eof-ab.steps`, `ryzen-zone-ab.steps`): at 512 connections multishot is ahead of kqueue (396–407 against 431–442 ns), at 2,048 both come from memory and multishot is 25% behind (1,371–1,398 against 1,090–1,113).
+
+So what counts is what each armed receive adds per connection: the request's lines, the socket's waiter list, and, on AF_UNIX stream sockets, the end-of-input knote (`kqring_kpoll_soeof_watch()`), which `sorwakeup()` asks on every message. An experiment build without the knote was about 3% faster at 2,048 connections (medians 1,329 against 1,372 ns) and within the noise at 1,024; the knote stays, since FreeBSD 15 runs no upcall when the peer shuts down writing.
+
+The requests were where the placement went wrong. They came from `malloc(9)`'s 1 KiB bucket, so each started on a 1 KiB boundary and the 4 lines a receive uses sat at the same offsets in every one: the 4,096 lines a thousand requests use mapped to a quarter of the sets of the L2 and L3. Requests now come from a zone of their own (`kqring_op`, 896-byte items), whose items fall at every offset. Alternated three times with the build before ([bench/fanin/ryzen-zone-unrelated.steps](bench/fanin/ryzen-zone-unrelated.steps), 2,048 from `ryzen-zone-ab.steps`):
+
+| ns per message | before | after | |
+|---|---:|---:|---:|
+| multishot, `DEFER_TASKRUN`, N = 1,024 | 645–660 | 562–583 | −10.0% |
+| multishot, default ring, N = 1,024 | 635–646 | 560–565 | −12.3% |
+| multishot, `DEFER_TASKRUN`, N = 2,048 | 1,375–1,388 | 1,298–1,312 | −5.6% |
+| one `NOP` per enter, ping-pong, `RECV`, fan-in at 16 and 256, batch | | | within ±2.2% |
+
+kqueue measured 500–534 ns at 1,024 connections in the same runs, so multishot is now about 10% behind there, from 16–20%. The tests' leak check, which counted kqring's `malloc(9)` memory, also counts the zone's requests in use.
+
 ## A multishot receive out of buffers
 
 A multishot `RECV` whose receive took the last buffer of its group went straight round again, failed to get a buffer, and ended with `-ENOBUFS`, even with nothing more to receive. Linux receives again at once only if more is buffered, and keeps the request armed otherwise: a buffer provided before more data comes keeps it going, and data with no buffer for it ends it. `tests/kqring_diff.c`'s `recv_mshot_drained` shows both, and kqring now matches Linux 7.3's output. `RECVMSG` had the same rule and the same change. A bundle still ends with the batch that empties its group, as in Linux.
@@ -138,6 +165,6 @@ Alternated three times on the Ryzen with the module before both changes (`XBENCH
 
 ## What is left
 
-- At 1,024 connections a multishot receive is still about 16% slower than kqueue on a `DEFER_TASKRUN` ring (579 against 497 ns).
+- At 1,024 connections a multishot receive is still about 10% slower than kqueue on a `DEFER_TASKRUN` ring, and 18% at 2,048: an armed receive keeps more lines per connection than a knote does (the request's four, the waiter list, and on AF_UNIX the end-of-input knote as well), and there the working set doesn't fit the L3.
 - When nobody waits in an enter, a default ring without `COOP_TASKRUN` still wakes its kernel thread for each message a socket upcall queues: 260 ns per message in ping-pong on the Ryzen, 563 on the i5. With `COOP_TASKRUN` the writer's return runs it, about 135 ns more than a `DEFER_TASKRUN` ring, and multishot fan-in written by the ring's own thread is 50% slower than with the kernel thread.
 - `kqring_bench`'s fan-in and ping-pong measure kqring's provided buffers, 4,096 of 4 KiB in turn and so out of cache, against kqueue's one.

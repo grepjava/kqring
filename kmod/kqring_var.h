@@ -109,6 +109,7 @@
 #include <vm/vm_pageout.h>
 #include <vm/vm_pager.h>
 #include <vm/vnode_pager.h>
+#include <vm/uma.h>
 
 #include <sys/kqring.h>
 
@@ -117,6 +118,8 @@
 #define _KQRING_VAR_H_
 
 MALLOC_DECLARE(M_KQRING);
+/* Requests (struct kqring_op): see kqring_op_alloc(). */
+extern uma_zone_t kqring_op_zone;
 /* posix_fadvise(2) state hung off struct file (freed by the kernel). */
 MALLOC_DECLARE(M_FADVISE);
 MALLOC_DECLARE(M_SELFD);

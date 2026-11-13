@@ -45,12 +45,15 @@ sysctl_num(const char *name)
 	return (len == sizeof(v.u32) ? (long)v.u32 : (long)v.u64);
 }
 
-/* InUse of malloc type "kqring" (vmstat -m), or -1. */
+/*
+ * InUse of malloc type "kqring" (vmstat -m) plus the requests in use from
+ * zone "kqring_op" (vmstat -z), or -1.
+ */
 static long
 kqring_malloc_inuse(void)
 {
 	char line[256], name[64];
-	long inuse = -1, n;
+	long inuse = -1, n, size, limit;
 	FILE *f = popen("vmstat -m", "r");
 
 	if (f == NULL)
@@ -59,6 +62,13 @@ kqring_malloc_inuse(void)
 		if (sscanf(line, " %63s %ld", name, &n) == 2 &&
 		    strcmp(name, "kqring") == 0)
 			inuse = n;
+	pclose(f);
+	if (inuse < 0 || (f = popen("vmstat -z", "r")) == NULL)
+		return (inuse);
+	while (fgets(line, sizeof(line), f) != NULL)
+		if (sscanf(line, " %63[^:]: %ld, %ld, %ld", name, &size, &limit,
+		    &n) == 4 && strcmp(name, "kqring_op") == 0)
+			inuse += n;
 	pclose(f);
 	return (inuse);
 }
@@ -174,7 +184,7 @@ check_leaks(long socks0, long wired0, long mem0)
 		usleep(500000);
 	}
 	printf("leak check: unreferenced sockets %ld -> %ld, user-wired pages %ld -> %ld, "
-	    "kqring malloc in use %ld -> %ld\n", socks0, socks, wired0, wired,
+	    "kqring malloc + requests in use %ld -> %ld\n", socks0, socks, wired0, wired,
 	    mem0, mem);
 	if (socks > socks0 || wired > wired0 || mem > mem0) {
 		fprintf(stderr, "%s: FAIL: resources still held "

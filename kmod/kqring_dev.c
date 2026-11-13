@@ -11,6 +11,7 @@
 #include <sys/sysent.h>
 
 MALLOC_DEFINE(M_KQRING, "kqring", "FreeBSD kqring I/O ring state");
+uma_zone_t kqring_op_zone;
 
 struct kqring_proc_list kqring_proc_hash[KQRING_PROC_HASH];
 struct kqring_ctx_list_head kqring_ctx_list =
@@ -584,7 +585,7 @@ kqring_ctx_free_final(struct kqring_ctx *ctx)
 
 	while ((op = TAILQ_FIRST(&ctx->free_ops)) != NULL) {
 		TAILQ_REMOVE(&ctx->free_ops, op, active_link);
-		free(op, M_KQRING);
+		uma_zfree(kqring_op_zone, op);
 	}
 	free(ctx->sw_cache[0], M_KQRING);
 	free(ctx->sw_cache[1], M_KQRING);
@@ -3422,6 +3423,14 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 {
 	switch (type) {
 	case MOD_LOAD:
+		/*
+		 * A zone of its own, not malloc(9)'s 1 KiB bucket: there every
+		 * request starts on a 1 KiB boundary, so the lines a receive
+		 * touches all fall in a quarter of the cache's sets.
+		 */
+		kqring_op_zone = uma_zcreate("kqring_op",
+		    sizeof(struct kqring_op), NULL, NULL, NULL, NULL,
+		    UMA_ALIGN_CACHE, 0);
 		mtx_init(&kqring_futex_mtx, "kqring futex", NULL, MTX_DEF);
 		mtx_init(&kqring_proc_mtx, "kqring proc", NULL, MTX_DEF);
 		rm_init(&kqring_rings_rm, "kqring rings");
@@ -3458,6 +3467,7 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			mtx_destroy(&kqring_futex_mtx);
 			for (int i = 0; i < KQRING_AST_HASH; i++)
 				mtx_destroy(&kqring_astq[i].mtx);
+			uma_zdestroy(kqring_op_zone);
 			return (ENOMEM);
 		}
 		kqring_ast_register();
@@ -3559,6 +3569,8 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 		rm_destroy(&kqring_rings_rm);
 		mtx_destroy(&kqring_proc_mtx);
 		mtx_destroy(&kqring_futex_mtx);
+		/* Every ring, and so every request, is gone. */
+		uma_zdestroy(kqring_op_zone);
 		printf("kqring: unloaded\n");
 		return (0);
 

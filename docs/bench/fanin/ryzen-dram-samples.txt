@@ -1,0 +1,180 @@
+20:55:04 loaded af005b4f
+20:55:08 fanin_kevent 488.3 ns msgs=; dram l2miss instr cyc:  3210613 317196420 21112679516 13613279848 
+20:55:11 fanin_ring_multishot 569.4 ns msgs=; dram l2miss instr cyc:  11951968 273714971 19415015443 14118130160 
+20:55:22 ls_refills_from_sys fanin_kevent 497.7 ns, cg     1494 lines
+20:55:33 ls_refills_from_sys fanin_ring_multishot 579.7 ns, cg     2872 lines
+20:55:44 l2_cache_req_stat fanin_kevent 521.2 ns, cg     2675 lines
+20:55:56 l2_cache_req_stat fanin_ring_multishot 594.8 ns, cg     2457 lines
+20:55:56 ALLDONE vmcores=3
+
+== samples of ls_refills_from_sys per function, fanin_kevent, N = 1024, DEFER_TASKRUN (top 40)
+  4633 TOTAL
+   656  14.2% Xfast_syscall
+   523  11.3% uipc_sosend_stream_or_seqpacket
+   431   9.3% knote
+   276   6.0% uipc_lock_peer
+   271   5.8% _mtx_trylock_flags_
+   259   5.6% filt_soread
+   247   5.3% soiolock
+   196   4.2% copyin_smap_std
+   179   3.9% sorwakeup_locked
+   168   3.6% mc_get
+   119   2.6% sousrsend
+   116   2.5% copyout_smap_std
+    90   1.9% sys_write
+    85   1.8% uma_zalloc_arg
+    84   1.8% amd64_syscall
+    77   1.7% mb_ctor_mbuf
+    71   1.5% mc_uiotomc
+    70   1.5% uiomove_faultflag
+    69   1.5% soiounlock
+    56   1.2% fget_unlocked_flags
+    56   1.2% cpu_fetch_syscall_args
+    48   1.0% so_rdknl_lock
+    47   1.0% kqueue_scan
+    41   0.9% knote_enqueue
+    34   0.7% __sys_write
+    18   0.4% write
+    18   0.4% doselwakeup
+    17   0.4% so_rdknl_unlock
+    15   0.3% uipc_soreceive_stream_or_seqpacket
+    15   0.3% __libc_interposing_slot
+    14   0.3% dofilewrite
+    12   0.3% cpu_set_syscall_retval
+    11   0.2% fanin_write
+    11   0.2% 0x1c8bb
+    10   0.2% userret
+    10   0.2% recv
+    10   0.2% pmap_enter
+     9   0.2% op_fanin_kevent
+     9   0.2% kern_recvit
+     8   0.2% pagezero_std
+
+== samples of ls_refills_from_sys per function, fanin_ring_multishot, N = 1024, DEFER_TASKRUN (top 40)
+ 19091 TOTAL
+  4129  21.6% uipc_sosend_stream_or_seqpacket
+  1533   8.0% uipc_lock_peer
+  1187   6.2% _mtx_trylock_flags_
+  1018   5.3% sousrsend
+   922   4.8% mc_get
+   779   4.1% fget_unlocked_flags
+   676   3.5% kqring_soupcall
+   663   3.5% knote
+   603   3.2% uma_zalloc_arg
+   507   2.7% filt_soread
+   500   2.6% copyin_smap_std
+   478   2.5% Xfast_syscall
+   474   2.5% mb_ctor_mbuf
+   380   2.0% __mtx_lock_flags
+   361   1.9% uipc_soreceive_stream_or_seqpacket
+   338   1.8% kqring_run_taskwork
+   315   1.6% kqring_exec_recv
+   267   1.4% kqring_taskwork_add_locked
+   207   1.1% doselwakeup
+   201   1.1% __mtx_unlock_flags
+   196   1.0% mc_uiotomc
+   188   1.0% uiomove_faultflag
+   179   0.9% sorwakeup_locked
+   167   0.9% soiolock
+   162   0.8% soiounlock
+   143   0.7% __sys_write
+   139   0.7% kqring_kp_eof_event
+   135   0.7% sys_write
+   135   0.7% copyout_smap_std
+   127   0.7% _rm_rlock
+   126   0.7% kqring_taskwork_run_one
+   118   0.6% mac_socket_check_send
+   109   0.6% dofilewrite
+    93   0.5% kqring_post_cqe_common
+    87   0.5% fget_write
+    87   0.5% amd64_syscall
+    81   0.4% kqring_buf_select
+    78   0.4% _rm_runlock
+    69   0.4% write
+    61   0.3% __libc_interposing_slot
+
+== samples of l2_cache_req_stat per function, fanin_kevent, N = 1024, DEFER_TASKRUN (top 40)
+103306 TOTAL
+ 12384  12.0% Xfast_syscall
+ 11482  11.1% uipc_sosend_stream_or_seqpacket
+  7758   7.5% kqueue_scan
+  5047   4.9% knote
+  4485   4.3% uipc_lock_peer
+  4402   4.3% so_rdknl_lock
+  4282   4.1% filt_soread
+  3783   3.7% copyin_smap_std
+  3673   3.6% _mtx_trylock_flags_
+  2830   2.7% so_rdknl_unlock
+  2662   2.6% mc_get
+  2602   2.5% copyout_smap_std
+  2568   2.5% __libsys_interposing_slot
+  2324   2.2% fget_unlocked_flags
+  2047   2.0% sorwakeup_locked
+  2015   2.0% __libc_interposing_slot
+  1970   1.9% soiolock
+  1863   1.8% __sys_recvfrom
+  1823   1.8% __sys_write
+  1804   1.7% sys_write
+  1608   1.6% sousrsend
+  1448   1.4% soiounlock
+  1077   1.0% amd64_syscall
+  1061   1.0% uiomove_faultflag
+  1057   1.0% mb_ctor_mbuf
+  1031   1.0% recv
+   988   1.0% uma_zalloc_arg
+   824   0.8% mc_uiotomc
+   753   0.7% uipc_soreceive_stream_or_seqpacket
+   588   0.6% 0x1c615
+   548   0.5% write
+   481   0.5% userret
+   476   0.5% cpu_set_syscall_retval
+   457   0.4% dofilewrite
+   434   0.4% op_fanin_kevent
+   381   0.4% 0x1c8b7
+   376   0.4% doselwakeup
+   361   0.3% 0x1c624
+   330   0.3% 0xf66a
+   327   0.3% knote_enqueue
+
+== samples of l2_cache_req_stat per function, fanin_ring_multishot, N = 1024, DEFER_TASKRUN (top 40)
+ 85990 TOTAL
+ 11219  13.0% uipc_sosend_stream_or_seqpacket
+  6197   7.2% kqring_exec_recv
+  4226   4.9% fget_unlocked_flags
+  4214   4.9% uipc_lock_peer
+  3855   4.5% _mtx_trylock_flags_
+  3716   4.3% kqring_run_taskwork
+  2922   3.4% uipc_soreceive_stream_or_seqpacket
+  2910   3.4% Xfast_syscall
+  2787   3.2% sousrsend
+  2658   3.1% kqring_soupcall
+  2655   3.1% __mtx_lock_flags
+  2484   2.9% kqring_post_cqe_common
+  2280   2.7% mc_get
+  2269   2.6% copyin_smap_std
+  2219   2.6% knote
+  1814   2.1% __mtx_unlock_flags
+  1326   1.5% uma_zalloc_arg
+  1310   1.5% kqring_taskwork_add_locked
+  1289   1.5% kqring_taskwork_run_one
+  1202   1.4% kqring_op_attempt
+  1178   1.4% mb_ctor_mbuf
+  1074   1.2% filt_soread
+  1052   1.2% uiomove_faultflag
+  1029   1.2% kqring_buf_select
+  1016   1.2% soiolock
+  1005   1.2% copyout_smap_std
+   895   1.0% __sys_write
+   834   1.0% doselwakeup
+   823   1.0% soiounlock
+   742   0.9% sys_write
+   733   0.9% kqring_recv_pick_buf
+   732   0.9% sorwakeup_locked
+   728   0.8% uma_zfree_arg
+   705   0.8% _rm_rlock
+   656   0.8% soreceive
+   652   0.8% mc_uiotomc
+   651   0.8% amd64_syscall
+   485   0.6% cpu_fetch_syscall_args
+   454   0.5% write
+   444   0.5% sx_try_xlock_int
