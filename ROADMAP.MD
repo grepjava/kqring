@@ -20,6 +20,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 10 | The cost of an enter | Done |
 | 11 | Cached file reads | Done |
 | 12 | Fan-in against kqueue | Done |
+| 13 | Refresh the evidence | In progress |
 
 ## Where kqring stands
 
@@ -229,6 +230,22 @@ Progress (13 November 2026), on the Ryzen:
 - Validated on the Ryzen with each change: the unit tests, the cross-process test, the comparison with Linux 7.3, liburing (220 of 245), stress and the fuzzer pass.
 
 Phase 12 is done. With buffers that stay in cache, fan-in on a `DEFER_TASKRUN` ring is level with kqueue or ahead up to 512 connections, and about 10% behind at 1,024, where the working set outgrows the L3. What is left is in [`TODO.MD`](TODO.MD).
+
+## Phase 13: Refresh the evidence
+
+Every figure in [BENCHMARK.MD](BENCHMARK.MD) is from `7641bf4` or `9918fea`, before phases 7 to 12, and [`docs/conformance/`](docs/conformance/) still has the 25-case comparison with Linux where `tests/kqring_diff.c` now has 30. `kqring_bench` also gave kqring's receives 4,096 provided buffers of 4 KiB in turn, out of cache, where kqueue read into one buffer, and most of the fan-in gap it reported was that.
+
+Order of work:
+
+1. `kqring_bench` sizes each group's provided buffers to what it has in flight: ping-pong 16 of 4 KiB, fan-in one buffer of the message's size per connection. Other groups keep the 4,096 × 4 KiB pool.
+2. Every `kqring_bench`, `kqring_mt_bench` and `kqring_diskbench` run behind BENCHMARK.MD repeated on the Ryzen from one build, by its method; the document regenerated and its prose checked against the new figures.
+3. `docs/conformance/` with Linux 7.3's and kqring's output of all 30 cases.
+
+Acceptance: BENCHMARK.MD names one build for every figure and its raw runs are kept; no claim in it, the README's summary or this roadmap contradicts the new figures; `docs/conformance/` holds the 30-case outputs and `tests/diff_compare.py` passes on them.
+
+Progress (14 November 2026):
+
+- Step 1: on the Ryzen, with the same module, the kqueue rows didn't move, and kqring's multishot fan-in went from 510–614 to 379–471 ns per message, now ahead of kqueue at 16 and 256 connections and level at 1,024; multishot ping-pong at 64 B went from 622–629 to 535–540, level with kqueue's 537–544.
 
 ## Research
 

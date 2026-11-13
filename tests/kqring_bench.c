@@ -67,6 +67,8 @@ struct ring {
 	struct io_uring_cqe	*cqes;
 	struct io_uring_buf_ring *br;
 	char			*bufs;
+	unsigned		nbufs;		/* a power of two */
+	size_t			buf_size, br_len;
 	uint16_t		br_tail;
 };
 
@@ -79,8 +81,13 @@ now_ns(void)
 	return ((uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec);
 }
 
+/*
+ * A ring with provided-buffer group 0 of nbufs buffers of size bytes.  The
+ * group hands its buffers out in turn, so a group much larger than what is
+ * in flight sends every receive to memory that is out of cache.
+ */
 static void
-ring_init(struct ring *r)
+ring_init_bufs(struct ring *r, unsigned nbufs, size_t size)
 {
 	struct io_uring_params p;
 	long page = sysconf(_SC_PAGESIZE);
@@ -115,44 +122,56 @@ ring_init(struct ring *r)
 	r->cq_mask = *(unsigned *)(base + p.cq_off.ring_mask);
 	r->cqes = (struct io_uring_cqe *)(base + p.cq_off.cqes);
 
-	size_t br_len = ((NBUFS * sizeof(struct io_uring_buf)) + page - 1) &
+	assert(nbufs != 0 && (nbufs & (nbufs - 1)) == 0);
+	r->nbufs = nbufs;
+	r->buf_size = size;
+	r->br_len = ((nbufs * sizeof(struct io_uring_buf)) + page - 1) &
 	    ~(size_t)(page - 1);
-	r->br = mmap(NULL, br_len, PROT_READ | PROT_WRITE,
+	r->br = mmap(NULL, r->br_len, PROT_READ | PROT_WRITE,
 	    MAP_PRIVATE | MAP_ANON, -1, 0);
-	r->bufs = mmap(NULL, (size_t)NBUFS * BUF_SIZE, PROT_READ | PROT_WRITE,
+	r->bufs = mmap(NULL, (size_t)nbufs * size, PROT_READ | PROT_WRITE,
 	    MAP_PRIVATE | MAP_ANON, -1, 0);
 	assert(r->br != MAP_FAILED && r->bufs != MAP_FAILED);
 	struct io_uring_buf_reg reg = {
 		.ring_addr = (uint64_t)(uintptr_t)r->br,
-		.ring_entries = NBUFS,
+		.ring_entries = nbufs,
 		.bgid = 0,
 	};
 	assert(kqring_register(r->fd, IORING_REGISTER_PBUF_RING, &reg, 1) == 0);
 	struct io_uring_buf *b = (struct io_uring_buf *)r->br;
-	for (unsigned i = 0; i < NBUFS; i++) {
-		b[i].addr = (uint64_t)(uintptr_t)(r->bufs + (size_t)i * BUF_SIZE);
-		b[i].len = BUF_SIZE;
+	for (unsigned i = 0; i < nbufs; i++) {
+		b[i].addr = (uint64_t)(uintptr_t)(r->bufs + (size_t)i * size);
+		b[i].len = (uint32_t)size;
 		b[i].bid = (uint16_t)i;
 	}
-	r->br_tail = NBUFS;
+	r->br_tail = (uint16_t)nbufs;
 	atomic_store_explicit((_Atomic uint16_t *)&r->br->tail, r->br_tail,
 	    memory_order_release);
+}
+
+/* 4,096 buffers of 4 KiB, for groups that don't size their own. */
+static void
+ring_init(struct ring *r)
+{
+	ring_init_bufs(r, NBUFS, BUF_SIZE);
 }
 
 static void
 ring_fini(struct ring *r)
 {
 	close(r->fd);
+	munmap(r->br, r->br_len);
+	munmap(r->bufs, (size_t)r->nbufs * r->buf_size);
 }
 
 static void
 ring_offer_buf(struct ring *r, uint16_t bid)
 {
 	struct io_uring_buf *b =
-	    &((struct io_uring_buf *)r->br)[r->br_tail & (NBUFS - 1)];
+	    &((struct io_uring_buf *)r->br)[r->br_tail & (r->nbufs - 1)];
 
-	b->addr = (uint64_t)(uintptr_t)(r->bufs + (size_t)bid * BUF_SIZE);
-	b->len = BUF_SIZE;
+	b->addr = (uint64_t)(uintptr_t)(r->bufs + (size_t)bid * r->buf_size);
+	b->len = (uint32_t)r->buf_size;
 	b->bid = bid;
 	r->br_tail++;
 	atomic_store_explicit((_Atomic uint16_t *)&r->br->tail, r->br_tail,
@@ -304,6 +323,7 @@ bench_floor(void)
  */
 
 #define PP_ITERS	200000
+#define PP_NBUFS	16		/* provided buffers: one in flight */
 
 static void
 pp_kqueue(const char *group, int rx, int tx, size_t len)
@@ -440,7 +460,8 @@ pp_run(const char *group, int rx, int tx, size_t len, bool plain)
 {
 	struct ring r;
 
-	ring_init(&r);
+	/* Few buffers, so that they stay in cache as kqueue's one does. */
+	ring_init_bufs(&r, PP_NBUFS, BUF_SIZE);
 	if (plain) {
 		pp_plain(group, rx, tx, len);	/* warm-up, discarded */
 		pp_plain(group, rx, tx, len);
@@ -559,8 +580,12 @@ bench_fanin_n(int n)
 	row(group, "kqueue", now_ns() - t0, (uint64_t)rounds * n);
 	close(kq);
 
-	/* kqring: one multishot RECV per socket; one enter reaps all N. */
-	ring_init(&r);
+	/*
+	 * kqring: one multishot RECV per socket; one enter reaps all N.  The
+	 * group has a buffer of the message's size for each of the N in
+	 * flight, the least a ring can receive them into.
+	 */
+	ring_init_bufs(&r, (unsigned)n, FANIN_LEN);
 	for (int i = 0; i < n; i++) {
 		struct io_uring_sqe *sqe = ring_prep(&r, IORING_OP_RECV, rx[i],
 		    (uint64_t)i);
@@ -581,7 +606,7 @@ bench_fanin_n(int n)
 	ring_fini(&r);
 
 	/* kqring: N single-shot RECVs submitted and completed in one enter. */
-	ring_init(&r);
+	ring_init_bufs(&r, (unsigned)n, FANIN_LEN);
 	t0 = now_ns();
 	for (int k = 0; k < rounds; k++) {
 		for (int i = 0; i < n; i++)
