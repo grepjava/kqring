@@ -18,7 +18,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 8 | Several processes submitting to one ring | Done |
 | 9 | Registered buffers on held pages | Done |
 | 10 | The cost of an enter | Done |
-| 11 | Cached file reads | In progress |
+| 11 | Cached file reads | Done |
 
 ## Where kqring stands
 
@@ -209,6 +209,9 @@ Progress (13 November 2026):
 - On the i5-8250U, booting each system: kqring's 4 jobs at 32 in flight reach 0.80 of FreeBSD's `psync` (0.39 before), io_uring's 0.67 of Linux's, and kqring reads 1.34 times as many pages a second. One job at 32 in flight, io_uring is 5% ahead.
 - `read(2)` of a tmpfs file into a writable shared mapping of the same page hangs on FreeBSD 15.1, without kqring; a worker reading it would hang the same way.
 - The fuzzer, with a new seed, found a panic from phase 9: a `fork(2)` in one thread released a registered buffer's old pages while the `SINGLE_ISSUER` ring's owner, which submits without `sq_sx`, was taking them for a request. The submitter now releases them ([docs/held-buffers.md](docs/held-buffers.md#4-fork2)).
+- Acceptance met. The unit tests (also in a tmpfs directory), the cross-process test, stress, the fuzzer (seed 7313), liburing (220 of 245) and the comparison with Linux 7.3 pass.
+
+Phase 11 is done: every criterion is met. One job reading cached pages in the enter is still slower than `pread(2)`: kqring's own functions cost about 190 ns per read (see [`TODO.MD`](TODO.MD)).
 
 ## Research
 
