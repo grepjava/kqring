@@ -12587,6 +12587,195 @@ stop_close_thread(void *arg)
 	return (NULL);
 }
 
+static void *
+tw_coop_writer(void *arg)
+{
+	assert(write(*(int *)arg, "coop", 4) == 4);
+	return (NULL);
+}
+
+struct tw_handoff_arg {
+	int		fd;
+	_Atomic int	asleep;
+	int		error;
+};
+
+static void *
+tw_handoff_waiter(void *arg)
+{
+	struct tw_handoff_arg *a = arg;
+
+	atomic_store(&a->asleep, 1);
+	a->error = kqring_enter(a->fd, 0, 1, IORING_ENTER_GETEVENTS, NULL, 0) <
+	    0 ? errno : 0;
+	return (NULL);
+}
+
+/*
+ * A ring without DEFER_TASKRUN posts its completions with nobody in an
+ * enter.  Taskwork queued while a thread of the process waits in an enter
+ * is left to that thread, without waking the ring's kernel thread: a
+ * waiter interrupted by a signal must not stay counted, or the receive
+ * that completes once it has gone is never posted.  Also the plain case:
+ * the waiter is woken and runs the receive itself.
+ */
+static void
+test_default_ring_waiter_handoff(void)
+{
+	struct sigaction sa = { .sa_handler = sigmask_handler }, osa;
+	struct tw_handoff_arg a;
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe c;
+	struct test_ring t;
+	pthread_t th;
+	char buf[16];
+	int sv[2];
+
+	ring_setup_shared = true;
+	ring_init(&t);
+	ring_setup_shared = false;
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	assert(sigaction(SIGUSR1, &sa, &osa) == 0);
+
+	for (int round = 0; round < 20; round++) {
+		/* 1. Armed, a waiter interrupted, then the data: posted. */
+		sqe = ring_prep(&t, IORING_OP_RECV, sv[0], 78000 + round);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		assert(ring_cq_ready(&t) == 0);
+		a = (struct tw_handoff_arg){ .fd = t.fd };
+		assert(pthread_create(&th, NULL, tw_handoff_waiter, &a) == 0);
+		while (atomic_load(&a.asleep) == 0)
+			usleep(100);
+		usleep(5000);
+		assert(pthread_kill(th, SIGUSR1) == 0);
+		assert(pthread_join(th, NULL) == 0);
+		assert(a.error == EINTR);
+		assert(write(sv[1], "hand", 4) == 4);
+		uint64_t deadline = now_ns() + 2000000000ULL;
+		while (ring_cq_ready(&t) == 0) {
+			assert(now_ns() < deadline);
+			usleep(50);
+		}
+		c = ring_pop_cqe(&t);
+		assert(c.user_data == 78000 + (uint64_t)round && c.res == 4);
+
+		/* 2. Armed, a waiter asleep, then the data: it posts it. */
+		sqe = ring_prep(&t, IORING_OP_RECV, sv[0], 78100 + round);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		a = (struct tw_handoff_arg){ .fd = t.fd };
+		assert(pthread_create(&th, NULL, tw_handoff_waiter, &a) == 0);
+		while (atomic_load(&a.asleep) == 0)
+			usleep(100);
+		usleep(round % 2 == 0 ? 2000 : 0);
+		assert(write(sv[1], "wait", 4) == 4);
+		assert(pthread_join(th, NULL) == 0);
+		assert(a.error == 0);
+		c = ring_pop_cqe(&t);
+		assert(c.user_data == 78100 + (uint64_t)round && c.res == 4);
+	}
+	assert(sigaction(SIGUSR1, &osa, NULL) == 0);
+
+	/*
+	 * 3. Work queued without a waiter's help: an async read cancelled
+	 * while its worker runs, and a MSG_RING from another ring.  Their
+	 * CQEs come with no enter on t.
+	 */
+	struct test_ring t2;
+	uint64_t deadline;
+	bool seen_read = false, seen_cancel = false;
+	int pfd[2];
+
+	assert(pipe(pfd) == 0);
+	sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 78200);
+	sqe->addr = (uint64_t)(uintptr_t)buf;
+	sqe->len = sizeof(buf);
+	sqe->off = (uint64_t)-1;
+	sqe->flags |= IOSQE_ASYNC;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	usleep(20000);
+	sqe = ring_prep(&t, IORING_OP_ASYNC_CANCEL, -1, 78201);
+	sqe->addr = 78200;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	deadline = now_ns() + 2000000000ULL;
+	while (!seen_read || !seen_cancel) {
+		if (ring_cq_ready(&t) == 0) {
+			assert(now_ns() < deadline);
+			usleep(50);
+			continue;
+		}
+		c = ring_pop_cqe(&t);
+		if (c.user_data == 78200) {
+			assert(c.res == -ECANCELED || c.res == -EINTR);
+			seen_read = true;
+		} else {
+			assert(c.user_data == 78201 &&
+			    (c.res == 0 || c.res == -EALREADY));
+			seen_cancel = true;
+		}
+	}
+	close(pfd[0]);
+	close(pfd[1]);
+
+	ring_init(&t2);
+	sqe = ring_prep(&t2, IORING_OP_MSG_RING, t.fd, 78300);
+	sqe->addr = IORING_MSG_DATA;
+	sqe->len = 7;
+	sqe->off = 78301;
+	ring_push_sqe(&t2);
+	ring_submit(&t2);
+	expect_cqe(&t2, 78300, 0);
+	deadline = now_ns() + 2000000000ULL;
+	while (ring_cq_ready(&t) == 0) {
+		assert(now_ns() < deadline);
+		usleep(50);
+	}
+	c = ring_pop_cqe(&t);
+	assert(c.user_data == 78301 && c.res == 7);
+	close(t2.fd);
+
+	/*
+	 * 4. COOP_TASKRUN (t has it): a write(2) by a thread of the process
+	 * runs the receive it completes as it returns, as io_uring's
+	 * task_work does, so the CQE is there when write(2) returns; from
+	 * another thread of the process, when that thread's has.
+	 */
+	for (int round = 0; round < 100; round++) {
+		pthread_t wt;
+
+		sqe = ring_prep(&t, IORING_OP_RECV, sv[0], 78400 + round);
+		sqe->addr = (uint64_t)(uintptr_t)buf;
+		sqe->len = sizeof(buf);
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		assert(ring_cq_ready(&t) == 0);
+		if (round % 2 == 0) {
+			assert(write(sv[1], "coop", 4) == 4);
+		} else {
+			assert(pthread_create(&wt, NULL, tw_coop_writer,
+			    &sv[1]) == 0);
+			assert(pthread_join(wt, NULL) == 0);
+		}
+		assert(ring_cq_ready(&t) == 1);
+		c = ring_pop_cqe(&t);
+		assert(c.user_data == 78400 + (uint64_t)round && c.res == 4);
+	}
+
+	close(sv[0]);
+	close(sv[1]);
+	close(t.fd);
+	printf("[PASS] default ring: a waiter runs its taskwork; one "
+	    "interrupted, a cancelled worker and MSG_RING leave it to the "
+	    "kernel thread; with COOP_TASKRUN the writer's return runs it\n");
+}
+
 /*
  * SIGSTOP (and so a debugger) must be able to stop a process that is
  * closing rings.  Teardown waits for the ring's kernel thread to exit, and
@@ -15279,6 +15468,7 @@ main(int argc, char **argv)
 		test_registered_rings();
 		test_sqpoll_and_iopoll();
 		test_stop_during_close();
+		test_default_ring_waiter_handoff();
 		test_phase5_security_audit();
 		printf("%s: %d failure(s)\n", failures ? "[FAIL]" : "[OK]",
 		    failures);

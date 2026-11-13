@@ -1,0 +1,27 @@
+# Ryzen, 13 Nov 2026. A = module of d366a4b, B = default-ring kernel thread on its own channel; xbench of B. Median of 5 one-second runs per line.
+16:27:46 test rc=0 146 pass; [PASS] default ring: a waiter runs its t
+16:27:51 A.1.xp_kevent 3631.8
+16:27:56 A.1.xp_def 3976.0
+16:28:02 A.1.xp_defer 3920.2
+16:28:07 A.1.pp_def 1110.4
+16:28:12 B.1.xp_kevent 3638.3
+16:28:17 B.1.xp_def 3924.8
+16:28:22 B.1.xp_defer 3923.1
+16:28:28 B.1.pp_def 1120.3
+16:28:33 A.2.xp_kevent 3615.9
+16:28:38 A.2.xp_def 3984.6
+16:28:43 A.2.xp_defer 3913.8
+16:28:48 A.2.pp_def 1087.5
+16:28:54 B.2.xp_kevent 3629.5
+16:28:59 B.2.xp_def 3927.1
+16:29:04 B.2.xp_defer 3931.6
+16:29:09 B.2.pp_def 1085.6
+16:29:14 A.3.xp_kevent 3621.9
+16:29:20 A.3.xp_def 3989.1
+16:29:25 A.3.xp_defer 3924.9
+16:29:30 A.3.pp_def 1102.4
+16:29:35 B.3.xp_kevent 3617.2
+16:29:41 B.3.xp_def 3928.8
+16:29:46 B.3.xp_defer 3919.1
+16:29:51 B.3.pp_def 1085.2
+16:29:51 ALLDONE vmcores=3

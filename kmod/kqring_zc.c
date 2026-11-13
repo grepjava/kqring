@@ -290,7 +290,7 @@ kqring_zc_rele(struct kqring_zc_notif *zc, bool in_issuer)
 			ctx->nrcq++;
 			atomic_set_32(&ctx->shm->sq_flags, IORING_SQ_TASKRUN);
 			if (ctx->sleeping)
-				wakeup(&ctx->wakeup_chan);
+				kqring_wakeup_locked(ctx);
 			if (ctx->sqpoll_waiting)
 				wakeup(&ctx->sqpoll_wait_chan);
 			rcqe = NULL;

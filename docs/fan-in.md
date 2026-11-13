@@ -95,8 +95,49 @@ Where the Ryzen's 300 ns or so between the armed `RECV` and the one that finds i
 
 The CPU's counters agree: about 6,000 instructions per message against 4,100, at the same rate (1.69 instructions per cycle against 1.74), and no more lines from memory. The time is in instructions and atomic operations, spread over the path; nothing in it is waiting or repeated. What could go without changing how it works is about 20 ns: the two locked increments of the per-CPU count of enters, which unload uses, and the ring's mutex taken again after the last taskwork item only to clear `IORING_SQ_TASKRUN`. That is under 3%, and neither change was made.
 
+## The default ring's kernel thread
+
+A ring without `DEFER_TASKRUN` or `SQPOLL` has a kernel thread that posts its completions, so that they appear with nobody in an enter. The thread slept on the same channel as the enters waiting for CQEs, and new taskwork woke both: a thread asleep in an enter, which runs its process's taskwork when woken, and the kernel thread, which then fought it for `sq_sx`, the lock that serialises a ring's submissions and completions. The kernel thread now sleeps on a channel of its own. Taskwork wakes it only when no thread of the request's process is asleep in an enter (`tw_waiters`); every other wake-up still wakes both. A waiter that leaves without running the taskwork (interrupted by a signal, or `sq_sx` not taken) wakes the kernel thread itself. `test_default_ring_waiter_handoff` covers both: a waiter interrupted 20 times leaves the receive to the kernel thread, and a sleeping waiter runs it itself.
+
+`kqring_xbench` has a ping-pong with a peer process, which echoes each message, so the reply comes while the ring's owner sleeps in its enter: `xp_kevent` and `xp_ring_armed`. Alternated three times on the Ryzen:
+
+| ns per round trip | before | after |
+|---|---:|---:|
+| kqueue | 3,616–3,632 | 3,617–3,638 |
+| `RECV` armed first, default ring | 3,976–3,989 | 3,925–3,929 |
+| `RECV` armed first, `DEFER_TASKRUN` ring | 3,914–3,925 | 3,919–3,932 |
+
+The default ring now costs what a `DEFER_TASKRUN` ring does when its owner waits, and the armed `RECV` is 1.08 times kqueue's loop. On the i5 under Linux 7.3 the same loop is noisier, and io_uring is further behind epoll: 7,973–9,426 ns for epoll, 9,986–10,032 for a `DEFER_TASKRUN` ring and 10,548–11,526 for a default one (raw outputs `ryzen-waiter-*.steps`, `i5-linux-xproc.steps`). The single-thread ping-pong above didn't change (1,088–1,110 against 1,085–1,120 ns), nor did any fan-in case: there the write comes before the enter that waits, so nobody waits when the upcall queues the receive, and the kernel thread runs it.
+
+### The writer's return to user space
+
+io_uring runs a default ring's taskwork in the submitting task, as it returns to user space. kqring now does that on rings set up with `IORING_SETUP_COOP_TASKRUN` (and without `DEFER_TASKRUN`), through a module AST (`ast_register()`, slot `TDA_MOD1`). When a request's completion is queued in a thread of its own process that may enter the ring, which is how a `write(2)` completes a `RECV` on the other end of a socket pair, `kqring_ast_try()` leaves it to that thread instead of waking the ring's kernel thread: the ring's context goes on a per-thread bucket, and `kqring_ast()` runs its taskwork as the thread leaves the kernel, so the CQE is there when `write(2)` returns. A completion queued anywhere else (an interrupt, a worker, another process) still goes to the kernel thread.
+
+- **A thread that blocks.** Taskwork left to a thread's return waits while that thread's system call blocks, where the kernel thread would have run it. Linux has the same rule under `COOP_TASKRUN`, which asks it not to interrupt the task, and interrupts it otherwise, so rings without `COOP_TASKRUN` keep the kernel thread for everything.
+- **A thread that never returns.** Another thread's `exit(2)` or `execve(2)` makes the rest exit in the kernel. The process's exit and exec hooks hand whatever was left to them to the kernel thread, and nothing is left to a thread once its process has `P_WEXIT` or `P_INEXEC` set.
+- **Unload.** kqring had such a hook until October ([`5780521`](https://github.com/grepjava/kqring/commit/5780521)) and dropped it because `ast_deregister()` doesn't wait for a thread already calling the handler. Unload now stops queueing, hands on what is queued, deregisters the hook, and waits until no thread is inside it (`kqring_ast_active`, the only part that can block). A thread can be on its way into the handler, or out of it, only while it runs or waits to run, so unload then makes every user thread that isn't blocked go through `ast()` once more (`kqring_sys_drain_threads()`, as for the system calls); after 10 seconds it gives up with `EBUSY` and registers the hook again.
+
+`test_default_ring_waiter_handoff` checks that on a `COOP_TASKRUN` ring the CQE is there when `write(2)` returns, from this thread or another of the process, and the stress test and fuzzer set up `COOP_TASKRUN` rings among others.
+
+Alternated three times on the Ryzen with the module before both changes (`XBENCH_COOP=1` sets up the ring with `COOP_TASKRUN`):
+
+| ns per message | before | after |
+|---|---:|---:|
+| ping-pong, `RECV` armed first, `COOP_TASKRUN` | 1,083–1,094 | **981–1,028** |
+| the same, default ring | 1,062–1,090 | 1,097–1,149 |
+| the same, `DEFER_TASKRUN` | 814–824 | 844–874 |
+| peer process echoes, `COOP_TASKRUN` | 3,959–3,980 | 3,919–3,955 |
+| fan-in, multishot, `COOP_TASKRUN`, N = 16 | 361–368 | 539–564 |
+| fan-in, multishot, `COOP_TASKRUN`, N = 256 | 349–363 | 548–577 |
+| fan-in, multishot, `COOP_TASKRUN`, N = 1,024 | 552–562 | 723–763 |
+| fan-in, single-shot batch, `COOP_TASKRUN`, any N | 390–453 | 391–461 |
+
+- **Ping-pong gains 10%, half of the default ring's 260 ns.** The rest is the hook's own cost. Against a `DEFER_TASKRUN` ring, which runs its taskwork in the enter that waits (DTrace's `profile-4999`; [bench/fanin/ryzen-hook-profile.txt](bench/fanin/ryzen-hook-profile.txt)): about 45 ns in the kernel's AST path (`ast_handler()` calls every registered handler's check, the thread lock twice, `ast_sig()`, `userret()`), 20 ns for `sq_sx`, which a ring with a kernel thread takes in the hook and again in the enter, 25 ns for a second pass of the taskwork, checks and eventfd, and 30 ns for queueing.
+- **Multishot fan-in in one thread loses 50%.** The thread that writes the N messages now runs each receive as its `write(2)` returns, one hook each, where the kernel thread ran them on a second CPU, many per wake-up. Linux's `COOP_TASKRUN` does the same. A fan-in whose messages come from other processes, as a server's do, is unaffected, since the hook only takes completions queued in the ring's own process; the single-shot batch, whose receives find their data, is too.
+- **Paths that don't use the hook are 1–2% slower** (`DEFER_TASKRUN` ping-pong, a `RECV` that finds its data, one `NOP` per enter; six alternations each, [bench/fanin/ryzen-hook-unrelated.steps](bench/fanin/ryzen-hook-unrelated.steps)). The same build with the hook never registered is as slow, and the waiter change alone was level, so it is where the module's code now lies rather than anything these paths run; the hook's fields of `struct kqring_tctx` were moved last, which didn't change it.
+
 ## What is left
 
 - At 1,024 connections a multishot receive is still about 16% slower than kqueue on a `DEFER_TASKRUN` ring (579 against 497 ns).
-- A default ring wakes its kernel thread for each message a socket upcall queues, and the thread and the writer contend for the ring's mutex. Linux runs a default ring's completions in the submitting task instead. In ping-pong this costs 260 ns per message on the Ryzen and 563 on the i5, where Linux's default ring costs what its `DEFER_TASKRUN` ring does.
+- When nobody waits in an enter, a default ring without `COOP_TASKRUN` still wakes its kernel thread for each message a socket upcall queues: 260 ns per message in ping-pong on the Ryzen, 563 on the i5. With `COOP_TASKRUN` the writer's return runs it, about 135 ns more than a `DEFER_TASKRUN` ring, and multishot fan-in written by the ring's own thread is 50% slower than with the kernel thread.
 - `kqring_bench`'s fan-in and ping-pong measure kqring's provided buffers, 4,096 of 4 KiB in turn and so out of cache, against kqueue's one.

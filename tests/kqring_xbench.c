@@ -90,6 +90,10 @@ ring_init(struct ring *r, unsigned entries)
 	    strcmp(getenv("XBENCH_DEFER"), "1") == 0)
 		p.flags = IORING_SETUP_SINGLE_ISSUER |
 		    IORING_SETUP_DEFER_TASKRUN;
+	/* XBENCH_COOP=1: no DEFER_TASKRUN, but COOP_TASKRUN. */
+	else if (getenv("XBENCH_COOP") != NULL &&
+	    strcmp(getenv("XBENCH_COOP"), "1") == 0)
+		p.flags = IORING_SETUP_COOP_TASKRUN;
 	r->fd = ring_sys_setup(entries, &p);
 	CHECK(r->fd >= 0);
 	sq_len = p.sq_off.array + p.sq_entries * sizeof(unsigned);
@@ -497,6 +501,88 @@ op_pp_ring_armed(void)
 	return (1);
 }
 
+/*
+ * Ping-pong with a peer process, which echoes each 64 bytes back: the
+ * waiter is asleep when the reply comes, as a server's usually is.
+ */
+static int xfd[2] = { -1, -1 }, xp_poll = -1;
+
+static void
+xp_peer(void)
+{
+	pid_t pid;
+
+	if (xfd[0] >= 0)
+		return;
+	CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, xfd) == 0);
+	CHECK((pid = fork()) >= 0);
+	if (pid == 0) {
+		char b[64];
+		ssize_t n;
+
+		close(xfd[0]);
+		while ((n = read(xfd[1], b, sizeof(b))) > 0)
+			if (write(xfd[1], b, (size_t)n) != n)
+				_exit(1);
+		_exit(0);
+	}
+	close(xfd[1]);
+}
+
+static unsigned
+op_xp_kevent(void)
+{
+	xp_peer();
+	if (xp_poll < 0) {
+#if defined(__linux__)
+		struct epoll_event ev = { .events = EPOLLIN | EPOLLET,
+		    .data.fd = xfd[0] };
+
+		xp_poll = epoll_create1(0);
+		CHECK(xp_poll >= 0);
+		CHECK(epoll_ctl(xp_poll, EPOLL_CTL_ADD, xfd[0], &ev) == 0);
+#else
+		struct kevent kev;
+
+		xp_poll = kqueue();
+		CHECK(xp_poll >= 0);
+		EV_SET(&kev, xfd[0], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+		CHECK(kevent(xp_poll, &kev, 1, NULL, 0, NULL) == 0);
+#endif
+	}
+	CHECK(write(xfd[0], buf, sizeof(buf)) == sizeof(buf));
+#if defined(__linux__)
+	struct epoll_event ev;
+
+	CHECK(epoll_wait(xp_poll, &ev, 1, -1) == 1);
+#else
+	struct kevent ev;
+
+	CHECK(kevent(xp_poll, NULL, 0, &ev, 1, NULL) == 1);
+#endif
+	CHECK(recv(xfd[0], buf, sizeof(buf), MSG_WAITALL) == sizeof(buf));
+	return (1);
+}
+
+static unsigned
+op_xp_ring_armed(void)
+{
+	struct io_uring_sqe *s;
+
+	xp_peer();
+	s = prep(&R, IORING_OP_RECV, xfd[0]);
+	s->addr = (uint64_t)(uintptr_t)buf;
+	s->len = sizeof(buf);
+	s->msg_flags = MSG_WAITALL;
+	atomic_store_explicit(R.sq_tail, R.tail, memory_order_release);
+	CHECK(ring_sys_enter(R.fd, 1, 0, 0, NULL, 0) == 1);
+	CHECK(write(xfd[0], buf, sizeof(buf)) == sizeof(buf));
+	CHECK(ring_sys_enter(R.fd, 0, 1, IORING_ENTER_GETEVENTS, NULL, 0) >=
+	    0);
+	fanin_reap(&R, 1, 0);
+	return (1);
+}
+
 static const struct bcase {
 	const char	*name;
 	unsigned	(*op)(void);
@@ -517,6 +603,10 @@ static const struct bcase {
 	    "write(2) 64 B, kevent/epoll_wait, recv(2), AF_UNIX stream" },
 	{ "pp_ring_armed", op_pp_ring_armed,
 	    "RECV armed first, write(2) 64 B, enter to wait, AF_UNIX stream" },
+	{ "xp_kevent", op_xp_kevent,
+	    "peer process echoes 64 B: write(2), kevent/epoll_wait, recv(2)" },
+	{ "xp_ring_armed", op_xp_ring_armed,
+	    "peer process echoes 64 B: RECV armed, write(2), enter to wait" },
 	{ "fanin_kevent", op_fanin_kevent,
 	    "fan-in: N write(2), kevent/epoll_wait, N recv(2), per message" },
 	{ "fanin_ring_batch", op_fanin_ring_batch,

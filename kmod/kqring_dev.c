@@ -755,7 +755,7 @@ kqring_ctx_cancel_begin(struct kqring_ctx *ctx, bool nowait)
 	mtx_lock(&ctx->mtx);
 	ctx->closing = true;
 	if (ctx->sleeping)
-		wakeup(&ctx->wakeup_chan);
+		kqring_wakeup_locked(ctx);
 	if (ctx->pollers) {
 		selwakeuppri(&ctx->rsel, PZERO);
 		KNOTE_LOCKED(&ctx->rsel.si_note, 0);
@@ -1171,7 +1171,7 @@ kqring_tctx_exit_task(void *arg, int pending __unused)
 	if (!t->exit_started) {
 		mtx_lock(&ctx->mtx);
 		while (t->task_running) {
-			wakeup(&ctx->wakeup_chan);
+			kqring_wakeup_locked(ctx);
 			(void)msleep(&t->task_running, &ctx->mtx, 0, "kqtxkt",
 			    hz / 100 + 1);
 		}
@@ -1219,7 +1219,7 @@ kqring_tctx_exit_task(void *arg, int pending __unused)
 		kqring_tctx_unlink(ctx, t);
 		mtx_lock(&ctx->mtx);
 		if (ctx->sleeping)
-			wakeup(&ctx->wakeup_chan);
+			kqring_wakeup_locked(ctx);
 		mtx_unlock(&ctx->mtx);
 	}
 	sx_xunlock(&ctx->sq_sx);
@@ -1246,7 +1246,7 @@ kqring_tctx_exit_locked(struct kqring_ctx *ctx, struct kqring_tctx *t)
 	t->dead = true;
 	kqring_tctx_solo_locked(ctx);
 	if (ctx->sleeping)
-		wakeup(&ctx->wakeup_chan);
+		kqring_wakeup_locked(ctx);
 	refcount_acquire(&t->refs);
 	refcount_acquire(&ctx->refs);
 	/* kqring_worker_hold(), whose lock the caller holds: unload waits. */
@@ -1489,9 +1489,12 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	 * describes, in an enter (liburing enters when IORING_SQ_TASKRUN is
 	 * set).  Without SINGLE_ISSUER, any thread of the process may submit
 	 * and wait (ctx->shared); DEFER_TASKRUN needs SINGLE_ISSUER, as in
-	 * io_uring.  COOP_TASKRUN and TASKRUN_FLAG describe what kqring
-	 * always does; without SUBMIT_ALL, submission stops at an SQE that
-	 * fails its checks (kqring_submit_sqes()).
+	 * io_uring.  Without DEFER_TASKRUN, COOP_TASKRUN lets a thread of
+	 * the process that completes a request run it as it returns to user
+	 * space, rather than the ring's kthread (kqring_ast_try());
+	 * TASKRUN_FLAG describes what kqring always does.  Without
+	 * SUBMIT_ALL, submission stops at an SQE that fails its checks
+	 * (kqring_submit_sqes()).
 	 */
 	if ((p.flags & ~KQRING_SETUP_FLAGS) != 0)
 		return (EINVAL);
@@ -2055,7 +2058,7 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 			mtx_lock(&ctx->mtx);
 			atomic_clear_32(&shm->sq_flags, IORING_SQ_NEED_WAKEUP);
 			if (ctx->sleeping)
-				wakeup(&ctx->wakeup_chan);
+				kqring_wakeup_locked(ctx);
 			mtx_unlock(&ctx->mtx);
 		}
 		if ((ea->flags & IORING_ENTER_SQ_WAIT) != 0) {
@@ -2064,7 +2067,7 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 			    atomic_load_acq_32(&shm->sq_head)) >=
 			    ctx->sq_entries && !ctx->closing) {
 				if (ctx->sleeping)
-					wakeup(&ctx->wakeup_chan);
+					kqring_wakeup_locked(ctx);
 				ctx->sqpoll_waiting = true;
 				error = msleep_sbt(&ctx->sqpoll_wait_chan,
 				    &ctx->mtx, PCATCH, "kqsqwt", SBT_1MS, 0,
@@ -2319,6 +2322,9 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		ctx->sleeping++;
 		ctx->cq_wait_nr = min_complete - cq_count;
 		ctx->tw_lazy = 0;
+		/* We run mine's taskwork once woken (drain below). */
+		if (mine != NULL && !foreign)
+			mine->tw_waiters++;
 		/* As precise as the io_uring_enter(2) timeout (an hrtimer). */
 		error = msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, PCATCH,
 		    "kqwait", sleep_sbt, 0, C_PREL(10));
@@ -2326,16 +2332,22 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		if (--ctx->cq_sleepers != 0)
 			ctx->cq_wait_nr = 1;
 		ctx->sleeping--;
+		if (mine != NULL && !foreign)
+			mine->tw_waiters--;
 		may_poll = !foreign;
+		if (error == EINTR || error == ERESTART) {
+			kqring_tw_handoff_locked(ctx, mine);
+			mtx_unlock(&ctx->mtx);
+			return (EINTR);
+		}
 		mtx_unlock(&ctx->mtx);
 
-		if (error == EINTR || error == ERESTART)
-			return (EINTR);
 		if (error == EWOULDBLOCK && has_timeout) {
 			if (kqring_until(deadline) == 0) {
 				if (foreign) {
 					/* Nothing of the owner's to run. */
 				} else if (kqring_enter_lock(ctx, lock) != 0) {
+					kqring_tw_handoff(ctx, mine);
 					return (EINTR);
 				} else {
 					if (!ctx->closing) {
@@ -2357,8 +2369,10 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 drain:
 		/* Events a knote woke us for (kqring_kp_filt_event()). */
 		kqring_kpoll_kicked(ctx);
-		if (kqring_enter_lock(ctx, lock) != 0)
+		if (kqring_enter_lock(ctx, lock) != 0) {
+			kqring_tw_handoff(ctx, mine);
 			return (EINTR);
+		}
 		if (ctx->closing) {
 			kqring_enter_unlock(ctx, lock);
 			return (EBADF);
@@ -2546,9 +2560,16 @@ kqring_proc_rings_teardown(struct proc *p, bool setid)
 	}
 }
 
+static void kqring_ast_purge(struct proc *p);
+
+/*
+ * Exit and exec make the other threads exit in the kernel, maybe with
+ * contexts queued for their return to user space: hand those on.
+ */
 static void
 kqring_proc_exit(void *arg __unused, struct proc *p)
 {
+	kqring_ast_purge(p);
 	kqring_proc_rings_teardown(p, false);
 }
 
@@ -2556,6 +2577,7 @@ static void
 kqring_proc_exec(void *arg __unused, struct proc *p,
     struct image_params *imgp)
 {
+	kqring_ast_purge(p);
 	kqring_proc_rings_teardown(p, imgp->credential_setid);
 }
 
@@ -2940,6 +2962,13 @@ kqring_sys_register_all(void)
  * ast() run) and wait until each has cleared it or is gone: then none can
  * be in the module.  A thread that doesn't return to user space within
  * 10 s (its process is stopped) fails the unload with EBUSY.
+ *
+ * With nums NULL, for the return-to-user hook (kqring_ast()) once it is
+ * deregistered: a thread can be calling it, or about to, only while it
+ * runs or waits to run, never blocked (the hook blocks only while counted
+ * in kqring_ast_active, which is 0 by then).  So every user thread not
+ * blocked is marked, and each is done once it has cleared the mark, is
+ * gone, or is blocked.
  */
 static int
 kqring_sys_drain_threads(const int *nums)
@@ -2954,16 +2983,29 @@ again:
 	sx_slock(&allproc_lock);
 	FOREACH_PROC_IN_SYSTEM(p) {
 		PROC_LOCK(p);
+		if (nums == NULL && ((p->p_flag & P_SYSTEM) != 0 ||
+		    p->p_state != PRS_NORMAL)) {
+			PROC_UNLOCK(p);
+			continue;
+		}
 		FOREACH_THREAD_IN_PROC(p, td) {
 			bool ours = false;
 
-			for (int i = 0; i < KQRING_NSYS; i++)
-				ours |= nums[i] != NO_SYSCALL &&
-				    td->td_sa.code == (u_int)nums[i];
+			if (nums == NULL) {
+				ours = (td->td_pflags & TDP_KTHREAD) == 0;
+			} else {
+				for (int i = 0; i < KQRING_NSYS; i++)
+					ours |= nums[i] != NO_SYSCALL &&
+					    td->td_sa.code == (u_int)nums[i];
+			}
 			if (!ours || td == curthread)
 				continue;
 			if (n < max) {
 				thread_lock(td);
+				if (nums == NULL && TD_IS_INHIBITED(td)) {
+					thread_unlock(td);
+					continue;
+				}
 				ast_sched_locked(td, TDA_AST);
 				thread_unlock(td);
 				w[n].pid = p->p_pid;
@@ -2994,7 +3036,8 @@ again:
 				continue;
 			}
 			thread_lock(td);
-			pending = (td->td_ast & TDAI(TDA_AST)) != 0;
+			pending = (td->td_ast & TDAI(TDA_AST)) != 0 &&
+			    (nums != NULL || !TD_IS_INHIBITED(td));
 			thread_unlock(td);
 			PROC_UNLOCK(td->td_proc);
 			if (pending)
@@ -3012,6 +3055,215 @@ again:
 	}
 	free(w, M_KQRING);
 	return (error);
+}
+
+/*
+ * Taskwork run as the thread that queued it returns to user space, as
+ * io_uring runs a ring's task_work in the submitting task: on a ring with
+ * COOP_TASKRUN and no DEFER_TASKRUN, a socket upcall (or other completion)
+ * that runs in a thread of the request's process, one that may enter the
+ * ring, leaves the request to that thread's return instead of waking the
+ * ring's kthread on another CPU (kqring_ast_try()).  As under Linux's
+ * COOP_TASKRUN, the CQE then waits while that thread's system call blocks.
+ *
+ * Contexts queued for a thread hang off a bucket of kqring_astq (by
+ * thread), each holding a reference to the context and its ring.  Its
+ * thread takes them in kqring_ast().  A thread can die without returning
+ * to user space, killed in the kernel by exit(2) or execve(2) of another
+ * thread: the process's exit and exec hooks hand its contexts to their
+ * kthreads (kqring_ast_purge()), and none is queued once P_WEXIT or
+ * P_INEXEC is set.
+ */
+#define	KQRING_TDA	TDA_MOD1
+#define	KQRING_AST_HASH	64
+
+static struct kqring_astq {
+	struct mtx		mtx;
+	TAILQ_HEAD(, kqring_tctx) q;
+} __aligned(CACHE_LINE_SIZE) kqring_astq[KQRING_AST_HASH];
+
+bool kqring_ast_on;		/* under every bucket's mtx to change */
+static u_int kqring_ast_active;		/* threads in kqring_ast() */
+
+static struct kqring_astq *
+kqring_astq_of(const struct thread *td)
+{
+	return (&kqring_astq[((uintptr_t)td >> 10) % KQRING_AST_HASH]);
+}
+
+/* Queue t for td's (curthread's) return to user space; false if not. */
+bool
+kqring_ast_queue(struct kqring_ctx *ctx, struct kqring_tctx *t,
+    struct thread *td)
+{
+	struct kqring_astq *q = kqring_astq_of(td);
+
+	struct thread *cur;
+
+	/*
+	 * ast_td is set under ctx->mtx and td's bucket's mtx, and cleared
+	 * under the bucket's alone, as the context leaves it: only td,
+	 * which holds that mtx now, could clear it while it is td.
+	 */
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	cur = (struct thread *)atomic_load_acq_ptr((uintptr_t *)&t->ast_td);
+	if (cur == td)
+		return (true);	/* td's return runs it, and what comes now */
+	if (cur != NULL)
+		return (false);	/* another's will, but it may be blocked */
+	mtx_lock(&q->mtx);
+	if (!kqring_ast_on) {
+		mtx_unlock(&q->mtx);
+		return (false);
+	}
+	t->ast_td = td;
+	refcount_acquire(&t->refs);
+	refcount_acquire(&ctx->refs);
+	TAILQ_INSERT_TAIL(&q->q, t, ast_link);
+	mtx_unlock(&q->mtx);
+	ast_sched(td, KQRING_TDA);
+	return (true);
+}
+
+/* Take t off bucket q (locked). */
+static void
+kqring_ast_unlink(struct kqring_astq *q, struct kqring_tctx *t)
+{
+	mtx_assert(&q->mtx, MA_OWNED);
+	TAILQ_REMOVE(&q->q, t, ast_link);
+	atomic_store_rel_ptr((uintptr_t *)&t->ast_td, 0);
+}
+
+/*
+ * Run t's taskwork in td, or (run false) only hand it to the kthread, and
+ * drop the queue's references.  t is off its bucket.
+ */
+static void
+kqring_ast_run(struct kqring_tctx *t, struct thread *td, bool run)
+{
+	struct kqring_ctx *ctx = t->ctx;
+
+	if (run && t->proc == td->td_proc && !ctx->closing && !t->dead &&
+	    sx_xlock_sig(&ctx->sq_sx) == 0) {
+		if (!ctx->closing && !t->dead) {
+			kqring_run_taskwork(ctx);
+			kqring_flush_overflow(ctx);
+			kqring_evfd_flush(ctx);
+		}
+		sx_xunlock(&ctx->sq_sx);
+	}
+	/*
+	 * Left over (not run, interrupted): the kthread runs it.  Taskwork
+	 * queued since t left its bucket went another way (ast_td was clear).
+	 */
+	if (!TAILQ_EMPTY(&t->taskwork))
+		kqring_tw_handoff(ctx, t);
+	kqring_tctx_rele(t);
+	kqring_ctx_rele(ctx);
+}
+
+/*
+ * The hook (KQRING_TDA), as td returns to user space.  It blocks only
+ * while counted in kqring_ast_active; see kqring_sys_drain_threads().
+ * A context of another process (td's struct thread reused after one
+ * that died with contexts queued, before the exit hook ran) is only
+ * handed to its kthread.
+ */
+static void
+kqring_ast(struct thread *td, int asts __unused)
+{
+	struct kqring_tctx *few[8], *t, *tn;
+	struct kqring_astq *q;
+	u_int n;
+
+	/* Only td queues for td, so it sees what it queued. */
+	q = kqring_astq_of(td);
+	if (TAILQ_EMPTY(&q->q))
+		return;
+	atomic_add_int(&kqring_ast_active, 1);
+	do {
+		n = 0;
+		mtx_lock(&q->mtx);
+		TAILQ_FOREACH_SAFE(t, &q->q, ast_link, tn) {
+			if (t->ast_td != td)
+				continue;
+			kqring_ast_unlink(q, t);
+			few[n++] = t;
+			if (n == nitems(few))
+				break;
+		}
+		mtx_unlock(&q->mtx);
+		for (u_int i = 0; i < n; i++)
+			kqring_ast_run(few[i], td, true);
+	} while (n == nitems(few));
+	atomic_subtract_int(&kqring_ast_active, 1);
+}
+
+/* Hand the contexts queued for p's threads (any, if p is NULL) on. */
+static void
+kqring_ast_purge(struct proc *p)
+{
+	struct kqring_tctx *t;
+
+	for (int i = 0; i < KQRING_AST_HASH; i++) {
+		struct kqring_astq *q = &kqring_astq[i];
+
+		while (!TAILQ_EMPTY(&q->q)) {
+			mtx_lock(&q->mtx);
+			TAILQ_FOREACH(t, &q->q, ast_link) {
+				if (p == NULL || t->proc == p)
+					break;
+			}
+			if (t != NULL)
+				kqring_ast_unlink(q, t);
+			mtx_unlock(&q->mtx);
+			if (t == NULL)
+				break;
+			kqring_ast_run(t, curthread, false);
+		}
+	}
+}
+
+static void
+kqring_ast_set_on(bool on)
+{
+	for (int i = 0; i < KQRING_AST_HASH; i++)
+		mtx_lock(&kqring_astq[i].mtx);
+	kqring_ast_on = on;
+	for (int i = 0; i < KQRING_AST_HASH; i++)
+		mtx_unlock(&kqring_astq[i].mtx);
+}
+
+static void
+kqring_ast_register(void)
+{
+	ast_register(KQRING_TDA, ASTR_ASTF_REQUIRED, 0, kqring_ast);
+	kqring_ast_set_on(true);
+}
+
+/*
+ * Stop queueing, hand on what is queued, and deregister the hook; then
+ * wait for the threads in it (kqring_ast_active) and for those that may
+ * be about to call it (kqring_sys_drain_threads()).  EBUSY, registered
+ * again, if they don't get out within 10 s.
+ */
+static int
+kqring_ast_unregister(void)
+{
+	int ticks_left;
+
+	kqring_ast_set_on(false);
+	kqring_ast_purge(NULL);
+	ast_deregister(KQRING_TDA);
+	for (ticks_left = 10 * hz; atomic_load_int(&kqring_ast_active) != 0 &&
+	    ticks_left > 0; ticks_left--)
+		pause("kqastd", 1);
+	if (atomic_load_int(&kqring_ast_active) != 0 ||
+	    kqring_sys_drain_threads(NULL) != 0) {
+		kqring_ast_register();
+		return (EBUSY);
+	}
+	return (0);
 }
 
 /*
@@ -3178,6 +3430,11 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			TAILQ_INIT(&kqring_futex_hash[i]);
 		for (int i = 0; i < KQRING_PROC_HASH; i++)
 			LIST_INIT(&kqring_proc_hash[i]);
+		for (int i = 0; i < KQRING_AST_HASH; i++) {
+			mtx_init(&kqring_astq[i].mtx, "kqring ast", NULL,
+			    MTX_DEF);
+			TAILQ_INIT(&kqring_astq[i].q);
+		}
 		kqring_teardown_tq = taskqueue_create("kqring teardown",
 		    M_WAITOK, taskqueue_thread_enqueue, &kqring_teardown_tq);
 		taskqueue_start_threads(&kqring_teardown_tq, 1, PWAIT,
@@ -3199,8 +3456,11 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			rm_destroy(&kqring_rings_rm);
 			mtx_destroy(&kqring_proc_mtx);
 			mtx_destroy(&kqring_futex_mtx);
+			for (int i = 0; i < KQRING_AST_HASH; i++)
+				mtx_destroy(&kqring_astq[i].mtx);
 			return (ENOMEM);
 		}
+		kqring_ast_register();
 		kqring_sys_register_all();
 		printf("kqring: loaded (/dev/kqring)\n");
 		return (0);
@@ -3239,6 +3499,14 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 		 * after destroy_dev() their rings would be gone.
 		 */
 		if (kqring_sys_deregister_all() != 0) {
+			kqring_sys_register_all();
+			mtx_lock(&kqring_proc_mtx);
+			kqring_unloading = false;
+			mtx_unlock(&kqring_proc_mtx);
+			return (EBUSY);
+		}
+		/* Then the hook, which runs taskwork as a system call does. */
+		if (kqring_ast_unregister() != 0) {
 			kqring_sys_register_all();
 			mtx_lock(&kqring_proc_mtx);
 			kqring_unloading = false;
@@ -3285,6 +3553,8 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 				free(pr, M_KQRING);
 			}
 		}
+		for (int i = 0; i < KQRING_AST_HASH; i++)
+			mtx_destroy(&kqring_astq[i].mtx);
 		mtx_destroy(&kqring_zc_mtx);
 		rm_destroy(&kqring_rings_rm);
 		mtx_destroy(&kqring_proc_mtx);

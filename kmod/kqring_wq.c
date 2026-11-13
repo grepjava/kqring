@@ -139,7 +139,7 @@ kqring_wq_mark_blocking(struct kqring_ctx *ctx, struct kqring_op *op)
 	mtx_lock(&ctx->mtx);
 	op->wq_blocking = true;
 	if (ctx->sleeping)
-		wakeup(&ctx->wakeup_chan);
+		kqring_wakeup_locked(ctx);
 	mtx_unlock(&ctx->mtx);
 }
 
@@ -620,7 +620,7 @@ kqring_wq_thread(void *arg)
 		op = capped ? NULL : kqring_wq_next_locked(wq, type);
 		if (op != NULL) {
 			uint64_t t0;
-			bool deferred = false, slept, switched;
+			bool added = false, deferred = false, slept, switched;
 			int hash = op->wq_hash;
 			long nvcsw;
 
@@ -729,9 +729,19 @@ kqring_wq_thread(void *arg)
 				else
 					deferred =
 					    kqring_taskwork_add_lazy_locked(ctx, op);
+				added = true;
 			}
-			if (ctx->sleeping && !deferred)
+			/*
+			 * Taskwork added above woke the kthread if it must;
+			 * a retired op's, queued directly, needs it woken.
+			 */
+			if (ctx->sleeping == 0 || deferred) {
+				/* Nobody to wake, or the wake is batched. */
+			} else if (!added) {
+				kqring_wakeup_locked(ctx);
+			} else if (ctx->sleeping != ctx->task_sleeping) {
 				wakeup(&ctx->wakeup_chan);
+			}
 			mtx_unlock(&ctx->mtx);
 			/* A read of a pipe: see kqring_file_rw(). */
 			if (sx_xlocked(&ctx->pipe_sx))
@@ -1448,8 +1458,10 @@ kqring_sqpoll_thread(void *arg)
 		}
 		if (elapsed < ctx->sqpoll_idle_sbt) {
 			ctx->sleeping++;
-			(void)msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, PCATCH,
+			ctx->task_sleeping++;
+			(void)msleep_sbt(&ctx->task_chan, &ctx->mtx, PCATCH,
 			    "kqsqpl", 50 * SBT_1US, 0, 0);
+			ctx->task_sleeping--;
 			ctx->sleeping--;
 			mtx_unlock(&ctx->mtx);
 			continue;
@@ -1483,8 +1495,10 @@ kqring_sqpoll_thread(void *arg)
 		 * then suspends or exits in kqring_kthread_check_suspend().
 		 */
 		ctx->sleeping++;
-		(void)msleep_sbt(&ctx->wakeup_chan, &ctx->mtx, PCATCH, "kqsqid",
+		ctx->task_sleeping++;
+		(void)msleep_sbt(&ctx->task_chan, &ctx->mtx, PCATCH, "kqsqid",
 		    period, 0, 0);
+		ctx->task_sleeping--;
 		ctx->sleeping--;
 		if (!taskrun)
 			atomic_clear_32(&shm->sq_flags, IORING_SQ_NEED_WAKEUP);
@@ -1579,7 +1593,7 @@ kqring_sqpoll_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) ||
 		    atomic_load_acq_32(&shm->sq_tail) !=
 		    atomic_load_acq_32(&shm->sq_head)) && ctx->sleeping)
-			wakeup(&ctx->wakeup_chan);
+			kqring_wakeup_locked(ctx);
 
 		sbintime_t sleep_sbt = has_timeout ? MIN(sbt, SBT_1MS) :
 		    SBT_1MS;

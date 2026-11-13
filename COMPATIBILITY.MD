@@ -107,7 +107,7 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_SETUP_ATTACH_WQ` | Equivalent | | `kqring_ioc_setup` | `test_setup_errors`, `test_sqe128_cqe32_attach_wq`, `fuzz` |
 | `IORING_SETUP_R_DISABLED` | Equivalent | Before enabling, one thread at a time may register. | `kqring_ioc_setup` | `test_restrictions`, `liburing/register-restrictions`, `fuzz` |
 | `IORING_SETUP_SUBMIT_ALL` | Equivalent | | `kqring_submit_sqes` | `test_compat_gaps`, `liburing/drop-submit`, `fuzz` |
-| `IORING_SETUP_COOP_TASKRUN` | Equivalent | A hint with nothing to do here: kqring sends no interrupts to the owner. | `kqring_ioc_setup` | `test_phase5_security_audit`, `fuzz` |
+| `IORING_SETUP_COOP_TASKRUN` | Equivalent | Without `DEFER_TASKRUN`, a completion queued in a thread of the ring's process runs as that thread returns to user space, as Linux's task_work, and waits while its system call blocks; others go to the ring's kernel thread. kqring sends no interrupts either way. | `kqring_ast_try` | `test_default_ring_waiter_handoff`, `test_phase5_security_audit`, `fuzz` |
 | `IORING_SETUP_TASKRUN_FLAG` | Equivalent | | `kqring_kp_kick` | `test_taskrun_on_wakeup`, `fuzz` |
 | `IORING_SETUP_SQE128` | Equivalent | | `kqring_ioc_setup` | `test_sqe128_cqe32_attach_wq`, `fuzz` |
 | `IORING_SETUP_CQE32` | Equivalent | | `kqring_ioc_setup` | `test_sqe128_cqe32_attach_wq`, `fuzz` |

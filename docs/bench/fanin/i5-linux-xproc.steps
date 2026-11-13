@@ -1,0 +1,14 @@
+# i5-8250U, Ubuntu, Linux 7.3, 13 Nov 2026. xbench of the default-ring change; median of 5 one-second runs per line.
+16:32:54 r=1 defer=1 xp_kevent            8410.6 ns  (7783.8-8786.5)  peer proces
+16:32:59 r=1 defer=1 xp_ring_armed       10003.3 ns  (9693.4-10223.8)  peer proce
+16:33:04 r=1 defer=0 xp_kevent            7972.7 ns  (7782.9-8144.8)  peer proces
+16:33:09 r=1 defer=0 xp_ring_armed       11525.8 ns  (10482.5-14018.8)  peer proc
+16:33:14 r=2 defer=1 xp_kevent            9425.7 ns  (7949.6-11540.0)  peer proce
+16:33:20 r=2 defer=1 xp_ring_armed       10031.5 ns  (9552.9-11537.9)  peer proce
+16:33:25 r=2 defer=0 xp_kevent            8353.1 ns  (8026.7-9751.5)  peer proces
+16:33:30 r=2 defer=0 xp_ring_armed       10548.0 ns  (10464.2-11117.9)  peer proc
+16:33:35 r=3 defer=1 xp_kevent            8005.4 ns  (7831.5-8177.1)  peer proces
+16:33:41 r=3 defer=1 xp_ring_armed        9985.9 ns  (9573.6-10158.1)  peer proce
+16:33:46 r=3 defer=0 xp_kevent            8136.3 ns  (7620.3-8618.5)  peer proces
+16:33:51 r=3 defer=0 xp_ring_armed       10685.8 ns  (10439.2-11489.0)  peer proc
+16:33:51 ALLDONE

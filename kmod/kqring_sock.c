@@ -1945,7 +1945,7 @@ kqring_wq_poll_wait(struct kqring_ctx *ctx, struct kqring_op *op)
 			    !ctx->closing) {
 				kqring_taskwork_add_locked(ctx, op);
 				if (ctx->sleeping)
-					wakeup(&ctx->wakeup_chan);
+					kqring_wakeup_locked(ctx);
 			}
 			mtx_unlock(&ctx->mtx);
 			kqring_wq_mark_blocking(ctx, op);

@@ -846,6 +846,11 @@ struct kqring_tctx {
 	struct timeout_task	exit_task;
 	/* Requests whose next step runs in proc; under ctx->mtx. */
 	struct kqring_op_list	taskwork;
+	/*
+	 * Threads of proc asleep in an enter's wait (kqring_wait_cqes()),
+	 * which run this taskwork when woken; under ctx->mtx.
+	 */
+	u_int			tw_waiters;
 	/* SQPOLL, or no DEFER_TASKRUN: its kthread; under ctx->mtx. */
 	struct thread		*task_td;
 	bool			task_running;
@@ -866,6 +871,14 @@ struct kqring_tctx {
 	 * Set from knote() with no ring lock; atomic.
 	 */
 	u_int			kp_kick;
+	/*
+	 * The thread whose return to user space runs this taskwork
+	 * (kqring_ast_queue()): set under ctx->mtx and that thread's
+	 * bucket's mtx, cleared under the bucket's; its link there.  Last,
+	 * off the lines the enter path reads.
+	 */
+	struct thread		*ast_td;
+	TAILQ_ENTRY(kqring_tctx) ast_link;
 };
 
 /* IORING_REGISTER_RESTRICTIONS, in force once the ring is enabled. */
@@ -1117,6 +1130,14 @@ struct kqring_ctx {
 	size_t			bio_held;
 	int			wakeup_chan;
 	u_int			sleeping;	/* threads in msleep; under mtx */
+	/*
+	 * The ring's kthreads (SQPOLL, or completions only) sleep apart, on
+	 * task_chan, and count in task_sleeping as well as sleeping, so that
+	 * taskwork an enter waiter will run itself need not wake them.
+	 * Under mtx; kqring_wakeup_locked() wakes both.
+	 */
+	int			task_chan;
+	u_int			task_sleeping;
 	/*
 	 * Enter waiters among them (kqring_wait_cqes()), the CQEs a lone one
 	 * still needs, and the lazy taskwork queued since it slept; see
@@ -1435,6 +1456,30 @@ kqring_until(sbintime_t deadline)
 	return (deadline > now ? deadline - now : 0);
 }
 
+extern bool kqring_ast_on;
+bool	kqring_ast_queue(struct kqring_ctx *ctx, struct kqring_tctx *t,
+	    struct thread *td);
+
+/*
+ * Taskwork the ring's kthread would run: leave it to curthread's return
+ * to user space instead (kqring_ast_queue()) when the ring has
+ * COOP_TASKRUN and curthread is a user thread of the request's process
+ * that may enter the ring, and isn't exiting or exec'ing.
+ */
+static inline bool
+kqring_ast_try(struct kqring_ctx *ctx, struct kqring_tctx *t)
+{
+	struct thread *td = curthread;
+
+	if ((ctx->flags & IORING_SETUP_COOP_TASKRUN) == 0 ||
+	    !ctx->taskrun_only || td->td_proc != t->proc || t->dead ||
+	    (td->td_pflags & TDP_KTHREAD) != 0 ||
+	    (td->td_proc->p_flag & (P_WEXIT | P_INEXEC)) != 0 ||
+	    (!ctx->shared && !kqring_is_owner(ctx, td)))
+		return (false);
+	return (kqring_ast_queue(ctx, t, td));
+}
+
 /* Returns true if it left the sleeper asleep (a deferred lazy wake-up). */
 static inline bool
 kqring_taskwork_add_common(struct kqring_ctx *ctx, struct kqring_op *op,
@@ -1463,6 +1508,14 @@ kqring_taskwork_add_common(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (ctx->sleeping == 0)
 		return (false);
 	/*
+	 * A thread of op's process asleep in an enter runs its taskwork when
+	 * woken, as io_uring runs a default ring's task_work in the task:
+	 * the ring's kthread is woken only when there is none, which saves
+	 * a wake-up on another CPU and a fight for sq_sx.  A waiter that
+	 * returns without running it hands it over (kqring_tw_handoff()).
+	 */
+	bool runner = op->tctx->tw_waiters != 0;
+	/*
 	 * As io_uring's lazy task-work wake for DEFER_TASKRUN: when the only
 	 * sleeper is an enter waiting for cq_wait_nr more CQEs, a plain read
 	 * or write completion (one CQE, nothing queued behind it) wakes it
@@ -1476,8 +1529,46 @@ kqring_taskwork_add_common(struct kqring_ctx *ctx, struct kqring_op *op,
 	    kqring_op_is_write(op->sqe.opcode)) &&
 	    ++ctx->tw_lazy < ctx->cq_wait_nr)
 		return (true);
-	wakeup(&ctx->wakeup_chan);
+	if (ctx->sleeping != ctx->task_sleeping)
+		wakeup(&ctx->wakeup_chan);
+	if (ctx->task_sleeping != 0 && !runner &&
+	    !kqring_ast_try(ctx, op->tctx))
+		wakeup(&ctx->task_chan);
 	return (false);
+}
+
+/*
+ * An enter waiter that returns without running its taskwork (a signal, or
+ * sq_sx not taken), which kqring_taskwork_add_common() may not have woken
+ * the kthread for: wake it, on a ring whose kthread posts completions.
+ */
+static inline void
+kqring_tw_handoff_locked(struct kqring_ctx *ctx, struct kqring_tctx *t)
+{
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	if (t != NULL && ctx->taskrun_only && ctx->task_sleeping != 0 &&
+	    !TAILQ_EMPTY(&t->taskwork))
+		wakeup(&ctx->task_chan);
+}
+
+static inline void
+kqring_tw_handoff(struct kqring_ctx *ctx, struct kqring_tctx *t)
+{
+	if (t == NULL || !ctx->taskrun_only)
+		return;
+	mtx_lock(&ctx->mtx);
+	kqring_tw_handoff_locked(ctx, t);
+	mtx_unlock(&ctx->mtx);
+}
+
+/* Wake every sleeper on the ring: waiters and the ring's kthreads. */
+static inline void
+kqring_wakeup_locked(struct kqring_ctx *ctx)
+{
+	mtx_assert(&ctx->mtx, MA_OWNED);
+	wakeup(&ctx->wakeup_chan);
+	if (ctx->task_sleeping != 0)
+		wakeup(&ctx->task_chan);
 }
 
 static inline void
