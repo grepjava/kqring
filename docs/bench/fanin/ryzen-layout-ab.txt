@@ -1,0 +1,146 @@
+10:19:26 A=7aa4cd9f B=2f5b82e4 R=3
+10:20:12 r1 A: 812.4 ms1024 402.9 ms256 934.7 bench1024
+10:20:58 r1 B: 578.6 ms1024 396.3 ms256 779.3 bench1024
+10:21:43 r2 A: 796.0 ms1024 399.9 ms256 910.7 bench1024
+10:22:29 r2 B: 584.1 ms1024 385.0 ms256 770.4 bench1024
+10:23:14 r3 A: 814.5 ms1024 400.5 ms256 928.6 bench1024
+10:24:00 r3 B: 576.9 ms1024 396.1 ms256 761.3 bench1024
+10:24:00 ALLDONE vmcores=3
+== A.1
+defer=1 N=16 fanin_ring_batch 387.1
+defer=1 N=16 fanin_ring_multishot 379.4
+defer=1 N=256 fanin_ring_batch 388.3
+defer=1 N=256 fanin_ring_multishot 402.9
+defer=1 N=1024 fanin_ring_batch 453.1
+defer=1 N=1024 fanin_ring_multishot 812.4
+defer=0 N=16 fanin_ring_batch 387.6
+defer=0 N=16 fanin_ring_multishot 344.8
+defer=0 N=256 fanin_ring_batch 389.0
+defer=0 N=256 fanin_ring_multishot 341.5
+defer=0 N=1024 fanin_ring_batch 460.3
+defer=0 N=1024 fanin_ring_multishot 701.4
+nop1 nop1 184.3
+ROW fanin_16 kqueue 398.2
+ROW fanin_16 kqring_multishot 513.0
+ROW fanin_16 kqring_recv_batch 522.1
+ROW fanin_256 kqueue 411.9
+ROW fanin_256 kqring_multishot 531.4
+ROW fanin_256 kqring_recv_batch 533.9
+ROW fanin_1024 kqueue 496.9
+ROW fanin_1024 kqring_multishot 934.7
+ROW fanin_1024 kqring_recv_batch 657.3
+== A.2
+defer=1 N=16 fanin_ring_batch 385.8
+defer=1 N=16 fanin_ring_multishot 380.4
+defer=1 N=256 fanin_ring_batch 387.0
+defer=1 N=256 fanin_ring_multishot 399.9
+defer=1 N=1024 fanin_ring_batch 453.9
+defer=1 N=1024 fanin_ring_multishot 796.0
+defer=0 N=16 fanin_ring_batch 388.2
+defer=0 N=16 fanin_ring_multishot 340.6
+defer=0 N=256 fanin_ring_batch 390.4
+defer=0 N=256 fanin_ring_multishot 347.5
+defer=0 N=1024 fanin_ring_batch 464.2
+defer=0 N=1024 fanin_ring_multishot 685.9
+nop1 nop1 210.5
+ROW fanin_16 kqueue 395.6
+ROW fanin_16 kqring_multishot 518.9
+ROW fanin_16 kqring_recv_batch 520.7
+ROW fanin_256 kqueue 411.2
+ROW fanin_256 kqring_multishot 535.6
+ROW fanin_256 kqring_recv_batch 535.9
+ROW fanin_1024 kqueue 492.8
+ROW fanin_1024 kqring_multishot 910.7
+ROW fanin_1024 kqring_recv_batch 652.2
+== A.3
+defer=1 N=16 fanin_ring_batch 385.2
+defer=1 N=16 fanin_ring_multishot 383.8
+defer=1 N=256 fanin_ring_batch 386.6
+defer=1 N=256 fanin_ring_multishot 400.5
+defer=1 N=1024 fanin_ring_batch 463.6
+defer=1 N=1024 fanin_ring_multishot 814.5
+defer=0 N=16 fanin_ring_batch 387.3
+defer=0 N=16 fanin_ring_multishot 337.2
+defer=0 N=256 fanin_ring_batch 387.9
+defer=0 N=256 fanin_ring_multishot 348.6
+defer=0 N=1024 fanin_ring_batch 453.0
+defer=0 N=1024 fanin_ring_multishot 680.5
+nop1 nop1 185.8
+ROW fanin_16 kqueue 396.1
+ROW fanin_16 kqring_multishot 517.9
+ROW fanin_16 kqring_recv_batch 527.1
+ROW fanin_256 kqueue 411.1
+ROW fanin_256 kqring_multishot 531.0
+ROW fanin_256 kqring_recv_batch 537.3
+ROW fanin_1024 kqueue 506.5
+ROW fanin_1024 kqring_multishot 928.6
+ROW fanin_1024 kqring_recv_batch 662.9
+== B.1
+defer=1 N=16 fanin_ring_batch 388.0
+defer=1 N=16 fanin_ring_multishot 378.1
+defer=1 N=256 fanin_ring_batch 390.1
+defer=1 N=256 fanin_ring_multishot 396.3
+defer=1 N=1024 fanin_ring_batch 447.8
+defer=1 N=1024 fanin_ring_multishot 578.6
+defer=0 N=16 fanin_ring_batch 386.5
+defer=0 N=16 fanin_ring_multishot 364.0
+defer=0 N=256 fanin_ring_batch 391.0
+defer=0 N=256 fanin_ring_multishot 359.2
+defer=0 N=1024 fanin_ring_batch 443.9
+defer=0 N=1024 fanin_ring_multishot 588.2
+nop1 nop1 181.6
+ROW fanin_16 kqueue 396.0
+ROW fanin_16 kqring_multishot 515.4
+ROW fanin_16 kqring_recv_batch 522.9
+ROW fanin_256 kqueue 407.8
+ROW fanin_256 kqring_multishot 531.3
+ROW fanin_256 kqring_recv_batch 530.7
+ROW fanin_1024 kqueue 510.7
+ROW fanin_1024 kqring_multishot 779.3
+ROW fanin_1024 kqring_recv_batch 663.3
+== B.2
+defer=1 N=16 fanin_ring_batch 386.5
+defer=1 N=16 fanin_ring_multishot 373.9
+defer=1 N=256 fanin_ring_batch 390.7
+defer=1 N=256 fanin_ring_multishot 385.0
+defer=1 N=1024 fanin_ring_batch 446.2
+defer=1 N=1024 fanin_ring_multishot 584.1
+defer=0 N=16 fanin_ring_batch 391.6
+defer=0 N=16 fanin_ring_multishot 362.8
+defer=0 N=256 fanin_ring_batch 391.9
+defer=0 N=256 fanin_ring_multishot 345.3
+defer=0 N=1024 fanin_ring_batch 439.3
+defer=0 N=1024 fanin_ring_multishot 585.2
+nop1 nop1 184.1
+ROW fanin_16 kqueue 394.8
+ROW fanin_16 kqring_multishot 511.3
+ROW fanin_16 kqring_recv_batch 522.9
+ROW fanin_256 kqueue 408.0
+ROW fanin_256 kqring_multishot 528.9
+ROW fanin_256 kqring_recv_batch 534.6
+ROW fanin_1024 kqueue 498.1
+ROW fanin_1024 kqring_multishot 770.4
+ROW fanin_1024 kqring_recv_batch 653.1
+== B.3
+defer=1 N=16 fanin_ring_batch 384.0
+defer=1 N=16 fanin_ring_multishot 380.2
+defer=1 N=256 fanin_ring_batch 387.3
+defer=1 N=256 fanin_ring_multishot 396.1
+defer=1 N=1024 fanin_ring_batch 435.5
+defer=1 N=1024 fanin_ring_multishot 576.9
+defer=0 N=16 fanin_ring_batch 392.4
+defer=0 N=16 fanin_ring_multishot 361.4
+defer=0 N=256 fanin_ring_batch 391.4
+defer=0 N=256 fanin_ring_multishot 360.4
+defer=0 N=1024 fanin_ring_batch 430.1
+defer=0 N=1024 fanin_ring_multishot 592.0
+nop1 nop1 185.5
+ROW fanin_16 kqueue 394.6
+ROW fanin_16 kqring_multishot 516.4
+ROW fanin_16 kqring_recv_batch 523.7
+ROW fanin_256 kqueue 408.0
+ROW fanin_256 kqring_multishot 529.3
+ROW fanin_256 kqring_recv_batch 536.2
+ROW fanin_1024 kqueue 496.4
+ROW fanin_1024 kqring_multishot 761.3
+ROW fanin_1024 kqring_recv_batch 648.4

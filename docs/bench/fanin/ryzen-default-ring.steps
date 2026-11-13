@@ -1,0 +1,14 @@
+10:10:23 loaded 7aa4cd9f probes=   83143
+10:10:28 N=16 fanin_kevent          397.4 ns  (396.4-398.6)  fan-in: N wri
+10:10:33 N=16 fanin_ring_batch      390.6 ns  (388.4-396.6)  fan-in: N wri
+10:10:38 N=16 fanin_ring_multishot    358.5 ns  (356.9-368.0)  fan-in: N w
+10:10:43 N=256 fanin_kevent          409.3 ns  (408.0-413.9)  fan-in: N wri
+10:10:49 N=256 fanin_ring_batch      390.2 ns  (388.6-391.3)  fan-in: N wri
+10:10:54 N=256 fanin_ring_multishot    323.4 ns  (321.9-338.1)  fan-in: N w
+10:11:00 N=1024 fanin_kevent          500.9 ns  (499.6-501.0)  fan-in: N wri
+10:11:05 N=1024 fanin_ring_batch      459.6 ns  (455.8-460.8)  fan-in: N wri
+10:11:11 N=1024 fanin_ring_multishot    666.9 ns  (664.0-676.6)  fan-in: N w
+10:11:13 bench: 9 rows
+10:11:28 fanin_kevent rc=0 TOTAL 34411 USER 5464 fanin_kevent          421.6 ns  (408.7-4
+10:11:42 fanin_ring_multishot rc=0 TOTAL 58441 USER 4598 fanin_ring_multishot    340.8 ns  (330.1
+10:11:42 ALLDONE vmcores=3

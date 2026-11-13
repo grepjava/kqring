@@ -1008,6 +1008,65 @@ c_provided_buffers(void)
 	ring_free(&r);
 }
 
+/*
+ * A multishot RECV that takes its group's last buffer: does it end at
+ * once, or only when data comes with no buffer for it?
+ */
+static void
+c_recv_mshot_drained(void)
+{
+	static char bufs[3][64];
+	struct ring r;
+	struct io_uring_sqe *s;
+	int sv[2];
+
+	CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	ring_init(&r, 16, NULL);
+	s = prep(&r, IORING_OP_PROVIDE_BUFFERS, 2, 1);
+	s->addr = (uint64_t)(uintptr_t)bufs;
+	s->len = 64;
+	s->buf_group = 8;
+	(void)submit(&r);
+	await(&r, 1, 2000);
+	dump(&r, "provide");
+
+	s = prep(&r, IORING_OP_RECV, sv[0], 2);
+	s->flags = IOSQE_BUFFER_SELECT;
+	s->buf_group = 8;
+	s->ioprio = IORING_RECV_MULTISHOT;
+	(void)submit(&r);
+	CHECK(write(sv[1], "a", 1) == 1);
+	await(&r, 1, 2000);
+	dump(&r, "first");
+	CHECK(write(sv[1], "b", 1) == 1);
+	await(&r, 1, 2000);
+	dump(&r, "last_buffer");
+	await(&r, 1, 100);
+	dump(&r, "idle");
+
+	/* A buffer provided now, and then data. */
+	s = prep(&r, IORING_OP_PROVIDE_BUFFERS, 1, 3);
+	s->addr = (uint64_t)(uintptr_t)bufs[2];
+	s->len = 64;
+	s->buf_group = 8;
+	s->off = 2;
+	(void)submit(&r);
+	await(&r, 1, 2000);
+	dump(&r, "provide_more");
+	CHECK(write(sv[1], "c", 1) == 1);
+	await(&r, 1, 2000);
+	dump(&r, "after_provide");
+
+	/* Data with no buffer for it. */
+	CHECK(write(sv[1], "d", 1) == 1);
+	await(&r, 1, 2000);
+	dump(&r, "no_buffer");
+
+	close(sv[0]);
+	close(sv[1]);
+	ring_free(&r);
+}
+
 /* Fixed buffers when the mapping behind them goes or changes. */
 static void
 c_buffer_lifetime(void)
@@ -2155,6 +2214,7 @@ static const struct {
 	{ "poll", c_poll },
 	{ "poll_hup", c_poll_hup },
 	{ "provided_buffers", c_provided_buffers },
+	{ "recv_mshot_drained", c_recv_mshot_drained },
 	{ "buffer_lifetime", c_buffer_lifetime },
 	{ "buffer_fork", c_buffer_fork },
 	{ "buffer_backing", c_buffer_backing },

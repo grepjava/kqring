@@ -245,7 +245,7 @@ These are the `IORING_FEAT_*` bits setup returns.
 | `IORING_ASYNC_CANCEL_USERDATA` | Equivalent | | `kqring_cancel_match_req` | `test_cancel` |
 | `IORING_ASYNC_CANCEL_OP` | Equivalent | | `kqring_cancel_match_req` | `test_cancel_flags` |
 | `IORING_RECVSEND_POLL_FIRST` | Equivalent | A hint. | `kqring_req_prep` | `test_multishot_and_eof`, `liburing/send-zerocopy` |
-| `IORING_RECV_MULTISHOT` | Equivalent | `sqe->len` caps one run's bytes, after which the request yields to other work, and `sqe->optlen` caps the total. | `kqring_exec_recv`, `kqring_op_attempt` | `test_multishot_and_eof`, `liburing/recv-multishot`, `liburing/recv-mshot-fair` |
+| `IORING_RECV_MULTISHOT` | Equivalent | `sqe->len` caps one run's bytes, after which the request yields to other work, and `sqe->optlen` caps the total. | `kqring_exec_recv`, `kqring_op_attempt` | `test_multishot_and_eof`, `liburing/recv-multishot`, `liburing/recv-mshot-fair`, `diff/recv_mshot_drained` |
 | `IORING_RECVSEND_FIXED_BUF` | Equivalent | | `kqring_req_resources` | `test_registered_buffers`, `liburing/send-zerocopy` |
 | `IORING_RECVSEND_BUNDLE` | Partial | Up to 32 buffers per CQE. | `kqring_exec_recv` | `liburing/recvsend_bundle` |
 | `IORING_SEND_ZC_REPORT_USAGE` | Equivalent | | `kqring_req_complete` | `test_send_zc`, `liburing/send-zerocopy` |

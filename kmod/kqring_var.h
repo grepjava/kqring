@@ -327,13 +327,44 @@ struct kqring_rmem {
  * soupcall with SBS_CANTRCVMORE.
  */
 struct kqring_op {
+	/*
+	 * First, in two cache lines, what an armed multishot receive reads
+	 * and writes from its socket's upcall to its CQE.  With a thousand
+	 * requests armed they don't stay in cache, and each line a message
+	 * touches comes from memory (docs/fan-in.md).
+	 */
 	struct kqring_ctx	*ctx;
 	/* Its submitter's context: the pool and taskwork it runs on. */
 	struct kqring_tctx	*tctx;
 	struct socket		*so;		/* soref'd while armed */
-	int			dirs;		/* KQ_DIR_* upcalls installed */
 	/* The waiter lists op is on: so_rcv (or the listener), so_snd. */
 	struct kqring_sowatch	*sw[2];
+	struct file		*sock_fp;	/* socket held while retried */
+	struct ucred		*cred;		/* sqe->personality's, see ffile */
+	/* Event-driven chains: see tstep below. */
+	struct kqring_trun	*trun;
+	struct kqring_trig	*trig_wait;
+	size_t			done_io;	/* MSG_WAITALL: bytes so far */
+	int32_t			res;		/* result of the last attempt */
+	uint32_t		cflags;		/* CQE flags of the last attempt */
+	bool			in_taskwork;
+	/* On its submitter's taskwork to be issued there (kqring_flush_ready()). */
+	bool			tw_issue;
+	bool			cancelled;	/* no longer armed; under mtx */
+	bool			armed;		/* on active_ops */
+	bool			listening;	/* armed via solisten_upcall_set */
+	bool			oneshot_sb;	/* one-shot single-dir sockbuf op */
+	bool			multishot;	/* prep: a multishot request */
+	bool			requeue;	/* multishot: yield to other work */
+	bool			sock_rw;	/* READ/WRITE(V) on a socket */
+	bool			short_io;	/* moved less than was asked */
+	bool			kbuf;		/* buffers in fzb->kva, see fzb */
+	bool			kp_on;		/* see kp_id */
+	bool			wq_retired;	/* awaiting worker release */
+	bool			wq_done;	/* worker finished */
+	bool			wq_wait_ready;	/* worker waits for readiness */
+	bool			bio_done;	/* all bios done; res is set */
+	int			dirs;		/* KQ_DIR_* upcalls installed */
 	struct kqring_sowatch	*reap_sw;	/* empty sw detached in upcall */
 	/*
 	 * POLL_ADD on a non-socket file, as knotes on the ring's kqueue
@@ -345,7 +376,6 @@ struct kqring_op {
 	uint8_t			kp_filters;	/* KQRING_KP_READ / _WRITE */
 	const void		*kp_data;	/* its file's f_data: only compared */
 	uint32_t		kp_evfd_seq;	/* ctx->evfd_signals when last delivered */
-	bool			kp_on;
 	int			kp_revents;
 	u_int			kp_nev;
 	uint32_t		kp_seen[2];	/* read, write: kqring_kp_filt_event() */
@@ -371,15 +401,8 @@ struct kqring_op {
 	bool			kq_bridge;
 	/* A trigger's kevent waiter: its kevent, instead of sqe->addr. */
 	const struct kevent	*trig_kev;
-	bool			listening;	/* armed via solisten_upcall_set */
-	bool			oneshot_sb;	/* one-shot single-dir sockbuf op */
 	bool			so_soref;	/* soref(so) held by op->so */
-	bool			in_taskwork;
-	/* On its submitter's taskwork to be issued there (kqring_flush_ready()). */
-	bool			tw_issue;
-	bool			cancelled;	/* no longer armed; under mtx */
 	bool			polled;		/* no upcall; see npolled */
-	bool			armed;		/* on active_ops */
 	bool			drain;		/* chain has IOSQE_IO_DRAIN */
 	bool			timer_init;	/* callout initialized */
 	bool			timer_pending;	/* callout scheduled; under mtx */
@@ -393,17 +416,12 @@ struct kqring_op {
 	bool			wq_running;	/* worker executing this op */
 	bool			wq_blocking;	/* worker in unbounded sleep */
 	bool			wq_canceled;	/* cancelled while running */
-	bool			wq_retired;	/* awaiting worker release */
 	bool			wq_complete_pending;
 	int32_t			wq_cancel_res;
 	uint32_t		wq_cancel_flags;
-	bool			wq_done;	/* worker finished */
-	bool			wq_wait_ready;	/* worker waits for readiness */
 	const struct file	*armed_fp;	/* non-socket armed file id */
 	int			prep_err;	/* SQE rejected at submission */
 	uint32_t		nchain;		/* chain head: requests in chain */
-	int32_t			res;		/* result of the last attempt */
-	uint32_t		cflags;		/* CQE flags of the last attempt */
 	struct kqring_op	*link;		/* next request in the chain */
 	struct kqring_op	*ltimeout;	/* LINK_TIMEOUT guarding this */
 	struct kqring_op	*ltarget;	/* LINK_TIMEOUT: request guarded */
@@ -420,11 +438,7 @@ struct kqring_op {
 	 */
 	void			*args;
 	size_t			args_len;
-	size_t			done_io;	/* MSG_WAITALL: bytes so far */
-	bool			short_io;	/* moved less than was asked */
 	bool			zc_copied;	/* SEND_ZC: some bytes copied */
-	bool			requeue;	/* multishot: yield to other work */
-	bool			sock_rw;	/* READ/WRITE(V) on a socket */
 	bool			connecting;	/* CONNECT: soconnect() issued */
 	bool			futex_woken;	/* FUTEX_WAKE hit; res in ->res */
 	uint32_t		nfwait;		/* FUTEX_WAIT(V) nodes in args */
@@ -443,10 +457,7 @@ struct kqring_op {
 	 * addresses in fzb->kva.
 	 */
 	struct kqring_zc_buf	*fzb;
-	bool			kbuf;
 	struct kqring_zc_notif	*zc_notif;
-	struct ucred		*cred;
-	struct file		*sock_fp;	/* socket held while retried */
 	/*
 	 * Block I/O on a disk device, sent straight to its driver
 	 * (kqring_file_bio()): bios in flight, and their summed results
@@ -454,7 +465,6 @@ struct kqring_op {
 	 */
 	struct file		*bio_fp;	/* the device, held until free */
 	bool			bio;		/* sent as bios; not cancelable */
-	bool			bio_done;	/* all bios done; res is set */
 	u_int			bio_refs;	/* bios not yet completed */
 	int			bio_errno;
 	u_long			bio_bytes;
@@ -464,8 +474,6 @@ struct kqring_op {
 	 * (its completions go to the trigger, never to the CQ), or the run
 	 * of a trigger this request belongs to.  Owner thread only.
 	 */
-	struct kqring_trig	*trig_wait;
-	struct kqring_trun	*trun;
 	uint8_t			tstep;		/* trun: KQRING_STEP_* */
 	/*
 	 * BUF_FROM_PREV (trun): the one provided buffer this request
@@ -480,7 +488,6 @@ struct kqring_op {
 		uint32_t	len;
 		uint64_t	addr;
 	}			tsel, tbuf;
-	bool			multishot;	/* prep: a multishot request */
 	/*
 	 * Not cleared when the op is reused (kqring_op_alloc()), from here
 	 * on: list linkage, set on insertion (what a request is on is in the
@@ -491,11 +498,11 @@ struct kqring_op {
 	 * only on IORING_SETUP_SQE128 rings).  Clearing all of the op cost
 	 * every request about 25 ns.
 	 */
-	TAILQ_ENTRY(kqring_op)	active_link;	/* active_ops or free_ops */
 	TAILQ_ENTRY(kqring_op)	taskwork_link;
+	TAILQ_ENTRY(kqring_op)	sw_link[2];	/* on sw[0], sw[1] */
+	TAILQ_ENTRY(kqring_op)	active_link;	/* active_ops or free_ops */
 	TAILQ_ENTRY(kqring_op)	q_link;		/* ready_q or defer_q */
 	TAILQ_ENTRY(kqring_op)	wq_link;	/* wq_ops[wq_type] */
-	TAILQ_ENTRY(kqring_op)	sw_link[2];	/* on sw[0], sw[1] */
 	TAILQ_ENTRY(kqring_op)	kp_link;	/* ctx->kp_ops[] */
 	/* An armed POLL_ADD: in ctx->poll_hash[] by user_data. */
 	LIST_ENTRY(kqring_op)	poll_hlink;
@@ -503,7 +510,8 @@ struct kqring_op {
 	struct timespec		ts;
 	uint64_t		cqe_extra[2];
 	struct callout		callout;	/* uses ctx->mtx */
-	struct io_uring_sqe	sqe;
+	/* In a cache line of its own: a receive reads it each time. */
+	struct io_uring_sqe	sqe __aligned(CACHE_LINE_SIZE);
 	uint8_t			sqe_extra[64];
 };
 

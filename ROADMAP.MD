@@ -19,6 +19,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 9 | Registered buffers on held pages | Done |
 | 10 | The cost of an enter | Done |
 | 11 | Cached file reads | Done |
+| 12 | Fan-in against kqueue | In progress |
 
 ## Where kqring stands
 
@@ -212,6 +213,16 @@ Progress (13 November 2026):
 - Acceptance met. The unit tests (also in a tmpfs directory), the cross-process test, stress, the fuzzer (seed 7313), liburing (220 of 245) and the comparison with Linux 7.3 pass.
 
 Phase 11 is done: every criterion is met. One job reading cached pages in the enter is still slower than `pread(2)`: kqring's own functions cost about 190 ns per read (see [`TODO.MD`](TODO.MD)).
+
+## Phase 12: Fan-in against kqueue
+
+On the Ryzen, where system calls are cheap, `kqring_bench`'s fan-in (many connections each get one message, and all are collected) was 26–66% slower than kqueue, and AF_UNIX ping-pong 2–16% ([BENCHMARK.MD](BENCHMARK.MD#why-the-results-depend-on-the-cpu)). [docs/fan-in.md](docs/fan-in.md) measures where the time goes.
+
+Progress (13 November 2026), on the Ryzen:
+
+- `tests/kqring_xbench.c` gains fan-in cases, on Linux too: kqueue (or epoll), single-shot `RECV`s in one enter, and multishot `RECV`s. With buffers that stay in cache, a `DEFER_TASKRUN` ring is level with kqueue or ahead at 16 and 256 connections. `kqring_bench`'s fan-in gives kqring 4,096 buffers of 4 KiB in turn, where its kqueue variant reads into one: part of its gap is that.
+- At 1,024 connections a multishot receive was about 65% slower than kqueue: each message brought about five cache lines from memory, where kqueue's brought half of one. Its fields now take 4 of a request's cache lines instead of 11: 812 to 579 ns per message, against kqueue's 497.
+- A multishot receive that took its group's last buffer ended with `-ENOBUFS` at once; as in Linux, it now waits for data with no buffer for it.
 
 ## Research
 

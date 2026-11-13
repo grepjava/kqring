@@ -12,6 +12,8 @@
  *   kqring_xbench [reps [case]]	(default 5 reps, every case)
  *
  * Naming a case runs only that one, which gives a profiler a steady loop.
+ * The fan-in cases use XBENCH_FANIN_N connections (default 256).
+ * XBENCH_DEFER=1 sets the rings up with SINGLE_ISSUER | DEFER_TASKRUN.
  *
  * Each case runs for about a second after a warm-up, reps times; the
  * output is one line per case with the median and the range, in
@@ -23,6 +25,11 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#if defined(__linux__)
+#include <sys/epoll.h>
+#else
+#include <sys/event.h>
+#endif
 #include <sys/utsname.h>
 
 #include <errno.h>
@@ -40,11 +47,15 @@
 #define ring_sys_setup(n, p)	((int)syscall(__NR_io_uring_setup, (n), (p)))
 #define ring_sys_enter(fd, s, w, f, a, z) \
 	((int)syscall(__NR_io_uring_enter, (fd), (s), (w), (f), (a), (z)))
+#define ring_sys_register(fd, op, arg, n) \
+	((int)syscall(__NR_io_uring_register, (fd), (op), (arg), (n)))
 #else
 #include <sys/kqring.h>
 #define ring_sys_setup(n, p)	((int)kqring_setup((n), (p)))
 #define ring_sys_enter(fd, s, w, f, a, z) \
 	((int)kqring_enter((fd), (s), (w), (f), (a), (z)))
+#define ring_sys_register(fd, op, arg, n) \
+	((int)kqring_register((fd), (op), (arg), (n)))
 #endif
 
 #define	CHECK(x)	do {						\
@@ -74,6 +85,11 @@ ring_init(struct ring *r, unsigned entries)
 
 	memset(&p, 0, sizeof(p));
 	memset(r, 0, sizeof(*r));
+	/* XBENCH_DEFER=1: completions run in the enter, on this thread. */
+	if (getenv("XBENCH_DEFER") != NULL &&
+	    strcmp(getenv("XBENCH_DEFER"), "1") == 0)
+		p.flags = IORING_SETUP_SINGLE_ISSUER |
+		    IORING_SETUP_DEFER_TASKRUN;
 	r->fd = ring_sys_setup(entries, &p);
 	CHECK(r->fd >= 0);
 	sq_len = p.sq_off.array + p.sq_entries * sizeof(unsigned);
@@ -207,6 +223,218 @@ op_unix_recv_ring(void)
 	return (1);
 }
 
+/*
+ * Fan-in: N connections each get one 64-byte message, and all N are
+ * collected, as a busy server does.  Per operation = per message; each
+ * includes its write(2).
+ */
+#define	FANIN_MAX	4096
+#define	FANIN_BGID	7
+static struct ring F;
+static int fan_n, fan_rx[FANIN_MAX], fan_tx[FANIN_MAX], fan_poll = -1;
+static char fan_buf[FANIN_MAX][64];
+static struct io_uring_buf_ring *fan_br;
+static unsigned fan_br_mask;
+static uint16_t fan_br_tail;
+static int fan_armed;
+
+static void
+fanin_setup(void)
+{
+	const char *e = getenv("XBENCH_FANIN_N");
+	int sv[2];
+
+	if (fan_n != 0)
+		return;
+	fan_n = e != NULL ? atoi(e) : 256;
+	CHECK(fan_n > 0 && fan_n <= FANIN_MAX);
+	for (int i = 0; i < fan_n; i++) {
+		CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0,
+		    sv) == 0);
+		fan_rx[i] = sv[0];
+		fan_tx[i] = sv[1];
+	}
+	ring_init(&F, (unsigned)fan_n);
+}
+
+static void
+fanin_write(void)
+{
+	for (int i = 0; i < fan_n; i++)
+		CHECK(write(fan_tx[i], buf, sizeof(buf)) == sizeof(buf));
+}
+
+/*
+ * Take the n CQEs, each a whole message.  With recycle, give each one's
+ * buffer back to the ring, and note a multishot RECV that stopped.
+ */
+static void
+fanin_reap(struct ring *r, unsigned n, int recycle)
+{
+	unsigned head = atomic_load_explicit(r->cq_head, memory_order_relaxed);
+	unsigned tail = atomic_load_explicit(r->cq_tail, memory_order_acquire);
+
+	if (tail - head != n) {
+		fprintf(stderr, "fan-in: %u CQEs, expected %u\n", tail - head,
+		    n);
+		for (unsigned i = head; i != tail && i - head < 40; i++)
+			fprintf(stderr, "  user_data %llu res %d flags %#x\n",
+			    (unsigned long long)r->cqes[i & r->cq_mask].user_data,
+			    r->cqes[i & r->cq_mask].res,
+			    r->cqes[i & r->cq_mask].flags);
+		exit(2);
+	}
+	for (unsigned i = head; i != tail; i++) {
+		struct io_uring_cqe *c = &r->cqes[i & r->cq_mask];
+
+		CHECK(c->res == (int)sizeof(buf));
+		if (recycle) {
+			unsigned bid = c->flags >> IORING_CQE_BUFFER_SHIFT;
+			struct io_uring_buf *b =
+			    &fan_br->bufs[fan_br_tail & fan_br_mask];
+
+			b->addr = (uint64_t)(uintptr_t)fan_buf[bid];
+			b->len = sizeof(buf);
+			b->bid = (uint16_t)bid;
+			fan_br_tail++;
+			if ((c->flags & IORING_CQE_F_MORE) == 0)
+				fan_armed = 0;
+		}
+	}
+	if (recycle)
+		atomic_store_explicit((_Atomic uint16_t *)&fan_br->tail,
+		    fan_br_tail, memory_order_release);
+	atomic_store_explicit(r->cq_head, tail, memory_order_release);
+}
+
+/* The system calls: N write(2), one kevent(2) or epoll_wait(2), N recv(2). */
+static unsigned
+op_fanin_kevent(void)
+{
+	int got = 0;
+
+	if (fan_poll < 0) {
+		fanin_setup();
+#if defined(__linux__)
+		fan_poll = epoll_create1(0);
+		CHECK(fan_poll >= 0);
+		for (int i = 0; i < fan_n; i++) {
+			struct epoll_event ev = { .events = EPOLLIN | EPOLLET,
+			    .data.fd = fan_rx[i] };
+
+			CHECK(epoll_ctl(fan_poll, EPOLL_CTL_ADD, fan_rx[i],
+			    &ev) == 0);
+		}
+#else
+		struct kevent kev;
+
+		fan_poll = kqueue();
+		CHECK(fan_poll >= 0);
+		for (int i = 0; i < fan_n; i++) {
+			EV_SET(&kev, fan_rx[i], EVFILT_READ, EV_ADD | EV_CLEAR,
+			    0, 0, NULL);
+			CHECK(kevent(fan_poll, &kev, 1, NULL, 0, NULL) == 0);
+		}
+#endif
+	}
+	fanin_write();
+	while (got < fan_n) {
+#if defined(__linux__)
+		static struct epoll_event evs[FANIN_MAX];
+		int m = epoll_wait(fan_poll, evs, fan_n, -1);
+
+		CHECK(m > 0);
+		for (int j = 0; j < m; j++)
+			CHECK(recv(evs[j].data.fd, buf, sizeof(buf), 0) ==
+			    sizeof(buf));
+#else
+		static struct kevent evs[FANIN_MAX];
+		int m = kevent(fan_poll, NULL, 0, evs, fan_n, NULL);
+
+		CHECK(m > 0);
+		for (int j = 0; j < m; j++)
+			CHECK(recv((int)evs[j].ident, buf, sizeof(buf), 0) ==
+			    sizeof(buf));
+#endif
+		got += m;
+	}
+	return ((unsigned)fan_n);
+}
+
+/* N single-shot RECVs, each into its own buffer, in one enter. */
+static unsigned
+op_fanin_ring_batch(void)
+{
+	fanin_setup();
+	fanin_write();
+	for (int i = 0; i < fan_n; i++) {
+		struct io_uring_sqe *s = prep(&F, IORING_OP_RECV, fan_rx[i]);
+
+		s->addr = (uint64_t)(uintptr_t)fan_buf[i];
+		s->len = sizeof(buf);
+	}
+	atomic_store_explicit(F.sq_tail, F.tail, memory_order_release);
+	CHECK(ring_sys_enter(F.fd, (unsigned)fan_n, (unsigned)fan_n,
+	    IORING_ENTER_GETEVENTS, NULL, 0) == fan_n);
+	fanin_reap(&F, (unsigned)fan_n, 0);
+	return ((unsigned)fan_n);
+}
+
+/*
+ * N multishot RECVs into a provided buffer ring, armed once; each round,
+ * one enter waits for the N CQEs.
+ */
+static unsigned
+op_fanin_ring_multishot(void)
+{
+	if (fan_br == NULL) {
+		struct io_uring_buf_reg reg;
+		unsigned entries = 1;
+
+		fanin_setup();
+		while (entries < (unsigned)fan_n * 2)
+			entries <<= 1;
+		fan_br = mmap(NULL, entries * sizeof(struct io_uring_buf),
+		    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+		CHECK(fan_br != MAP_FAILED);
+		fan_br_mask = entries - 1;
+		for (int i = 0; i < fan_n; i++) {
+			fan_br->bufs[i].addr = (uint64_t)(uintptr_t)fan_buf[i];
+			fan_br->bufs[i].len = sizeof(buf);
+			fan_br->bufs[i].bid = (uint16_t)i;
+		}
+		fan_br_tail = (uint16_t)fan_n;
+		atomic_store_explicit((_Atomic uint16_t *)&fan_br->tail,
+		    fan_br_tail, memory_order_release);
+		memset(&reg, 0, sizeof(reg));
+		reg.ring_addr = (uint64_t)(uintptr_t)fan_br;
+		reg.ring_entries = entries;
+		reg.bgid = FANIN_BGID;
+		CHECK(ring_sys_register(F.fd, IORING_REGISTER_PBUF_RING, &reg,
+		    1) == 0);
+	}
+	if (!fan_armed) {
+		for (int i = 0; i < fan_n; i++) {
+			struct io_uring_sqe *s = prep(&F, IORING_OP_RECV,
+			    fan_rx[i]);
+
+			s->user_data = (uint64_t)i;
+			s->flags = IOSQE_BUFFER_SELECT;
+			s->buf_group = FANIN_BGID;
+			s->ioprio = IORING_RECV_MULTISHOT;
+		}
+		atomic_store_explicit(F.sq_tail, F.tail, memory_order_release);
+		CHECK(ring_sys_enter(F.fd, (unsigned)fan_n, 0, 0, NULL, 0) ==
+		    fan_n);
+		fan_armed = 1;
+	}
+	fanin_write();
+	CHECK(ring_sys_enter(F.fd, 0, (unsigned)fan_n, IORING_ENTER_GETEVENTS,
+	    NULL, 0) >= 0);
+	fanin_reap(&F, (unsigned)fan_n, 1);
+	return ((unsigned)fan_n);
+}
+
 static const struct bcase {
 	const char	*name;
 	unsigned	(*op)(void);
@@ -223,6 +451,12 @@ static const struct bcase {
 	    "write(2) 64 B then recv(2) it, AF_UNIX stream" },
 	{ "unix_recv_ring", op_unix_recv_ring,
 	    "write(2) 64 B then RECV it, AF_UNIX stream" },
+	{ "fanin_kevent", op_fanin_kevent,
+	    "fan-in: N write(2), kevent/epoll_wait, N recv(2), per message" },
+	{ "fanin_ring_batch", op_fanin_ring_batch,
+	    "fan-in: N write(2), N RECVs in one enter, per message" },
+	{ "fanin_ring_multishot", op_fanin_ring_multishot,
+	    "fan-in: N write(2), one enter for N multishot CQEs, per message" },
 };
 
 static double

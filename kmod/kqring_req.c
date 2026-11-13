@@ -631,7 +631,7 @@ kqring_op_alloc(struct kqring_ctx *ctx)
 		ctx->nfree--;
 		/* Inline stores: rep stos costs more to start than this. */
 		__builtin_memset_inline(op, 0,
-		    offsetof(struct kqring_op, active_link));
+		    offsetof(struct kqring_op, taskwork_link));
 	} else {
 		op = malloc(sizeof(*op), M_KQRING, M_WAITOK | M_ZERO);
 	}

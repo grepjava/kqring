@@ -384,7 +384,7 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	/* As io_uring: sqe->optlen bounds all a multishot RECV receives. */
 	bool mshot_total = multishot && sqe->opcode == IORING_OP_RECV &&
 	    sqe->optlen != 0;
-	bool drained = false, last = false, waitall;
+	bool last = false, waitall;
 	size_t n;
 	int error, flags, rc;
 
@@ -493,8 +493,6 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (buf_select) {
 		if (n > 0)
 			cqe_flags |= kqring_buf_commit_op(ctx, op, &sel, n);
-		if (multishot)
-			drained = kqring_buf_drained(&sel);
 		if (bg_lock)
 			sx_xunlock(&ctx->bg_sx);
 	}
@@ -504,8 +502,13 @@ kqring_exec_recv(struct kqring_ctx *ctx, struct kqring_op *op,
 	}
 	if (multishot && n > 0 && !last) {
 		cqe_flags |= IORING_CQE_F_MORE;
-		/* Out of buffers: go again, to end with ENOBUFS. */
-		*more_out = drained || kqring_so_rcv_pending(so, true);
+		/*
+		 * Again at once only if more is buffered.  A group this left
+		 * empty doesn't end the receive: as in io_uring, data that
+		 * comes with no buffer for it does (ENOBUFS), and buffers
+		 * provided before it keep the receive going.
+		 */
+		*more_out = kqring_so_rcv_pending(so, true);
 	} else if (kqring_so_rcv_pending(so, false)) {
 		cqe_flags |= IORING_CQE_F_SOCK_NONEMPTY;
 	}
@@ -1277,9 +1280,8 @@ kqring_exec_recvmsg_multi(struct kqring_ctx *ctx, struct kqring_op *op,
 	n = hdr + MIN(n, biov.iov_len - hdr);
 	rc = kqring_done(op, kqring_xfer_res(n),
 	    kqring_buf_commit_op(ctx, op, &sel, n) | IORING_CQE_F_MORE);
-	/* Out of buffers: go again, to end with ENOBUFS. */
-	*more_out = kqring_buf_drained(&sel) ||
-	    kqring_so_rcv_pending(so, true);
+	/* As kqring_exec_recv(): again at once only if more is buffered. */
+	*more_out = kqring_so_rcv_pending(so, true);
 	return (rc);
 }
 
