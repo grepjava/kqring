@@ -57,6 +57,8 @@ kqring reaches more of the drive with less CPU. One at a time, Linux is slower w
 | 4 | 1 | 721 | 0.31 | 395 | 0.20 | 2,298 | 1,961 |
 | 4 | 32 | 782 | **0.34** | 1,138 | **0.58** | | |
 
+Since phase 11 kqring reads these pages in the submitting thread too: 4 jobs at 32 in flight reach 0.80 of `psync` on the same laptop ([cached-reads.md](cached-reads.md#on-the-machine-that-runs-both)). The table is from before.
+
 With 32 in flight, Linux reads a cached page in the submitting thread and only sends a read that would block to its workers. kqring sends tmpfs reads to workers until the readers take most of the CPUs ([the policy](worker-wakeups.md#reads-in-the-submitting-thread)), and with 4 jobs on 8 threads they don't, so it reaches a third of its own `psync` where Linux reaches more than half of its. One read at a time, kqring is ahead: its issuer spins briefly for the worker rather than sleep.
 
 **A 256 MiB RAM disk**, md(4) against Linux's brd. These mostly compare the drivers: md(4) serves every request from one thread, brd in the caller's, so FreeBSD's `psync` is 2.7–3.6 times slower than Linux's.
@@ -75,7 +77,7 @@ Within each system, kqring's direct bio path gets three times `psync`'s IOPS fro
 
 - kqring matches or beats io_uring where the device sets the pace, and does it with less CPU.
 - Its fixed cost per enter is about 250 ns above io_uring's. Batching hides it, and per batched operation kqring is the cheaper of the two.
-- Cached file reads from several threads are where io_uring is ahead, because Linux can try a read without blocking and kqring can't on FreeBSD's filesystems. On tmpfs and UFS that would need a non-blocking `VOP_READ`, on ZFS the change described in [async-zfs-reads.md](async-zfs-reads.md).
+- Cached file reads from several threads were where io_uring was ahead, because Linux tries a read without blocking and kqring sent tmpfs reads to workers. Since phase 11 kqring reads cached tmpfs pages in the enter and is ahead there too ([cached-reads.md](cached-reads.md)); on ZFS that would need the change described in [async-zfs-reads.md](async-zfs-reads.md).
 
 ## Not covered
 

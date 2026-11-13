@@ -1,0 +1,17 @@
+07:33:22 ready 7.3.0-10-generic gov=powersave
+07:33:34 r1 def psync qd1 j4 iops=2027046
+07:33:47 r1 def io_uring qd32 j4 iops=1393449
+07:33:59 r1 def io_uring qd32 j1 iops=594044
+07:34:11 r1 def io_uring qd1 j1 iops=146026
+07:34:24 r1 def psync qd1 j1 iops=563992
+07:34:36 r2 def psync qd1 j4 iops=1976691
+07:34:49 r2 def io_uring qd32 j4 iops=1291441
+07:35:01 r2 def io_uring qd32 j1 iops=548471
+07:35:14 r2 def io_uring qd1 j1 iops=140974
+07:35:26 r2 def psync qd1 j1 iops=562811
+07:35:39 r3 def psync qd1 j4 iops=2003246
+07:35:51 r3 def io_uring qd32 j4 iops=1338926
+07:36:04 r3 def io_uring qd32 j1 iops=593419
+07:36:16 r3 def io_uring qd1 j1 iops=136761
+07:36:28 r3 def psync qd1 j1 iops=560974
+07:36:28 ALLDONE

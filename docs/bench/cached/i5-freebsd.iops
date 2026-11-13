@@ -1,0 +1,11 @@
+# i5-8250U, FreeBSD 15.1, tmpfs (default mount), fio 3.43 4 KiB randread; old = phase 10 module e796021f, new = b52475c4
+old psync.qd1.j4 2321236 2270518 2169552 median 2270518
+old io_uring.qd32.j4 995356 867304 891966 median 891966
+old io_uring.qd32.j1 521652 520168 530350 median 521652
+old io_uring.qd1.j1 389777 395572 385271 median 389777
+old psync.qd1.j1 674389 674489 670646 median 674389
+new psync.qd1.j4 2238432 2324122 2242347 median 2242347
+new io_uring.qd32.j4 1790144 1775889 1794058 median 1790144
+new io_uring.qd32.j1 562598 568211 562661 median 562661
+new io_uring.qd1.j1 575863 573081 574814 median 574814
+new psync.qd1.j1 679150 674808 673938 median 674808

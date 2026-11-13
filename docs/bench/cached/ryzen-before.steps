@@ -1,0 +1,34 @@
+05:29:55 ready tmpfs on /mnt/p11def (tmpfs, local) tmpfs on /mnt/p11pg (tmpfs, local) 
+05:30:08 dtrace def: rw_inline ret 0: 6340602 wq_enqueue 6340602  
+05:30:20 dtrace pg: rw_inline ret 1: 8734054  
+05:30:33 r1 def psync qd1 j4 iops=3042101
+05:30:46 r1 def io_uring qd32 j4 iops=1656405
+05:30:58 r1 def io_uring qd32 j1 iops=924431
+05:31:11 r1 def io_uring qd1 j1 iops=579557
+05:31:24 r1 def psync qd1 j1 iops=1091765
+05:31:36 r1 pg psync qd1 j4 iops=3088931
+05:31:49 r1 pg io_uring qd32 j4 iops=2723319
+05:32:02 r1 pg io_uring qd32 j1 iops=796213
+05:32:14 r1 pg io_uring qd1 j1 iops=800927
+05:32:27 r1 pg psync qd1 j1 iops=1099695
+05:32:39 r2 def psync qd1 j4 iops=3014848
+05:32:52 r2 def io_uring qd32 j4 iops=1607401
+05:33:05 r2 def io_uring qd32 j1 iops=917639
+05:33:17 r2 def io_uring qd1 j1 iops=573924
+05:33:30 r2 def psync qd1 j1 iops=1091230
+05:33:43 r2 pg psync qd1 j4 iops=3045998
+05:33:55 r2 pg io_uring qd32 j4 iops=2682368
+05:34:08 r2 pg io_uring qd32 j1 iops=789447
+05:34:21 r2 pg io_uring qd1 j1 iops=806841
+05:34:33 r2 pg psync qd1 j1 iops=1091945
+05:34:46 r3 def psync qd1 j4 iops=3069314
+05:34:59 r3 def io_uring qd32 j4 iops=1610545
+05:35:11 r3 def io_uring qd32 j1 iops=920342
+05:35:24 r3 def io_uring qd1 j1 iops=577262
+05:35:37 r3 def psync qd1 j1 iops=1084092
+05:35:49 r3 pg psync qd1 j4 iops=3068860
+05:36:02 r3 pg io_uring qd32 j4 iops=2683234
+05:36:14 r3 pg io_uring qd32 j1 iops=790314
+05:36:27 r3 pg io_uring qd1 j1 iops=800549
+05:36:40 r3 pg psync qd1 j1 iops=1093085
+05:36:40 ALLDONE vmcores=2

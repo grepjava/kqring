@@ -7372,9 +7372,9 @@ test_fixed_buf_fork_threads(void)
  * the same result as before.
  */
 static void
-test_inline_file_pipe(void)
+test_inline_file_pipe(const char *dir)
 {
-	char path[] = "/tmp/kqring_inline.XXXXXX";
+	char path[PATH_MAX];
 	static char data[3 * 4096], buf[3 * 4096];
 	struct io_uring_sqe *sqe;
 	struct test_ring t;
@@ -7386,6 +7386,7 @@ test_inline_file_pipe(void)
 		data[i] = (char)('a' + i % 26);
 	/* An unmapped destination would fault, so go to a worker: map it. */
 	memset(buf, 0, sizeof(buf));
+	snprintf(path, sizeof(path), "%s/kqring_inline.XXXXXX", dir);
 	fd = mkstemp(path);
 	assert(fd >= 0);
 	unlink(path);
@@ -7431,7 +7432,8 @@ test_inline_file_pipe(void)
 
 	/*
 	 * None of the above started a worker thread when the filesystem
-	 * supports VOP_READ_PGCACHE (UFS, tmpfs).  ZFS does not implement
+	 * supports VOP_READ_PGCACHE (UFS) or is tmpfs, which kqring reads
+	 * itself with or without -o pgread.  ZFS does not implement
 	 * VOP_READ_PGCACHE, so file reads go through a worker while ready
 	 * pipe I/O still completes inline.
 	 */
@@ -7496,6 +7498,18 @@ test_inline_file_pipe(void)
 	assert(ring_wait(&t, 1, 2000) == 0);
 	expect_cqe(&t, 62014, pres);
 
+	/* End of file within a page, past what was written: as pread(2). */
+	assert(ftruncate(fd, sizeof(data) + 123) == 0);
+	memset(buf, 0x55, sizeof(buf));
+	prep_pread(&t, fd, buf, 8192, sizeof(data) - 100, 62015);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 62015, 223);
+	assert(memcmp(buf, data + sizeof(data) - 100, 100) == 0);
+	for (size_t i = 100; i < 223; i++)
+		assert(buf[i] == 0);
+	assert((unsigned char)buf[223] == 0x55);
+
 	/*
 	 * A hole has no pages, so the read goes to a worker.  A range whose
 	 * first page is cached but whose second is a hole is copied in part
@@ -7527,7 +7541,17 @@ test_inline_file_pipe(void)
 	ring_submit(&t);
 	assert(ring_wait(&t, 1, 2000) == 0);
 	expect_cqe(&t, 62007, -EFAULT);
-	char *map = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED,
+	/*
+	 * On tmpfs, read(2) itself into such a buffer never returns (FreeBSD
+	 * 15.1): tmpfs doesn't set MNTK_NO_IOPF, so vn_io_fault() doesn't
+	 * hold the buffer's pages first, and tmpfs_read() faults on the page
+	 * it holds busied.  The inline copy gives up with EFAULT, but the
+	 * worker it goes to would read(2) as that.
+	 */
+	char *map;
+	if (strcmp(sfs.f_fstypename, "tmpfs") == 0)
+		goto skip_selfmap;
+	map = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED,
 	    fd, 0);
 	assert(map != MAP_FAILED);
 	prep_pread(&t, fd, map, 2 * 4096, 0, 62012);
@@ -7541,6 +7565,7 @@ test_inline_file_pipe(void)
 	expect_cqe(&t, 62013, 4096);
 	assert(memcmp(map + 4096, data, 4096) == 0);
 	munmap(map, 2 * 4096);
+skip_selfmap:
 
 	/* IOSQE_ASYNC still goes through a worker. */
 	prep_pread(&t, fd, buf, 64, 0, 62008);
@@ -7551,9 +7576,9 @@ test_inline_file_pipe(void)
 	assert(memcmp(buf, data, 64) == 0);
 	close(fd);
 	close(t.fd);
-	printf("[PASS] Inline READ: page-cache file reads and non-blocking "
-	    "pipes skip the worker; misses, EOF, holes and IOSQE_ASYNC "
-	    "fall back\n");
+	printf("[PASS] Inline READ (%s): page-cache file reads and "
+	    "non-blocking pipes skip the worker; misses, EOF, holes and "
+	    "IOSQE_ASYNC fall back\n", dir);
 }
 
 /* Cancellation acknowledgement may precede worker release. */
@@ -15204,7 +15229,10 @@ main(int argc, char **argv)
 		test_fixed_file_ops();
 		test_iowq_register();
 		test_worker_nonblocking_pipe();
-		test_inline_file_pipe();
+		test_inline_file_pipe("/tmp");
+		/* A tmpfs directory, e.g. a mount without -o pgread. */
+		if (getenv("KQRING_TEST_TMPFS") != NULL)
+			test_inline_file_pipe(getenv("KQRING_TEST_TMPFS"));
 		test_disk_bio();
 		test_napi_busy_poll();
 		test_worker_buffer_reservation();

@@ -1,0 +1,37 @@
+07:23:44 ready b52475c4 vmcores=2
+07:24:02 kqring_test rc=0 pass=145 inline: [PASS] Inline READ (/tmp): page-cache fi [PASS] Inline READ (/mnt/p11def): page-c 
+07:24:02 verify def rc=0 0 err-lines; READ: bw=5486MiB/s (5752MB/s)
+07:24:03 verify pg rc=0 0 err-lines; READ: bw=7111MiB/s (7457MB/s)
+07:24:17 dtrace def: dtrace: invalid probe specifier fbt:kqring:kqring_file_rw_inline:return { @r[arg1] = count(); } fbt:kqring:kqring_wq_enqueue:entry { @q = count(); } tick-4s { exit(0); } END { printa("rw_inline ret %d: %@d\n", @r); printa("wq_enqueue %@d\n", @q); }: probe description fbt:kqring:kqring_file_rw_inline:return does not match any probes 
+07:24:30 dtrace pg: dtrace: invalid probe specifier fbt:kqring:kqring_file_rw_inline:return { @r[arg1] = count(); } fbt:kqring:kqring_wq_enqueue:entry { @q = count(); } tick-4s { exit(0); } END { printa("rw_inline ret %d: %@d\n", @r); printa("wq_enqueue %@d\n", @q); }: probe description fbt:kqring:kqring_file_rw_inline:return does not match any probes 
+07:24:42 r1 def psync qd1 j4 iops=3001455
+07:24:55 r1 def io_uring qd32 j4 iops=2643461
+07:25:07 r1 def io_uring qd32 j1 iops=808796
+07:25:20 r1 def io_uring qd1 j1 iops=809422
+07:25:33 r1 def psync qd1 j1 iops=1090127
+07:25:45 r1 pg psync qd1 j4 iops=3114081
+07:25:58 r1 pg io_uring qd32 j4 iops=2696659
+07:26:11 r1 pg io_uring qd32 j1 iops=806238
+07:26:23 r1 pg io_uring qd1 j1 iops=811900
+07:26:36 r1 pg psync qd1 j1 iops=1104174
+07:26:49 r2 def psync qd1 j4 iops=3029037
+07:27:01 r2 def io_uring qd32 j4 iops=2717771
+07:27:14 r2 def io_uring qd32 j1 iops=802353
+07:27:27 r2 def io_uring qd1 j1 iops=805921
+07:27:39 r2 def psync qd1 j1 iops=1086735
+07:27:52 r2 pg psync qd1 j4 iops=2999643
+07:28:05 r2 pg io_uring qd32 j4 iops=2583083
+07:28:17 r2 pg io_uring qd32 j1 iops=805076
+07:28:30 r2 pg io_uring qd1 j1 iops=815168
+07:28:42 r2 pg psync qd1 j1 iops=1114224
+07:28:55 r3 def psync qd1 j4 iops=3022044
+07:29:08 r3 def io_uring qd32 j4 iops=2716440
+07:29:20 r3 def io_uring qd32 j1 iops=802447
+07:29:33 r3 def io_uring qd1 j1 iops=803226
+07:29:46 r3 def psync qd1 j1 iops=1086457
+07:29:58 r3 pg psync qd1 j4 iops=3116591
+07:30:11 r3 pg io_uring qd32 j4 iops=2692998
+07:30:24 r3 pg io_uring qd32 j1 iops=802273
+07:30:36 r3 pg io_uring qd1 j1 iops=810624
+07:30:49 r3 pg psync qd1 j1 iops=1108930
+07:30:49 ALLDONE vmcores=2

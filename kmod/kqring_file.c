@@ -8,7 +8,16 @@
 
 #include <sys/bio.h>
 #include <sys/buf.h>
+#include <sys/dirent.h>
+#include <sys/smr.h>
 #include <geom/geom.h>
+#include <vm/vm.h>
+#include <vm/vm_object.h>
+#include <vm/vm_page.h>
+#include <fs/tmpfs/tmpfs_vnops.h>
+#include <fs/tmpfs/tmpfs.h>
+
+VFS_SMR_DECLARE;
 
 static int	kqring_file_rw(struct kqring_ctx *ctx, struct kqring_op *op,
 	    bool is_write, bool nowait, bool local, bool *punt);
@@ -385,6 +394,89 @@ kqring_file_bio_try(struct kqring_ctx *ctx, struct kqring_op *op,
 	return (sent);
 }
 
+static bool
+kqring_vp_is_tmpfs(const struct vnode *vp)
+{
+	return (vp->v_op == &tmpfs_vnodeop_entries ||
+	    vp->v_op == &tmpfs_vnodeop_nonc_entries);
+}
+
+/*
+ * A tmpfs file's resident pages, copied to uio without sleeping.  tmpfs's
+ * own VOP_READ_PGCACHE does this only on a mount with -o pgread (off by
+ * default), and even then pages a swapped-out page back in, which sleeps.
+ * This is vn_read_from_obj() for tmpfs: the node's swap object is the
+ * vnode's, but its size is the node's (tn_size), not the vnode pager's.
+ * The node is read under SMR, as tmpfs_read_pgcache() does; vm_objects are
+ * type-stable, so holding the object (vm_object_pip_add()) after leaving
+ * SMR is safe, and OBJ_DEAD is checked once it is held.  Pages are taken
+ * one at a time, never created or waited for, and copied with
+ * uiomove_fromphys(); the caller holds the range read-locked, so the file
+ * can't be truncated under the copy, and has page faults disabled.
+ *
+ * Returns 0 when uio was filled or the file ended (a short read at end of
+ * file), or EJUSTRETURN when a page wasn't resident and valid, with uio
+ * advanced over what was copied: the caller redoes the whole read on a
+ * worker.  Other errors are the copy's (EFAULT).
+ */
+static int
+kqring_tmpfs_read(struct vnode *vp, struct uio *uio)
+{
+	struct tmpfs_node *node;
+	vm_object_t obj;
+	vm_page_t m;
+	off_t size;
+	size_t len;
+	int error;
+	u_int off;
+
+	vfs_smr_enter();
+	node = VP_TO_TMPFS_NODE_SMR(vp);
+	if (node == NULL || VN_IS_DOOMED(vp) || node->tn_type != VREG ||
+	    (obj = node->tn_reg.tn_aobj) == NULL) {
+		vfs_smr_exit();
+		return (EJUSTRETURN);
+	}
+	size = node->tn_size;
+	tmpfs_set_accessed(node->tn_reg.tn_tmp, node);
+	vfs_smr_exit();
+
+	vm_object_pip_add(obj, 1);
+	if ((obj->flags & OBJ_DEAD) != 0) {
+		vm_object_pip_wakeup(obj);
+		return (EJUSTRETURN);
+	}
+	error = 0;
+	while (uio->uio_resid > 0 && uio->uio_offset < size) {
+		off = uio->uio_offset & PAGE_MASK;
+		len = MIN(PAGE_SIZE - off,
+		    MIN((size_t)uio->uio_resid, (size_t)(size - uio->uio_offset)));
+		m = vm_page_grab_unlocked(obj, OFF_TO_IDX(uio->uio_offset),
+		    VM_ALLOC_NOCREAT | VM_ALLOC_SBUSY | VM_ALLOC_IGN_SBUSY |
+		    VM_ALLOC_NOWAIT);
+		if (m == NULL) {
+			error = EJUSTRETURN;
+			break;
+		}
+		/*
+		 * A busied page keeps vgonel() from terminating the object
+		 * past it, so the vnode is checked again after.
+		 */
+		if (!vm_page_all_valid(m) || VN_IS_DOOMED(vp)) {
+			vm_page_sunbusy(m);
+			error = EJUSTRETURN;
+			break;
+		}
+		error = uiomove_fromphys(&m, off, len, uio);
+		vm_page_activate(m);
+		vm_page_sunbusy(m);
+		if (error != 0)
+			break;
+	}
+	vm_object_pip_wakeup(obj);
+	return (error);
+}
+
 /*
  * READ / WRITE on a descriptor that is not a socket, on the issuer when
  * that cannot block it, as io_uring tries non-blocking I/O before punting
@@ -398,6 +490,10 @@ kqring_file_bio_try(struct kqring_ctx *ctx, struct kqring_op *op,
  *  - A positioned read of a regular file that the page cache satisfies.
  *    VOP_READ_PGCACHE grabs resident pages without sleeping and gives up
  *    with EJUSTRETURN otherwise; vn_read() tries it first the same way.
+ *    tmpfs files are read by kqring_tmpfs_read() instead, which needs no
+ *    mount option and never pages in from swap.  Its EJUSTRETURN always
+ *    sends the read to a worker: it returns 0 at end of file, and a tmpfs
+ *    object has no vnode pager size to tell the two apart by.
  *    A destination that is not mapped yet, or a contended range, also
  *    goes to the worker.
  *
@@ -427,6 +523,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	size_t done;
 	void *rl;
 	int error, flags, save;
+	bool tmpfs;
 
 	/* A bad descriptor fails here, as the worker would fail it. */
 	if ((error = kqring_rw_fget(op, is_write, &fp, &flags)) != 0) {
@@ -462,7 +559,12 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 	if (is_write || flags == 0 || (sqe->flags & IOSQE_BUFFER_SELECT) != 0 ||
 	    fp->f_type != DTYPE_VNODE || vp->v_type != VREG ||
 	    (fp->f_flag & O_DIRECT) != 0 || mac_vnode_check_read_enabled() ||
-	    (vn_irflag_read(vp) & (VIRF_DOOMED | VIRF_PGREAD)) != VIRF_PGREAD) {
+	    (vn_irflag_read(vp) & VIRF_DOOMED) != 0) {
+		fdrop(fp, td);
+		return (KQRING_RW_PUNT);
+	}
+	tmpfs = kqring_vp_is_tmpfs(vp);
+	if (!tmpfs && (vn_irflag_read(vp) & VIRF_PGREAD) == 0) {
 		fdrop(fp, td);
 		return (KQRING_RW_PUNT);
 	}
@@ -503,7 +605,8 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 		return (KQRING_RW_PUNT);
 	}
 	save = vm_fault_disable_pagefaults();
-	error = VOP_READ_PGCACHE(vp, &auio, 0, fp->f_cred);
+	error = tmpfs ? kqring_tmpfs_read(vp, &auio) :
+	    VOP_READ_PGCACHE(vp, &auio, 0, fp->f_cred);
 	vm_fault_enable_pagefaults(save);
 	vn_rangelock_unlock(vp, rl);
 	free(hiov, M_KQRING);
@@ -519,7 +622,7 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 		 * whole answer at end of file, as for read(2).
 		 */
 		obj = atomic_load_ptr(&vp->v_object);
-		if (done == 0 || obj == NULL || auio.uio_offset <
+		if (tmpfs || done == 0 || obj == NULL || auio.uio_offset <
 		    (off_t)atomic_load_64(&obj->un_pager.vnp.vnp_size)) {
 			fdrop(fp, td);
 			return (KQRING_RW_PUNT);

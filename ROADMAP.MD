@@ -18,6 +18,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 8 | Several processes submitting to one ring | Done |
 | 9 | Registered buffers on held pages | Done |
 | 10 | The cost of an enter | Done |
+| 11 | Cached file reads | In progress |
 
 ## Where kqring stands
 
@@ -192,6 +193,22 @@ Progress (12 November 2026), on the Ryzen:
 - On the i5-8250U laptop, booting each system in turn: one `NOP` per enter costs kqring 165 ns above FreeBSD's system call floor, where it cost 622 ns with the phase 9 build, and io_uring 173 ns above Linux 7.3's. A pipe `READ` costs 255 ns above `read(2)` (Linux: 266), an AF_UNIX `RECV` 181 ns above `recv(2)` (Linux: 328).
 
 Phase 10 is done: every criterion is met. What is left of an enter's cost is spread thinly, and fan-in and single requests still trail kqueue on the Ryzen (see [`TODO.MD`](TODO.MD)).
+
+## Phase 11: Cached file reads
+
+On the laptop that ran both systems, fio's cached reads of a tmpfs file, 4 jobs at 32 in flight, reached 34% of FreeBSD's own `psync` on kqring and 58% of Linux's on io_uring ([docs/linux-comparison.md](docs/linux-comparison.md#fio)). Linux reads a cached page in the submitting thread and hands only a read that would block to a worker.
+
+[docs/cached-reads.md](docs/cached-reads.md) finds why kqring didn't on tmpfs and records what changed.
+
+Acceptance: a cached read of a tmpfs file on a default mount completes in the enter, without a worker and without sleeping; on the same machine, kqring's 4 jobs at 32 in flight reach at least the share of `psync` that io_uring's reach of Linux's; the unit tests, the cross-process test, stress, the fuzzer, liburing and the comparison with Linux 7.3 pass as before.
+
+Progress (13 November 2026):
+
+- kqring already read cached pages in the enter, through `VOP_READ_PGCACHE`, but tmpfs offers it only on a mount with `-o pgread`, which is off by default, so every tmpfs read went to a worker. On the Ryzen, `-o pgread` alone took 4 jobs at 32 in flight from 53% of `psync` to 87%.
+- kqring now reads tmpfs pages itself, with or without the option, and never pages one in from swap in the enter, which tmpfs's own read does. A default mount reads as fast as a `pgread` one: 90% of `psync` on the Ryzen. No read goes to a worker.
+- On the i5-8250U, booting each system: kqring's 4 jobs at 32 in flight reach 0.80 of FreeBSD's `psync` (0.39 before), io_uring's 0.67 of Linux's, and kqring reads 1.34 times as many pages a second. One job at 32 in flight, io_uring is 5% ahead.
+- `read(2)` of a tmpfs file into a writable shared mapping of the same page hangs on FreeBSD 15.1, without kqring; a worker reading it would hang the same way.
+- The fuzzer, with a new seed, found a panic from phase 9: a `fork(2)` in one thread released a registered buffer's old pages while the `SINGLE_ISSUER` ring's owner, which submits without `sq_sx`, was taking them for a request. The submitter now releases them ([docs/held-buffers.md](docs/held-buffers.md#4-fork2)).
 
 ## Research
 
