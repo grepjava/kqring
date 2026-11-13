@@ -1,0 +1,67 @@
+# Ryzen, pp_ring_armed vs unix_recv_ring vs pp_kevent, DEFER_TASKRUN ring, module 2f5b82e4 (d366a4b).
+# DTrace profile-4999 for 6 s; ns per round trip = samples / total * the run's ns.
+# Kernel functions (self time); USER = user mode.  a-r = armed minus already-there.
+func                                   armed recvrng  kevent     a-r
+USER                                   106.1    61.2    92.5    44.9
+0xffffffff81                            67.0    39.6    67.9    27.3
+kqring_ioc_enter                        45.0    20.3     0.0    24.7
+kqring_arm_socket_op                    22.0     0.0     0.0    22.0
+__mtx_lock_flags                        21.5     0.0     0.0    21.5
+kqring_run_taskwork                     24.7     4.2     0.0    20.5
+amd64_syscall                           34.0    14.0    34.1    20.0
+kqring_sys_enter                        28.7    10.2     0.0    18.5
+kqring_sb_arm                           11.4     0.0     0.0    11.4
+__mtx_unlock_flags                      10.6     0.0     0.0    10.6
+knote                                   12.6     3.4    13.0     9.2
+kqring_req_issue                        19.5    10.6     0.0     8.9
+kqring_exec_recv                        32.3    24.6     0.0     7.8
+kqring_soupcall                          7.0     0.0     0.0     7.0
+kqring_taskwork_add_locked               6.9     0.0     0.0     6.9
+fget_unlocked_flags                     22.3    15.9    17.3     6.4
+kqring_sock_disarm                       5.8     0.0     0.0     5.8
+kqring_taskwork_run_one                  5.4     0.0     0.0     5.4
+_rm_rlock                               12.3     6.9    10.3     5.3
+kqring_evfd_flush                        7.9     3.4     0.0     4.5
+kqring_post_cqe_common                  10.0     6.9     0.0     3.1
+mac_policy_slock_nosleep                 5.2     2.3     3.3     2.9
+kqring_run_checks                        8.2     5.2     0.0     2.9
+sousrsend                                6.1     3.2     3.8     2.9
+kqring_req_prep                         10.8     8.4     0.0     2.4
+userret                                  7.6     5.4     6.7     2.2
+_rm_runlock                              6.8     4.7     6.4     2.1
+mac_socket_check_receive                 6.1     4.2     1.7     1.9
+kqring_req_complete                     11.6    10.0     0.0     1.6
+kqring_getsock                           5.2     3.7     0.0     1.5
+cpu_set_syscall_retval                   5.8     4.4     6.1     1.4
+kqring_op_attempt                       11.4    10.1     0.0     1.2
+uma_zalloc_arg                           5.7     5.2    12.3     0.4
+cpu_fetch_syscall_args                  11.3    11.1    10.8     0.2
+copyin_smap_std                         11.0    10.9    12.7     0.2
+sorwakeup_locked                         4.0     4.0     5.3     0.0
+kqueue_acquire_ref                       0.0     0.0     8.3     0.0
+kern_kevent_generic                      0.0     0.0     9.4     0.0
+kern_kevent_fp                           0.0     0.0    11.4     0.0
+kern_recvit                              0.0     0.0    12.1     0.0
+kqueue_scan                              0.0     0.0    20.6     0.0
+uma_zfree_arg                            7.0     7.2    11.3    -0.1
+sys_write                                8.3     8.4     7.1    -0.2
+copyout_smap_std                        11.9    12.2    21.4    -0.3
+uipc_sosend_stream_or_seqpacket         20.4    21.2    19.5    -0.8
+kqring_op_free                          12.8    13.7     0.0    -0.9
+kqring_submit_sqes                      32.3    33.5     0.0    -1.1
+mc_uiotomc                               4.8     6.2     6.4    -1.4
+kqring_wait_cqes                         3.9     5.3     0.0    -1.4
+uipc_lock_peer                           4.9     7.2     6.9    -2.2
+soiounlock                               5.9     8.2     4.9    -2.3
+soreceive                                3.0     5.5     1.7    -2.5
+mc_get                                   4.9     7.4     7.6    -2.5
+uipc_soreceive_stream_or_seqpacket      18.4    24.1    16.9    -5.7
+uiomove_faultflag                        9.8    19.0    11.0    -9.2
+TOTAL                                  854.6   545.1   543.9
+
+# hwpmc over a 3.2 s run (ex_ret_instr ls_not_halted_cyc ls_l1_d_tlb_miss.all ls_refills_from_sys.ls_mabresp_lcl_dram):
+14:58:47 loaded 2f5b82e4
+14:58:50 pp_kevent 538.5 ns; instr cyc dtlb dram:  24352153831 13075130643 7941 5422 
+14:58:53 unix_recv_ring 574.1 ns; instr cyc dtlb dram:  22745304811 13077391482 7846 4643 
+14:58:56 pp_ring_armed 868.4 ns; instr cyc dtlb dram:  22177167771 13084989595 9160 5261 
+14:58:56 ALLDONE vmcores=3

@@ -1,0 +1,14 @@
+15:02:07 loaded 2f5b82e4
+15:02:12 defer=1 getppid               192.5 ns  (192.3-192.5)  get
+15:02:17 defer=1 unix_recv_syscall     721.0 ns  (720.9-721.4)  wri
+15:02:22 defer=1 pp_kevent            1127.2 ns  (1126.3-1128.0)  w
+15:02:27 defer=1 unix_recv_ring        887.6 ns  (887.3-890.3)  wri
+15:02:33 defer=1 pp_ring_armed        1332.2 ns  (1332.1-1334.4)  R
+15:02:38 defer=1 nop1                  348.8 ns  (348.8-348.9)  1 N
+15:02:43 defer=0 getppid               194.3 ns  (194.3-194.4)  get
+15:02:48 defer=0 unix_recv_syscall     722.4 ns  (722.3-722.8)  wri
+15:02:53 defer=0 pp_kevent            1121.6 ns  (1121.2-1121.8)  w
+15:02:59 defer=0 unix_recv_ring        905.6 ns  (905.5-906.1)  wri
+15:03:04 defer=0 pp_ring_armed        1895.2 ns  (1886.4-1905.1)  R
+15:03:09 defer=0 nop1                  362.7 ns  (362.7-362.8)  1 N
+15:03:09 ALLDONE vmcores=7

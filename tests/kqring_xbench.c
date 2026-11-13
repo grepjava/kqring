@@ -435,6 +435,68 @@ op_fanin_ring_multishot(void)
 	return ((unsigned)fan_n);
 }
 
+/*
+ * Ping-pong on one AF_UNIX connection, the way a server waits for a
+ * message: readiness first, then the read.  Per operation = one 64-byte
+ * message written and received.
+ */
+static int pp_poll = -1;
+
+static unsigned
+op_pp_kevent(void)
+{
+	if (pp_poll < 0) {
+#if defined(__linux__)
+		struct epoll_event ev = { .events = EPOLLIN | EPOLLET,
+		    .data.fd = sfd[0] };
+
+		pp_poll = epoll_create1(0);
+		CHECK(pp_poll >= 0);
+		CHECK(epoll_ctl(pp_poll, EPOLL_CTL_ADD, sfd[0], &ev) == 0);
+#else
+		struct kevent kev;
+
+		pp_poll = kqueue();
+		CHECK(pp_poll >= 0);
+		EV_SET(&kev, sfd[0], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+		CHECK(kevent(pp_poll, &kev, 1, NULL, 0, NULL) == 0);
+#endif
+	}
+	CHECK(write(sfd[1], buf, sizeof(buf)) == sizeof(buf));
+#if defined(__linux__)
+	struct epoll_event ev;
+
+	CHECK(epoll_wait(pp_poll, &ev, 1, -1) == 1);
+#else
+	struct kevent ev;
+
+	CHECK(kevent(pp_poll, NULL, 0, &ev, 1, NULL) == 1);
+#endif
+	CHECK(recv(sfd[0], buf, sizeof(buf), 0) == sizeof(buf));
+	return (1);
+}
+
+/*
+ * A RECV submitted before the data, which arms the socket's upcall; the
+ * write completes it, and a second enter waits for the CQE.
+ */
+static unsigned
+op_pp_ring_armed(void)
+{
+	struct io_uring_sqe *s;
+
+	s = prep(&R, IORING_OP_RECV, sfd[0]);
+	s->addr = (uint64_t)(uintptr_t)buf;
+	s->len = sizeof(buf);
+	atomic_store_explicit(R.sq_tail, R.tail, memory_order_release);
+	CHECK(ring_sys_enter(R.fd, 1, 0, 0, NULL, 0) == 1);
+	CHECK(write(sfd[1], buf, sizeof(buf)) == sizeof(buf));
+	CHECK(ring_sys_enter(R.fd, 0, 1, IORING_ENTER_GETEVENTS, NULL, 0) >=
+	    0);
+	fanin_reap(&R, 1, 0);
+	return (1);
+}
+
 static const struct bcase {
 	const char	*name;
 	unsigned	(*op)(void);
@@ -451,6 +513,10 @@ static const struct bcase {
 	    "write(2) 64 B then recv(2) it, AF_UNIX stream" },
 	{ "unix_recv_ring", op_unix_recv_ring,
 	    "write(2) 64 B then RECV it, AF_UNIX stream" },
+	{ "pp_kevent", op_pp_kevent,
+	    "write(2) 64 B, kevent/epoll_wait, recv(2), AF_UNIX stream" },
+	{ "pp_ring_armed", op_pp_ring_armed,
+	    "RECV armed first, write(2) 64 B, enter to wait, AF_UNIX stream" },
 	{ "fanin_kevent", op_fanin_kevent,
 	    "fan-in: N write(2), kevent/epoll_wait, N recv(2), per message" },
 	{ "fanin_ring_batch", op_fanin_ring_batch,

@@ -1,0 +1,12 @@
+14:54:47 defer=1 unix_recv_syscall    2219.7 ns  (2215.8-2244.7)  write(2) 64
+14:54:52 defer=1 pp_kevent            3022.0 ns  (3019.1-3022.8)  write(2) 64
+14:54:57 defer=1 unix_recv_ring       2443.4 ns  (2431.5-2451.5)  write(2) 64
+14:55:03 defer=1 pp_ring_armed        3666.9 ns  (3661.1-3688.7)  RECV armed 
+14:55:08 defer=1 nop1                  753.8 ns  (753.2-758.5)  1 NOP per ent
+14:55:13 defer=0 unix_recv_syscall    2322.0 ns  (2315.7-2332.4)  write(2) 64
+14:55:18 defer=0 pp_kevent            3024.4 ns  (3023.5-3030.1)  write(2) 64
+14:55:24 defer=0 unix_recv_ring       2473.6 ns  (2457.3-2493.5)  write(2) 64
+14:55:29 defer=0 pp_ring_armed        3639.2 ns  (3634.1-3670.2)  RECV armed 
+14:55:34 defer=0 nop1                  766.2 ns  (764.7-767.4)  1 NOP per ent
+14:55:34 ALLDONE
+15:10 (after reboot) getppid               573.2 ns  (571.8-575.6)  getppid(2): the system call floor

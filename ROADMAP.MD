@@ -223,6 +223,7 @@ Progress (13 November 2026), on the Ryzen:
 - `tests/kqring_xbench.c` gains fan-in cases, on Linux too: kqueue (or epoll), single-shot `RECV`s in one enter, and multishot `RECV`s. With buffers that stay in cache, a `DEFER_TASKRUN` ring is level with kqueue or ahead at 16 and 256 connections. `kqring_bench`'s fan-in gives kqring 4,096 buffers of 4 KiB in turn, where its kqueue variant reads into one: part of its gap is that.
 - At 1,024 connections a multishot receive was about 65% slower than kqueue: each message brought about five cache lines from memory, where kqueue's brought half of one. Its fields now take 4 of a request's cache lines instead of 11: 812 to 579 ns per message, against kqueue's 497.
 - A multishot receive that took its group's last buffer ended with `-ENOBUFS` at once; as in Linux, it now waits for data with no buffer for it.
+- A `RECV` submitted before its data, on a `DEFER_TASKRUN` ring, spends about 250 ns arming, waking and receiving again on both the Ryzen and the i5, where io_uring spends 651 ns on the same i5; it is 1.18 times kqueue's loop there, as io_uring is 1.21 times epoll's. On the Ryzen, where a system call costs 53 ns, the same 250 ns is 60% of kqueue's loop. The time is spread over the path, and what could go without a redesign is under 3%. A default ring adds 260 ns (Ryzen) and 563 ns (i5) per message for its kernel thread, where Linux runs the taskwork in the submitter.
 
 ## Research
 

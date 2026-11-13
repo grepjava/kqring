@@ -12,7 +12,7 @@ Status: in progress, November 2026. Roadmap phase 12.
 - `fanin_ring_batch`: N single-shot `RECV`s, each into its own buffer, submitted and waited for in one enter;
 - `fanin_ring_multishot`: N multishot `RECV`s armed once on a provided buffer ring of 64-byte buffers, one enter per round to wait for the N CQEs.
 
-Times are per message and include its `write(2)`, medians of 5 one-second runs (3 in an A/B, which alternates the two modules three times). `XBENCH_FANIN_N` sets N, and `XBENCH_DEFER=1` sets the ring up with `SINGLE_ISSUER | DEFER_TASKRUN`, as `kqring_bench` does; without it the ring has the default flags, and its kernel thread completes the receives the socket upcalls queue, on another CPU. Ryzen 3 PRO 4350G, FreeBSD 15.1 `GENERIC` ([BENCHMARK.MD](../BENCHMARK.MD)). Raw outputs are in [bench/fanin/](bench/fanin/).
+Times are per message and include its `write(2)`, medians of 5 one-second runs (3 in an A/B, which alternates the two modules three times). `XBENCH_FANIN_N` sets N, and `XBENCH_DEFER=1` sets the ring up with `SINGLE_ISSUER | DEFER_TASKRUN`, as `kqring_bench` does; without it the ring has the default flags, and its kernel thread completes the receives the socket upcalls queue, on another CPU. Ryzen 3 PRO 4350G, FreeBSD 15.1 `GENERIC` ([BENCHMARK.MD](../BENCHMARK.MD)), and for ping-pong also the i5-8250U that boots FreeBSD 15.1 and Ubuntu with Linux 7.3. Raw outputs are in [bench/fanin/](bench/fanin/).
 
 ## Where kqring stood
 
@@ -64,8 +64,39 @@ Every other row moved less than 2%. The default ring at 16 and 256 connections, 
 
 A multishot `RECV` whose receive took the last buffer of its group went straight round again, failed to get a buffer, and ended with `-ENOBUFS`, even with nothing more to receive. Linux receives again at once only if more is buffered, and keeps the request armed otherwise: a buffer provided before more data comes keeps it going, and data with no buffer for it ends it. `tests/kqring_diff.c`'s `recv_mshot_drained` shows both, and kqring now matches Linux 7.3's output. `RECVMSG` had the same rule and the same change. A bundle still ends with the batch that empties its group, as in Linux.
 
+## A receive that waits
+
+`kqring_bench`'s ping-pong has a `RECV` submitted before its data 85% slower than kqueue on the Ryzen (991 against 536 ns at 64 bytes). It is how a server usually waits: the `RECV` finds nothing, arms the socket's upcall, the peer's write runs the upcall, which queues the request as taskwork, and the next enter runs the receive again and posts the CQE. `kqring_xbench` has the same loop, `pp_ring_armed`, with one buffer, against `pp_kevent`, which waits in `kevent(2)` (on Linux `epoll_wait(2)`, edge-triggered) and then calls `recv(2)`. Both make three system calls per message. `unix_recv_ring` is a `RECV` submitted after the write, which finds the data there; `getppid` is the system call floor.
+
+| ns per message | Ryzen | i5-8250U, FreeBSD | i5-8250U, Linux 7.3 |
+|---|---:|---:|---:|
+| `getppid(2)` | 53 | 193 | 573 |
+| kqueue or epoll, then `recv(2)` | 531 | 1,127 | 3,022 |
+| `RECV` with the data there | 544 | 888 | 2,443 |
+| `RECV` armed first, `DEFER_TASKRUN` ring | 847 | 1,332 | 3,667 |
+| `RECV` armed first, default ring | 1,107 | 1,895 | 3,639 |
+| armed less data-there less one system call | 249 | 252 | 651 |
+
+All from 13 November, FreeBSD with the module of the multishot layout change; raw outputs in [bench/fanin/](bench/fanin/) (`*-pingpong.steps`). Linux's floor was measured after a reboot, with the same build.
+
+- **On a `DEFER_TASKRUN` ring, waiting costs kqring about 250 ns on both machines, and io_uring 651 on the same i5.** Arming, the upcall, the taskwork and the second receive take under 40% of what they take on Linux, and on the i5 the armed `RECV` is 1.18 times kqueue's loop where io_uring's is 1.21 times epoll's. On the Ryzen, where a system call costs 53 ns, the same 250 ns is 60% of kqueue's whole loop.
+- **A default ring adds 260 ns on the Ryzen and 563 on the i5,** for the hop to the ring's kernel thread, which runs the taskwork, and back. Linux runs a default ring's taskwork in the submitting task, and its two rows are the same.
+
+Where the Ryzen's 300 ns or so between the armed `RECV` and the one that finds its data go (310 in the profiled runs), from DTrace's `profile-4999` (self time per function, scaled to each case's time; [bench/fanin/ryzen-pingpong-profile.txt](bench/fanin/ryzen-pingpong-profile.txt)):
+
+| ns per message | |
+|---|---:|
+| the second enter's system call: user mode, entry, `amd64_syscall()` | ~92 |
+| the enter's own work with nothing to submit: `kqring_sys_enter()`, `kqring_ioc_enter()`, taskwork, checks, eventfd | ~70 |
+| arming: `kqring_arm_socket_op()`, `kqring_sb_arm()` | ~33 |
+| the ring's mutex, four times: arming, the upcall, taking the taskwork, and once more after it | ~32 |
+| the upcall, queueing and running the taskwork, disarming | ~25 |
+| the end-of-file knote on AF_UNIX sockets, which `knote()` runs for each wake-up | 9 |
+
+The CPU's counters agree: about 6,000 instructions per message against 4,100, at the same rate (1.69 instructions per cycle against 1.74), and no more lines from memory. The time is in instructions and atomic operations, spread over the path; nothing in it is waiting or repeated. What could go without changing how it works is about 20 ns: the two locked increments of the per-CPU count of enters, which unload uses, and the ring's mutex taken again after the last taskwork item only to clear `IORING_SQ_TASKRUN`. That is under 3%, and neither change was made.
+
 ## What is left
 
 - At 1,024 connections a multishot receive is still about 16% slower than kqueue on a `DEFER_TASKRUN` ring (579 against 497 ns).
-- A default ring wakes its kernel thread for each message a socket upcall queues, and the thread and the writer contend for the ring's mutex. Linux runs a default ring's completions in the submitting task instead.
-- `kqring_bench`'s fan-in measures cold buffers against a hot one.
+- A default ring wakes its kernel thread for each message a socket upcall queues, and the thread and the writer contend for the ring's mutex. Linux runs a default ring's completions in the submitting task instead. In ping-pong this costs 260 ns per message on the Ryzen and 563 on the i5, where Linux's default ring costs what its `DEFER_TASKRUN` ring does.
+- `kqring_bench`'s fan-in and ping-pong measure kqring's provided buffers, 4,096 of 4 KiB in turn and so out of cache, against kqueue's one.
