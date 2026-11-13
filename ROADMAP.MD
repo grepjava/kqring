@@ -19,7 +19,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 9 | Registered buffers on held pages | Done |
 | 10 | The cost of an enter | Done |
 | 11 | Cached file reads | Done |
-| 12 | Fan-in against kqueue | In progress |
+| 12 | Fan-in against kqueue | Done |
 
 ## Where kqring stands
 
@@ -226,6 +226,9 @@ Progress (13 November 2026), on the Ryzen:
 - A `RECV` submitted before its data, on a `DEFER_TASKRUN` ring, spends about 250 ns arming, waking and receiving again on both the Ryzen and the i5, where io_uring spends 651 ns on the same i5; it is 1.18 times kqueue's loop there, as io_uring is 1.21 times epoll's. On the Ryzen, where a system call costs 53 ns, the same 250 ns is 60% of kqueue's loop. The time is spread over the path, and what could go without a redesign is under 3%. A default ring adds 260 ns (Ryzen) and 563 ns (i5) per message for its kernel thread, where Linux runs the taskwork in the submitter.
 - A default ring's kernel thread now sleeps apart from the enters waiting for CQEs, and taskwork wakes it only when no thread of the process waits in an enter, which runs it itself. With a peer process echoing (`xp_ring_armed`), a default ring now costs what a `DEFER_TASKRUN` ring does: 3,925 ns per round trip, from 3,985; kqueue 3,620. On a `COOP_TASKRUN` ring a completion queued in a thread of the ring's process now runs as that thread returns to user space, as Linux's task_work does: single-thread ping-pong 1,083 to 981–1,028 ns, half of the default ring's gap, and multishot fan-in written by the ring's own thread 50% slower, as each `write(2)` runs its receive. Paths that don't use it are 1–2% slower, from where the code now lies.
 - At 1,024 connections the remaining gap was the working set outgrowing the L3: the extra lines from memory were mostly in the writer's `write(2)`, not kqring's code. Requests came from `malloc(9)`'s 1 KiB bucket, which put the lines a receive uses in a quarter of the cache's sets; a zone of their own makes multishot 10–12% faster there (562–583 ns per message against kqueue's 500–534), with other paths unchanged.
+- Validated on the Ryzen with each change: the unit tests, the cross-process test, the comparison with Linux 7.3, liburing (220 of 245), stress and the fuzzer pass.
+
+Phase 12 is done. With buffers that stay in cache, fan-in on a `DEFER_TASKRUN` ring is level with kqueue or ahead up to 512 connections, and about 10% behind at 1,024, where the working set outgrows the L3. What is left is in [`TODO.MD`](TODO.MD).
 
 ## Research
 

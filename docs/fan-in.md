@@ -1,6 +1,6 @@
 # Fan-in against kqueue
 
-Status: in progress, November 2026. Roadmap phase 12.
+Status: done, November 2026. Roadmap phase 12.
 
 [BENCHMARK.MD](../BENCHMARK.MD#fan-in-many-connections-each-get-one-message-and-all-of-them-are-collected) has kqring's fan-in, many connections each getting one message and all of them collected, 26–66% slower than kqueue on the Ryzen, where a system call is cheap. This note measures where the time goes.
 
