@@ -570,6 +570,8 @@ kqring_req_resources(struct kqring_ctx *ctx, struct kqring_op *op)
 	if (ctx->bufs == NULL || idx >= ctx->nbufs ||
 	    (r = ctx->bufs[idx]) == NULL)
 		return (EFAULT);
+	/* Nothing is taking a buffer now: release those a fork replaced. */
+	kqring_bufs_retired_drain(ctx);
 	/*
 	 * The request names its buffer by user address, which must lie
 	 * inside the registered range, whatever the submitter has mapped
@@ -577,7 +579,9 @@ kqring_req_resources(struct kqring_ctx *ctx, struct kqring_op *op)
 	 * kernel at zb->kva, which the request uses from here on, from any
 	 * process (docs/held-buffers.md).
 	 */
-	zb = r->zbuf;
+	/* A fork in another thread may replace it (kqring_bufs_fork()). */
+	zb = (struct kqring_zc_buf *)atomic_load_acq_ptr(
+	    (volatile uintptr_t *)&r->zbuf);
 #define	KQRING_KADDR(u)	((u) - zb->page_base + zb->kva)
 	if (sqe->opcode == IORING_OP_SENDMSG_ZC) {
 		struct kqring_msg_args *ma = op->args;

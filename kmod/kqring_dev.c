@@ -2111,6 +2111,7 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 		kqring_enter_unlock(ctx, lock);
 		return (EBADF);
 	}
+	kqring_bufs_retired_drain(ctx);
 	if (ea->to_submit > 0) {
 		/*
 		 * Cached file reads may run here (kqring_wq_try_inline()),

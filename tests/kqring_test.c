@@ -7284,6 +7284,86 @@ test_disk_bio(void)
 }
 
 /*
+ * A registered buffer is held again when its process forks
+ * (kqring_bufs_fork()), from the thread that forked, while the ring's
+ * owner may be taking the old one for a request: on a SINGLE_ISSUER ring
+ * without a kernel thread it does so without sq_sx.  The old one must stay
+ * mapped until no request can be taking it; it was released at once, and a
+ * fixed WRITE then copied from its freed kernel mapping (a panic the
+ * fuzzer found).  The window is a few instructions, so this rarely hits
+ * it; it checks that every write reads the buffer's bytes.
+ */
+struct fbfork_arg {
+	_Atomic bool	stop;
+	int		pfd[2];
+	unsigned long	writes;
+};
+
+static void *
+fbfork_writer(void *arg)
+{
+	struct fbfork_arg *a = arg;
+	static char buf[2 * 4096] __attribute__((aligned(4096)));
+	struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) };
+	struct io_uring_sqe *sqe;
+	struct test_ring t;
+	char got[512];
+
+	ring_init(&t);	/* SINGLE_ISSUER | DEFER_TASKRUN, owned here */
+	for (size_t i = 0; i < sizeof(buf); i++)
+		buf[i] = (char)('A' + i % 23);
+	assert(kqring_register(t.fd, IORING_REGISTER_BUFFERS, &iov, 1) == 0);
+	while (!atomic_load(&a->stop)) {
+		size_t off = (a->writes * 509) % (sizeof(buf) - sizeof(got));
+
+		sqe = ring_prep(&t, IORING_OP_WRITE_FIXED, a->pfd[1], 64001);
+		sqe->addr = (uint64_t)(uintptr_t)(buf + off);
+		sqe->len = sizeof(got);
+		sqe->buf_index = 0;
+		sqe->off = (uint64_t)-1;
+		ring_push_sqe(&t);
+		assert(submit_one(&t) == (int32_t)sizeof(got));
+		assert(read(a->pfd[0], got, sizeof(got)) == (ssize_t)sizeof(got));
+		assert(memcmp(got, buf + off, sizeof(got)) == 0);
+		a->writes++;
+	}
+	assert(kqring_register(t.fd, IORING_UNREGISTER_BUFFERS, NULL, 0) == 0);
+	close(t.fd);
+	return (NULL);
+}
+
+static void
+test_fixed_buf_fork_threads(void)
+{
+	struct fbfork_arg a = { .writes = 0 };
+	struct timespec t0, now;
+	pthread_t td;
+	int forks = 0;
+
+	atomic_init(&a.stop, false);
+	assert(pipe(a.pfd) == 0);
+	assert(pthread_create(&td, NULL, fbfork_writer, &a) == 0);
+	assert(clock_gettime(CLOCK_MONOTONIC, &t0) == 0);
+	do {
+		pid_t pid = fork();
+
+		assert(pid >= 0);
+		if (pid == 0)
+			_exit(0);
+		assert(waitpid(pid, NULL, 0) == pid);
+		forks++;
+		assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+	} while (now.tv_sec - t0.tv_sec < 2);
+	atomic_store(&a.stop, true);
+	assert(pthread_join(td, NULL) == 0);
+	assert(forks > 0 && a.writes > 0);
+	close(a.pfd[0]);
+	close(a.pfd[1]);
+	printf("[PASS] Fixed WRITE in one thread while another forks: %d "
+	    "forks, %lu writes\n", forks, a.writes);
+}
+
+/*
  * Reads that cannot block complete on the issuer, without a worker: a
  * positioned read of a regular file from the page cache, and READ / WRITE
  * on a non-blocking pipe.  No worker thread is started for them.
@@ -15120,6 +15200,7 @@ main(int argc, char **argv)
 		test_restrictions(&r);
 		test_send_fd();
 		test_fixed_cancel();
+		test_fixed_buf_fork_threads();
 		test_fixed_file_ops();
 		test_iowq_register();
 		test_worker_nonblocking_pipe();

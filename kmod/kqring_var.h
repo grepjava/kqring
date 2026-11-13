@@ -608,6 +608,8 @@ struct kqring_zc_buf {
 	/* A registered buffer's pages, mapped in the kernel; or 0. */
 	vm_offset_t		kva;
 	struct kqring_pin_acct	*acct;
+	/* On ctx->zb_retired, replaced at a fork (kqring_bufs_fork()). */
+	struct kqring_zc_buf	*retired_next;
 	vm_page_t		pages[];
 };
 
@@ -974,6 +976,11 @@ struct kqring_ctx {
 	uint32_t		file_alloc_end;
 	uint32_t		file_alloc_hint;
 	struct kqring_rsrc	**bufs;
+	/*
+	 * Buffers kqring_bufs_fork() replaced, under mtx, released where no
+	 * request can be taking one (kqring_bufs_retired_drain()).
+	 */
+	struct kqring_zc_buf	*zb_retired;
 	uint32_t		nbufs;
 	volatile u_int		cow_gen;	/* bumped on fork() */
 	TAILQ_HEAD(, kqring_zc_notif) zc_pending;
@@ -1888,6 +1895,19 @@ int32_t	kqring_remove_buffers(struct kqring_ctx *ctx,
 	    const struct io_uring_sqe *sqe);
 void	kqring_files_free(struct kqring_ctx *ctx);
 void	kqring_bufs_free(struct kqring_ctx *ctx);
+void	kqring_bufs_retired_drain_slow(struct kqring_ctx *ctx);
+
+/*
+ * Release the registered buffers a fork replaced.  Called where no request
+ * of the ring is taking its buffer (kqring_req_resources()): by whoever
+ * submits, holding the enter's lock if the ring has one.
+ */
+static inline void
+kqring_bufs_retired_drain(struct kqring_ctx *ctx)
+{
+	if (__predict_false(atomic_load_ptr(&ctx->zb_retired) != NULL))
+		kqring_bufs_retired_drain_slow(ctx);
+}
 void	kqring_bgroup_free(struct kqring_ctx *ctx, struct kqring_bgroup *bg);
 int	kqring_files_register(struct kqring_ctx *ctx, uint64_t ufds,
 	    uint64_t utags, uint32_t nr, bool sparse);

@@ -671,6 +671,13 @@ kqring_bufs_set(struct kqring_ctx *ctx, uint32_t slot,
  * that can't be held again (unmapped or made read-only since) keeps its
  * pages, which the parent no longer writes.  Requests in flight keep the
  * pages they took (op->fzb).
+ *
+ * sq_sx doesn't keep a request from taking a buffer meanwhile: on a
+ * SINGLE_ISSUER ring without a kernel thread the owner submits without it
+ * (kqring_enter_locks()), and the thread that forked may be another.  So
+ * the new buffer is published with a release store, and the old one isn't
+ * released here, where the owner may have just read it and not yet taken
+ * its reference: it goes on ctx->zb_retired, which the submitter drains.
  */
 void
 kqring_bufs_fork(struct kqring_ctx *ctx, uint64_t tid, struct thread *td)
@@ -690,10 +697,29 @@ kqring_bufs_fork(struct kqring_ctx *ctx, uint64_t tid, struct thread *td)
 		if (kqring_rbuf_alloc(td, (vm_offset_t)r->addr, r->len,
 		    discount, &zb) != 0)
 			continue;
-		r->zbuf = zb;
-		kqring_zc_buf_rele(old);
+		atomic_store_rel_ptr((volatile uintptr_t *)&r->zbuf,
+		    (uintptr_t)zb);
+		mtx_lock(&ctx->mtx);
+		old->retired_next = ctx->zb_retired;
+		ctx->zb_retired = old;
+		mtx_unlock(&ctx->mtx);
 	}
 	sx_xunlock(&ctx->sq_sx);
+}
+
+void
+kqring_bufs_retired_drain_slow(struct kqring_ctx *ctx)
+{
+	struct kqring_zc_buf *zb, *next;
+
+	mtx_lock(&ctx->mtx);
+	zb = ctx->zb_retired;
+	ctx->zb_retired = NULL;
+	mtx_unlock(&ctx->mtx);
+	for (; zb != NULL; zb = next) {
+		next = zb->retired_next;
+		kqring_zc_buf_rele(zb);
+	}
 }
 
 /* Whether [addr, addr + len) lies inside registered buffer r. */
@@ -965,6 +991,7 @@ kqring_bufs_free(struct kqring_ctx *ctx)
 	struct kqring_rsrc **bufs = ctx->bufs;
 	uint32_t n = ctx->nbufs;
 
+	kqring_bufs_retired_drain(ctx);
 	if (bufs == NULL)
 		return;
 	ctx->bufs = NULL;
