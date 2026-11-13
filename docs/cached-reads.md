@@ -73,7 +73,7 @@ kqring's own functions take 190 ns of each read, the whole of the difference in 
 
 ## A FreeBSD hang this found
 
-`read(2)` of a tmpfs file into a writable `MAP_SHARED` mapping of the same page never returns, on FreeBSD 15.1 without kqring. tmpfs doesn't set `MNTK_NO_IOPF`, so `vn_io_fault()` doesn't hold the destination's pages first; `tmpfs_read()` busies the file's page, and the copy faults on its mapping, which waits for the page to be unbusied: by itself. The wait can't be interrupted, and the machine can't finish a shutdown. ZFS and UFS hold the pages first and return. kqring's read in the enter gives up with `EFAULT` (faults are disabled), and the worker it goes to reads as `read(2)` does, and hangs as it does; the unit test skips that case on tmpfs.
+`read(2)` of a tmpfs file into a writable `MAP_SHARED` mapping of the same page never returns, on FreeBSD 15.1 without kqring. tmpfs doesn't set `MNTK_NO_IOPF`, so `vn_io_fault()` doesn't hold the destination's pages first; `tmpfs_read()` busies the file's page, and the copy faults on its mapping, which waits for the page to be unbusied: by itself. The wait can't be interrupted, and the machine can't finish a shutdown. ZFS and UFS hold the pages first and return. kqring's read in the enter gives up with `EFAULT` (faults are disabled), and the worker it goes to reads as `read(2)` does, and hangs as it does; the unit test skips that case on tmpfs. Reported as [FreeBSD bug 300734](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=300734).
 
 ## Acceptance
 
