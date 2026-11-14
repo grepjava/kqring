@@ -589,6 +589,7 @@ kqring_ctx_free_final(struct kqring_ctx *ctx)
 	}
 	free(ctx->sw_cache[0], M_KQRING);
 	free(ctx->sw_cache[1], M_KQRING);
+	kqring_bpf_ctx_free(ctx);
 
 	/* Every request (and its references) is gone: drop the tables. */
 	kqring_kpoll_close_all(ctx);
@@ -1679,6 +1680,9 @@ kqring_ioc_setup(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	mtx_unlock(&ctx->mtx);
 
 	error = kqring_setup_rings(ctx, uarg, td);
+	/* What the process registered, before anything can be submitted. */
+	if (error == 0)
+		kqring_task_rst_apply(ctx, td->td_proc);
 
 	mtx_lock(&ctx->mtx);
 	ctx->setup_busy = false;
@@ -2572,6 +2576,7 @@ kqring_proc_exit(void *arg __unused, struct proc *p)
 {
 	kqring_ast_purge(p);
 	kqring_proc_rings_teardown(p, false);
+	kqring_task_rst_exit(p);
 }
 
 static void
@@ -2602,6 +2607,8 @@ kqring_proc_fork(void *arg __unused, struct proc *p1,
 	bool rehold = curproc == p1 && p2->p_vmspace != p1->p_vmspace;
 	u_int max = 0, n = 0;
 
+	/* IORING_REGISTER_RESTRICTIONS / _BPF_FILTER for the process. */
+	kqring_task_rst_fork(p1, p2);
 	for (int pass = 0; pass < 2; pass++) {
 		mtx_lock(&kqring_proc_mtx);
 		LIST_FOREACH(ctx, &kqring_ctx_list, proc_link) {
@@ -3571,6 +3578,7 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 		mtx_destroy(&kqring_futex_mtx);
 		/* Every ring, and so every request, is gone. */
 		uma_zdestroy(kqring_op_zone);
+		kqring_task_rst_unload();
 		printf("kqring: unloaded\n");
 		return (0);
 

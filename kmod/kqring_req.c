@@ -1503,6 +1503,7 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 	bool direct = sqe->file_index != 0;
 	bool multishot = false, buf_select_ok = false, bundle_ok = false;
 	bool ext = false;
+	uint8_t sqe_opcode;
 	int error;
 
 	/*
@@ -1531,8 +1532,10 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		return (EINVAL);
 	if ((sqe->flags & ~KQRING_SQE_FLAGS) != 0)
 		return (EINVAL);
-	if (ctx->restricted && !kqring_restriction_ok(ctx, sqe))
+	if (ctx->op_restricted && !kqring_restriction_ok(ctx, sqe))
 		return (EACCES);
+	/* The opcode a filter sees, before NOP128 becomes NOP below. */
+	sqe_opcode = sqe->opcode;
 	/*
 	 * The 128-byte opcodes are NOP and URING_CMD with a 128-byte SQE,
 	 * which kqring_submit_sqes() read whole on an SQE_MIXED ring.
@@ -2016,6 +2019,12 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 	if (multishot && (sqe->flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK |
 	    IOSQE_CQE_SKIP_SUCCESS)) != 0)
 		return (EINVAL);
+	/* IORING_REGISTER_BPF_FILTER: last, on a request otherwise valid. */
+	if (__predict_false(ctx->bpf != NULL)) {
+		error = kqring_bpf_check(ctx, op, sqe_opcode, ext);
+		if (error != 0)
+			return (error);
+	}
 	op->multishot = multishot;
 	return (0);
 }

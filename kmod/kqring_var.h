@@ -76,6 +76,7 @@
 #include <sys/protosw.h>
 #include <netinet/in.h>
 #include <net/vnet.h>
+#include <net/bpf.h>
 #include <sys/uio.h>
 #include <sys/poll.h>
 #include <sys/refcount.h>
@@ -884,13 +885,42 @@ struct kqring_tctx {
 	TAILQ_ENTRY(kqring_tctx) ast_link;
 };
 
-/* IORING_REGISTER_RESTRICTIONS, in force once the ring is enabled. */
+/*
+ * IORING_REGISTER_RESTRICTIONS, on a ring (in force once it is enabled) or
+ * for a process (kqring_bpf.c; copied into the rings it sets up).  As in
+ * Linux, opcode and flag entries restrict requests and register entries
+ * restrict registrations, each only if some were given; none restricts
+ * both, to nothing.
+ */
 struct kqring_restrictions {
 	uint64_t	register_op[4];		/* bitmaps over 0..255 */
 	uint64_t	sqe_op[4];
 	uint8_t		sqe_flags_allowed;
 	uint8_t		sqe_flags_required;
-	bool		registered;
+	bool		op_registered;
+	bool		reg_registered;
+};
+
+/*
+ * IORING_REGISTER_BPF_FILTER (kqring_bpf.c).  A node is one classic BPF
+ * program, len 0 the placeholder IO_URING_BPF_FILTER_DENY_REST puts on
+ * opcodes without one.  An opcode's filters are a list, newest first, that
+ * is only ever prepended to, so lists share their tails; a node holds a
+ * reference on the next.  A table is the list heads by opcode, shared by
+ * reference between a process and the rings it sets up, and copied by
+ * whichever adds a filter next.
+ */
+struct kqring_bpf_node {
+	volatile u_int		refs;
+	struct kqring_bpf_node	*next;
+	u_int			len;
+	struct bpf_insn		insns[];
+};
+
+struct kqring_bpf_table {
+	volatile u_int		refs;
+	struct kqring_bpf_table	*retired;	/* a ring's earlier tables */
+	struct kqring_bpf_node	*op[IORING_OP_LAST];
 };
 
 /*
@@ -1047,7 +1077,15 @@ struct kqring_ctx {
 	volatile uint32_t	cq_timeouts;
 
 	struct kqring_restrictions rst;
-	bool			restricted;	/* rst in force */
+	bool			op_restricted;	/* rst's requests in force */
+	bool			reg_restricted;	/* rst's registrations */
+	bool			reg_inherited;	/* the process's: even disabled */
+	/*
+	 * IORING_REGISTER_BPF_FILTER: NULL, or this ring's table, read without
+	 * a lock at submission.  Registering replaces it and keeps the one it
+	 * replaced (->retired) until the ring is freed.
+	 */
+	struct kqring_bpf_table	*bpf;
 	uint32_t		clockid;	/* IORING_REGISTER_CLOCK */
 	/*
 	 * IORING_REGISTER_MEM_REGION, set once (under sq_sx) and freed with
@@ -1922,6 +1960,20 @@ uint32_t kqring_buf_commit(struct kqring_ctx *ctx,
 	    const struct kqring_sel *sel, size_t done);
 uint32_t kqring_buf_eof(const struct kqring_sel *sel);
 int	kqring_register_blind(struct kqring_register_arg *ra);
+/* kqring_bpf.c */
+int	kqring_restrictions_parse(struct kqring_restrictions *r,
+	    const void *uarg, uint32_t nr);
+int	kqring_task_restrictions_register(struct thread *td,
+	    const struct kqring_register_arg *ra);
+int	kqring_bpf_register(struct kqring_ctx *ctx, struct thread *td,
+	    const struct kqring_register_arg *ra);
+int	kqring_bpf_check(struct kqring_ctx *ctx, const struct kqring_op *op,
+	    uint8_t opcode, bool ext);
+void	kqring_task_rst_apply(struct kqring_ctx *ctx, struct proc *p);
+void	kqring_task_rst_fork(struct proc *p1, struct proc *p2);
+void	kqring_task_rst_exit(struct proc *p);
+void	kqring_task_rst_unload(void);
+void	kqring_bpf_ctx_free(struct kqring_ctx *ctx);
 uint32_t kqring_buf_commit_op(struct kqring_ctx *ctx, struct kqring_op *op,
 	    const struct kqring_sel *sel, size_t done);
 void	kqring_buf_give_back(struct kqring_ctx *ctx,

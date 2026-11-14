@@ -20,6 +20,7 @@
 #include <sys/linker.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/procctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -29,6 +30,7 @@
 #include <sys/umtx.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <net/bpf.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -12240,7 +12242,6 @@ test_compat_contracts(void)
 	static const uint32_t bad_reg[] = {
 		32,		/* IORING_REGISTER_ZCRX_IFQ */
 		36,		/* IORING_REGISTER_ZCRX_CTRL */
-		37,		/* IORING_REGISTER_BPF_FILTER */
 	};
 	static const uint32_t bad_nop[] = {
 		1U << 1,	/* IORING_NOP_FILE */
@@ -12270,6 +12271,8 @@ test_compat_contracts(void)
 		    errno == EINVAL);
 	for (size_t i = 0; i < nitems(bad_reg); i++)
 		assert(reg(&t, bad_reg[i], NULL, 0) == -EOPNOTSUPP);
+	/* A filter takes one struct io_uring_bpf (test_bpf_process()). */
+	assert(reg(&t, IORING_REGISTER_BPF_FILTER, NULL, 0) == -EINVAL);
 	for (size_t i = 0; i < nitems(bad_nop); i++) {
 		sqe = ring_prep(&t, IORING_OP_NOP, -1, 78101);
 		sqe->nop_flags = bad_nop[i];
@@ -12312,9 +12315,11 @@ test_compat_contracts(void)
 	assert(submit_one(&t) == -EINVAL);
 
 	/* Registration without a ring, and the field that was reserved. */
+	/* For the process: no_new_privs or root first, as Linux. */
 	assert(kqring_register(-1, IORING_REGISTER_RESTRICTIONS, NULL, 0) ==
-	    -1 && errno == EOPNOTSUPP);
-	assert(kqring_register(-1, 37, NULL, 0) == -1 && errno == EOPNOTSUPP);
+	    -1 && errno == (geteuid() == 0 ? EINVAL : EACCES));
+	assert(kqring_register(-1, IORING_REGISTER_BPF_FILTER, NULL, 0) ==
+	    -1 && errno == (geteuid() == 0 ? EINVAL : EACCES));
 	assert(kqring_register(-1, IORING_REGISTER_PROBE, NULL, 0) == -1 &&
 	    errno == EINVAL);
 	{
@@ -15297,6 +15302,155 @@ test_triggers(struct test_ring *plain)
 	test_fifo_read();
 }
 
+/* ---- Restrictions and filters for a process (kqring_bpf.c) ---- */
+
+static void
+bpf_set_nnp(void)
+{
+	int v = PROC_NO_NEW_PRIVS_ENABLE;
+
+	assert(procctl(P_PID, 0, PROC_NO_NEW_PRIVS_CTL, &v) == 0);
+}
+
+/* NOP, then one more request; returns the second's result. */
+static int
+bpf_nop_then(struct test_ring *r, struct io_uring_sqe *(*prep2)(
+    struct test_ring *))
+{
+	struct io_uring_cqe c;
+	int res2 = 1, n = 0;
+
+	ring_prep(r, IORING_OP_NOP, -1, 1);
+	ring_push_sqe(r);
+	prep2(r);
+	ring_push_sqe(r);
+	ring_submit(r);
+	assert(ring_wait(r, 2, 2000) == 0);
+	while (n < 2) {
+		c = ring_pop_cqe(r);
+		if (c.user_data == 1)
+			assert(c.res == 0);
+		else
+			res2 = c.res;
+		n++;
+	}
+	return (res2);
+}
+
+/* A kevent request on a pipe with data: it completes at once. */
+static struct io_uring_sqe *
+bpf_prep_kevent(struct test_ring *r)
+{
+	static struct kevent k;
+	static int pfd[2] = { -1, -1 };
+
+	if (pfd[0] < 0) {
+		assert(pipe(pfd) == 0);
+		assert(write(pfd[1], "x", 1) == 1);
+	}
+	EV_SET(&k, pfd[0], EVFILT_READ, 0, 0, 0, NULL);
+	return (kev_prep(r, &k, 2, false));
+}
+
+static struct io_uring_sqe *
+bpf_prep_read(struct test_ring *r)
+{
+	static char b[1];
+	struct io_uring_sqe *sqe = ring_prep(r, IORING_OP_READ, 0, 2);
+
+	sqe->addr = (uint64_t)(uintptr_t)b;
+	sqe->len = 0;
+	return (sqe);
+}
+
+static void *
+bpf_register_thread(void *arg __unused)
+{
+	static const struct bpf_insn allow[] = { BPF_STMT(BPF_RET | BPF_K, 1) };
+	struct io_uring_bpf b = {
+		.cmd_type = IO_URING_BPF_CMD_FILTER,
+		.filter = {
+			.opcode = IORING_OP_NOP,
+			.filter_len = 1,
+			.filter_ptr = (uint64_t)(uintptr_t)allow,
+		},
+	};
+
+	return ((void *)(intptr_t)kqring_register(-1,
+	    IORING_REGISTER_BPF_FILTER, &b, 1));
+}
+
+/*
+ * What kqring does beyond Linux's tests (liburing's cbpf_filter and
+ * task-restrict, and kqring_diff's restrictions cases cover the rest):
+ * a filter registered in one thread holds for rings the process's other
+ * threads set up (they are per process here), a ring with filters refuses
+ * kqring's extension requests, and restrictions outlive execve(2).
+ */
+static void
+test_bpf_process(void)
+{
+	pid_t pid;
+	int st;
+
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		struct test_ring r;
+		pthread_t th;
+		void *rc;
+
+		/* Without filters the request goes through. */
+		trig_ring(&r);
+		if (bpf_nop_then(&r, bpf_prep_kevent) < 0)
+			_exit(2);
+		close(r.fd);
+		bpf_set_nnp();
+		assert(pthread_create(&th, NULL, bpf_register_thread, NULL) ==
+		    0);
+		assert(pthread_join(th, &rc) == 0 && rc == NULL);
+		trig_ring(&r);
+		if (bpf_nop_then(&r, bpf_prep_kevent) != -EACCES)
+			_exit(1);
+		close(r.fd);
+		_exit(0);
+	}
+	assert(waitpid(pid, &st, 0) == pid);
+	if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+		printf("[FAIL] process filter: kevent request on a filtered "
+		    "ring not refused (status %#x)\n", st);
+		failures++;
+		return;
+	}
+
+	pid = fork();
+	assert(pid >= 0);
+	if (pid == 0) {
+		struct io_uring_task_restriction *tr = calloc(1, sizeof(*tr) +
+		    sizeof(tr->restrictions[0]));
+
+		assert(tr != NULL);
+		tr->nr_res = 1;
+		tr->restrictions[0].opcode = IORING_RESTRICTION_SQE_OP;
+		tr->restrictions[0].sqe_op = IORING_OP_NOP;
+		bpf_set_nnp();
+		assert(kqring_register(-1, IORING_REGISTER_RESTRICTIONS, tr,
+		    1) == 0);
+		execl(test_argv0, test_argv0, "--exec-restricted",
+		    (char *)NULL);
+		_exit(127);
+	}
+	assert(waitpid(pid, &st, 0) == pid);
+	if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+		printf("[FAIL] process restrictions after execve(2) "
+		    "(status %#x)\n", st);
+		failures++;
+		return;
+	}
+	printf("[PASS] process filters and restrictions: per process, "
+	    "extension requests refused, kept across execve(2)\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -15304,6 +15458,11 @@ main(int argc, char **argv)
 	bool run_bench = argc < 2 || strcmp(argv[1], "tests") != 0;
 	struct test_ring r;
 
+	/* The new image of test_bpf_process(): the restrictions came along. */
+	if (argc == 2 && strcmp(argv[1], "--exec-restricted") == 0) {
+		ring_init(&r);
+		return (bpf_nop_then(&r, bpf_prep_read) == -EACCES ? 0 : 1);
+	}
 	/* The new image of test_exec_kthreads(). */
 	if (argc == 4 && strcmp(argv[1], "--exec-after") == 0) {
 		if (strcmp(argv[3], "closed") == 0)
@@ -15469,6 +15628,7 @@ main(int argc, char **argv)
 		test_sqpoll_and_iopoll();
 		test_stop_during_close();
 		test_default_ring_waiter_handoff();
+		test_bpf_process();
 		test_phase5_security_audit();
 		printf("%s: %d failure(s)\n", failures ? "[FAIL]" : "[OK]",
 		    failures);

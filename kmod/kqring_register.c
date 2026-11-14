@@ -171,57 +171,25 @@ kqring_ring_fds_unregister(struct thread *td,
 }
 
 
-/* IORING_REGISTER_RESTRICTIONS, on a ring created IORING_SETUP_R_DISABLED. */
+/*
+ * IORING_REGISTER_RESTRICTIONS, on a ring created IORING_SETUP_R_DISABLED:
+ * once, and not on a ring that has its process's (kqring_bpf.c).
+ */
 static int
 kqring_restrictions_register(struct kqring_ctx *ctx,
     const struct kqring_register_arg *ra)
 {
 	struct kqring_restrictions *r = &ctx->rst;
-	struct io_uring_restriction res;
-	int error = 0;
+	int error;
 
 	if ((ctx->flags & IORING_SETUP_R_DISABLED) == 0 || ctx->enabled)
 		return (EBADF);
-	if (r->registered)
+	if (r->op_registered || r->reg_registered)
 		return (EBUSY);
-	if (ra->arg == NULL || ra->nr_args >
-	    IORING_RESTRICTION_LAST + IORING_REGISTER_LAST + IORING_OP_LAST)
-		return (EINVAL);
-	for (uint32_t i = 0; i < ra->nr_args && error == 0; i++) {
-		error = copyin((const char *)ra->arg + i * sizeof(res), &res,
-		    sizeof(res));
-		if (error != 0)
-			break;
-		switch (res.opcode) {
-		case IORING_RESTRICTION_REGISTER_OP:
-			if (res.register_op >= IORING_REGISTER_LAST)
-				error = EINVAL;
-			else
-				kqring_bit_set(r->register_op, res.register_op);
-			break;
-		case IORING_RESTRICTION_SQE_OP:
-			if (res.sqe_op >= IORING_OP_LAST)
-				error = EINVAL;
-			else
-				kqring_bit_set(r->sqe_op, res.sqe_op);
-			break;
-		case IORING_RESTRICTION_SQE_FLAGS_ALLOWED:
-			r->sqe_flags_allowed = res.sqe_flags;
-			break;
-		case IORING_RESTRICTION_SQE_FLAGS_REQUIRED:
-			r->sqe_flags_required = res.sqe_flags;
-			break;
-		default:
-			error = EINVAL;
-			break;
-		}
-	}
-	if (error != 0) {
+	error = kqring_restrictions_parse(r, ra->arg, ra->nr_args);
+	if (error != 0)
 		bzero(r, sizeof(*r));
-		return (error);
-	}
-	r->registered = true;
-	return (0);
+	return (error);
 }
 
 
@@ -913,7 +881,8 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 		}
 		kqring_set_owner(ctx, td);
 		ctx->enabled = true;
-		ctx->restricted = ctx->rst.registered;
+		ctx->op_restricted = ctx->rst.op_registered;
+		ctx->reg_restricted = ctx->rst.reg_registered;
 		mtx_unlock(&ctx->mtx);
 		if (kqring_has_kthread(ctx)) {
 			/* A disabled ring has only its setup context. */
@@ -931,6 +900,8 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
 
 	case IORING_REGISTER_RESTRICTIONS:
 		return (kqring_restrictions_register(ctx, ra));
+	case IORING_REGISTER_BPF_FILTER:
+		return (kqring_bpf_register(ctx, td, ra));
 
 	case IORING_REGISTER_FILES:
 		return (kqring_files_register(ctx, (uintptr_t)ra->arg, 0,
@@ -1164,8 +1135,8 @@ kqring_register_query(const struct kqring_register_arg *ra)
 
 /*
  * A registration with no ring (descriptor -1), as io_uring_register(2)
- * takes for these opcodes since Linux 6.13.  SEND_MSG_RING and QUERY are
- * implemented; the others exist, so they fail as unsupported.
+ * takes for these opcodes since Linux 6.13: RESTRICTIONS and BPF_FILTER
+ * then apply to the calling process (kqring_bpf.c).
  */
 int
 kqring_register_blind(struct kqring_register_arg *ra)
@@ -1176,8 +1147,9 @@ kqring_register_blind(struct kqring_register_arg *ra)
 	case IORING_REGISTER_QUERY:
 		return (kqring_register_query(ra));
 	case IORING_REGISTER_RESTRICTIONS:
-	case 37:	/* IORING_REGISTER_BPF_FILTER */
-		return (EOPNOTSUPP);
+		return (kqring_task_restrictions_register(curthread, ra));
+	case IORING_REGISTER_BPF_FILTER:
+		return (kqring_bpf_register(NULL, curthread, ra));
 	default:
 		return (EINVAL);
 	}
@@ -1200,7 +1172,8 @@ kqring_ioc_register(struct kqring_ctx *ctx, struct kqring_register_arg *ra,
 
 	if (!ctx->setup_done || ctx->closing)
 		return (EBADF);
-	if (ctx->restricted && (ra->opcode >= 256 ||
+	/* The ring's own rules once it's enabled; its process's at once. */
+	if (ctx->reg_restricted && (ra->opcode >= 256 ||
 	    !kqring_bit_isset(ctx->rst.register_op, ra->opcode)))
 		return (EACCES);
 

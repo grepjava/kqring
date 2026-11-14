@@ -35,9 +35,9 @@ liburing's test suite, run on FreeBSD 15.1 with `kqring.ko` from this tree (Nove
 |---|---|
 | In liburing 2.15 | 258 |
 | Built | 245 |
-| Passed | **220** |
-| Skipped | 19 (the test found a feature missing and said so) |
-| Failed | 6, explained below |
+| Passed | **223** |
+| Skipped | 17 (the test found a feature missing and said so) |
+| Failed | 5, explained below |
 | Not built | 9 not portable, 2 BPF, 2 AddressSanitizer only, explained below |
 
 `fixed-buf-merge`, `read-write` and `send-zerocopy` register more buffer memory than FreeBSD's default `RLIMIT_MEMLOCK` (64 KiB; Linux uses 8 MiB), so they need it raised: `ulimit -l 65536` as root, or `memorylocked` in `login.conf(5)`. With it raised, `send-zerocopy` sends and checks a 32 MiB buffer in every configuration, which takes two to three minutes, so `make check` gives it 300 seconds where the other tests get 30.
@@ -52,16 +52,14 @@ These results aren't a compatibility percentage. Some of the tests are adapted, 
 | `pipe-reuse`, `splice` | FreeBSD writes large blocks to a pipe directly from the writer's pages, and such a `write(2)` blocks until a reader has taken all of it, which these tests don't expect. |
 | `recv-bundle-short-ooo` | Writes 1 MiB to a TCP socket before reading any of it. FreeBSD takes about 48 KiB on an unread loopback socket, so the write blocks. |
 | `vec-regbuf` | Expects a 49,185-byte zero-copy send on a new TCP socket to complete in full. A new FreeBSD TCP socket's send buffer takes 48,972 bytes, and a plain non-blocking `send(2)` stops there too. |
-| `iopoll-sync` | Compares a socket option with 1. FreeBSD's `getsockopt(2)` returns the option's bit. |
 
 ### Skipped tests
 
-The 19 skips are tests that check for a feature and report its absence:
+The 17 skips are tests that check for a feature and report its absence:
 
 - **Not implemented in kqring** (see [`COMPATIBILITY.MD`](../COMPATIBILITY.MD)):
   - `IOPOLL` on an `O_DIRECT` file in the test's directory, which completes with `-EOPNOTSUPP` (`500f9fbadef8`).
   - Zero-copy receive (`zcrx`), which `IORING_REGISTER_QUERY` reports missing.
-  - BPF filters on a ring (`cbpf_filter`) and task restrictions (`task-restrict`), refused with `EOPNOTSUPP`.
 - **`epwait`** needs `IORING_OP_EPOLL_WAIT`, and FreeBSD has no epoll.
 - **Linux-only facilities:** fault injection (`fc2a85cb02ef`), fsnotify (`fsnotify`), ublk (`uring_cmd_ublk`), the kernel's io_uring mock files (`mock_file`), requested huge pages (`fixed-hugepage`), and `/proc` (`wq-aff`, `io-wq-unused-exit`, `resize-mmap-fail`). `iowait` runs its waits with and without `IORING_ENTER_NO_IOWAIT`, then skips where it would read the time spent waiting for I/O from `/proc/stat`: FreeBSD doesn't count that time apart.
 - **`fallocate`** skips when the test directory is on ZFS, which doesn't support preallocation: the `FALLOCATE` completes with `EOPNOTSUPP`, which the test takes as unsupported.
@@ -94,11 +92,12 @@ The tests that are changed, or that test something else, are:
 | `statx` | Compares with `fstatat(2)`, through `test-compat.h` | FreeBSD has no `statx(2)`. Without a reference, the test would pass without comparing anything. |
 | `regbuf-merge` | Linux's system call numbers go to kqring, through `test-compat.h` | Otherwise it makes whichever FreeBSD system calls have those numbers, and never reaches kqring. |
 | `socket-getsetsock-cmd` | Uses `TCP_KEEPIDLE` for `TCP_USER_TIMEOUT`, `SO_TYPE` for `SO_PEERNAME`, and compares `SO_REUSEPORT` as true or false | FreeBSD has neither option, and `getsockopt(2)` returns the option's bit rather than 1. |
+| `iopoll-sync` | Compares `SO_REUSEADDR` as true or false | `getsockopt(2)` returns the option's bit rather than 1. |
+| `cbpf_filter` | Uses `RESOLVE_BENEATH` where it uses `RESOLVE_IN_ROOT`, and gives each socket it connects a one-second `TCP_KEEPINIT` | kqring doesn't implement `RESOLVE_IN_ROOT` and refuses it before a filter runs; the filter reads either bit the same way. One allowed `CONNECT` goes to 2001:db8::1, which on a host with an IPv6 route waits for FreeBSD's 75-second connection timeout, longer than `make check` gives a test; only whether the filter allowed it matters. |
 | `socket-io-cmd` | Waits 300 ms after sending | FreeBSD counts data as sent until a delayed ACK comes back, so it shows on both ends at first. |
 | `futex` | A wake doesn't change the word, and a cancel expects 0 | See [Differences from Linux](../README.md#differences-from-linux). |
 | `waitid` | Expects `-ETIME` from a link timeout and 0 from a cancel | Linux's 1 for both is what cancelling a `WAITID` returns inside the kernel, not a documented result. |
 | `poll-v-poll`, `epwait` | Take `EOPNOTSUPP` as epoll not being supported, as they do `EINVAL` | FreeBSD has no epoll. `poll-v-poll` polls a kqueue in place of an epoll descriptor. |
-| `cbpf_filter`, `task-restrict` | Take `EOPNOTSUPP` as the feature not being supported, as they do `EINVAL` | kqring refuses these registrations with `EOPNOTSUPP`, where a Linux kernel without them gives `EINVAL`. |
 | `reg-wait` | Gives a signal mask the size of FreeBSD's `sigset_t` (`_NSIG / 8`, 16 bytes) where it expects `EFAULT` from a bad pointer | Linux's is 8 bytes. With 8, kqring fails the size check first, with `EINVAL`. |
 | `iowait` | Skips where it would read `/proc/stat`, after its waits | FreeBSD has no `/proc/stat`, and doesn't count time waiting for I/O apart. Without the change it reads 0 and fails. |
 | `sendzc-bug` | Doesn't set `SO_ZEROCOPY` where the platform has no such option, as liburing's own helpers already don't | io_uring's zero-copy sends don't need it, and FreeBSD has no such option. |

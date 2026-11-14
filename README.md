@@ -105,11 +105,11 @@ Of the 8 failures, 6 come from Linux-only assumptions in the tests and 2 are del
 
 | How it's tested | Result on `v0.3.0` |
 |---|---|
-| kqring's own suite, stock and debug kernels | 127 tests pass |
+| kqring's own suite | 147 tests pass (the first 127 on a debug kernel too) |
 | Fuzzer, whole interface, 30 minutes on a debug kernel | clean, no leaks |
 | Stress test, 10 minutes on a debug kernel | clean, no leaks |
 | KASAN kernel with `kqring.ko` instrumented: suite, stress and 7 full fuzz runs | no memory errors reported in kqring |
-| liburing 2.9's test suite | 179 of 196 pass, every failure explained |
+| liburing 2.15's test suite | 223 of 245 pass, every failure explained |
 | `kqring_diskbench -V`, every read checked against what was written | passed on an md(4) disk and a ZFS file |
 
 It has also been reviewed against the classes of bugs behind Linux io_uring's CVEs.
@@ -305,7 +305,7 @@ Programs that use liburing build against the port in [`liburing/`](liburing/), w
   - Ring descriptors: `RING_FDS` and `UNREGISTER_RING_FDS` (with `IORING_ENTER_REGISTERED_RING`, `IORING_REGISTER_USE_REGISTERED_RING`, and `IORING_FEAT_REG_REG_RING`).
   - Workers: `IOWQ_AFF`, `UNREGISTER_IOWQ_AFF` and `IOWQ_MAX_WORKERS`.
   - Rings: `RESIZE_RINGS` (on `DEFER_TASKRUN` rings, as on Linux; queued SQEs and CQEs move to the new rings, which are mapped afresh).
-  - Other: `EVENTFD`, `EVENTFD_ASYNC`, `UNREGISTER_EVENTFD`, `PERSONALITY`, `UNREGISTER_PERSONALITY`, `RESTRICTIONS`, `ENABLE_RINGS`, `PROBE`, `QUERY` (also without a ring), `SYNC_CANCEL`, `SEND_MSG_RING` and `CLOCK`.
+  - Other: `EVENTFD`, `EVENTFD_ASYNC`, `UNREGISTER_EVENTFD`, `PERSONALITY`, `UNREGISTER_PERSONALITY`, `RESTRICTIONS` and `BPF_FILTER` (also without a ring, for the process), `ENABLE_RINGS`, `PROBE`, `QUERY` (also without a ring), `SYNC_CANCEL`, `SEND_MSG_RING` and `CLOCK`.
 
 `IORING_REGISTER_PROBE` reports exactly which opcodes are available. These Linux operations have no FreeBSD equivalent and are rejected with `-EOPNOTSUPP` or `-EINVAL`: `EPOLL_CTL`, `EPOLL_WAIT` and `RECV_ZC`. `IORING_REGISTER_NAPI` is accepted, but FreeBSD has no NAPI polling for a module to call, so it sets only a busy-wait: a wait spins up to `busy_poll_to` µs for completions before it sleeps. The static NAPI id operations fail with `EOPNOTSUPP`.
 
@@ -331,6 +331,7 @@ See [docs/event-chains-spec.md](docs/event-chains-spec.md) for the interface.
 - **One clock.** FreeBSD defines `CLOCK_BOOTTIME` as `CLOCK_MONOTONIC`, so `IORING_REGISTER_CLOCK` takes either and `IORING_ENTER_ABS_TIMER` deadlines are times of that one clock.
 - **A cached ZFS read is a guess.** Linux runs a read in the enter only if the page cache can serve it without blocking (`IOCB_NOWAIT`). ZFS can't be asked, so kqring goes by whether the ring's recent reads slept, and a read it runs in the enter that misses the ARC holds up that enter until the disk answers, as it would hold up a `pread(2)` caller. After a few such reads, the ring's reads go back to workers. `IOSQE_ASYNC` always means a worker.
 - **`SIGPIPE`** is never raised.
+- **Restrictions and filters for a process.** `IORING_REGISTER_RESTRICTIONS` and `IORING_REGISTER_BPF_FILTER` without a ring apply to the whole process and the processes it forks, where Linux keeps them per thread. They need `PROC_NO_NEW_PRIVS_CTL` (`procctl(2)`) or root, and stay across `execve(2)`. A ring with BPF filters refuses kqring's extension requests with `-EACCES` ([docs/bpf-filters.md](docs/bpf-filters.md)).
 
 **Values and formats**
 - **Native values.** Flags and constants use their FreeBSD values: `O_*`, `AT_*`, `MSG_*`, `SOCK_*`, `POSIX_FADV_*`, `MADV_*`, `idtype_t` and `W*`. CQE errors are negated FreeBSD errnos.

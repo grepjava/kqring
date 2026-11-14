@@ -47,6 +47,7 @@
 #if defined(__linux__)
 #include <linux/io_uring.h>
 #include <sys/eventfd.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #define ring_sys_setup(n, p)	((int)syscall(__NR_io_uring_setup, (n), (p)))
 #define ring_sys_enter(fd, s, w, f, a, z) \
@@ -56,6 +57,7 @@
 #else
 #include <sys/eventfd.h>
 #include <sys/kqring.h>
+#include <sys/procctl.h>
 #define ring_sys_setup(n, p)	((int)kqring_setup((n), (p)))
 #define ring_sys_enter(fd, s, w, f, a, z) \
 	((int)kqring_enter((fd), (s), (w), (f), (a), (z)))
@@ -102,7 +104,8 @@ errname(int e)
 		{ EOPNOTSUPP, "EOPNOTSUPP" }, { EPIPE, "EPIPE" },
 		{ EINTR, "EINTR" }, { ENOMEM, "ENOMEM" }, { EACCES, "EACCES" },
 		{ ENOTSOCK, "ENOTSOCK" }, { EOVERFLOW, "EOVERFLOW" },
-		{ ENXIO, "ENXIO" },
+		{ ENXIO, "ENXIO" }, { EPERM, "EPERM" },
+		{ EMSGSIZE, "EMSGSIZE" },
 #if defined(__linux__)
 		{ EBADFD, "EBADFD" }, { ETIMEDOUT, "ETIMEDOUT" },
 #endif
@@ -2197,6 +2200,449 @@ c_reg_wait(void)
 	munmap(ro, (size_t)page);
 }
 
+/*
+ * Restrictions and classic BPF filters (IORING_REGISTER_RESTRICTIONS,
+ * IORING_REGISTER_BPF_FILTER).  The filter structs and BPF opcodes are
+ * spelled out here, in Linux's layout, so that the case doesn't depend on
+ * which headers the system has.
+ */
+struct t_insn {
+	uint16_t	code;
+	uint8_t		jt, jf;
+	uint32_t	k;
+};
+#define	T_LD		0x00
+#define	T_LDX		0x01
+#define	T_ST		0x02
+#define	T_ALU		0x04
+#define	T_JMP		0x05
+#define	T_RET		0x06
+#define	T_MISC		0x07
+#define	T_B		0x10
+#define	T_ABS		0x20
+#define	T_MEM		0x60
+#define	T_LEN		0x80
+#define	T_DIV		0x30
+#define	T_MOD		0x90
+#define	T_JEQ		0x10
+#define	T_X		0x08
+#define	T_A		0x10
+#define	T_TXA		0x80
+#define	T_STMT(c, k)	{ (uint16_t)(c), 0, 0, (k) }
+#define	T_JUMP(c, k, t, f) { (uint16_t)(c), (t), (f), (k) }
+#define	T_N(a)		((uint32_t)(sizeof(a) / sizeof((a)[0])))
+
+struct t_bpf {
+	uint16_t	cmd_type;
+	uint16_t	cmd_flags;
+	uint32_t	resv;
+	uint32_t	opcode;
+	uint32_t	flags;
+	uint32_t	filter_len;
+	uint8_t		pdu_size;
+	uint8_t		resv1[3];
+	uint64_t	filter_ptr;
+	uint64_t	resv2[5];
+};
+
+struct t_task_rst {
+	uint16_t	flags;
+	uint16_t	nr_res;
+	uint32_t	resv[3];
+	struct io_uring_restriction res[2];
+};
+
+static const struct t_insn t_allow[] = { T_STMT(T_RET, 1) };
+
+/* no_new_privs, which registering for the process needs (or root). */
+static void
+set_nnp(void)
+{
+#if defined(__linux__)
+	CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+#else
+	int v = PROC_NO_NEW_PRIVS_ENABLE;
+
+	CHECK(procctl(P_PID, 0, PROC_NO_NEW_PRIVS_CTL, &v) == 0);
+#endif
+}
+
+/* IORING_REGISTER_BPF_FILTER on fd (-1: the process); *pdu in and out. */
+static int
+t_filter(int fd, uint32_t opcode, uint32_t flags, const struct t_insn *f,
+    uint32_t len, uint8_t *pdu)
+{
+	struct t_bpf b;
+	int rc;
+
+	memset(&b, 0, sizeof(b));
+	b.cmd_type = 1;		/* IO_URING_BPF_CMD_FILTER */
+	b.opcode = opcode;
+	b.flags = flags;
+	b.filter_len = len;
+	b.filter_ptr = (uint64_t)(uintptr_t)f;
+	b.pdu_size = pdu != NULL ? *pdu : 0;
+	rc = ring_sys_register(fd, 37, &b, 1);
+	if (pdu != NULL)
+		*pdu = b.pdu_size;
+	return (rc);
+}
+
+/* Run fn in a child, so what it registers for itself goes with it. */
+static void
+in_child(void (*fn)(void))
+{
+	pid_t pid;
+	int st;
+
+	fflush(stdout);
+	pid = fork();
+	CHECK(pid >= 0);
+	if (pid == 0) {
+		fn();
+		fflush(stdout);
+		_exit(0);
+	}
+	CHECK(waitpid(pid, &st, 0) == pid);
+	say("child", "%d", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+}
+
+/*
+ * Ring restrictions: opcode entries alone leave registrations free, and an
+ * empty set restricts both.
+ */
+static void
+c_restrictions_split(void)
+{
+	struct io_uring_params p;
+	struct io_uring_restriction res[1];
+	struct io_uring_sqe *s;
+	struct ring r;
+	int fds[2];
+
+	CHECK(pipe(fds) == 0);
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_R_DISABLED;
+	ring_init(&r, 8, &p);
+	memset(res, 0, sizeof(res));
+	res[0].opcode = IORING_RESTRICTION_SQE_OP;
+	res[0].sqe_op = IORING_OP_NOP;
+	say_rc("ops_only", ring_sys_register(r.fd,
+	    IORING_REGISTER_RESTRICTIONS, res, 1));
+	say_rc("again", ring_sys_register(r.fd,
+	    IORING_REGISTER_RESTRICTIONS, res, 1));
+	say_rc("enable", ring_sys_register(r.fd,
+	    IORING_REGISTER_ENABLE_RINGS, NULL, 0));
+	say_rc("register_files", ring_sys_register(r.fd,
+	    IORING_REGISTER_FILES, fds, 2));
+	prep(&r, IORING_OP_NOP, -1, 1);
+	s = prep(&r, IORING_OP_READ, fds[0], 2);
+	s->len = 0;
+	say_rc("submit", submit(&r));
+	await(&r, 2, 2000);
+	dump_sorted(&r, "ops_only");
+	ring_free(&r);
+
+	ring_init(&r, 8, &p);
+	say_rc("none", ring_sys_register(r.fd,
+	    IORING_REGISTER_RESTRICTIONS, res, 0));
+	say_rc("enable", ring_sys_register(r.fd,
+	    IORING_REGISTER_ENABLE_RINGS, NULL, 0));
+	say_rc("register_files_none", ring_sys_register(r.fd,
+	    IORING_REGISTER_FILES, fds, 2));
+	prep(&r, IORING_OP_NOP, -1, 3);
+	(void)submit(&r);
+	await(&r, 1, 2000);
+	dump(&r, "none");
+	ring_free(&r);
+	close(fds[0]);
+	close(fds[1]);
+}
+
+static void
+task_restrict_child(void)
+{
+	struct t_task_rst tr;
+	struct io_uring_params p;
+	struct io_uring_sqe *s;
+	struct ring r;
+	uint64_t buf;
+	struct iovec iov = { &buf, sizeof(buf) };
+	int fds[2];
+
+	CHECK(pipe(fds) == 0);
+	memset(&tr, 0, sizeof(tr));
+	tr.nr_res = 2;
+	tr.res[0].opcode = IORING_RESTRICTION_SQE_OP;
+	tr.res[0].sqe_op = IORING_OP_NOP;
+	tr.res[1].opcode = IORING_RESTRICTION_REGISTER_OP;
+	tr.res[1].register_op = IORING_REGISTER_FILES;
+	if (geteuid() != 0)
+		say_rc("without_nnp", ring_sys_register(-1,
+		    IORING_REGISTER_RESTRICTIONS, &tr, 1));
+	else
+		printf("%s/without_nnp -EACCES\n", current);
+	set_nnp();
+	say_rc("nr_args_2", ring_sys_register(-1,
+	    IORING_REGISTER_RESTRICTIONS, &tr, 2));
+	say_rc("register", ring_sys_register(-1,
+	    IORING_REGISTER_RESTRICTIONS, &tr, 1));
+	say_rc("again", ring_sys_register(-1,
+	    IORING_REGISTER_RESTRICTIONS, &tr, 1));
+
+	ring_init(&r, 8, NULL);
+	say_rc("register_files", ring_sys_register(r.fd,
+	    IORING_REGISTER_FILES, fds, 2));
+	say_rc("register_buffers", ring_sys_register(r.fd,
+	    IORING_REGISTER_BUFFERS, &iov, 1));
+	prep(&r, IORING_OP_NOP, -1, 1);
+	s = prep(&r, IORING_OP_READ, fds[0], 2);
+	s->len = 0;
+	say_rc("submit", submit(&r));
+	await(&r, 2, 2000);
+	dump_sorted(&r, "inherited");
+	ring_free(&r);
+
+	/* A disabled ring: the process's register rules apply already. */
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_R_DISABLED;
+	ring_init(&r, 8, &p);
+	say_rc("ring_restrictions", ring_sys_register(r.fd,
+	    IORING_REGISTER_RESTRICTIONS, tr.res, 1));
+	say_rc("enable", ring_sys_register(r.fd,
+	    IORING_REGISTER_ENABLE_RINGS, NULL, 0));
+	ring_free(&r);
+
+	/* A filter for the process too, after restrictions: allowed. */
+	say_rc("filter", t_filter(-1, IORING_OP_NOP, 0, t_allow, 1, NULL));
+	close(fds[0]);
+	close(fds[1]);
+}
+
+static void
+task_restrict_grandchild(void)
+{
+	struct ring r;
+
+	struct io_uring_sqe *s;
+	int fd = scratch_file("x", 1);
+
+	ring_init(&r, 8, NULL);
+	prep(&r, IORING_OP_NOP, -1, 1);
+	s = prep(&r, IORING_OP_FSYNC, fd, 2);
+	s->len = 0;
+	(void)submit(&r);
+	await(&r, 2, 2000);
+	dump_sorted(&r, "forked");
+	ring_free(&r);
+	close(fd);
+}
+
+static void
+task_restrict_forker(void)
+{
+	struct t_task_rst tr;
+
+	memset(&tr, 0, sizeof(tr));
+	tr.nr_res = 1;
+	tr.res[0].opcode = IORING_RESTRICTION_SQE_OP;
+	tr.res[0].sqe_op = IORING_OP_NOP;
+	set_nnp();
+	say_rc("register", ring_sys_register(-1,
+	    IORING_REGISTER_RESTRICTIONS, &tr, 1));
+	in_child(task_restrict_grandchild);
+}
+
+/* Restrictions for the process, then for the rings it sets up. */
+static void
+c_task_restrict(void)
+{
+	in_child(task_restrict_child);
+	in_child(task_restrict_forker);
+}
+
+static void
+bpf_filter_child(void)
+{
+	/* user_data's low word 7: deny. */
+	static const struct t_insn deny7[] = {
+		T_STMT(T_LD | T_ABS, 0),
+		T_JUMP(T_JMP | T_JEQ, 7, 0, 1),
+		T_STMT(T_RET, 0),
+		T_STMT(T_RET, 1),
+	};
+	/* The context's length (40) through scratch memory and X. */
+	static const struct t_insn len40[] = {
+		T_STMT(T_LD | T_LEN, 0),
+		T_STMT(T_ST, 0),
+		T_STMT(T_LDX | T_MEM, 0),
+		T_STMT(T_MISC | T_TXA, 0),
+		T_JUMP(T_JMP | T_JEQ, 40, 0, 1),
+		T_STMT(T_RET, 1),
+		T_STMT(T_RET, 0),
+	};
+	/* A division by an X of 0: the program returns 0. */
+	static const struct t_insn divx0[] = {
+		T_STMT(T_LDX, 0),
+		T_STMT(T_LD, 1),
+		T_STMT(T_ALU | T_DIV | T_X, 0),
+		T_STMT(T_RET, 1),
+	};
+	/* SOCKET: only family 2 (AF_INET on both systems). */
+	static const struct t_insn inet[] = {
+		T_STMT(T_LD | T_ABS, 16),
+		T_JUMP(T_JMP | T_JEQ, 2, 0, 1),
+		T_STMT(T_RET, 1),
+		T_STMT(T_RET, 0),
+	};
+	static const struct t_insn mod[] = {
+		T_STMT(T_LD, 5), T_STMT(T_ALU | T_MOD, 2), T_STMT(T_RET | T_A, 0),
+	};
+	static const struct t_insn byte[] = {
+		T_STMT(T_LD | T_B | T_ABS, 0), T_STMT(T_RET | T_A, 0),
+	};
+	static const struct t_insn unaligned[] = {
+		T_STMT(T_LD | T_ABS, 2), T_STMT(T_RET | T_A, 0),
+	};
+	static const struct t_insn past[] = {
+		T_STMT(T_LD | T_ABS, 40), T_STMT(T_RET | T_A, 0),
+	};
+	static const struct t_insn jump_past[] = {
+		T_STMT(T_JMP, 1), T_STMT(T_RET, 1),
+	};
+	static const struct t_insn no_ret[] = { T_STMT(T_LD, 1) };
+	static const struct t_insn mem_unset[] = {
+		T_STMT(T_LD | T_MEM, 0), T_STMT(T_RET | T_A, 0),
+	};
+	static const struct t_insn div0[] = {
+		T_STMT(T_LD, 1), T_STMT(T_ALU | T_DIV, 0), T_STMT(T_RET | T_A, 0),
+	};
+	struct io_uring_sqe *s;
+	struct t_bpf b;
+	struct ring r, r2;
+	uint8_t pdu;
+	int fd = scratch_file("x", 1);
+
+	memset(&b, 0, sizeof(b));
+	if (geteuid() != 0)
+		say_rc("task_without_nnp", t_filter(-1, IORING_OP_NOP, 0,
+		    t_allow, 1, NULL));
+	else
+		printf("%s/task_without_nnp -EACCES\n", current);
+	set_nnp();
+	ring_init(&r, 8, NULL);
+	say_rc("nr_args_0", ring_sys_register(r.fd, 37, &b, 0));
+	say_rc("mod", t_filter(r.fd, IORING_OP_NOP, 0, mod, T_N(mod), NULL));
+	say_rc("byte_load", t_filter(r.fd, IORING_OP_NOP, 0, byte, T_N(byte),
+	    NULL));
+	say_rc("unaligned", t_filter(r.fd, IORING_OP_NOP, 0, unaligned,
+	    T_N(unaligned), NULL));
+	say_rc("past_ctx", t_filter(r.fd, IORING_OP_NOP, 0, past, T_N(past),
+	    NULL));
+	say_rc("jump_past", t_filter(r.fd, IORING_OP_NOP, 0, jump_past,
+	    T_N(jump_past), NULL));
+	say_rc("no_ret", t_filter(r.fd, IORING_OP_NOP, 0, no_ret,
+	    T_N(no_ret), NULL));
+	say_rc("mem_unset", t_filter(r.fd, IORING_OP_NOP, 0, mem_unset,
+	    T_N(mem_unset), NULL));
+	say_rc("div_zero", t_filter(r.fd, IORING_OP_NOP, 0, div0, T_N(div0),
+	    NULL));
+	say_rc("len_0", t_filter(r.fd, IORING_OP_NOP, 0, t_allow, 0, NULL));
+	say_rc("len_4097", t_filter(r.fd, IORING_OP_NOP, 0, t_allow, 4097,
+	    NULL));
+	say_rc("opcode_255", t_filter(r.fd, 255, 0, t_allow, 1, NULL));
+	say_rc("flags_4", t_filter(r.fd, IORING_OP_NOP, 4, t_allow, 1, NULL));
+	memset(&b, 0, sizeof(b));
+	b.cmd_type = 2;
+	b.opcode = IORING_OP_NOP;
+	b.filter_len = 1;
+	b.filter_ptr = (uint64_t)(uintptr_t)t_allow;
+	say_rc("cmd_type_2", ring_sys_register(r.fd, 37, &b, 1));
+	pdu = 24;
+	say_rc("pdu_big", t_filter(r.fd, IORING_OP_SOCKET, 0, t_allow, 1,
+	    &pdu));
+	say("pdu_big_out", "%d", pdu);
+	pdu = 8;
+	say_rc("pdu_strict", t_filter(r.fd, IORING_OP_SOCKET, 2, t_allow, 1,
+	    &pdu));
+	say("pdu_strict_out", "%d", pdu);
+	pdu = 0;
+	say_rc("pdu_nop", t_filter(r.fd, IORING_OP_NOP, 0, t_allow, 1, &pdu));
+	say("pdu_nop_out", "%d", pdu);
+
+	say_rc("deny7", t_filter(r.fd, IORING_OP_NOP, 0, deny7, T_N(deny7),
+	    NULL));
+	say_rc("len40", t_filter(r.fd, IORING_OP_NOP, 0, len40, T_N(len40),
+	    NULL));
+	prep(&r, IORING_OP_NOP, -1, 7);
+	prep(&r, IORING_OP_NOP, -1, 8);
+	say_rc("submit", submit(&r));
+	await(&r, 2, 2000);
+	dump_sorted(&r, "nop_filters");
+
+	ring_init(&r2, 8, NULL);
+	say_rc("divx0", t_filter(r2.fd, IORING_OP_NOP, 0, divx0, T_N(divx0),
+	    NULL));
+	prep(&r2, IORING_OP_NOP, -1, 9);
+	(void)submit(&r2);
+	await(&r2, 1, 2000);
+	dump(&r2, "divx0");
+	ring_free(&r2);
+
+	/* Deny the rest; a filter added later can't undo that. */
+	ring_init(&r2, 8, NULL);
+	say_rc("deny_rest", t_filter(r2.fd, IORING_OP_NOP, 1, t_allow, 1,
+	    NULL));
+	say_rc("allow_fsync", t_filter(r2.fd, IORING_OP_FSYNC, 0, t_allow,
+	    1, NULL));
+	prep(&r2, IORING_OP_NOP, -1, 10);
+	prep(&r2, IORING_OP_FSYNC, fd, 11);
+	(void)submit(&r2);
+	await(&r2, 2, 2000);
+	dump_sorted(&r2, "deny_rest");
+	ring_free(&r2);
+
+	ring_init(&r2, 8, NULL);
+	say_rc("inet_only", t_filter(r2.fd, IORING_OP_SOCKET, 0, inet,
+	    T_N(inet), NULL));
+	s = prep(&r2, IORING_OP_SOCKET, 2, 12);	/* AF_INET */
+	s->off = SOCK_STREAM;
+	s = prep(&r2, IORING_OP_SOCKET, 1, 13);	/* AF_UNIX */
+	s->off = SOCK_STREAM;
+	res_fd_mask = 1ULL << 12;
+	(void)submit(&r2);
+	await(&r2, 2, 2000);
+	dump_sorted(&r2, "socket");
+	res_fd_mask = 0;
+	ring_free(&r2);
+
+	/* For the process: rings set up afterwards only. */
+	ring_free(&r);
+	ring_init(&r2, 8, NULL);
+	say_rc("task_deny7", t_filter(-1, IORING_OP_NOP, 0, deny7,
+	    T_N(deny7), NULL));
+	prep(&r2, IORING_OP_NOP, -1, 7);
+	(void)submit(&r2);
+	await(&r2, 1, 2000);
+	dump(&r2, "ring_before");
+	ring_free(&r2);
+	ring_init(&r, 8, NULL);
+	prep(&r, IORING_OP_NOP, -1, 7);
+	prep(&r, IORING_OP_NOP, -1, 6);
+	(void)submit(&r);
+	await(&r, 2, 2000);
+	dump_sorted(&r, "ring_after");
+	ring_free(&r);
+	close(fd);
+}
+
+/* Classic BPF filters on a ring and for the process. */
+static void
+c_bpf_filter(void)
+{
+	in_child(bpf_filter_child);
+}
+
 static const struct {
 	const char	*name;
 	void		(*fn)(void);
@@ -2231,6 +2677,9 @@ static const struct {
 	{ "abs_timer", c_abs_timer },
 	{ "reg_wait", c_reg_wait },
 	{ "ext_arg_order", c_ext_arg_order },
+	{ "restrictions_split", c_restrictions_split },
+	{ "task_restrict", c_task_restrict },
+	{ "bpf_filter", c_bpf_filter },
 };
 
 static void

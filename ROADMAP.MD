@@ -21,6 +21,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 11 | Cached file reads | Done |
 | 12 | Fan-in against kqueue | Done |
 | 13 | Refresh the evidence | Done |
+| 14 | liburing's remaining failures and skips | Done |
 
 ## Where kqring stands
 
@@ -28,10 +29,10 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 
 FreeBSD-native extensions add persistent event-driven chains, result and buffer forwarding between steps, native kevent requests and a kqueue bridge. These stay an opt-in interface alongside the Linux-compatible API.
 
-The liburing 2.15 port passes 220 of the 245 tests it builds, with `RLIMIT_MEMLOCK` raised. That isn't a compatibility percentage:
+The liburing 2.15 port passes 223 of the 245 tests it builds, with `RLIMIT_MEMLOCK` raised. That isn't a compatibility percentage:
 
 - 13 more tests can't be built here, each for a recorded reason.
-- The port carries portability shims and adapts some tests, 27 tests skip, and the 6 failures are intentional differences or the platform's.
+- The port carries portability shims and adapts some tests, 17 tests skip, and the 5 failures are the platform's.
 - A test stops at its first failure, so the subtests after it haven't run.
 
 The probe also can't speak for every variant of an operation. `SYNC_FILE_RANGE` syncs the whole file, and `URING_CMD` supports four socket commands only.
@@ -251,6 +252,21 @@ Progress (14 November 2026):
 - BENCHMARK.MD's generator now fails if its summary's claims about fan-in and ping-pong stop holding. Its comparison with the i5 leaves out the laptop's fan-in, measured with the old buffer pool, and the README marks those rows. The claim that an enter costs kqring 250 ns more than io_uring, from before phase 10, is corrected in the README and docs/linux-comparison.md.
 
 Phase 13 is done: BENCHMARK.MD names one build for every figure, with its raw runs; on the Ryzen kqring is now level with kqueue on sockets, ahead on fan-in up to 256 connections, and behind on a single request per enter.
+
+## Phase 14: liburing's remaining failures and skips
+
+Every liburing test that fails or skips has a written reason ([liburing/README.md](liburing/README.md#test-results)). This phase checks each reason again and turns into a pass whatever kqring can.
+
+Acceptance: each of the 6 failures and 19 skips passes, or its reason is still true and written down; what kqring adds matches Linux 7.3 in `tests/kqring_diff.c`; the unit tests, the cross-process test, stress, the fuzzer and liburing pass as before or better.
+
+Progress (14 November 2026), on the Ryzen:
+
+- Restrictions and classic BPF filters for a process (`IORING_REGISTER_RESTRICTIONS` without a ring, `IORING_REGISTER_BPF_FILTER`), from Linux 7.3's source: `task-restrict` and `cbpf_filter`, which skipped, pass, and three new `kqring_diff` cases match Linux 7.3 line for line ([docs/bpf-filters.md](docs/bpf-filters.md)). kqring keeps them per process rather than per thread. Along the way, a ring's restrictions that named only request opcodes no longer refuse its registrations.
+- `iopoll-sync` failed only on `getsockopt(2)` returning the option's bit; adapted as `socket-getsetsock-cmd` is, it passes.
+- liburing: 223 of 245 pass (was 220), 17 skip, 5 fail. The failures (`self`, `pipe-reuse`, `splice`, `recv-bundle-short-ooo`, `vec-regbuf`) and the remaining skips were checked again against their output, and still hold: `self` can't open `/proc/self/comm`; `vec-regbuf` reads 48,972 bytes of 49,185 from ZFS; `pipe-reuse` and `splice` block in the test's own `write(2)` to a pipe (`pipe_direct_write`), and `recv-bundle-short-ooo` in its `write(2)` to a full loopback socket (`sosend`); each skip prints the missing facility its row names, or skips before printing anything.
+- Validation of the build: unit tests 147 of 147, the cross-process test 20 rounds, `kqring_diff` 33 cases without a problem, stress 600 s and the fuzzer 1,800 s (seed 7319) passed, with no new crash dump.
+
+Phase 14 is done: the two skips kqring could turn into passes, and one failure, now pass; every remaining failure and skip has a reason confirmed on this build.
 
 ## Research
 

@@ -627,6 +627,7 @@ enum {
 	IORING_REGISTER_RESIZE_RINGS		= 33,
 	IORING_REGISTER_MEM_REGION		= 34,
 	IORING_REGISTER_QUERY			= 35,	/* with or without a ring */
+	IORING_REGISTER_BPF_FILTER		= 37,	/* with or without a ring */
 	IORING_REGISTER_LAST
 };
 
@@ -698,6 +699,84 @@ struct io_uring_restriction {
 	};
 	__u8	resv;
 	__u32	resv2[3];
+};
+
+/*
+ * IORING_REGISTER_RESTRICTIONS with no ring (fd -1, nr_args 1): for the
+ * process and the processes it forks, applied to every ring they set up
+ * afterwards.  Needs PROC_NO_NEW_PRIVS_CTL (procctl(2)) or root.
+ */
+struct io_uring_task_restriction {
+	__u16	flags;
+	__u16	nr_res;
+	__u32	resv[3];
+	struct io_uring_restriction restrictions[];
+};
+
+/*
+ * IORING_REGISTER_BPF_FILTER (nr_args 1), on a ring or with no ring for the
+ * process: a classic BPF program (struct bpf_insn, as Linux's struct
+ * sock_filter) run on each request of one opcode as it is submitted.  It
+ * sees a struct io_uring_bpf_ctx through BPF_LD|BPF_W|BPF_ABS, in host byte
+ * order; 0 denies the request (-EACCES), anything else lets it through.
+ */
+struct io_uring_bpf_ctx {
+	__u64	user_data;
+	__u8	opcode;
+	__u8	sqe_flags;
+	__u8	pdu_size;	/* bytes of the union below for this opcode */
+	__u8	pad[5];
+	union {
+		struct {		/* IORING_OP_SOCKET */
+			__u32	family;
+			__u32	type;
+			__u32	protocol;
+		} socket;
+		struct {		/* IORING_OP_OPENAT, IORING_OP_OPENAT2 */
+			__u64	flags;
+			__u64	mode;
+			__u64	resolve;
+		} open;
+		struct {		/* IORING_OP_CONNECT */
+			__u32	family;
+			__u16	port;		/* network byte order */
+			__u8	pad[2];
+			union {
+				__u32	v4_addr;	/* network byte order */
+				__u8	v6_addr[16];
+			};
+		} connect;
+	};
+};
+
+enum {
+	/* Every opcode with no filter yet gets one that denies. */
+	IO_URING_BPF_FILTER_DENY_REST	= 1,
+	/* Fail if pdu_size is not this kernel's size for the opcode. */
+	IO_URING_BPF_FILTER_SZ_STRICT	= 2,
+};
+
+struct io_uring_bpf_filter {
+	__u32	opcode;
+	__u32	flags;
+	__u32	filter_len;	/* instructions, 1 to 4096 */
+	__u8	pdu_size;	/* in: expected; out: the kernel's */
+	__u8	resv[3];
+	__u64	filter_ptr;	/* struct bpf_insn * */
+	__u64	resv2[5];
+};
+
+enum {
+	IO_URING_BPF_CMD_FILTER	= 1,
+};
+
+struct io_uring_bpf {
+	__u16	cmd_type;
+	__u16	cmd_flags;
+	__u32	resv;
+	union {
+		struct io_uring_bpf_filter	filter;
+	};
 };
 
 /* IORING_REGISTER_SYNC_CANCEL */

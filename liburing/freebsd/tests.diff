@@ -210,53 +210,59 @@
  		}
 --- test/cbpf_filter.c
 +++ test/cbpf_filter.c
-@@ -2653,7 +2653,7 @@
- 	waitpid(pid, &status, 0);
- 	if (WIFEXITED(status)) {
- 		int code = WEXITSTATUS(status);
--		if (code == EINVAL || code == ENOSYS)
-+		if (code == EINVAL || code == ENOSYS || code == EOPNOTSUPP)
- 			return -1;  /* Not supported */
- 		return 0;  /* Supported (or other error we'll catch later) */
+@@ -16,6 +16,7 @@
+ #include <sys/prctl.h>
+ #include <linux/filter.h>
+ #include <netinet/in.h>
++#include <netinet/tcp.h>
+ #include <sys/un.h>
+ 
+ #include "liburing.h"
+@@ -25,6 +26,13 @@
+ #ifndef RESOLVE_IN_ROOT
+ #define RESOLVE_IN_ROOT	0x10
+ #endif
++/*
++ * kqring has no RESOLVE_IN_ROOT, and refuses it before any filter runs.
++ * RESOLVE_BENEATH stands in: the filter reads the resolve field the same
++ * way whichever bit it tests.
++ */
++#undef RESOLVE_IN_ROOT
++#define RESOLVE_IN_ROOT	0x08	/* RESOLVE_BENEATH */
+ 
+ /*
+  * cBPF filter context layout (struct io_uring_bpf_ctx):
+@@ -638,6 +646,18 @@
+ 	if (fd < 0) {
+ 		printf("FAIL (socket: %s)\n", strerror(errno));
+ 		return -1;
++	}
++	/*
++	 * A connect the filter lets through may go to an address nobody
++	 * answers (2001:db8::1 leaves a host with an IPv6 route): give up
++	 * after a second rather than FreeBSD's 75, so the test fits make
++	 * check's 30.  Only whether the filter denied it matters here.
++	 */
++	{
++		int keepinit = 1;
++
++		setsockopt(fd, IPPROTO_TCP, TCP_KEEPINIT, &keepinit,
++		    sizeof(keepinit));
  	}
---- test/task-restrict.c
-+++ test/task-restrict.c
-@@ -75,7 +75,7 @@
  
- 		/* Register task restriction, then create ring */
- 		ret = register_task_restrictions(res, 1);
--		if (ret == -EINVAL || ret == -EBADF) {
-+		if (ret == -EINVAL || ret == -EBADF || ret == -EOPNOTSUPP) {
- 			/* Kernel doesn't support per-task restrictions */
- 			_exit(T_EXIT_SKIP);
- 		}
-@@ -170,7 +170,7 @@
- 
- 		/* Register task restriction then fork again */
- 		ret = register_task_restrictions(res, 2);
--		if (ret == -EINVAL) {
-+		if (ret == -EINVAL || ret == -EOPNOTSUPP) {
- 			_exit(T_EXIT_SKIP);
- 		}
- 		if (ret) {
-@@ -278,7 +278,7 @@
- 		prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
- 
- 		ret = register_task_restrictions(res, 1);
--		if (ret == -EINVAL) {
-+		if (ret == -EINVAL || ret == -EOPNOTSUPP) {
- 			_exit(T_EXIT_SKIP);
- 		}
- 		if (ret) {
-@@ -325,7 +325,7 @@
- 		prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
- 
- 		ret = register_task_restrictions(res, 1);
--		if (ret == -EINVAL) {
-+		if (ret == -EINVAL || ret == -EOPNOTSUPP) {
- 			_exit(T_EXIT_SKIP);
- 		}
- 		if (ret) {
+ 	sqe = io_uring_get_sqe(ring);
+--- test/iopoll-sync.c
++++ test/iopoll-sync.c
+@@ -113,7 +113,8 @@
+ 		fprintf(stderr, "GETSOCKOPT returned %d\n", cqe->res);
+ 		return T_EXIT_FAIL;
+ 	}
+-	if (optval3 != 1) {
++	/* FreeBSD's getsockopt(2) returns the option's bit, not 1. */
++	if (!optval3) {
+ 		fprintf(stderr, "optval %d != 1\n", optval3);
+ 		return T_EXIT_FAIL;
+ 	}
 --- test/sendzc-bug.c
 +++ test/sendzc-bug.c
 @@ -89,9 +89,11 @@

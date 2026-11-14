@@ -119,8 +119,8 @@ newer/uring_cmd128 ud=2 res=-EINVAL flags=-
 newer/timeout_immediate ud=3 res=-EINVAL flags=-
 newer/getsockname ud=4 res=-EOPNOTSUPP flags=-
 newer/register_zcrx_ctrl -EOPNOTSUPP
-newer/register_bpf_filter -EOPNOTSUPP
-newer/task_restrictions -EOPNOTSUPP
+newer/register_bpf_filter -EINVAL
+newer/task_restrictions -EACCES
 newer/pbuf_min_left -EINVAL
 bad_sqe/opcode ud=1 res=-EINVAL flags=-
 bad_sqe/flags ud=2 res=-EINVAL flags=-
@@ -350,4 +350,71 @@ reg_wait/enabled_wait -EFAULT
 ext_arg_order/bad_argsz -EINVAL
 ext_arg_order/submitted 0
 ext_arg_order/cqe ud=1 res=0 flags=-
+restrictions_split/ops_only 0
+restrictions_split/again -EBUSY
+restrictions_split/enable 0
+restrictions_split/register_files 0
+restrictions_split/submit 2
+restrictions_split/ops_only ud=1 res=0 flags=-
+restrictions_split/ops_only ud=2 res=-EACCES flags=-
+restrictions_split/none 0
+restrictions_split/enable 0
+restrictions_split/register_files_none -EACCES
+restrictions_split/none ud=3 res=-EACCES flags=-
+task_restrict/without_nnp -EACCES
+task_restrict/nr_args_2 -EINVAL
+task_restrict/register 0
+task_restrict/again -EPERM
+task_restrict/register_files 0
+task_restrict/register_buffers -EACCES
+task_restrict/submit 2
+task_restrict/inherited ud=1 res=0 flags=-
+task_restrict/inherited ud=2 res=-EACCES flags=-
+task_restrict/ring_restrictions -EACCES
+task_restrict/enable -EACCES
+task_restrict/filter 0
+task_restrict/child 0
+task_restrict/register 0
+task_restrict/forked ud=1 res=0 flags=-
+task_restrict/forked ud=2 res=-EACCES flags=-
+task_restrict/child 0
+task_restrict/child 0
+bpf_filter/task_without_nnp -EACCES
+bpf_filter/nr_args_0 -EINVAL
+bpf_filter/mod -EINVAL
+bpf_filter/byte_load -EINVAL
+bpf_filter/unaligned -EINVAL
+bpf_filter/past_ctx -EINVAL
+bpf_filter/jump_past -EINVAL
+bpf_filter/no_ret -EINVAL
+bpf_filter/mem_unset -EINVAL
+bpf_filter/div_zero -EINVAL
+bpf_filter/len_0 -EINVAL
+bpf_filter/len_4097 -EINVAL
+bpf_filter/opcode_255 -EINVAL
+bpf_filter/flags_4 -EINVAL
+bpf_filter/cmd_type_2 -EINVAL
+bpf_filter/pdu_big -EMSGSIZE
+bpf_filter/pdu_big_out 12
+bpf_filter/pdu_strict -EMSGSIZE
+bpf_filter/pdu_strict_out 12
+bpf_filter/pdu_nop 0
+bpf_filter/pdu_nop_out 0
+bpf_filter/deny7 0
+bpf_filter/len40 0
+bpf_filter/submit 1
+bpf_filter/nop_filters ud=7 res=-EACCES flags=-
+bpf_filter/divx0 0
+bpf_filter/divx0 ud=9 res=-EACCES flags=-
+bpf_filter/deny_rest 0
+bpf_filter/allow_fsync 0
+bpf_filter/deny_rest ud=10 res=0 flags=-
+bpf_filter/deny_rest ud=11 res=-EACCES flags=-
+bpf_filter/inet_only 0
+bpf_filter/socket ud=12 res=fd flags=-
+bpf_filter/socket ud=13 res=-EACCES flags=-
+bpf_filter/task_deny7 0
+bpf_filter/ring_before ud=7 res=0 flags=-
+bpf_filter/ring_after ud=7 res=-EACCES flags=-
+bpf_filter/child 0
 # end

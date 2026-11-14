@@ -57,7 +57,7 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_OP_MADVISE` | Equivalent | | `kqring_exec_sync` | `test_path_ops`, `liburing/madvise`, `fuzz` |
 | `IORING_OP_SEND` | Equivalent | Takes provided buffers, bundles and a destination address. `SIGPIPE` is never raised. | `kqring_exec_send` | `test_send_armed`, `liburing/send_recv`, `liburing/recvsend_bundle`, `fuzz` |
 | `IORING_OP_RECV` | Equivalent | A read at end of file consumes no provided buffer. | `kqring_exec_recv` | `test_multishot_and_eof`, `test_waitall`, `test_short_links`, `liburing/send_recv`, `liburing/recv-multishot`, `fuzz` |
-| `IORING_OP_OPENAT2` | Equivalent | | `kqring_exec_openat` | `test_path_ops`, `liburing/openat2`, `fuzz` |
+| `IORING_OP_OPENAT2` | Partial | `RESOLVE_BENEATH`, `RESOLVE_NO_MAGICLINKS` and `RESOLVE_CACHED`; `RESOLVE_IN_ROOT`, `RESOLVE_NO_XDEV` and `RESOLVE_NO_SYMLINKS` fail with `EINVAL`. **Platform:** FreeBSD's lookup can't take a directory as its root. | `kqring_exec_openat` | `test_path_ops`, `liburing/openat2`, `fuzz` |
 | `IORING_OP_EPOLL_CTL` | Unsupported | `-EOPNOTSUPP`. **Platform:** FreeBSD has no epoll. | `kqring_req_prep` | `test_phase2_validation`, `liburing/poll-v-poll` |
 | `IORING_OP_SPLICE` | Partial | One side must be a pipe. **Platform:** large pipe writes block until read, which stops `liburing/splice` early. | `kqring_exec_splice` | `test_splice_and_tee`, `liburing/splice`, `fuzz` |
 | `IORING_OP_PROVIDE_BUFFERS` | Partial | At most 2^18 buffers per ring. | `kqring_provide_buffers` | `test_buffer_groups`, `test_worker_buffer_reservation` |
@@ -162,7 +162,7 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_REGISTER_PROBE` | Equivalent | Works from any thread. | `kqring_register_probe` | `test_probe`, `liburing/probe`, `fuzz` |
 | `IORING_REGISTER_PERSONALITY` | Different | Can't be used to leave capability mode. | `kqring_personality_register` | `test_personality`, `liburing/personality`, `fuzz` |
 | `IORING_UNREGISTER_PERSONALITY` | Equivalent | | `kqring_personality_unregister` | `test_personality` |
-| `IORING_REGISTER_RESTRICTIONS` | Equivalent | | `kqring_restrictions_register` | `test_restrictions`, `liburing/register-restrictions` |
+| `IORING_REGISTER_RESTRICTIONS` | Equivalent | Opcode and flag entries restrict requests, register entries registrations, each only if some were given. | `kqring_restrictions_register` | `test_restrictions`, `liburing/register-restrictions`, `diff/restrictions_split` |
 | `IORING_REGISTER_ENABLE_RINGS` | Equivalent | | `kqring_register_op` | `test_restrictions`, `liburing/register-restrictions`, `fuzz` |
 | `IORING_REGISTER_FILES2` | Equivalent | | `kqring_files_register` | `test_rsrc_tags`, `liburing/rsrc_tags` |
 | `IORING_REGISTER_FILES_UPDATE2` | Equivalent | A refused descriptor leaves its slot empty. | `kqring_files_update` | `test_rsrc_tags`, `test_files_update_refused`, `liburing/rsrc_tags` |
@@ -189,8 +189,8 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_REGISTER_MEM_REGION` | Equivalent | One region per ring, the caller's pages (held, so they must be mapped writable) or the module's, mapped at the offset it returns. With `IORING_MEM_REGION_REG_WAIT_ARG` it holds registered waits, and needs a ring still disabled. The module's memory counts against `kern.kqring.user_ring_mem` (see Resource limits). | `kqring_register_mem_region` | `test_reg_wait`, `liburing/reg-wait`, `fuzz` |
 | `IORING_REGISTER_QUERY` | Partial | With or without a ring. `IO_URING_QUERY_OPCODES` reports kqring's own counts, flags and features; `IO_URING_QUERY_SCQ` its 64-byte ring header. `IO_URING_QUERY_ZCRX` gives `-EOPNOTSUPP`, as kqring has no zero-copy receive. | `kqring_register_query` | `test_register_query`, `liburing/ring-query`, `fuzz` |
 | `IORING_REGISTER_ZCRX_CTRL` | Unsupported | `EOPNOTSUPP`. **Platform:** needs driver support FreeBSD lacks. | `kqring_register_op` | `test_compat_contracts` |
-| `IORING_REGISTER_BPF_FILTER` | Unsupported | `EOPNOTSUPP`. | `kqring_register_op` | `test_compat_contracts` |
-| `io_uring_task_restriction` | Unsupported | `EOPNOTSUPP`: restrictions apply to one ring. | `kqring_register_blind` | `test_compat_contracts` |
+| `IORING_REGISTER_BPF_FILTER` | Different | Classic BPF filters on `struct io_uring_bpf_ctx`, checked and run as Linux's, on a ring or without one for the process (see `io_uring_task_restriction`). A ring with filters refuses kqring's extension requests with `-EACCES`. [docs/bpf-filters.md](docs/bpf-filters.md). | `kqring_bpf_register`, `kqring_bpf_check` | `test_bpf_process`, `liburing/cbpf_filter`, `diff/bpf_filter` |
+| `io_uring_task_restriction` | Different | `IORING_REGISTER_RESTRICTIONS` without a ring, applied to the rings set up afterwards. Kept per process, not per thread, inherited by `fork(2)` and kept across `execve(2)`; needs `PROC_NO_NEW_PRIVS_CTL` or root. | `kqring_task_restrictions_register` | `test_bpf_process`, `liburing/task-restrict`, `diff/task_restrict` |
 | `io_uring_buf_reg.min_left` | Equivalent | Only with `IOU_PBUF_RING_INC`, else `EINVAL`. A buffer with less than `min_left` bytes left is used up, without `IORING_CQE_F_BUF_MORE`. | `kqring_pbuf_register`, `kqring_buf_commit` | `test_buffer_groups`, `test_compat_contracts`, `liburing/recvmsg-inc-tail`, `fuzz` |
 
 ## Features
