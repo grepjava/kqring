@@ -23,6 +23,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 13 | Refresh the evidence | Done |
 | 14 | liburing's remaining failures and skips | Done |
 | 15 | A worker that can't hang, and small gaps | Done |
+| 16 | Fan-in at a thousand connections | Done |
 
 ## Where kqring stands
 
@@ -293,6 +294,27 @@ Progress (14 November 2026), on the Ryzen:
 - Validation: unit tests 151 of 151, the cross-process test 20 rounds, `kqring_diff` 38 cases without a problem (33 match, 5 differ on purpose; [docs/conformance/](docs/conformance/) from three identical runs on each system), liburing 223 passed, 17 skipped, 5 failed as before, stress 600 s and the fuzzer 1,800 s (seed 1515) passed, with no new crash dump.
 
 Phase 15 is done: no kqring worker hangs on a self-mapped tmpfs file, and the four gaps are closed except a polled wait from another thread on a `SINGLE_ISSUER` `IOPOLL` ring.
+
+## Phase 16: Fan-in at a thousand connections
+
+With multishot receives armed on 1,024 AF_UNIX connections, kqring collects a message about 10% slower than kqueue on the Ryzen, and 18% slower at 2,048; up to 512 it is level or ahead ([docs/fan-in.md](docs/fan-in.md#what-is-left)). Most of the extra time is the writer's `write(2)` waiting for the socket's own lines from memory: the working set has outgrown the 4 MiB L3, and what each armed receive adds per connection decides how far. Each message touches the request's four hot lines, the socket's waiter list (a separate allocation), on AF_UNIX the end-of-input knote, and the provided buffer, where kqueue touches a knote.
+
+Order of work:
+
+1. Measure the build from phase 15 at 512, 1,024 and 2,048 connections, kqueue against multishot on both kinds of ring, with the DRAM fills per function, to know what each line is worth.
+2. Fewer lines per armed receive, each change measured on its own against the one before: the request's cycle in fewer lines; the waiter list in the request when it is the socket's only waiter; on AF_UNIX, one structure per connection rather than an upcall and a knote.
+3. Keep what helps, and check what it might slow: one `NOP` per enter, ping-pong, fan-in at 16 and 256, the single-shot batch.
+
+Acceptance: multishot fan-in at 1,024 and 2,048 connections on a `DEFER_TASKRUN` ring within 5% of kqueue or ahead, or what stops it measured and written down; nothing else in `kqring_xbench` more than 2% slower; the unit tests, the cross-process test, `kqring_diff`, liburing, stress and the fuzzer pass as before.
+
+Progress (14 November 2026), on the Ryzen ([docs/fan-in.md](docs/fan-in.md#a-thousand-connections-again)):
+
+- The request's upcall fields have a cache line of their own, its hot fields sit in the next lines, and a socket's only waiter is the upcall's argument, with no waiter list. Multishot fan-in is 6–8% faster at 1,024 and 2,048 connections on both kinds of ring; nothing else in `kqring_xbench` moved more than 1.2%.
+- On a `DEFER_TASKRUN` ring multishot is now 2% behind kqueue at 1,024 connections, from 11%, and 8% at 2,048, from 16%; a default ring is level at 1,024 and 9% ahead at 2,048. At 2,048 the working set still outgrows the L3: each message brings 1.4 more lines from memory than kqueue's, 0.4 of them the provided buffer and its ring entry.
+- The lone waiter first panicked the stress test: moving a lone waiter onto a list set its `sw[i]` to NULL for a moment, which its own thread reads without the sockbuf lock, and it was armed twice. It now changes in one store.
+- Moving the module's code alone changes fan-in at 2,048 by up to 5% and the single-shot batch by 4%; layouts without the lone waiter gave less, or cost the batch.
+
+Phase 16 is done: within 5% of kqueue at 1,024 connections, and what stops it at 2,048 measured and written down.
 
 ## Research
 

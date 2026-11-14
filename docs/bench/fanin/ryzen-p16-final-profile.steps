@@ -1,0 +1,18 @@
+23:09:02 loaded 10c05f9a vmcores=8
+23:09:08 kq512 433.5
+23:09:13 ms512.defer 398.6
+23:09:18 ms512.def 348.1
+23:09:24 ba512.defer 403.7
+23:09:29 kq1024 500.0
+23:09:35 ms1024.defer 531.2
+23:09:41 ms1024.def 515.0
+23:09:46 ba1024.defer 444.7
+23:09:53 kq2048 1116.1
+23:10:00 ms2048.defer 1214.7
+23:10:06 ms2048.def 1003.8
+23:10:13 ba2048.defer 952.8
+23:10:24 sample 1024 fanin_kevent 509.1 ns, cg     1719 lines
+23:10:36 sample 1024 fanin_ring_multishot 536.4 ns, cg     2345 lines
+23:10:48 sample 2048 fanin_kevent 1123.6 ns, cg     2467 lines
+23:11:02 sample 2048 fanin_ring_multishot 1230.5 ns, cg     1738 lines
+23:11:02 ALLDONE vmcores=8

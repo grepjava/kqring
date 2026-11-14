@@ -1,0 +1,18 @@
+17:04:25 loaded f53472ae vmcores=3
+17:04:30 kq512 440.0
+17:04:36 ms512.defer 406.8
+17:04:41 ms512.def 360.3
+17:04:46 ba512.defer 405.4
+17:04:52 kq1024 555.3
+17:04:58 ms1024.defer 593.9
+17:05:03 ms1024.def 568.8
+17:05:09 ba1024.defer 448.0
+17:05:16 kq2048 1198.9
+17:05:23 ms2048.defer 1311.0
+17:05:30 ms2048.def 1087.4
+17:05:38 ba2048.defer 949.9
+17:05:49 sample 1024 fanin_kevent 642.4 ns, cg     2685 lines
+17:06:00 sample 1024 fanin_ring_multishot 675.8 ns, cg     1548 lines
+17:06:13 sample 2048 fanin_kevent 1191.6 ns, cg     4082 lines
+17:06:28 sample 2048 fanin_ring_multishot 1338.8 ns, cg     3267 lines
+17:06:28 ALLDONE vmcores=3

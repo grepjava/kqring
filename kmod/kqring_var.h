@@ -332,32 +332,44 @@ struct kqring_rmem {
  */
 struct kqring_op {
 	/*
-	 * First, in two cache lines, what an armed multishot receive reads
-	 * and writes from its socket's upcall to its CQE.  With a thousand
-	 * requests armed they don't stay in cache, and each line a message
-	 * touches comes from memory (docs/fan-in.md).
+	 * First, in the first lines, what an armed multishot receive reads
+	 * and writes from its socket's upcall to its CQE, and then its SQE,
+	 * in a line of its own at the end.  With a thousand requests armed
+	 * they don't stay in cache, and each line a message touches comes
+	 * from memory (docs/fan-in.md).
+	 *
+	 * In one line, all a socket's upcall touches (kqring_soupcall()):
+	 * on a ring whose kernel thread runs the requests, the writer's CPU
+	 * and the thread's share it, and nothing else.  Not cleared on
+	 * reuse (kqring_op_alloc()): the link is set on insertion, the rest
+	 * by kqring_op_alloc() itself.
 	 */
+	TAILQ_ENTRY(kqring_op)	taskwork_link;
 	struct kqring_ctx	*ctx;
 	/* Its submitter's context: the pool and taskwork it runs on. */
 	struct kqring_tctx	*tctx;
+	bool			in_taskwork;
+	bool			cancelled;	/* no longer armed; under mtx */
+	bool			oneshot_sb;	/* one-shot single-dir sockbuf op */
+	/* Cleared on reuse, from here to sw_link. */
 	struct socket		*so;		/* soref'd while armed */
 	/* The waiter lists op is on: so_rcv (or the listener), so_snd. */
 	struct kqring_sowatch	*sw[2];
-	struct file		*sock_fp;	/* socket held while retried */
 	struct ucred		*cred;		/* sqe->personality's, see ffile */
-	/* Event-driven chains: see tstep below. */
-	struct kqring_trun	*trun;
-	struct kqring_trig	*trig_wait;
+	struct kqring_trig	*trig_wait;	/* event-driven chains, see tstep */
 	size_t			done_io;	/* MSG_WAITALL: bytes so far */
+	/*
+	 * SQE arguments copied in at submission (IORING_FEAT_SUBMIT_STABLE):
+	 * a request that runs later (linked, drained, armed) never reads
+	 * user memory the SQE pointed to, except for output buffers.
+	 */
+	void			*args;
 	int32_t			res;		/* result of the last attempt */
 	uint32_t		cflags;		/* CQE flags of the last attempt */
-	bool			in_taskwork;
 	/* On its submitter's taskwork to be issued there (kqring_flush_ready()). */
 	bool			tw_issue;
-	bool			cancelled;	/* no longer armed; under mtx */
 	bool			armed;		/* on active_ops */
 	bool			listening;	/* armed via solisten_upcall_set */
-	bool			oneshot_sb;	/* one-shot single-dir sockbuf op */
 	bool			multishot;	/* prep: a multishot request */
 	bool			requeue;	/* multishot: yield to other work */
 	bool			sock_rw;	/* READ/WRITE(V) on a socket */
@@ -370,6 +382,9 @@ struct kqring_op {
 	bool			bio_done;	/* all bios done; res is set */
 	int			dirs;		/* KQ_DIR_* upcalls installed */
 	struct kqring_sowatch	*reap_sw;	/* empty sw detached in upcall */
+	size_t			args_len;
+	struct file		*sock_fp;	/* socket held while retried */
+	struct kqring_trun	*trun;		/* event-driven chains */
 	/*
 	 * POLL_ADD on a non-socket file, as knotes on the ring's kqueue
 	 * (kqring_kpoll.c): in ctx->kp_ops[] by fd while kp_on (kp_link), with
@@ -435,13 +450,6 @@ struct kqring_op {
 	uint32_t		seq_count;
 	uint32_t		repeats;	/* multishot: left, 0 = forever */
 	bool			seq_timeout;	/* counted in ctx->nseqto */
-	/*
-	 * SQE arguments copied in at submission (IORING_FEAT_SUBMIT_STABLE):
-	 * a request that runs later (linked, drained, armed) never reads
-	 * user memory the SQE pointed to, except for output buffers.
-	 */
-	void			*args;
-	size_t			args_len;
 	bool			zc_copied;	/* SEND_ZC: some bytes copied */
 	bool			connecting;	/* CONNECT: soconnect() issued */
 	bool			futex_woken;	/* FUTEX_WAKE hit; res in ->res */
@@ -494,15 +502,13 @@ struct kqring_op {
 	}			tsel, tbuf;
 	/*
 	 * Not cleared when the op is reused (kqring_op_alloc()), from here
-	 * on: list linkage, set on insertion (what a request is on is in the
+	 * on (sw_link): list linkage, set on insertion (what a request is on is in the
 	 * flags above, never read from its links); values always written
 	 * before they are read (wq_caps with wq_fp, ts by a timeout's prep,
-	 * cqe_extra with cqe_has_extra); the callout, initialized once
-	 * timer_init is set; and the SQE copied in at submission (sqe_extra
-	 * only on IORING_SETUP_SQE128 rings).  Clearing all of the op cost
-	 * every request about 25 ns.
+	 * cqe_extra with cqe_has_extra); and the callout, initialized once
+	 * timer_init is set.  Clearing all of the op cost every request
+	 * about 25 ns.
 	 */
-	TAILQ_ENTRY(kqring_op)	taskwork_link;
 	TAILQ_ENTRY(kqring_op)	sw_link[2];	/* on sw[0], sw[1] */
 	TAILQ_ENTRY(kqring_op)	active_link;	/* active_ops or free_ops */
 	TAILQ_ENTRY(kqring_op)	q_link;		/* ready_q or defer_q */
@@ -514,7 +520,10 @@ struct kqring_op {
 	struct timespec		ts;
 	uint64_t		cqe_extra[2];
 	struct callout		callout;	/* uses ctx->mtx */
-	/* In a cache line of its own: a receive reads it each time. */
+	/*
+	 * The SQE copied in at submission, in a line of its own (sqe_extra
+	 * only on IORING_SETUP_SQE128 rings).
+	 */
 	struct io_uring_sqe	sqe __aligned(CACHE_LINE_SIZE);
 	uint8_t			sqe_extra[64];
 };

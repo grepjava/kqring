@@ -1,0 +1,18 @@
+17:54:40 loaded c70d4dda vmcores=3
+17:54:45 kq512 445.0
+17:54:50 ms512.defer 399.6
+17:54:56 ms512.def 342.0
+17:55:01 ba512.defer 408.2
+17:55:07 kq1024 510.2
+17:55:12 ms1024.defer 551.7
+17:55:18 ms1024.def 562.1
+17:55:23 ba1024.defer 439.2
+17:55:30 kq2048 1160.2
+17:55:37 ms2048.defer 1251.5
+17:55:43 ms2048.def 1044.6
+17:55:50 ba2048.defer 948.3
+17:56:02 sample 1024 fanin_kevent 543.0 ns, cg     1327 lines
+17:56:13 sample 1024 fanin_ring_multishot 578.2 ns, cg     3495 lines
+17:56:26 sample 2048 fanin_kevent 1190.2 ns, cg     2287 lines
+17:56:40 sample 2048 fanin_ring_multishot 1259.6 ns, cg     1478 lines
+17:56:40 ALLDONE vmcores=3

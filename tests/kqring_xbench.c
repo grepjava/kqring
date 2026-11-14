@@ -14,6 +14,8 @@
  * Naming a case runs only that one, which gives a profiler a steady loop.
  * The fan-in cases use XBENCH_FANIN_N connections (default 256).
  * XBENCH_DEFER=1 sets the rings up with SINGLE_ISSUER | DEFER_TASKRUN.
+ * XBENCH_FANIN_OWNBUF=1 makes fanin_kevent read each connection into a
+ * buffer of its own, as the ring's cases receive, rather than into one.
  *
  * Each case runs for about a second after a warm-up, reps times; the
  * output is one line per case with the median and the range, in
@@ -315,8 +317,12 @@ fanin_reap(struct ring *r, unsigned n, int recycle)
 static unsigned
 op_fanin_kevent(void)
 {
+	static int ownbuf = -1;
 	int got = 0;
 
+	if (ownbuf < 0)
+		ownbuf = getenv("XBENCH_FANIN_OWNBUF") != NULL &&
+		    strcmp(getenv("XBENCH_FANIN_OWNBUF"), "1") == 0;
 	if (fan_poll < 0) {
 		fanin_setup();
 #if defined(__linux__)
@@ -324,7 +330,8 @@ op_fanin_kevent(void)
 		CHECK(fan_poll >= 0);
 		for (int i = 0; i < fan_n; i++) {
 			struct epoll_event ev = { .events = EPOLLIN | EPOLLET,
-			    .data.fd = fan_rx[i] };
+			    .data.u64 = (uint64_t)(uint32_t)fan_rx[i] |
+			    (uint64_t)i << 32 };
 
 			CHECK(epoll_ctl(fan_poll, EPOLL_CTL_ADD, fan_rx[i],
 			    &ev) == 0);
@@ -336,7 +343,7 @@ op_fanin_kevent(void)
 		CHECK(fan_poll >= 0);
 		for (int i = 0; i < fan_n; i++) {
 			EV_SET(&kev, fan_rx[i], EVFILT_READ, EV_ADD | EV_CLEAR,
-			    0, 0, NULL);
+			    0, 0, (void *)(intptr_t)i);
 			CHECK(kevent(fan_poll, &kev, 1, NULL, 0, NULL) == 0);
 		}
 #endif
@@ -349,16 +356,18 @@ op_fanin_kevent(void)
 
 		CHECK(m > 0);
 		for (int j = 0; j < m; j++)
-			CHECK(recv(evs[j].data.fd, buf, sizeof(buf), 0) ==
-			    sizeof(buf));
+			CHECK(recv((int)(uint32_t)evs[j].data.u64, ownbuf ?
+			    fan_buf[evs[j].data.u64 >> 32] : buf, sizeof(buf),
+			    0) == sizeof(buf));
 #else
 		static struct kevent evs[FANIN_MAX];
 		int m = kevent(fan_poll, NULL, 0, evs, fan_n, NULL);
 
 		CHECK(m > 0);
 		for (int j = 0; j < m; j++)
-			CHECK(recv((int)evs[j].ident, buf, sizeof(buf), 0) ==
-			    sizeof(buf));
+			CHECK(recv((int)evs[j].ident, ownbuf ?
+			    fan_buf[(intptr_t)evs[j].udata] : buf, sizeof(buf),
+			    0) == sizeof(buf));
 #endif
 		got += m;
 	}

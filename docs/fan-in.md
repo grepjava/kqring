@@ -1,6 +1,6 @@
 # Fan-in against kqueue
 
-Status: done, November 2026. Roadmap phase 12.
+Status: done, November 2026. Roadmap phases 12 and 16.
 
 [BENCHMARK.MD](../BENCHMARK.MD#fan-in-many-connections-each-get-one-message-and-all-of-them-are-collected) had kqring's fan-in, many connections each getting one message and all of them collected, 26–66% slower than kqueue on the Ryzen, where a system call is cheap. This note measures where the time went. Since phase 13, when `kqring_bench` stopped handing kqring's receives a 16 MiB pool of buffers, BENCHMARK.MD has it level with kqueue.
 
@@ -163,8 +163,67 @@ Alternated three times on the Ryzen with the module before both changes (`XBENCH
 - **Multishot fan-in in one thread loses 50%.** The thread that writes the N messages now runs each receive as its `write(2)` returns, one hook each, where the kernel thread ran them on a second CPU, many per wake-up. Linux's `COOP_TASKRUN` does the same. A fan-in whose messages come from other processes, as a server's do, is unaffected, since the hook only takes completions queued in the ring's own process; the single-shot batch, whose receives find their data, is too.
 - **Paths that don't use the hook are 1–2% slower** (`DEFER_TASKRUN` ping-pong, a `RECV` that finds its data, one `NOP` per enter; six alternations each, [bench/fanin/ryzen-hook-unrelated.steps](bench/fanin/ryzen-hook-unrelated.steps)). The same build with the hook never registered is as slow, and the waiter change alone was level, so it is where the module's code now lies rather than anything these paths run; the hook's fields of `struct kqring_tctx` were moved last, which didn't change it.
 
+## A thousand connections, again
+
+Roadmap phase 16 took up the gap at a thousand connections. The build from phase 15 had multishot fan-in on a `DEFER_TASKRUN` ring 7–16% behind kqueue at 1,024 connections and 9–16% at 2,048, depending on the run, and its DRAM fills per message (sampled as above, per 500, divided by the messages in the window) were 7.6 at 2,048 against kqueue's 5.7, 1.3 of them in kqring's own functions ([bench/fanin/ryzen-p16-baseline.steps](bench/fanin/ryzen-p16-baseline.steps)). Each message touched up to six of the request's lines, scattered: the two hot lines, the taskwork and waiter links on line 7, the SQE on line 12, and sometimes lines 2 and 4; and the socket's waiter list, an allocation of its own.
+
+Each change below was alternated three times with the build before it on the Ryzen (`kqring_xbench`, medians of 5 one-second runs per round); raw outputs are the `ryzen-p16-*.steps` files.
+
+| Change | multishot, `DEFER_TASKRUN`, N = 1,024 / 2,048 | Kept |
+|---|---|---|
+| The request's links, contexts and hot fields in adjacent lines, the SQE first | −6.6% / −3.1% | yes, the SQE moved back (below) |
+| Prefetch the next queued request's lines in the taskwork loop | +1.8% / +0.1% | no |
+| A socket's only waiter as the upcall's argument, with no waiter list | −2.6% / −3.3% | yes |
+| All the upcall touches in one line, apart from what the kernel thread writes | 0.0% / −0.4%, and the default ring at 16 and 256 connections −11% and −9% | yes |
+| Prefetch the next buffer-ring line, and the hot fields in three lines | +0.1% / +2.2%, the default ring at 16 and 256 +8% | no |
+| The hot fields in three lines alone | −0.9% / +0.6% | no |
+| Clearing on reuse from a line's start | +2.6% / +2.6% | no |
+| The SQE in a line of its own at the end, as before | −0.1% / +2.3%, one `NOP` per enter −2.1% | yes |
+
+The first change put the upcall's writes in the line the ring's kernel thread writes (`res`, the flags), and on a default ring, where the writer's CPU queues requests that the kernel thread runs, that line went back and forth: fan-in at 16 and 256 connections lost 4% to it, and as much again with the waiter list gone, until the upcall's fields (`taskwork_link`, `ctx`, `tctx`, `in_taskwork`, `cancelled`, `oneshot_sb`) had a line of their own. With the SQE first, one `NOP` per enter cost 2.2–2.6% more over five alternated rounds ([ryzen-p16-nop-ab.steps](bench/fanin/ryzen-p16-nop-ab.steps)); with it last again that is gone, for 2.3% at 2,048 connections.
+
+### The lone waiter's bug
+
+The lone waiter first failed the stress test, three panics in 20 minutes: page faults in the upcall, in `sowwakeup()` and in arming, a request on its socket's list twice. When a second request arms on a socket whose upcall argument is a lone waiter, `kqring_sb_arm()` puts both on a new list, and it set the first's `sw[i]` to NULL before linking it. That request's own thread reads the field without the sockbuf lock, in `kqring_taskwork_run_one()`, to ask whether the request is still waiting, and in `kqring_sb_disarm()`. Reading NULL in that window, it armed the request a second time, or could have freed it still on the list. A build that printed a stack wherever a request was armed while still on a list found it within a minute, from the SQPOLL thread. The field now goes from the tag to the list in one store, and the stress test, the fuzzer and the rest pass.
+
+Without the lone waiter the layout alone gives less, and costs elsewhere. With the upcall's line holding `sw_link`, as the list needs, multishot fan-in at 1,024 and 2,048 connections was 4–7% faster than phase 15, but the single-shot batch at 1,024 was 4–5% slower and fan-in at 16 and 256 on a default ring about 3%; with the layout above, everything was within the noise ([ryzen-p16-layout-only-o.steps](bench/fanin/ryzen-p16-layout-only-o.steps), [-q](bench/fanin/ryzen-p16-layout-only-q.steps); `-m` and `-n` are two more layouts, one clearing from the middle of a line, which cost one `NOP` per enter 4–5%).
+
+### How much is noise
+
+Moving the module's code is enough to change these numbers. The build from phase 15 with its request code moved by 16 to 144 bytes, or its socket code by 64 to 512 (an unused block in front), measured 1,064–1,120 ns per message at 2,048 connections on a default ring and 433–452 for the single-shot batch at 1,024; one `NOP` per enter stayed within 3 ns ([ryzen-p16-placement-req.steps](bench/fanin/ryzen-p16-placement-req.steps), [-sock](bench/fanin/ryzen-p16-placement-sock.steps)). A difference of 3% at a thousand connections can be where the code lies rather than what it does; the changes kept here are beyond that.
+
+### Against phase 15
+
+Alternated three times with phase 15's build ([ryzen-p16-final-ab.steps](bench/fanin/ryzen-p16-final-ab.steps); the same layout before the fix, [ryzen-p16-before-fix-ab.steps](bench/fanin/ryzen-p16-before-fix-ab.steps)):
+
+| ns per message | phase 15 | phase 16 | |
+|---|---:|---:|---:|
+| multishot, `DEFER_TASKRUN`, N = 1,024 | 556 | 512 | −7.9% |
+| multishot, `DEFER_TASKRUN`, N = 2,048 | 1,296 | 1,204 | −7.1% |
+| multishot, default ring, N = 1,024 | 537 | 505 | −5.9% |
+| multishot, default ring, N = 2,048 | 1,073 | 1,006 | −6.3% |
+| one `NOP` per enter, ping-pong, a `RECV` with its data, fan-in at 16 and 256, the single-shot batch | | | +1.2% to −1.8% |
+| kqueue, N = 1,024 / 2,048 | 502 / 1,115 | 501 / 1,111 | |
+| kqueue, a buffer per connection, N = 1,024 / 2,048 | 514 / 1,122 | 513 / 1,123 | |
+
+kqueue's fan-in reads every message into one buffer, which stays in cache, where each multishot receive takes a provided buffer of its own. `XBENCH_FANIN_OWNBUF=1` gives kqueue a buffer per connection as well, as a server keeps one per connection: that costs it up to 2%.
+
+So on a `DEFER_TASKRUN` ring multishot is now 2% behind kqueue at 1,024 connections and level with kqueue reading into a buffer per connection, from 11%; at 2,048 it is 8% behind (7% with a buffer per connection), from 16%. A default ring is level at 1,024 and 9% ahead at 2,048, and both are ahead at 512 (399 and 348 ns against kqueue's 434, [ryzen-p16-final-profile.steps](bench/fanin/ryzen-p16-final-profile.steps)).
+
+### What stops it at 2,048
+
+At 2,048 connections the working set still outgrows the L3. DRAM fills per message, sampled as above in the same runs:
+
+| | kqueue | multishot, `DEFER_TASKRUN` | of which kqring's functions |
+|---|---:|---:|---:|
+| phase 15, N = 2,048 | 5.7 | 7.6 | 1.3 |
+| phase 16, N = 2,048 | 4.8 | 6.2 | 1.0 |
+| phase 16, N = 1,024 | 0.2 | 0.5 | 0.04 |
+
+At 1,024 almost nothing comes from memory any more. At 2,048 multishot still brings 1.4 lines per message more than kqueue: 0.4 in `kqring_recv_pick_buf()`, the provided buffer's ring entry and the buffer itself, which kqueue's one buffer doesn't need; 0.1–0.2 each in `kqring_exec_recv()` and the taskwork loop, the request's lines; and the rest in the socket's own code, where an armed receive's lines have pushed the socket's out. Closing that would take fewer lines per armed receive than kqring's request, its SQE and a provided buffer, for instance a receive that doesn't keep its SQE ([What is left](#what-is-left)).
+
 ## What is left
 
-- At 1,024 connections a multishot receive is still about 10% slower than kqueue on a `DEFER_TASKRUN` ring, and 18% at 2,048: an armed receive keeps more lines per connection than a knote does (the request's four, the waiter list, and on AF_UNIX the end-of-input knote as well), and there the working set doesn't fit the L3.
+- At 2,048 connections a multishot receive on a `DEFER_TASKRUN` ring is still 8% slower than kqueue, and 2% at 1,024 ([above](#what-stops-it-at-2048)): an armed receive still touches more lines per message than a knote does (the request's three lines and its SQE, the provided buffer and its ring entry, and on AF_UNIX the end-of-input knote as well), and at 2,048 the working set doesn't fit the L3.
 - When nobody waits in an enter, a default ring without `COOP_TASKRUN` still wakes its kernel thread for each message a socket upcall queues: 260 ns per message in ping-pong on the Ryzen, 563 on the i5. With `COOP_TASKRUN` the writer's return runs it, about 135 ns more than a `DEFER_TASKRUN` ring, and multishot fan-in written by the ring's own thread is 50% slower than with the kernel thread.
 - `kqring_bench`'s fan-in and ping-pong measure kqring's provided buffers, 4,096 of 4 KiB in turn and so out of cache, against kqueue's one.

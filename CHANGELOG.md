@@ -23,6 +23,7 @@
 
 ### Changed
 
+- Multishot receives at a thousand connections are 6–8% faster: a request's fields that an upcall and a receive touch now sit together, the upcall's in a line of their own, and a socket's only waiter is the upcall's argument, with no waiter list. At 1,024 AF_UNIX connections on the Ryzen, multishot fan-in on a `DEFER_TASKRUN` ring is 2% behind kqueue, from 11%, and 8% at 2,048, from 16%; a default ring is level at 1,024 and 9% ahead at 2,048. See [docs/fan-in.md](docs/fan-in.md#a-thousand-connections-again).
 - On a `SINGLE_ISSUER` ring another thread or process may now wait for completions, as on Linux, rather than fail with `EEXIST` when the CQ can't satisfy it yet; not on a `DEFER_TASKRUN` ring, as on Linux, nor in a polled wait on an `IOPOLL` ring.
 - A `DEFER_TASKRUN` ring's completions now wait for an enter with `IORING_ENTER_GETEVENTS`, as Linux runs its local work only then; an enter that only submitted used to post them. A `MSG_RING` to its own ring without `DEFER_TASKRUN` posts its CQE at once, before the request's own, as Linux.
 - `IOSQE_FIXED_FILE` on an opcode that takes no file is ignored, as on Linux, rather than failing with `EINVAL`, except that a path opcode (`OPENAT`, `CLOSE`, `STATX`, …) fails with `EBADF`, as on Linux.

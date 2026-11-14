@@ -677,8 +677,12 @@ kqring_op_alloc(struct kqring_ctx *ctx)
 		TAILQ_REMOVE(&ctx->free_ops, op, active_link);
 		ctx->nfree--;
 		/* Inline stores: rep stos costs more to start than this. */
-		__builtin_memset_inline(op, 0,
-		    offsetof(struct kqring_op, taskwork_link));
+		__builtin_memset_inline(&op->so, 0,
+		    offsetof(struct kqring_op, sw_link) -
+		    offsetof(struct kqring_op, so));
+		op->in_taskwork = false;
+		op->cancelled = false;
+		op->oneshot_sb = false;
 	} else {
 		op = uma_zalloc(kqring_op_zone, M_WAITOK | M_ZERO);
 	}

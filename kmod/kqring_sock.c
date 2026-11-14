@@ -21,12 +21,47 @@ static int kqring_soupcall(struct socket *so, void *arg, int waitflag);
  * waiter took the data or the connection) stays armed.
  */
 
+/*
+ * A socket buffer's only waiter is the upcall's argument itself, tagged,
+ * rather than on a waiter list of its own: with a thousand requests armed
+ * that is a cache line less from memory per message (docs/fan-in.md).
+ * The request's sw[i] is then KQRING_SW_SOLO.  A second waiter moves both
+ * onto a list (kqring_sb_arm()); a listener's waiters are always one.
+ * Requests come from a cache-aligned zone, so bits 0 and 1 are free: bit
+ * 0 marks a lone waiter, bit 1 is its slot.
+ */
+static struct kqring_sowatch kqring_sw_solo_mark;
+#define	KQRING_SW_SOLO		(&kqring_sw_solo_mark)
+#define	KQRING_SOLO_ARG(op, i)						\
+	((void *)((uintptr_t)(op) | 1 | ((uintptr_t)(i) << 1)))
+#define	KQRING_ARG_SOLO(arg)	(((uintptr_t)(arg) & 1) != 0)
+#define	KQRING_SOLO_OP(arg)						\
+	((struct kqring_op *)((uintptr_t)(arg) & ~(uintptr_t)3))
+#define	KQRING_SOLO_IDX(arg)	((int)(((uintptr_t)(arg) >> 1) & 1))
+
 static int
 kqring_soupcall(struct socket *so, void *arg, int waitflag __unused)
 {
 	struct kqring_sowatch *sw = arg;
 	struct kqring_op *op, *tmp;
-	int i = sw->idx;
+	int i;
+
+	if (KQRING_ARG_SOLO(arg)) {
+		struct kqring_ctx *ctx;
+
+		op = KQRING_SOLO_OP(arg);
+		i = KQRING_SOLO_IDX(arg);
+		ctx = op->ctx;
+		mtx_lock(&ctx->mtx);
+		if (op->oneshot_sb && !op->cancelled && !ctx->closing) {
+			op->sw[i] = NULL;
+			soupcall_clear(so, i == 0 ? SO_RCV : SO_SND);
+		}
+		kqring_taskwork_add_locked(ctx, op);
+		mtx_unlock(&ctx->mtx);
+		return (SU_OK);
+	}
+	i = sw->idx;
 
 	TAILQ_FOREACH_SAFE(op, &sw->ops, sw_link[i], tmp) {
 		struct kqring_ctx *ctx = op->ctx;
@@ -61,6 +96,10 @@ kqring_sowatch_leave(struct kqring_op *op, int i)
 
 	if (sw == NULL)
 		return (NULL);
+	if (sw == KQRING_SW_SOLO) {
+		op->sw[i] = NULL;
+		return (sw);
+	}
 	TAILQ_REMOVE(&sw->ops, op, sw_link[i]);
 	op->sw[i] = NULL;
 	return (TAILQ_EMPTY(&sw->ops) ? sw : NULL);
@@ -70,7 +109,7 @@ kqring_sowatch_leave(struct kqring_op *op, int i)
 void
 kqring_sowatch_free(struct kqring_ctx *ctx, struct kqring_sowatch *sw)
 {
-	if (sw == NULL)
+	if (sw == NULL || sw == KQRING_SW_SOLO)
 		return;
 	if (!ctx->closing && !ctx->cancelling &&
 	    ctx->sw_cache[sw->idx] == NULL) {
@@ -98,7 +137,8 @@ kqring_sb_disarm(struct kqring_op *op, struct socket *so, int which)
 	SOCK_BUF_LOCK(so, which);
 	sw = kqring_sowatch_leave(op, i);
 	if (sw != NULL && !SOLISTENING(so) &&
-	    kqring_sb(so, which)->sb_upcallarg == sw)
+	    kqring_sb(so, which)->sb_upcallarg == (sw == KQRING_SW_SOLO ?
+	    KQRING_SOLO_ARG(op, i) : sw))
 		soupcall_clear(so, which);
 	SOCK_BUF_UNLOCK(so, which);
 	kqring_sowatch_free(op->ctx, sw);
@@ -2323,6 +2363,14 @@ again:
 		return (EBUSY);
 	}
 	if (sb->sb_upcall == NULL) {
+		/* The only waiter: no list (KQRING_SW_SOLO). */
+		soupcall_set(so, which, kqring_soupcall,
+		    KQRING_SOLO_ARG(op, i));
+		op->sw[i] = KQRING_SW_SOLO;
+	} else if (KQRING_ARG_SOLO(sb->sb_upcallarg)) {
+		struct kqring_op *first = KQRING_SOLO_OP(sb->sb_upcallarg);
+
+		/* A second waiter: both onto a list. */
 		if (nsw == NULL)
 			nsw = ctx->sw_cache[i];
 		if (nsw == NULL) {
@@ -2330,9 +2378,19 @@ again:
 			nsw = kqring_sowatch_new(ctx, i);
 			goto again;
 		}
-		ctx->sw_cache[i] = NULL;
-		soupcall_set(so, which, kqring_soupcall, nsw);
+		if (ctx->sw_cache[i] == nsw)
+			ctx->sw_cache[i] = NULL;
+		/*
+		 * first->sw[i] goes from KQRING_SW_SOLO to the list in one
+		 * store, never NULL: its owner reads it without the sockbuf
+		 * lock (kqring_taskwork_run_one(), kqring_sb_disarm()), and
+		 * a NULL there would have it armed twice, or freed still on
+		 * the list.
+		 */
+		TAILQ_INSERT_TAIL(&nsw->ops, first, sw_link[i]);
+		first->sw[i] = nsw;
 		kqring_sowatch_join(op, i, NULL, &nsw);
+		soupcall_set(so, which, kqring_soupcall, first->sw[i]);
 	} else {
 		kqring_sowatch_join(op, i, sb->sb_upcallarg, &nsw);
 	}
