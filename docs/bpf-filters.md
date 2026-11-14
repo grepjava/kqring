@@ -47,5 +47,5 @@ kqring's own requests (event-driven chains, kevent requests, the kqueue bridge) 
 ## Tests
 
 - `tests/kqring_diff.c` cases `restrictions_split`, `task_restrict` and `bpf_filter` give the same output on kqring as on Linux 7.3: the error for each invalid program and argument, `pdu_size` written back, a division by 0, `DENY_REST`, socket arguments, inheritance and the rings set up before and after.
-- liburing's `task-restrict` and `cbpf_filter` pass. `cbpf_filter` is adapted in two places ([liburing/README.md](../liburing/README.md#adapted-tests)): `RESOLVE_IN_ROOT`, which kqring doesn't implement, gives way to `RESOLVE_BENEATH`, and a connect the filter allows to an address nobody answers gives up after a second instead of FreeBSD's 75.
+- liburing's `task-restrict` and `cbpf_filter` pass. `cbpf_filter` is adapted in one place ([liburing/README.md](../liburing/README.md#adapted-tests)): a connect the filter allows to an address nobody answers gives up after a second instead of FreeBSD's 75. (Until phase 15 it also used `RESOLVE_BENEATH` for `RESOLVE_IN_ROOT`, which kqring then lacked; see [openat2-resolve.md](openat2-resolve.md).)
 - `tests/kqring_test.c`'s `test_bpf_process`: per process, extension requests refused, restrictions kept across `execve(2)`.

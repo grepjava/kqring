@@ -112,6 +112,8 @@ setup_flags/defer+sqpoll -EINVAL
 setup_flags/defer+coop 0
 setup_flags/defer+flag 0
 setup_flags/defer+iopoll 0
+setup_flags/hybrid -EINVAL
+setup_flags/hybrid+iopoll 0
 newer/sqe_mixed 0
 newer/sq_rewind 0
 newer/nop128 ud=1 res=-EINVAL flags=-
@@ -416,4 +418,217 @@ bpf_filter/task_deny7 0
 bpf_filter/ring_before ud=7 res=0 flags=-
 bpf_filter/ring_after ud=7 res=-EACCES flags=-
 bpf_filter/child 0
+nop_flags/register_files 0
+nop_flags/register_buffers 0
+nop_flags/file ud=1 res=0 flags=-
+nop_flags/file_inject ud=2 res=7 flags=-
+nop_flags/file_bad ud=3 res=-EBADF flags=-
+nop_flags/file_bad_inject ud=4 res=-EBADF flags=-
+nop_flags/fixed ud=5 res=0 flags=-
+nop_flags/fixed_empty ud=6 res=-EBADF flags=-
+nop_flags/fixed_past ud=7 res=-EBADF flags=-
+nop_flags/sqe_fixed ud=8 res=0 flags=-
+nop_flags/sqe_fixed_empty ud=9 res=-EBADF flags=-
+nop_flags/sqe_fixed_alone ud=10 res=0 flags=-
+nop_flags/fixed_alone ud=11 res=0 flags=-
+nop_flags/buffer ud=12 res=0 flags=-
+nop_flags/buffer_past ud=13 res=-EFAULT flags=-
+nop_flags/buffer_inject ud=14 res=-EFAULT flags=-
+nop_flags/file_bad_buffer_past ud=15 res=-EBADF flags=-
+nop_flags/tw ud=16 res=0 flags=-
+nop_flags/tw_inject ud=17 res=3 flags=-
+nop_flags/tw_file_bad ud=18 res=-EBADF flags=-
+nop_flags/unknown ud=19 res=-EINVAL flags=-
+nop_flags/defer_submit 2
+nop_flags/defer_ready 1
+nop_flags/defer_before_wait ud=30 res=0 flags=-
+nop_flags/defer_wait 0
+nop_flags/defer_after_wait ud=31 res=0 flags=-
+openat2_resolve/none:a/f fd
+openat2_resolve/none:a/rel fd
+openat2_resolve/none:a/abs -ENOENT
+openat2_resolve/none:a/dir/a/f fd
+openat2_resolve/none:a/up fd
+openat2_resolve/none:a/up/a/f -ENOENT
+openat2_resolve/none:a/../a/f fd
+openat2_resolve/none:../x -ENOENT
+openat2_resolve/none:/a/f -ENOENT
+openat2_resolve/none:a/f/ -ENOTDIR
+openat2_resolve/none:a/ fd
+openat2_resolve/none:. fd
+openat2_resolve/none:.. fd
+openat2_resolve/none:a/rel/ -ENOTDIR
+openat2_resolve/none:a/none -ENOENT
+openat2_resolve/none:a/dangling -ENOENT
+openat2_resolve/none:a/loop -ELOOP
+openat2_resolve/none:a/f/x -ENOTDIR
+openat2_resolve/nosym:a/f fd
+openat2_resolve/nosym:a/rel -ELOOP
+openat2_resolve/nosym:a/abs -ELOOP
+openat2_resolve/nosym:a/dir/a/f -ELOOP
+openat2_resolve/nosym:a/up -ELOOP
+openat2_resolve/nosym:a/up/a/f -ELOOP
+openat2_resolve/nosym:a/../a/f fd
+openat2_resolve/nosym:../x -ENOENT
+openat2_resolve/nosym:/a/f -ENOENT
+openat2_resolve/nosym:a/f/ -ENOTDIR
+openat2_resolve/nosym:a/ fd
+openat2_resolve/nosym:. fd
+openat2_resolve/nosym:.. fd
+openat2_resolve/nosym:a/rel/ -ELOOP
+openat2_resolve/nosym:a/none -ENOENT
+openat2_resolve/nosym:a/dangling -ELOOP
+openat2_resolve/nosym:a/loop -ELOOP
+openat2_resolve/nosym:a/f/x -ENOTDIR
+openat2_resolve/noxdev:a/f fd
+openat2_resolve/noxdev:a/rel fd
+openat2_resolve/noxdev:a/dir/a/f fd
+openat2_resolve/noxdev:a/up fd
+openat2_resolve/noxdev:a/up/a/f -ENOENT
+openat2_resolve/noxdev:a/../a/f fd
+openat2_resolve/noxdev:../x -ENOENT
+openat2_resolve/noxdev:/a/f -ENOENT
+openat2_resolve/noxdev:a/f/ -ENOTDIR
+openat2_resolve/noxdev:a/ fd
+openat2_resolve/noxdev:. fd
+openat2_resolve/noxdev:.. fd
+openat2_resolve/noxdev:a/rel/ -ENOTDIR
+openat2_resolve/noxdev:a/none -ENOENT
+openat2_resolve/noxdev:a/dangling -ENOENT
+openat2_resolve/noxdev:a/loop -ELOOP
+openat2_resolve/noxdev:a/f/x -ENOTDIR
+openat2_resolve/beneath:a/f fd
+openat2_resolve/beneath:a/rel fd
+openat2_resolve/beneath:a/abs -EXDEV
+openat2_resolve/beneath:a/dir/a/f fd
+openat2_resolve/beneath:a/up -EXDEV
+openat2_resolve/beneath:a/up/a/f -EXDEV
+openat2_resolve/beneath:a/../a/f fd
+openat2_resolve/beneath:../x -EXDEV
+openat2_resolve/beneath:/a/f -EXDEV
+openat2_resolve/beneath:a/f/ -ENOTDIR
+openat2_resolve/beneath:a/ fd
+openat2_resolve/beneath:. fd
+openat2_resolve/beneath:.. -EXDEV
+openat2_resolve/beneath:a/rel/ -ENOTDIR
+openat2_resolve/beneath:a/none -ENOENT
+openat2_resolve/beneath:a/dangling -ENOENT
+openat2_resolve/beneath:a/loop -ELOOP
+openat2_resolve/beneath:a/f/x -ENOTDIR
+openat2_resolve/inroot:a/f fd
+openat2_resolve/inroot:a/rel fd
+openat2_resolve/inroot:a/abs fd
+openat2_resolve/inroot:a/dir/a/f fd
+openat2_resolve/inroot:a/up fd
+openat2_resolve/inroot:a/up/a/f fd
+openat2_resolve/inroot:a/../a/f fd
+openat2_resolve/inroot:../x -ENOENT
+openat2_resolve/inroot:/a/f fd
+openat2_resolve/inroot:a/f/ -ENOTDIR
+openat2_resolve/inroot:a/ fd
+openat2_resolve/inroot:. fd
+openat2_resolve/inroot:.. fd
+openat2_resolve/inroot:a/rel/ -ENOTDIR
+openat2_resolve/inroot:a/none -ENOENT
+openat2_resolve/inroot:a/dangling -ENOENT
+openat2_resolve/inroot:a/loop -ELOOP
+openat2_resolve/inroot:a/f/x -ENOTDIR
+openat2_resolve/inroot_nosym:a/f fd
+openat2_resolve/inroot_nosym:a/rel -ELOOP
+openat2_resolve/inroot_nosym:a/abs -ELOOP
+openat2_resolve/inroot_nosym:a/dir/a/f -ELOOP
+openat2_resolve/inroot_nosym:a/up -ELOOP
+openat2_resolve/inroot_nosym:a/up/a/f -ELOOP
+openat2_resolve/inroot_nosym:a/../a/f fd
+openat2_resolve/inroot_nosym:../x -ENOENT
+openat2_resolve/inroot_nosym:/a/f fd
+openat2_resolve/inroot_nosym:a/f/ -ENOTDIR
+openat2_resolve/inroot_nosym:a/ fd
+openat2_resolve/inroot_nosym:. fd
+openat2_resolve/inroot_nosym:.. fd
+openat2_resolve/inroot_nosym:a/rel/ -ELOOP
+openat2_resolve/inroot_nosym:a/none -ENOENT
+openat2_resolve/inroot_nosym:a/dangling -ELOOP
+openat2_resolve/inroot_nosym:a/loop -ELOOP
+openat2_resolve/inroot_nosym:a/f/x -ENOTDIR
+openat2_resolve/beneath_nosym:a/f fd
+openat2_resolve/beneath_nosym:a/rel -ELOOP
+openat2_resolve/beneath_nosym:a/abs -ELOOP
+openat2_resolve/beneath_nosym:a/dir/a/f -ELOOP
+openat2_resolve/beneath_nosym:a/up -ELOOP
+openat2_resolve/beneath_nosym:a/up/a/f -ELOOP
+openat2_resolve/beneath_nosym:a/../a/f fd
+openat2_resolve/beneath_nosym:../x -EXDEV
+openat2_resolve/beneath_nosym:/a/f -EXDEV
+openat2_resolve/beneath_nosym:a/f/ -ENOTDIR
+openat2_resolve/beneath_nosym:a/ fd
+openat2_resolve/beneath_nosym:. fd
+openat2_resolve/beneath_nosym:.. -EXDEV
+openat2_resolve/beneath_nosym:a/rel/ -ELOOP
+openat2_resolve/beneath_nosym:a/none -ENOENT
+openat2_resolve/beneath_nosym:a/dangling -ELOOP
+openat2_resolve/beneath_nosym:a/loop -ELOOP
+openat2_resolve/beneath_nosym:a/f/x -ENOTDIR
+openat2_resolve/beneath_inroot:a/f -EINVAL
+openat2_resolve/beneath_inroot:a/rel -EINVAL
+openat2_resolve/beneath_inroot:a/abs -EINVAL
+openat2_resolve/beneath_inroot:a/dir/a/f -EINVAL
+openat2_resolve/beneath_inroot:a/up -EINVAL
+openat2_resolve/beneath_inroot:a/up/a/f -EINVAL
+openat2_resolve/beneath_inroot:a/../a/f -EINVAL
+openat2_resolve/beneath_inroot:../x -EINVAL
+openat2_resolve/beneath_inroot:/a/f -EINVAL
+openat2_resolve/beneath_inroot:a/f/ -EINVAL
+openat2_resolve/beneath_inroot:a/ -EINVAL
+openat2_resolve/beneath_inroot:. -EINVAL
+openat2_resolve/beneath_inroot:.. -EINVAL
+openat2_resolve/beneath_inroot:a/rel/ -EINVAL
+openat2_resolve/beneath_inroot:a/none -EINVAL
+openat2_resolve/beneath_inroot:a/dangling -EINVAL
+openat2_resolve/beneath_inroot:a/loop -EINVAL
+openat2_resolve/beneath_inroot:a/f/x -EINVAL
+openat2_resolve/nosym_path_through -ELOOP
+openat2_resolve/inroot_create_up fd
+openat2_resolve/inroot_create_up_where 1
+openat2_resolve/inroot_create_dangling fd
+openat2_resolve/inroot_create_dangling_where 1
+openat2_resolve/nosym_create_dangling -ELOOP
+openat2_resolve/inroot_create_excl_link -EEXIST
+openat2_resolve/cached_create -EAGAIN
+openat2_resolve/cached_trunc -EAGAIN
+openat2_resolve/cached fd
+openat2_resolve/inroot_directory -ENOTDIR
+openat2_resolve/inroot_dir fd
+openat2_resolve/inroot_empty -ENOENT
+openat2_resolve/inroot_cwd fd
+openat2_resolve/noxdev_dev -EXDEV
+openat2_resolve/dev fd
+openat2_resolve/noxdev_root fd
+openat2_resolve/noxdev_dotdot_out -EXDEV
+single_issuer_wait/plain_nop 0
+single_issuer_wait/plain_nop ud=1 res=0 flags=-
+single_issuer_wait/plain_read 0
+single_issuer_wait/plain_read ud=2 res=1 flags=-
+single_issuer_wait/coop_nop 0
+single_issuer_wait/coop_nop ud=1 res=0 flags=-
+single_issuer_wait/coop_read 0
+single_issuer_wait/coop_read ud=2 res=1 flags=-
+single_issuer_wait/defer_nop -EEXIST
+single_issuer_wait/defer_nop ud=1 res=0 flags=-
+single_issuer_wait/defer_read -EEXIST
+single_issuer_wait/defer_read ud=2 res=1 flags=-
+fixed_flag/cancel ud=1 res=-ENOENT flags=-
+fixed_flag/timeout ud=2 res=-ETIME flags=-
+fixed_flag/socket ud=3 res=fd flags=-
+fixed_flag/pipe ud=4 res=0 flags=-
+fixed_flag/openat ud=5 res=-EBADF flags=-
+fixed_flag/close ud=6 res=-EBADF flags=-
+fixed_flag/mkdirat ud=7 res=-EBADF flags=-
+msg_ring_self/plain_ready 2
+msg_ring_self/plain_submit ud=2 res=9 flags=-
+msg_ring_self/plain_submit ud=1 res=0 flags=-
+msg_ring_self/plain_wait none
+msg_ring_self/defer_ready 1
+msg_ring_self/defer_submit ud=1 res=0 flags=-
+msg_ring_self/defer_wait ud=2 res=9 flags=-
 # end

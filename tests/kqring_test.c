@@ -488,14 +488,6 @@ getevents_from_other_thread(void *arg)
 }
 
 static void *
-wait_from_other_thread(void *arg)
-{
-	struct test_ring *r = arg;
-	long rc = kqring_enter(r->fd, 0, 1, IORING_ENTER_GETEVENTS, NULL, 0);
-	return ((void *)(intptr_t)(rc < 0 ? errno : 0));
-}
-
-static void *
 unregister_from_other_thread(void *arg)
 {
 	struct test_ring *r = arg;
@@ -526,11 +518,6 @@ test_single_issuer(struct test_ring *r)
 	    "-> EEXIST, an idle enter -> 0\n");
 }
 
-/*
- * SINGLE_ISSUER without DEFER_TASKRUN: another thread's wait sees the CQ as
- * it stands.  Linux would wait; here the owner's state can't be run from
- * another thread, so a wait the CQ can't satisfy fails rather than hang.
- */
 /*
  * Rings used by more than one process (docs/concurrent-submitters.md): on
  * a ring set up without SINGLE_ISSUER each process that submits has its
@@ -961,40 +948,96 @@ test_cross_process_rings(void)
 	    "drain across processes, waits, CQEs at exit\n");
 }
 
+/* A wait for one CQE from another thread, for 2 s at most. */
+static void *
+timed_wait_from_other_thread(void *arg)
+{
+	struct test_ring *r = arg;
+	struct __kernel_timespec ts = { .tv_sec = 2 };
+	struct io_uring_getevents_arg ga = {
+		.ts = (uint64_t)(uintptr_t)&ts,
+	};
+	long rc = kqring_enter(r->fd, 0, 1, IORING_ENTER_GETEVENTS |
+	    IORING_ENTER_EXT_ARG, &ga, sizeof(ga));
+
+	return ((void *)(intptr_t)(rc < 0 ? errno : 0));
+}
+
+/*
+ * SINGLE_ISSUER without DEFER_TASKRUN: another thread may wait, as on
+ * Linux, where only DEFER_TASKRUN keeps waits to the submitter.  It waits
+ * for completions the owner posts, the ring's kthread posts (a default
+ * ring), or a writer's return to user space posts (COOP_TASKRUN).
+ */
 static void
 test_single_issuer_wait(void)
 {
-	struct io_uring_params p;
-	struct test_ring t;
-	pthread_t th;
-	void *res;
+	static const uint32_t setups[] = {
+		IORING_SETUP_SINGLE_ISSUER,
+		IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN,
+	};
 
-	memset(&p, 0, sizeof(p));
-	p.flags = IORING_SETUP_SINGLE_ISSUER;
-	memset(&t, 0, sizeof(t));
-	t.fd = (int)kqring_setup(SQ_ENTRIES, &p);
-	assert(t.fd >= 0);
-	ring_map(&t, &p);
+	for (size_t i = 0; i < nitems(setups); i++) {
+		struct io_uring_params p;
+		struct io_uring_sqe *sqe;
+		struct test_ring t;
+		pthread_t th;
+		void *res;
+		char c;
+		int pfd[2];
 
-	assert(pthread_create(&th, NULL, getevents_from_other_thread, &t) == 0);
-	assert(pthread_join(th, &res) == 0);
-	assert((intptr_t)res == 0);
-	assert(pthread_create(&th, NULL, wait_from_other_thread, &t) == 0);
-	assert(pthread_join(th, &res) == 0);
-	assert((intptr_t)res == EEXIST);
+		memset(&p, 0, sizeof(p));
+		p.flags = setups[i];
+		memset(&t, 0, sizeof(t));
+		t.fd = (int)kqring_setup(SQ_ENTRIES, &p);
+		assert(t.fd >= 0);
+		ring_map(&t, &p);
 
-	(void)ring_prep(&t, IORING_OP_NOP, -1, 79001);
-	ring_push_sqe(&t);
-	ring_submit(&t);
-	assert(ring_wait(&t, 1, 2000) == 0);
-	assert(pthread_create(&th, NULL, wait_from_other_thread, &t) == 0);
-	assert(pthread_join(th, &res) == 0);
-	assert((intptr_t)res == 0);
-	expect_cqe(&t, 79001, 0);
-	munmap(t.ring_map, t.ring_map_len);
-	munmap(t.sqes, t.sqes_len);
-	close(t.fd);
-	printf("[PASS] SINGLE_ISSUER: another thread's wait sees the CQ\n");
+		assert(pthread_create(&th, NULL, getevents_from_other_thread,
+		    &t) == 0);
+		assert(pthread_join(th, &res) == 0);
+		assert((intptr_t)res == 0);
+		/* Nothing comes: the wait times out. */
+		assert(pthread_create(&th, NULL, timed_wait_from_other_thread,
+		    &t) == 0);
+		assert(pthread_join(th, &res) == 0);
+		assert((intptr_t)res == ETIMEDOUT);
+
+		/* The owner submits while the other thread waits. */
+		assert(pthread_create(&th, NULL, timed_wait_from_other_thread,
+		    &t) == 0);
+		usleep(50000);
+		(void)ring_prep(&t, IORING_OP_NOP, -1, 79001);
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		assert(pthread_join(th, &res) == 0);
+		assert((intptr_t)res == 0);
+		expect_cqe(&t, 79001, 0);
+
+		/* A read that completes later, while the owner is away. */
+		assert(pipe(pfd) == 0);
+		sqe = ring_prep(&t, IORING_OP_READ, pfd[0], 79002);
+		sqe->addr = (uint64_t)(uintptr_t)&c;
+		sqe->len = 1;
+		sqe->off = (uint64_t)-1;
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		assert(pthread_create(&th, NULL, timed_wait_from_other_thread,
+		    &t) == 0);
+		usleep(50000);
+		assert(write(pfd[1], "w", 1) == 1);
+		assert(pthread_join(th, &res) == 0);
+		assert((intptr_t)res == 0);
+		expect_cqe(&t, 79002, 1);
+		close(pfd[0]);
+		close(pfd[1]);
+
+		munmap(t.ring_map, t.ring_map_len);
+		munmap(t.sqes, t.sqes_len);
+		close(t.fd);
+	}
+	printf("[PASS] SINGLE_ISSUER: another thread's wait waits, for the "
+	    "owner's, the kthread's and COOP_TASKRUN's completions\n");
 }
 
 
@@ -1017,7 +1060,8 @@ test_setup_errors(void)
 	    IORING_SETUP_DEFER_TASKRUN;
 	static const uint32_t bad[] = {
 		IORING_SETUP_SQ_AFF,
-		IORING_SETUP_ATTACH_WQ, 1U << 17 /* HYBRID_IOPOLL */,
+		IORING_SETUP_ATTACH_WQ,
+		IORING_SETUP_HYBRID_IOPOLL,	/* without IOPOLL */
 	};
 	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
 		p.flags = req | bad[i];
@@ -1089,7 +1133,7 @@ test_sqe_validation(struct test_ring *r)
 {
 	static char buf[64];
 	static const uint8_t bad_flags[] = {
-		IOSQE_FIXED_FILE, 1U << 7,
+		1U << 7,
 	};
 	struct io_uring_sqe *sqe;
 	int sv[2];
@@ -1100,6 +1144,19 @@ test_sqe_validation(struct test_ring *r)
 		ring_push_sqe(r);
 		assert(submit_one(r) == -EINVAL);
 	}
+	/*
+	 * IOSQE_FIXED_FILE where no file is taken: ignored, as Linux, but a
+	 * path opcode fails with EBADF.
+	 */
+	sqe = ring_prep(r, IORING_OP_NOP, 3, 11010);
+	sqe->flags = IOSQE_FIXED_FILE;
+	ring_push_sqe(r);
+	assert(submit_one(r) == 0);
+	sqe = ring_prep(r, IORING_OP_OPENAT, AT_FDCWD, 11011);
+	sqe->addr = (uint64_t)(uintptr_t)"/dev/null";
+	sqe->flags = IOSQE_FIXED_FILE;
+	ring_push_sqe(r);
+	assert(submit_one(r) == -EBADF);
 	/* IOSQE_ASYNC is a hint. */
 	sqe = ring_prep(r, IORING_OP_NOP, -1, 11100);
 	sqe->flags = IOSQE_ASYNC;
@@ -1371,13 +1428,13 @@ test_futex_wait(struct test_ring *r)
 	assert(ring_cq_ready(r) == 0);
 
 	atomic_store(&w2, 1);
-	assert(kqring_enter(r->fd, 0, 0, 0, NULL, 0) == 0);
+	assert(kqring_enter(r->fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) == 0);
 	assert(ring_cq_ready(r) == 1);
 	c = ring_pop_cqe(r);
 	assert(c.user_data == 4102 && c.res == 0);
 
 	atomic_store(&w1, 1);
-	assert(kqring_enter(r->fd, 0, 0, 0, NULL, 0) == 0);
+	assert(kqring_enter(r->fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) == 0);
 	assert(ring_cq_ready(r) == 1);
 	c = ring_pop_cqe(r);
 	assert(c.user_data == 4101 && c.res == 0);
@@ -1974,7 +2031,11 @@ static _Atomic uint32_t futex_word2;
 static struct io_uring_cqe
 expect_cqe(struct test_ring *r, uint64_t ud, int32_t res)
 {
-	assert(ring_cq_ready(r) > 0);
+	if (ring_cq_ready(r) == 0) {
+		fprintf(stderr, "expected cqe ud=%llu res=%d, got none\n",
+		    (unsigned long long)ud, res);
+		abort();
+	}
 	struct io_uring_cqe c = ring_pop_cqe(r);
 	if (c.user_data != ud || c.res != res) {
 		fprintf(stderr, "expected cqe ud=%llu res=%d, got ud=%llu "
@@ -4611,7 +4672,7 @@ test_path_ops(struct test_ring *r)
 	assert(fd >= 0);
 	assert(write(fd, "0123456789", 10) == 10);
 
-	/* RESOLVE_BENEATH stops an escape from dfd. */
+	/* RESOLVE_BENEATH stops an escape from dfd, with Linux's EXDEV. */
 	how.flags = O_RDONLY;
 	how.mode = 0;
 	sqe = ring_prep(r, IORING_OP_OPENAT2, dfd, 30803);
@@ -4619,7 +4680,7 @@ test_path_ops(struct test_ring *r)
 	sqe->addr2 = (uint64_t)(uintptr_t)&how;
 	sqe->len = sizeof(how);
 	ring_push_sqe(r);
-	assert(submit_one(r) == -ENOTCAPABLE);
+	assert(submit_one(r) == -EXDEV);
 	/* A mode without O_CREAT, and unknown trailing struct bytes. */
 	how.mode = 0600;
 	sqe = ring_prep(r, IORING_OP_OPENAT2, dfd, 30804);
@@ -4835,8 +4896,8 @@ test_futex_wake(struct test_ring *r)
 	ring_submit(r);
 	assert(ring_cq_ready(r) == 0);
 	prep_futex(r, IORING_OP_FUTEX_WAKE, &w, 1, 0, 31002);
-	ring_submit(r);
-	assert(ring_cq_ready(r) == 2);
+	/* The woken wait's CQE comes from taskwork: wait for it. */
+	assert(ring_wait(r, 2, 2000) == 0);
 	expect_cqe(r, 31002, 1);
 	expect_cqe(r, 31001, 0);
 
@@ -4845,13 +4906,11 @@ test_futex_wake(struct test_ring *r)
 	prep_futex(r, IORING_OP_FUTEX_WAIT, &w, 0, 0, 31021);
 	ring_submit(r);
 	prep_futex(r, IORING_OP_FUTEX_WAKE, &w, 1, 0, 31022);
-	ring_submit(r);
-	assert(ring_cq_ready(r) == 2);
+	assert(ring_wait(r, 2, 2000) == 0);
 	expect_cqe(r, 31022, 1);
 	expect_cqe(r, 31020, 0);
 	prep_futex(r, IORING_OP_FUTEX_WAKE, &w, 1, 0, 31023);
-	ring_submit(r);
-	assert(ring_cq_ready(r) == 2);
+	assert(ring_wait(r, 2, 2000) == 0);
 	expect_cqe(r, 31023, 1);
 	expect_cqe(r, 31021, 0);
 
@@ -4861,8 +4920,7 @@ test_futex_wake(struct test_ring *r)
 	prep_futex(r, IORING_OP_FUTEX_WAKE, &w, 1, 0x2, 31004);
 	assert(submit_one(r) == 0);
 	prep_futex(r, IORING_OP_FUTEX_WAKE, &w, 1, 0x3, 31005);
-	ring_submit(r);
-	assert(ring_cq_ready(r) == 2);
+	assert(ring_wait(r, 2, 2000) == 0);
 	expect_cqe(r, 31005, 1);
 	expect_cqe(r, 31003, 0);
 
@@ -4963,7 +5021,7 @@ test_msg_ring(struct test_ring *r)
 	sqe->off = 0xabc;
 	ring_push_sqe(r);
 	assert(submit_one(r) == 0);
-	assert(kqring_enter(r2.fd, 0, 0, 0, NULL, 0) == 0);
+	assert(kqring_enter(r2.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) == 0);
 	struct io_uring_cqe c = expect_cqe(&r2, 0xabc, 123);
 	assert(c.flags == 0);
 
@@ -4975,7 +5033,7 @@ test_msg_ring(struct test_ring *r)
 	sqe->file_index = 0x5a0000;
 	ring_push_sqe(r);
 	assert(submit_one(r) == 0);
-	assert(kqring_enter(r2.fd, 0, 0, 0, NULL, 0) == 0);
+	assert(kqring_enter(r2.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) == 0);
 	c = expect_cqe(&r2, 0xabd, 0);
 	assert(c.flags == 0x5a0000);
 	close(r2.fd);
@@ -4987,8 +5045,10 @@ test_msg_ring(struct test_ring *r)
 	sqe->off = 0xabe;
 	ring_push_sqe(r);
 	ring_submit(r);
-	assert(ring_cq_ready(r) == 2);
+	/* This ring is DEFER_TASKRUN: the message waits for a wait. */
+	assert(ring_cq_ready(r) == 1);
 	expect_cqe(r, 32003, 0);
+	assert(ring_wait(r, 1, 2000) == 0);
 	expect_cqe(r, 0xabe, 9);
 
 	/* Not a ring. */
@@ -5281,12 +5341,12 @@ test_fixed_files(void)
 	/* No table yet. */
 	assert(reg(&t, IORING_UNREGISTER_FILES, NULL, 0) == -ENXIO);
 	assert(fixed_rw(&t, IORING_OP_READ, 0, buf, 1, 40001) == -EBADF);
-	/* FIXED_FILE only applies to ops that take a file. */
+	/* A path can't be a fixed slot: EBADF, as Linux. */
 	sqe = ring_prep(&t, IORING_OP_OPENAT, AT_FDCWD, 40002);
 	sqe->flags = IOSQE_FIXED_FILE;
 	sqe->addr = (uint64_t)(uintptr_t)"/dev/null";
 	ring_push_sqe(&t);
-	assert(submit_one(&t) == -EINVAL);
+	assert(submit_one(&t) == -EBADF);
 
 	int fds[4] = { pfd[0], pfd[1], sv[0], -1 };
 	assert(reg(&t, IORING_REGISTER_FILES, fds, 0) == -EINVAL);
@@ -6589,7 +6649,7 @@ test_send_fd(void)
 	sqe->off = 0x5e4d;
 	ring_push_sqe(&a);
 	assert(submit_one(&a) == 0);
-	assert(kqring_enter(b.fd, 0, 0, 0, NULL, 0) == 0);
+	assert(kqring_enter(b.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) == 0);
 	expect_cqe(&b, 0x5e4d, 0);
 	assert(fixed_rw(&b, IORING_OP_WRITE, 0, "fd!", 3, 48002) == 3);
 	assert(read(pfd[0], buf, sizeof(buf)) == 3 && memcmp(buf, "fd!", 3) == 0);
@@ -6606,7 +6666,7 @@ test_send_fd(void)
 	sqe->msg_ring_flags = IORING_MSG_RING_CQE_SKIP;
 	ring_push_sqe(&a);
 	assert(submit_one(&a) == 0);
-	assert(kqring_enter(b.fd, 0, 0, 0, NULL, 0) == 0);
+	assert(kqring_enter(b.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) == 0);
 	expect_cqe(&b, 0x5e4e, 0);
 	assert(ring_cq_ready(&b) == 0);
 	assert(fixed_rw(&b, IORING_OP_WRITE, 1, "1", 1, 48005) == 1);
@@ -6620,7 +6680,7 @@ test_send_fd(void)
 	sqe->off = 0x5e4f;
 	ring_push_sqe(&a);
 	assert(submit_one(&a) == 0);
-	assert(kqring_enter(c.fd, 0, 0, 0, NULL, 0) == 0);
+	assert(kqring_enter(c.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) == 0);
 	expect_cqe(&c, 0x5e4f, -ENFILE);	/* no table to allocate from */
 	sqe = ring_prep(&a, IORING_OP_MSG_RING, b.fd, 48008);
 	sqe->addr = IORING_MSG_SEND_FD;
@@ -6628,7 +6688,7 @@ test_send_fd(void)
 	sqe->off = 0x5e50;
 	ring_push_sqe(&a);
 	assert(submit_one(&a) == 0);
-	assert(kqring_enter(b.fd, 0, 0, 0, NULL, 0) == 0);
+	assert(kqring_enter(b.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) == 0);
 	expect_cqe(&b, 0x5e50, -EINVAL);
 	/* Errors the sender sees: itself, an empty source slot. */
 	sqe = ring_prep(&a, IORING_OP_MSG_RING, a.fd, 48009);
@@ -6652,7 +6712,7 @@ test_send_fd(void)
 		.off = 0xbeef,
 	};
 	assert(reg(&a, IORING_REGISTER_SEND_MSG_RING, &msg, 1) == 0);
-	assert(kqring_enter(c.fd, 0, 0, 0, NULL, 0) == 0);
+	assert(kqring_enter(c.fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) == 0);
 	expect_cqe(&c, 0xbeef, 44);
 	msg.addr = IORING_MSG_SEND_FD;
 	assert(reg(&a, IORING_REGISTER_SEND_MSG_RING, &msg, 1) == -EINVAL);
@@ -7545,29 +7605,75 @@ test_inline_file_pipe(const char *dir)
 	expect_cqe(&t, 62007, -EFAULT);
 	/*
 	 * On tmpfs, read(2) itself into such a buffer never returns (FreeBSD
-	 * 15.1): tmpfs doesn't set MNTK_NO_IOPF, so vn_io_fault() doesn't
-	 * hold the buffer's pages first, and tmpfs_read() faults on the page
-	 * it holds busied.  The inline copy gives up with EFAULT, but the
-	 * worker it goes to would read(2) as that.
+	 * 15.1, bug 300734): tmpfs doesn't set MNTK_NO_IOPF, so vn_io_fault()
+	 * doesn't hold the buffer's pages first, and tmpfs_read() faults on
+	 * the page it holds busied.  kqring's worker holds them first on such
+	 * a filesystem, so the read returns there too.  So does a write from
+	 * such a buffer.
 	 */
-	char *map;
-	if (strcmp(sfs.f_fstypename, "tmpfs") == 0)
-		goto skip_selfmap;
-	map = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED,
-	    fd, 0);
-	assert(map != MAP_FAILED);
+	char *map = NULL;
+	/* A new mapping each time, so the copy has to fault it in. */
+#define	SELFMAP() do {									if (map != NULL)								munmap(map, 2 * 4096);						map = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE,			    MAP_SHARED, fd, 0);							assert(map != MAP_FAILED);					} while (0)
+	SELFMAP();
 	prep_pread(&t, fd, map, 2 * 4096, 0, 62012);
 	ring_submit(&t);
 	assert(ring_wait(&t, 1, 2000) == 0);
 	expect_cqe(&t, 62012, 2 * 4096);
 	assert(memcmp(map, data, 2 * 4096) == 0);
+	SELFMAP();
 	prep_pread(&t, fd, map + 4096, 4096, 0, 62013);	/* overlapping */
 	ring_submit(&t);
 	assert(ring_wait(&t, 1, 2000) == 0);
 	expect_cqe(&t, 62013, 4096);
 	assert(memcmp(map + 4096, data, 4096) == 0);
+	/* Page 1 now holds page 0's bytes: write them back from page 0. */
+	SELFMAP();
+	sqe = ring_prep(&t, IORING_OP_WRITE, fd, 62016);
+	sqe->addr = (uint64_t)(uintptr_t)map;
+	sqe->len = 4096;
+	sqe->off = 0;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 62016, 4096);
+	/* From page 0 to page 1. */
+	SELFMAP();
+	sqe = ring_prep(&t, IORING_OP_WRITE, fd, 62017);
+	sqe->addr = (uint64_t)(uintptr_t)map;
+	sqe->len = 4096;
+	sqe->off = 4096;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 62017, 4096);
+	assert(memcmp(map, data, 4096) == 0 &&
+	    memcmp(map + 4096, data, 4096) == 0);
+	/*
+	 * A vectored read from page 1 into page 1 (400 bytes lower) and
+	 * page 0: each copy is a memmove(), so the bytes are the file's.
+	 */
+	assert(pwrite(fd, data, sizeof(data), 0) == (ssize_t)sizeof(data));
+	SELFMAP();
+	{
+		struct iovec siov[2] = {
+			{ map + 4096 + 100, 3000 },
+			{ map + 7, 1093 },
+		};
+
+		sqe = ring_prep(&t, IORING_OP_READV, fd, 62018);
+		sqe->addr = (uint64_t)(uintptr_t)siov;
+		sqe->len = 2;
+		sqe->off = 4096 + 500;
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		assert(ring_wait(&t, 1, 2000) == 0);
+		expect_cqe(&t, 62018, 4093);
+		assert(memcmp(map + 4096 + 100, data + 4096 + 500, 3000) == 0);
+		assert(memcmp(map + 7, data + 4096 + 3500, 1093) == 0);
+	}
+#undef	SELFMAP
 	munmap(map, 2 * 4096);
-skip_selfmap:
+	assert(pwrite(fd, data, sizeof(data), 0) == (ssize_t)sizeof(data));
 
 	/* IOSQE_ASYNC still goes through a worker. */
 	prep_pread(&t, fd, buf, 64, 0, 62008);
@@ -12133,7 +12239,7 @@ test_register_query(void)
 	    IORING_SETUP_SQ_REWIND | IORING_SETUP_DEFER_TASKRUN)) ==
 	    (IORING_SETUP_CQE_MIXED | IORING_SETUP_SQ_REWIND |
 	    IORING_SETUP_DEFER_TASKRUN));
-	assert((op.ring_setup_flags & (1U << 17)) == 0);	/* HYBRID_IOPOLL */
+	assert((op.ring_setup_flags & IORING_SETUP_HYBRID_IOPOLL) != 0);
 	assert((op.enter_flags & IORING_ENTER_GETEVENTS) != 0);
 	assert(op.sqe_flags == (IOSQE_FIXED_FILE | IOSQE_IO_DRAIN |
 	    IOSQE_IO_LINK | IOSQE_IO_HARDLINK | IOSQE_ASYNC |
@@ -12219,6 +12325,230 @@ test_register_query(void)
 	    "short and long answers, errors, chains\n");
 }
 
+/* One NOP with these flags, alone: its result. */
+static int32_t
+nop_res(struct test_ring *t, uint32_t nop_flags, uint8_t sqe_flags, int fd,
+    uint16_t buf_index, uint32_t len)
+{
+	struct io_uring_sqe *sqe = ring_prep(t, IORING_OP_NOP, fd, 79500);
+	struct io_uring_cqe c;
+
+	sqe->nop_flags = nop_flags;
+	sqe->flags = sqe_flags;
+	sqe->buf_index = buf_index;
+	sqe->len = len;
+	ring_push_sqe(t);
+	ring_submit(t);
+	assert(ring_wait(t, 1, 2000) == 0);
+	c = ring_pop_cqe(t);
+	assert(c.user_data == 79500);
+	return (c.res);
+}
+
+/*
+ * NOP's IORING_NOP_FILE, FIXED_FILE, FIXED_BUFFER and TW, as Linux 7.3's
+ * io_nop(); tests/kqring_diff.c's nop_flags compares them line by line.
+ */
+static void
+test_nop_flags(void)
+{
+	struct io_uring_params p;
+	struct test_ring t;
+	struct iovec iov;
+	int pfd[2], files[2];
+	void *m;
+
+	ring_init(&t);
+	assert(pipe(pfd) == 0);
+	files[0] = pfd[0];
+	files[1] = -1;
+	assert(kqring_register(t.fd, IORING_REGISTER_FILES, files, 2) == 0);
+	m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
+	    -1, 0);
+	assert(m != MAP_FAILED);
+	iov.iov_base = m;
+	iov.iov_len = 4096;
+	assert(kqring_register(t.fd, IORING_REGISTER_BUFFERS, &iov, 1) == 0);
+
+	assert(nop_res(&t, IORING_NOP_FILE, 0, pfd[0], 0, 0) == 0);
+	assert(nop_res(&t, IORING_NOP_FILE | IORING_NOP_INJECT_RESULT, 0,
+	    pfd[0], 0, 7) == 7);
+	assert(nop_res(&t, IORING_NOP_FILE | IORING_NOP_INJECT_RESULT, 0,
+	    1000, 0, 7) == -EBADF);
+	assert(nop_res(&t, IORING_NOP_FILE | IORING_NOP_FIXED_FILE, 0, 0, 0,
+	    0) == 0);
+	assert(nop_res(&t, IORING_NOP_FILE | IORING_NOP_FIXED_FILE, 0, 1, 0,
+	    0) == -EBADF);
+	assert(nop_res(&t, IORING_NOP_FILE | IORING_NOP_FIXED_FILE, 0, 99, 0,
+	    0) == -EBADF);
+	assert(nop_res(&t, IORING_NOP_FILE, IOSQE_FIXED_FILE, 0, 0, 0) == 0);
+	assert(nop_res(&t, 0, IOSQE_FIXED_FILE, 1, 0, 0) == 0);
+	assert(nop_res(&t, IORING_NOP_FIXED_FILE, 0, 5, 0, 0) == 0);
+	assert(nop_res(&t, IORING_NOP_FIXED_BUFFER, 0, -1, 0, 0) == 0);
+	assert(nop_res(&t, IORING_NOP_FIXED_BUFFER | IORING_NOP_INJECT_RESULT,
+	    0, -1, 3, 9) == -EFAULT);
+	assert(nop_res(&t, IORING_NOP_FILE | IORING_NOP_FIXED_BUFFER, 0, 1000,
+	    3, 0) == -EBADF);
+	assert(nop_res(&t, IORING_NOP_TW | IORING_NOP_INJECT_RESULT, 0, -1, 0,
+	    3) == 3);
+	assert(nop_res(&t, IORING_NOP_TW | IORING_NOP_FILE, 0, 1000, 0, 0) ==
+	    -EBADF);
+	assert(nop_res(&t, 1U << 6, 0, -1, 0, 0) == -EINVAL);
+	close(t.fd);
+	munmap(m, 4096);
+
+	/* DEFER_TASKRUN: the TW one's CQE waits for a wait. */
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+	memset(&t, 0, sizeof(t));
+	t.fd = (int)kqring_setup(SQ_ENTRIES, &p);
+	assert(t.fd >= 0);
+	ring_map(&t, &p);
+	(void)ring_prep(&t, IORING_OP_NOP, -1, 79501);
+	ring_push_sqe(&t);
+	ring_prep(&t, IORING_OP_NOP, -1, 79502)->nop_flags = IORING_NOP_TW;
+	ring_push_sqe(&t);
+	ring_submit(&t);
+	assert(ring_cq_ready(&t) == 1);
+	expect_cqe(&t, 79501, 0);
+	assert(ring_wait(&t, 1, 2000) == 0);
+	expect_cqe(&t, 79502, 0);
+	munmap(t.ring_map, t.ring_map_len);
+	munmap(t.sqes, t.sqes_len);
+	close(t.fd);
+	close(pfd[0]);
+	close(pfd[1]);
+	printf("[PASS] NOP flags: FILE, FIXED_FILE, FIXED_BUFFER and TW as "
+	    "Linux 7.3\n");
+}
+
+/* OPENAT2 of path from dirfd: the descriptor (closed), or -errno. */
+static int32_t
+openat2_res(struct test_ring *t, int dirfd, const char *path, int flags,
+    uint64_t resolve)
+{
+	struct open_how how = {
+		.flags = (uint64_t)flags,
+		.mode = (flags & O_CREAT) != 0 ? 0644 : 0,
+		.resolve = resolve,
+	};
+	struct io_uring_sqe *sqe = ring_prep(t, IORING_OP_OPENAT2, dirfd,
+	    79600);
+	struct io_uring_cqe c;
+
+	sqe->addr = (uint64_t)(uintptr_t)path;
+	sqe->len = sizeof(how);
+	sqe->off = (uint64_t)(uintptr_t)&how;
+	ring_push_sqe(t);
+	ring_submit(t);
+	assert(ring_wait(t, 1, 2000) == 0);
+	c = ring_pop_cqe(t);
+	assert(c.user_data == 79600);
+	if (c.res >= 0) {
+		close(c.res);
+		return (0);
+	}
+	return (c.res);
+}
+
+/*
+ * OPENAT2's RESOLVE_IN_ROOT, NO_XDEV and NO_SYMLINKS, walked by kqring a
+ * component at a time; tests/kqring_diff.c's openat2_resolve compares
+ * the rest with Linux 7.3.
+ */
+static void
+test_openat2_resolve(void)
+{
+	char root[] = "/tmp/kqring_resolve.XXXXXX";
+	struct test_ring t;
+	int dfd, fd;
+
+	assert(mkdtemp(root) != NULL);
+	dfd = open(root, O_RDONLY | O_DIRECTORY);
+	assert(dfd >= 0);
+	assert(mkdirat(dfd, "a", 0755) == 0);
+	fd = openat(dfd, "a/f", O_CREAT | O_WRONLY, 0644);
+	assert(fd >= 0 && write(fd, "f", 1) == 1);
+	close(fd);
+	assert(symlinkat("f", dfd, "a/rel") == 0);
+	assert(symlinkat("/a/f", dfd, "a/abs") == 0);
+	assert(symlinkat("../..", dfd, "a/up") == 0);
+	assert(symlinkat("loop", dfd, "a/loop") == 0);
+	ring_init(&t);
+
+	/* IN_ROOT: "/" and ".." stop at the directory. */
+	assert(openat2_res(&t, dfd, "a/abs", O_RDONLY, RESOLVE_IN_ROOT) == 0);
+	assert(openat2_res(&t, dfd, "/a/f", O_RDONLY, RESOLVE_IN_ROOT) == 0);
+	assert(openat2_res(&t, dfd, "a/up/a/f", O_RDONLY, RESOLVE_IN_ROOT) ==
+	    0);
+	assert(openat2_res(&t, dfd, "../../../a/f", O_RDONLY,
+	    RESOLVE_IN_ROOT) == 0);
+	assert(openat2_res(&t, dfd, "a/abs", O_RDONLY, 0) == -ENOENT);
+	assert(openat2_res(&t, dfd, "a/up/new", O_CREAT | O_WRONLY,
+	    RESOLVE_IN_ROOT) == 0);
+	assert(faccessat(dfd, "new", F_OK, 0) == 0);
+	assert(unlinkat(dfd, "new", 0) == 0);
+	/* BENEATH: the same escapes fail, alone and with the walk. */
+	assert(openat2_res(&t, dfd, "a/abs", O_RDONLY, RESOLVE_BENEATH) ==
+	    -EXDEV);
+	assert(openat2_res(&t, dfd, "a/up/a/f", O_RDONLY, RESOLVE_BENEATH |
+	    RESOLVE_NO_SYMLINKS) == -ELOOP);
+	assert(openat2_res(&t, dfd, "a/../..", O_RDONLY, RESOLVE_BENEATH |
+	    RESOLVE_NO_XDEV) == -EXDEV);
+	assert(openat2_res(&t, dfd, "a/../a/f", O_RDONLY, RESOLVE_BENEATH |
+	    RESOLVE_NO_XDEV) == 0);
+	assert(openat2_res(&t, dfd, "a/f", O_RDONLY, RESOLVE_BENEATH |
+	    RESOLVE_IN_ROOT) == -EINVAL);
+	/* NO_SYMLINKS: any symlink on the way. */
+	assert(openat2_res(&t, dfd, "a/rel", O_RDONLY, RESOLVE_NO_SYMLINKS) ==
+	    -ELOOP);
+	assert(openat2_res(&t, dfd, "a/f", O_RDONLY, RESOLVE_NO_SYMLINKS) ==
+	    0);
+	assert(openat2_res(&t, dfd, "a/loop", O_RDONLY, RESOLVE_IN_ROOT) ==
+	    -ELOOP);
+	/* NO_XDEV: /dev is a mount of its own. */
+	assert(openat2_res(&t, AT_FDCWD, "/dev/null", O_RDONLY,
+	    RESOLVE_NO_XDEV) == -EXDEV);
+	assert(openat2_res(&t, dfd, "a/f", O_RDONLY, RESOLVE_NO_XDEV) == 0);
+	/* A cached lookup won't create. */
+	assert(openat2_res(&t, dfd, "a/g", O_CREAT | O_WRONLY,
+	    RESOLVE_CACHED) == -EAGAIN);
+
+	/* Into a fixed slot. */
+	{
+		struct io_uring_sqe *sqe;
+		struct open_how how = {
+			.flags = O_RDONLY,
+			.resolve = RESOLVE_IN_ROOT,
+		};
+		int files[1] = { -1 };
+
+		assert(kqring_register(t.fd, IORING_REGISTER_FILES, files,
+		    1) == 0);
+		sqe = ring_prep(&t, IORING_OP_OPENAT2, dfd, 79601);
+		sqe->addr = (uint64_t)(uintptr_t)"/a/abs";
+		sqe->len = sizeof(how);
+		sqe->off = (uint64_t)(uintptr_t)&how;
+		sqe->file_index = 1;
+		ring_push_sqe(&t);
+		ring_submit(&t);
+		assert(ring_wait(&t, 1, 2000) == 0);
+		expect_cqe(&t, 79601, 0);
+	}
+	close(t.fd);
+
+	assert(unlinkat(dfd, "a/rel", 0) == 0);
+	assert(unlinkat(dfd, "a/abs", 0) == 0);
+	assert(unlinkat(dfd, "a/up", 0) == 0);
+	assert(unlinkat(dfd, "a/loop", 0) == 0);
+	assert(unlinkat(dfd, "a/f", 0) == 0);
+	assert(unlinkat(dfd, "a", AT_REMOVEDIR) == 0);
+	close(dfd);
+	assert(rmdir(root) == 0);
+	printf("[PASS] OPENAT2: RESOLVE_IN_ROOT, NO_XDEV, NO_SYMLINKS walked, "
+	    "with BENEATH\n");
+}
+
 /*
  * The rest of COMPATIBILITY.MD: what is refused, ignored or kept. The
  * refused values are Linux 7.3's, which <sys/kqring.h> leaves out; when one
@@ -12228,7 +12558,7 @@ static void
 test_compat_contracts(void)
 {
 	static const uint32_t bad_setup[] = {
-		1U << 17,	/* IORING_SETUP_HYBRID_IOPOLL */
+		IORING_SETUP_HYBRID_IOPOLL,	/* without IOPOLL */
 		IORING_SETUP_TASKRUN_FLAG,
 		IORING_SETUP_SQPOLL | IORING_SETUP_COOP_TASKRUN,
 		IORING_SETUP_SQPOLL | IORING_SETUP_COOP_TASKRUN |
@@ -12244,10 +12574,7 @@ test_compat_contracts(void)
 		36,		/* IORING_REGISTER_ZCRX_CTRL */
 	};
 	static const uint32_t bad_nop[] = {
-		1U << 1,	/* IORING_NOP_FILE */
-		1U << 2,	/* IORING_NOP_FIXED_FILE */
-		1U << 3,	/* IORING_NOP_FIXED_BUFFER */
-		1U << 4,	/* IORING_NOP_TW */
+		1U << 6,
 		IORING_NOP_CQE32,	/* without CQE32 or CQE_MIXED */
 	};
 	struct io_uring_params p;
@@ -15474,6 +15801,21 @@ main(int argc, char **argv)
 	}
 	test_argv0 = argv[0];
 	ring_init(&r);
+	/* "p15": the tests of roadmap phase 15 only. */
+	if (argc >= 2 && strcmp(argv[1], "p15") == 0) {
+		test_setup_errors();
+		test_inline_file_pipe("/tmp");
+		if (getenv("KQRING_TEST_TMPFS") != NULL)
+			test_inline_file_pipe(getenv("KQRING_TEST_TMPFS"));
+		if (getenv("KQRING_TEST_UFS") != NULL)
+			test_inline_file_pipe(getenv("KQRING_TEST_UFS"));
+		test_single_issuer_wait();
+		test_nop_flags();
+		test_openat2_resolve();
+		test_compat_contracts();
+		printf("[OK]: %d failure(s)\n", failures);
+		return (failures != 0);
+	}
 	/* "trig": only the event-driven chain tests. */
 	if (argc >= 2 && strcmp(argv[1], "trig") == 0) {
 		test_triggers(&r);
@@ -15581,6 +15923,8 @@ main(int argc, char **argv)
 		/* A tmpfs directory, e.g. a mount without -o pgread. */
 		if (getenv("KQRING_TEST_TMPFS") != NULL)
 			test_inline_file_pipe(getenv("KQRING_TEST_TMPFS"));
+		if (getenv("KQRING_TEST_UFS") != NULL)
+			test_inline_file_pipe(getenv("KQRING_TEST_UFS"));
 		test_disk_bio();
 		test_napi_busy_poll();
 		test_worker_buffer_reservation();
@@ -15608,6 +15952,8 @@ main(int argc, char **argv)
 		test_files_update_refused();
 		test_cross_process_rings();
 		test_single_issuer_wait();
+		test_nop_flags();
+		test_openat2_resolve();
 		test_compat_contracts();
 		test_register_query();
 		test_exec_kthreads();

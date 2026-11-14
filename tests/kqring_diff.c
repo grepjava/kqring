@@ -105,7 +105,9 @@ errname(int e)
 		{ EINTR, "EINTR" }, { ENOMEM, "ENOMEM" }, { EACCES, "EACCES" },
 		{ ENOTSOCK, "ENOTSOCK" }, { EOVERFLOW, "EOVERFLOW" },
 		{ ENXIO, "ENXIO" }, { EPERM, "EPERM" },
-		{ EMSGSIZE, "EMSGSIZE" },
+		{ EMSGSIZE, "EMSGSIZE" }, { ELOOP, "ELOOP" },
+		{ EXDEV, "EXDEV" }, { ENOTDIR, "ENOTDIR" },
+		{ EISDIR, "EISDIR" }, { ENAMETOOLONG, "ENAMETOOLONG" },
 #if defined(__linux__)
 		{ EBADFD, "EBADFD" }, { ETIMEDOUT, "ETIMEDOUT" },
 #endif
@@ -392,6 +394,8 @@ c_setup_flags(void)
 		    IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_TASKRUN_FLAG },
 		{ "defer+iopoll", IORING_SETUP_SINGLE_ISSUER |
 		    IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_IOPOLL },
+		{ "hybrid", 1U << 17 },		/* IORING_SETUP_HYBRID_IOPOLL */
+		{ "hybrid+iopoll", (1U << 17) | IORING_SETUP_IOPOLL },
 	};
 	size_t n = sizeof(fl) / sizeof(fl[0]);
 	char step[64];
@@ -2643,6 +2647,441 @@ c_bpf_filter(void)
 	in_child(bpf_filter_child);
 }
 
+/* Linux 7.3's values, for older headers. */
+#define	D_NOP_INJECT_RESULT	(1U << 0)
+#define	D_NOP_FILE		(1U << 1)
+#define	D_NOP_FIXED_FILE	(1U << 2)
+#define	D_NOP_FIXED_BUFFER	(1U << 3)
+#define	D_NOP_TW		(1U << 4)
+#define	D_RESOLVE_NO_XDEV	0x01
+#define	D_RESOLVE_NO_SYMLINKS	0x04
+#define	D_RESOLVE_BENEATH	0x08
+#define	D_RESOLVE_IN_ROOT	0x10
+#define	D_RESOLVE_CACHED	0x20
+
+struct d_open_how {
+	uint64_t	flags;
+	uint64_t	mode;
+	uint64_t	resolve;
+};
+
+/* One request, submitted alone: its CQE. */
+static void
+one(struct ring *r, const char *step)
+{
+	(void)submit(r);
+	await(r, 1, 2000);
+	dump(r, step);
+}
+
+/*
+ * NOP's flags: a descriptor or fixed slot that must be open, a registered
+ * buffer that must exist, and a completion from task work, which on a
+ * DEFER_TASKRUN ring waits for a wait.
+ */
+static void
+c_nop_flags(void)
+{
+	static const struct {
+		const char	*name;
+		uint32_t	nop_flags;
+		uint8_t		sqe_flags;
+		int		fd;		/* -2: the pipe */
+		uint16_t	buf_index;
+		uint32_t	len;
+	} t[] = {
+		{ "file", D_NOP_FILE, 0, -2, 0, 0 },
+		{ "file_inject", D_NOP_FILE | D_NOP_INJECT_RESULT, 0, -2, 0, 7 },
+		{ "file_bad", D_NOP_FILE, 0, 1000, 0, 0 },
+		{ "file_bad_inject", D_NOP_FILE | D_NOP_INJECT_RESULT, 0, 1000,
+		    0, 7 },
+		{ "fixed", D_NOP_FILE | D_NOP_FIXED_FILE, 0, 0, 0, 0 },
+		{ "fixed_empty", D_NOP_FILE | D_NOP_FIXED_FILE, 0, 1, 0, 0 },
+		{ "fixed_past", D_NOP_FILE | D_NOP_FIXED_FILE, 0, 99, 0, 0 },
+		{ "sqe_fixed", D_NOP_FILE, IOSQE_FIXED_FILE, 0, 0, 0 },
+		{ "sqe_fixed_empty", D_NOP_FILE, IOSQE_FIXED_FILE, 1, 0, 0 },
+		{ "sqe_fixed_alone", 0, IOSQE_FIXED_FILE, 1, 0, 0 },
+		{ "fixed_alone", D_NOP_FIXED_FILE, 0, 5, 0, 0 },
+		{ "buffer", D_NOP_FIXED_BUFFER, 0, -1, 0, 0 },
+		{ "buffer_past", D_NOP_FIXED_BUFFER, 0, -1, 3, 0 },
+		{ "buffer_inject", D_NOP_FIXED_BUFFER | D_NOP_INJECT_RESULT,
+		    0, -1, 3, 9 },
+		{ "file_bad_buffer_past", D_NOP_FILE | D_NOP_FIXED_BUFFER, 0,
+		    1000, 3, 0 },
+		{ "tw", D_NOP_TW, 0, -1, 0, 0 },
+		{ "tw_inject", D_NOP_TW | D_NOP_INJECT_RESULT, 0, -1, 0, 3 },
+		{ "tw_file_bad", D_NOP_TW | D_NOP_FILE, 0, 1000, 0, 0 },
+		{ "unknown", 1U << 6, 0, -1, 0, 0 },
+	};
+	struct io_uring_params p;
+	struct io_uring_sqe *s;
+	struct iovec iov;
+	struct ring r;
+	int pfd[2], files[2];
+	void *m;
+
+	ring_init(&r, 8, NULL);
+	CHECK(pipe(pfd) == 0);
+	files[0] = pfd[0];
+	files[1] = -1;
+	say_rc("register_files", ring_sys_register(r.fd, IORING_REGISTER_FILES,
+	    files, 2));
+	m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
+	    -1, 0);
+	CHECK(m != MAP_FAILED);
+	iov.iov_base = m;
+	iov.iov_len = 4096;
+	say_rc("register_buffers", ring_sys_register(r.fd,
+	    IORING_REGISTER_BUFFERS, &iov, 1));
+	for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+		s = prep(&r, IORING_OP_NOP, t[i].fd == -2 ? pfd[0] : t[i].fd,
+		    i + 1);
+		s->nop_flags = t[i].nop_flags;
+		s->flags = t[i].sqe_flags;
+		s->buf_index = t[i].buf_index;
+		s->len = t[i].len;
+		one(&r, t[i].name);
+	}
+	ring_free(&r);
+
+	/* DEFER_TASKRUN: the TW one's CQE waits for a wait. */
+	memset(&p, 0, sizeof(p));
+	p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+	ring_init(&r, 8, &p);
+	prep(&r, IORING_OP_NOP, -1, 30);
+	s = prep(&r, IORING_OP_NOP, -1, 31);
+	s->nop_flags = D_NOP_TW;
+	say_rc("defer_submit", submit(&r));
+	say("defer_ready", "%d", (int)ready(&r));
+	dump(&r, "defer_before_wait");
+	{
+		struct __kernel_timespec ts = { .tv_sec = 1 };
+		struct io_uring_getevents_arg ga;
+
+		memset(&ga, 0, sizeof(ga));
+		ga.ts = (uint64_t)(uintptr_t)&ts;
+		say_rc("defer_wait", ring_sys_enter(r.fd, 0, 1,
+		    IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &ga,
+		    sizeof(ga)));
+	}
+	dump(&r, "defer_after_wait");
+	ring_free(&r);
+	close(pfd[0]);
+	close(pfd[1]);
+	munmap(m, 4096);
+}
+
+/* OPENAT2 of path from dirfd with resolve: "fd", or the error. */
+static void
+openat2_one(struct ring *r, int dirfd, const char *path, int flags,
+    uint64_t resolve, const char *step)
+{
+	struct d_open_how how = {
+		.flags = (uint64_t)flags,
+		.mode = (flags & O_CREAT) != 0 ? 0644 : 0,
+		.resolve = resolve,
+	};
+	struct io_uring_sqe *s;
+	struct io_uring_cqe *c;
+	unsigned h;
+
+	s = prep(r, IORING_OP_OPENAT2, dirfd, 1);
+	s->addr = (uint64_t)(uintptr_t)path;
+	s->len = sizeof(how);
+	s->off = (uint64_t)(uintptr_t)&how;
+	(void)submit(r);
+	await(r, 1, 2000);
+	if (ready(r) != 1) {
+		printf("%s/%s cqes=%u\n", current, step, ready(r));
+		dump(r, step);
+		return;
+	}
+	h = atomic_load_explicit(r->cq_head, memory_order_relaxed);
+	c = &r->cqes[h & r->cq_mask];
+	if (c->res >= 0) {
+		printf("%s/%s fd\n", current, step);
+		close(c->res);
+	} else {
+		printf("%s/%s -%s\n", current, step, errname(-c->res));
+	}
+	atomic_store_explicit(r->cq_head, h + 1, memory_order_release);
+}
+
+/*
+ * OPENAT2's resolve flags over a tree with every kind of symlink, from a
+ * directory taken as the root, and across mounts from "/".
+ */
+static void
+c_openat2_resolve(void)
+{
+	static const struct {
+		const char	*name;
+		uint64_t	resolve;
+	} rs[] = {
+		{ "none", 0 },
+		{ "nosym", D_RESOLVE_NO_SYMLINKS },
+		{ "noxdev", D_RESOLVE_NO_XDEV },
+		{ "beneath", D_RESOLVE_BENEATH },
+		{ "inroot", D_RESOLVE_IN_ROOT },
+		{ "inroot_nosym", D_RESOLVE_IN_ROOT | D_RESOLVE_NO_SYMLINKS },
+		{ "beneath_nosym", D_RESOLVE_BENEATH | D_RESOLVE_NO_SYMLINKS },
+		{ "beneath_inroot", D_RESOLVE_BENEATH | D_RESOLVE_IN_ROOT },
+	};
+	static const char *paths[] = {
+		"a/f", "a/rel", "a/abs", "a/dir/a/f", "a/up", "a/up/a/f",
+		"a/../a/f", "../x", "/a/f", "a/f/", "a/", ".", "..", "a/rel/",
+		"a/none", "a/dangling", "a/loop", "a/f/x",
+	};
+	char root[] = "kqdiff.XXXXXX", step[96];
+	struct ring r;
+	int dfd, devfd;
+
+	CHECK(mkdtemp(root) != NULL);
+	dfd = open(root, O_RDONLY | O_DIRECTORY);
+	CHECK(dfd >= 0);
+	CHECK(mkdirat(dfd, "a", 0755) == 0);
+	CHECK(close(openat(dfd, "a/f", O_CREAT | O_WRONLY, 0644)) == 0);
+	CHECK(symlinkat("f", dfd, "a/rel") == 0);
+	CHECK(symlinkat("/a/f", dfd, "a/abs") == 0);
+	CHECK(symlinkat("..", dfd, "a/dir") == 0);
+	CHECK(symlinkat("../..", dfd, "a/up") == 0);
+	CHECK(symlinkat("nothing", dfd, "a/dangling") == 0);
+	CHECK(symlinkat("loop", dfd, "a/loop") == 0);
+
+	ring_init(&r, 8, NULL);
+	for (size_t i = 0; i < sizeof(rs) / sizeof(rs[0]); i++) {
+		for (size_t j = 0; j < sizeof(paths) / sizeof(paths[0]); j++) {
+			/* Whether "/" is another mount depends on the host. */
+			if (rs[i].resolve == D_RESOLVE_NO_XDEV &&
+			    strcmp(paths[j], "a/abs") == 0)
+				continue;
+			snprintf(step, sizeof(step), "%s:%s", rs[i].name,
+			    paths[j]);
+			openat2_one(&r, dfd, paths[j], O_RDONLY, rs[i].resolve,
+			    step);
+		}
+	}
+	/* Trailing symlinks not followed, and creating through symlinks. */
+	openat2_one(&r, dfd, "a/dir/a/rel", O_RDONLY | O_NOFOLLOW | O_PATH,
+	    D_RESOLVE_NO_SYMLINKS, "nosym_path_through");
+	openat2_one(&r, dfd, "a/up/new1", O_CREAT | O_WRONLY,
+	    D_RESOLVE_IN_ROOT, "inroot_create_up");
+	say("inroot_create_up_where", "%d", faccessat(dfd, "new1", F_OK,
+	    0) == 0);
+	openat2_one(&r, dfd, "a/dangling", O_CREAT | O_WRONLY,
+	    D_RESOLVE_IN_ROOT, "inroot_create_dangling");
+	say("inroot_create_dangling_where", "%d", faccessat(dfd, "a/nothing",
+	    F_OK, 0) == 0);
+	openat2_one(&r, dfd, "a/dangling", O_CREAT | O_WRONLY,
+	    D_RESOLVE_NO_SYMLINKS, "nosym_create_dangling");
+	openat2_one(&r, dfd, "a/rel", O_CREAT | O_EXCL | O_WRONLY,
+	    D_RESOLVE_IN_ROOT, "inroot_create_excl_link");
+	openat2_one(&r, dfd, "a/new2", O_CREAT | O_WRONLY, D_RESOLVE_CACHED,
+	    "cached_create");
+	openat2_one(&r, dfd, "a/f", O_RDONLY | O_TRUNC, D_RESOLVE_CACHED,
+	    "cached_trunc");
+	openat2_one(&r, dfd, "a/f", O_RDONLY, D_RESOLVE_CACHED, "cached");
+	openat2_one(&r, dfd, "a/f", O_RDONLY | O_DIRECTORY, D_RESOLVE_IN_ROOT,
+	    "inroot_directory");
+	openat2_one(&r, dfd, "a", O_RDONLY | O_DIRECTORY, D_RESOLVE_IN_ROOT,
+	    "inroot_dir");
+	openat2_one(&r, dfd, "", O_RDONLY, D_RESOLVE_IN_ROOT, "inroot_empty");
+	openat2_one(&r, AT_FDCWD, root, O_RDONLY, D_RESOLVE_IN_ROOT,
+	    "inroot_cwd");
+	/* From "/": /dev is a mount of its own on both systems. */
+	openat2_one(&r, AT_FDCWD, "/dev/null", O_RDONLY, D_RESOLVE_NO_XDEV,
+	    "noxdev_dev");
+	openat2_one(&r, AT_FDCWD, "/dev/null", O_RDONLY, 0, "dev");
+	openat2_one(&r, AT_FDCWD, "/", O_RDONLY, D_RESOLVE_NO_XDEV,
+	    "noxdev_root");
+	devfd = open("/dev", O_RDONLY | O_DIRECTORY);
+	CHECK(devfd >= 0);
+	openat2_one(&r, devfd, "..", O_RDONLY, D_RESOLVE_NO_XDEV,
+	    "noxdev_dotdot_out");
+	close(devfd);
+	ring_free(&r);
+
+	(void)unlinkat(dfd, "a/nothing", 0);
+	(void)unlinkat(dfd, "new1", 0);
+	(void)unlinkat(dfd, "a/new2", 0);
+	for (size_t j = 0; j < 6; j++) {
+		static const char *ln[] = { "a/rel", "a/abs", "a/dir", "a/up",
+		    "a/dangling", "a/loop" };
+
+		CHECK(unlinkat(dfd, ln[j], 0) == 0);
+	}
+	CHECK(unlinkat(dfd, "a/f", 0) == 0);
+	CHECK(unlinkat(dfd, "a", AT_REMOVEDIR) == 0);
+	close(dfd);
+	CHECK(rmdir(root) == 0);
+}
+
+static void *
+other_thread_wait(void *arg)
+{
+	struct ring *r = arg;
+	struct __kernel_timespec ts = { .tv_sec = 2 };
+	struct io_uring_getevents_arg ga;
+	int rc;
+
+	memset(&ga, 0, sizeof(ga));
+	ga.ts = (uint64_t)(uintptr_t)&ts;
+	rc = ring_sys_enter(r->fd, 0, 1, IORING_ENTER_GETEVENTS |
+	    IORING_ENTER_EXT_ARG, &ga, sizeof(ga));
+	return ((void *)(intptr_t)(rc < 0 ? errno : 0));
+}
+
+/*
+ * SINGLE_ISSUER: another thread's wait waits, for the owner's CQE or a
+ * read's, unless the ring is DEFER_TASKRUN.
+ */
+static void
+c_single_issuer_wait(void)
+{
+	static const struct {
+		const char	*name;
+		uint32_t	flags;
+	} rings[] = {
+		{ "plain", IORING_SETUP_SINGLE_ISSUER },
+		{ "coop", IORING_SETUP_SINGLE_ISSUER |
+		    IORING_SETUP_COOP_TASKRUN },
+		{ "defer", IORING_SETUP_SINGLE_ISSUER |
+		    IORING_SETUP_DEFER_TASKRUN },
+	};
+	struct io_uring_params p;
+	struct io_uring_sqe *s;
+	struct ring r;
+	pthread_t th;
+	void *res;
+	char step[64], c;
+	int pfd[2];
+
+	for (size_t i = 0; i < sizeof(rings) / sizeof(rings[0]); i++) {
+		memset(&p, 0, sizeof(p));
+		p.flags = rings[i].flags;
+		ring_init(&r, 8, &p);
+
+		CHECK(pthread_create(&th, NULL, other_thread_wait, &r) == 0);
+		pause_ms(50);
+		prep(&r, IORING_OP_NOP, -1, 1);
+		(void)submit(&r);
+		CHECK(pthread_join(th, &res) == 0);
+		errno = (int)(intptr_t)res;
+		snprintf(step, sizeof(step), "%s_nop", rings[i].name);
+		say_rc(step, errno != 0 ? -1 : 0);
+		await(&r, 1, 2000);
+		dump(&r, step);
+
+		CHECK(pipe(pfd) == 0);
+		s = prep(&r, IORING_OP_READ, pfd[0], 2);
+		s->addr = (uint64_t)(uintptr_t)&c;
+		s->len = 1;
+		s->off = (uint64_t)-1;
+		(void)submit(&r);
+		CHECK(pthread_create(&th, NULL, other_thread_wait, &r) == 0);
+		pause_ms(50);
+		CHECK(write(pfd[1], "w", 1) == 1);
+		CHECK(pthread_join(th, &res) == 0);
+		errno = (int)(intptr_t)res;
+		snprintf(step, sizeof(step), "%s_read", rings[i].name);
+		say_rc(step, errno != 0 ? -1 : 0);
+		await(&r, 1, 2000);
+		dump(&r, step);
+		close(pfd[0]);
+		close(pfd[1]);
+		ring_free(&r);
+	}
+}
+
+/*
+ * IOSQE_FIXED_FILE on opcodes that take no file: ignored, but a path
+ * opcode fails with EBADF.
+ */
+static void
+c_fixed_flag(void)
+{
+	struct __kernel_timespec ts = { 0, 1000000 };
+	struct io_uring_sqe *s;
+	struct ring r;
+	int files[1], pfd[2];
+
+	ring_init(&r, 8, NULL);
+	files[0] = open("/dev/null", O_RDONLY);
+	CHECK(files[0] >= 0);
+	CHECK(ring_sys_register(r.fd, IORING_REGISTER_FILES, files, 1) == 0);
+	s = prep(&r, IORING_OP_ASYNC_CANCEL, 0, 1);
+	s->flags = IOSQE_FIXED_FILE;
+	s->addr = 12345;
+	one(&r, "cancel");
+	s = prep(&r, IORING_OP_TIMEOUT, 0, 2);
+	s->flags = IOSQE_FIXED_FILE;
+	set_timeout(s, &ts, 1);
+	one(&r, "timeout");
+	res_fd_mask = 1ULL << 3;
+	s = prep(&r, IORING_OP_SOCKET, 0, 3);
+	s->flags = IOSQE_FIXED_FILE;
+	s->fd = AF_UNIX;
+	s->off = SOCK_STREAM;
+	one(&r, "socket");
+	res_fd_mask = 0;
+	s = prep(&r, IORING_OP_PIPE, 0, 4);
+	s->flags = IOSQE_FIXED_FILE;
+	s->addr = (uint64_t)(uintptr_t)pfd;
+	one(&r, "pipe");
+	close(pfd[0]);
+	close(pfd[1]);
+	s = prep(&r, IORING_OP_OPENAT, AT_FDCWD, 5);
+	s->flags = IOSQE_FIXED_FILE;
+	s->addr = (uint64_t)(uintptr_t)"/dev/null";
+	one(&r, "openat");
+	s = prep(&r, IORING_OP_CLOSE, 0, 6);
+	s->flags = IOSQE_FIXED_FILE;
+	one(&r, "close");
+	s = prep(&r, IORING_OP_MKDIRAT, AT_FDCWD, 7);
+	s->flags = IOSQE_FIXED_FILE;
+	s->addr = (uint64_t)(uintptr_t)"kqdiff.fixeddir";
+	one(&r, "mkdirat");
+	(void)rmdir("kqdiff.fixeddir");
+	ring_free(&r);
+	close(files[0]);
+}
+
+/*
+ * MSG_RING to the sender's own ring: posted before the request's CQE, but
+ * on a DEFER_TASKRUN ring only once a wait runs its task work.
+ */
+static void
+c_msg_ring_self(void)
+{
+	struct io_uring_params p;
+	struct io_uring_sqe *s;
+	struct ring r;
+
+	for (int defer = 0; defer < 2; defer++) {
+		const char *pfx = defer ? "defer" : "plain";
+		char step[32];
+
+		memset(&p, 0, sizeof(p));
+		if (defer)
+			p.flags = IORING_SETUP_SINGLE_ISSUER |
+			    IORING_SETUP_DEFER_TASKRUN;
+		ring_init(&r, 8, &p);
+		s = prep(&r, IORING_OP_MSG_RING, r.fd, 1);
+		s->addr = IORING_MSG_DATA;
+		s->len = 9;
+		s->off = 2;
+		(void)submit(&r);
+		snprintf(step, sizeof(step), "%s_ready", pfx);
+		say(step, "%d", (int)ready(&r));
+		snprintf(step, sizeof(step), "%s_submit", pfx);
+		dump(&r, step);
+		await(&r, 1, 1000);
+		snprintf(step, sizeof(step), "%s_wait", pfx);
+		dump(&r, step);
+		ring_free(&r);
+	}
+}
+
 static const struct {
 	const char	*name;
 	void		(*fn)(void);
@@ -2680,6 +3119,11 @@ static const struct {
 	{ "restrictions_split", c_restrictions_split },
 	{ "task_restrict", c_task_restrict },
 	{ "bpf_filter", c_bpf_filter },
+	{ "nop_flags", c_nop_flags },
+	{ "openat2_resolve", c_openat2_resolve },
+	{ "single_issuer_wait", c_single_issuer_wait },
+	{ "fixed_flag", c_fixed_flag },
+	{ "msg_ring_self", c_msg_ring_self },
 };
 
 static void

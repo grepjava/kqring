@@ -204,6 +204,8 @@ _Static_assert(sizeof(struct io_uring_cqe) == 16, "io_uring_cqe must be 16 bytes
 #define IORING_SETUP_NO_MMAP		(1U << 14)
 #define IORING_SETUP_REGISTERED_FD_ONLY	(1U << 15)
 #define IORING_SETUP_NO_SQARRAY		(1U << 16)
+/* Needs IOPOLL; how long to sleep before polling, which kqring doesn't. */
+#define IORING_SETUP_HYBRID_IOPOLL	(1U << 17)
 /*
  * CQE_MIXED: a CQ of 16-byte slots where a 32-byte CQE (IORING_CQE_F_32)
  * takes two; one that would wrap is preceded by an IORING_CQE_F_SKIP
@@ -314,10 +316,17 @@ enum io_uring_op {
 
 /*
  * sqe->nop_flags: INJECT_RESULT completes with (int32_t)sqe->len instead
- * of 0; CQE32 (CQE32 or CQE_MIXED rings) posts a 32-byte CQE whose
- * big_cqe holds sqe->off and sqe->addr.
+ * of 0; FILE fails with -EBADF unless sqe->fd is open (a fixed slot with
+ * FIXED_FILE or IOSQE_FIXED_FILE); FIXED_BUFFER fails with -EFAULT unless
+ * registered buffer sqe->buf_index exists; TW posts the CQE from taskwork;
+ * CQE32 (CQE32 or CQE_MIXED rings) posts a 32-byte CQE whose big_cqe
+ * holds sqe->off and sqe->addr.
  */
 #define IORING_NOP_INJECT_RESULT	(1U << 0)
+#define IORING_NOP_FILE			(1U << 1)
+#define IORING_NOP_FIXED_FILE		(1U << 2)
+#define IORING_NOP_FIXED_BUFFER		(1U << 3)
+#define IORING_NOP_TW			(1U << 4)
 #define IORING_NOP_CQE32		(1U << 5)
 
 /*

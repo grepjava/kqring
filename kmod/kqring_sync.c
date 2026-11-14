@@ -338,6 +338,21 @@ kqring_msg_ring(struct kqring_ctx *ctx, const struct kqring_op *op)
 			rc->has_extra = true;
 		}
 	}
+	/*
+	 * To its own ring, from the issuer: posted now, before the request's
+	 * own CQE, as Linux posts it (io_post_aux_cqe()).  A DEFER_TASKRUN
+	 * ring's messages, its own too, wait for its task work, as Linux's
+	 * (io_msg_need_remote()).
+	 */
+	if (error == 0 && tctx == ctx && !op->wq_running &&
+	    (ctx->flags & IORING_SETUP_DEFER_TASKRUN) == 0) {
+		ctx->cq_seq++;
+		kqring_post_cqe_extra(ctx, rc->cqe.user_data, rc->cqe.res,
+		    rc->cqe.flags, rc->has_extra ? rc->extra : NULL);
+		kqring_rcqe_free(rc);
+		fdrop(fp, td);
+		return (0);
+	}
 	if (error == 0)
 		error = kqring_rcqe_queue(tctx, rc);
 	if (error != 0)

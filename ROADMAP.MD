@@ -22,6 +22,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 12 | Fan-in against kqueue | Done |
 | 13 | Refresh the evidence | Done |
 | 14 | liburing's remaining failures and skips | Done |
+| 15 | A worker that can't hang, and small gaps | Done |
 
 ## Where kqring stands
 
@@ -267,6 +268,31 @@ Progress (14 November 2026), on the Ryzen:
 - Validation of the build: unit tests 147 of 147, the cross-process test 20 rounds, `kqring_diff` 33 cases without a problem, stress 600 s and the fuzzer 1,800 s (seed 7319) passed, with no new crash dump.
 
 Phase 14 is done: the two skips kqring could turn into passes, and one failure, now pass; every remaining failure and skip has a reason confirmed on this build.
+
+## Phase 15: A worker that can't hang, and small gaps
+
+A kqring worker reading a tmpfs file into a shared mapping of the same page hangs for good, as `read(2)` does on FreeBSD 15.1 ([bug 300734](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=300734)): the thread can't be killed and the machine can't finish a shutdown. Any program can cause it. Four smaller differences from Linux 7.3 are also left in [COMPATIBILITY.MD](COMPATIBILITY.MD).
+
+Order of work:
+
+1. A worker's tmpfs read holds the destination's pages first and copies into them through the direct map, so the read never faults on a page tmpfs holds busied. The unit test that skips this case on tmpfs runs it.
+2. `OPENAT2` takes `RESOLVE_IN_ROOT`, `RESOLVE_NO_XDEV` and `RESOLVE_NO_SYMLINKS`. FreeBSD's lookup takes its root from the process, so kqring walks the path a component at a time with these, as Linux's `openat2(2)` defines them.
+3. `IORING_OP_NOP` takes `IORING_NOP_FILE`, `IORING_NOP_FIXED_FILE`, `IORING_NOP_FIXED_BUFFER` and `IORING_NOP_TW`, as Linux 7.3's `io_nop()`.
+4. `IORING_SETUP_HYBRID_IOPOLL` is accepted with `IORING_SETUP_IOPOLL`, as Linux.
+5. On a `SINGLE_ISSUER` ring without `DEFER_TASKRUN`, another thread's wait waits, as on Linux, rather than fail with `EEXIST`.
+
+Acceptance: the tmpfs case completes in the unit tests on tmpfs, ZFS and UFS; each new behaviour matches Linux 7.3 in `tests/kqring_diff.c`; COMPATIBILITY.MD rows move to Equivalent or name what is left; the unit tests, the cross-process test, stress, the fuzzer and liburing pass as before or better.
+
+Progress (14 November 2026), on the Ryzen:
+
+- Step 1: a worker's read or write of a regular file on a filesystem without `MNTK_NO_IOPF` holds the user's pages, 1 MiB at a time, and the filesystem copies through their direct-map addresses ([docs/cached-reads.md](docs/cached-reads.md)). The unit test reads, writes and reads vectored into a fresh shared mapping of the same file on tmpfs, UFS on md(4) and ZFS; on tmpfs it used to be skipped, because it hung.
+- Step 2: `OPENAT2` walks the path itself for `RESOLVE_IN_ROOT`, `RESOLVE_NO_XDEV` and `RESOLVE_NO_SYMLINKS` ([docs/openat2-resolve.md](docs/openat2-resolve.md)); `RESOLVE_BENEATH` fails with Linux's `EXDEV`. The new `openat2_resolve` case, 161 opens over symlinks of every kind and `/dev`'s mount, matches Linux 7.3 line for line, and liburing's `cbpf_filter` keeps `RESOLVE_IN_ROOT`.
+- Steps 3 and 4: NOP's four flags and `HYBRID_IOPOLL` match Linux 7.3 (`nop_flags`, `setup_flags`).
+- Step 5: another thread's wait on a `SINGLE_ISSUER` ring waits, for the owner's, the kthread's and `COOP_TASKRUN`'s completions (`single_issuer_wait`). Still `EEXIST`: a `DEFER_TASKRUN` ring, as Linux, and a polled `IOPOLL` wait.
+- Found by comparing with Linux, and fixed: a `DEFER_TASKRUN` ring ran its taskwork in every enter, where Linux runs it only with `IORING_ENTER_GETEVENTS`; a `MSG_RING` to its own ring posted after the request's CQE; `IOSQE_FIXED_FILE` on an opcode that takes no file failed with `EINVAL`, where Linux ignores it, or fails a path opcode with `EBADF`. New cases `fixed_flag` and `msg_ring_self` match Linux 7.3. Unit tests that relied on the old taskwork timing now wait for their CQEs, and those that asserted the old errors expect Linux's.
+- Validation: unit tests 151 of 151, the cross-process test 20 rounds, `kqring_diff` 38 cases without a problem (33 match, 5 differ on purpose; [docs/conformance/](docs/conformance/) from three identical runs on each system), liburing 223 passed, 17 skipped, 5 failed as before, stress 600 s and the fuzzer 1,800 s (seed 1515) passed, with no new crash dump.
+
+Phase 15 is done: no kqring worker hangs on a self-mapped tmpfs file, and the four gaps are closed except a polled wait from another thread on a `SINGLE_ISSUER` `IOPOLL` ring.
 
 ## Research
 

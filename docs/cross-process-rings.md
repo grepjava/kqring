@@ -28,7 +28,7 @@ A second process can't use those threads: their addresses and descriptors are th
 
 ### 1. Waiting from another process
 
-Any process holding a ring set up without `SINGLE_ISSUER` (and so without `DEFER_TASKRUN`, which needs it) may wait on it with `IORING_ENTER_GETEVENTS`, unless the ring is `IOPOLL`, whose waits drive the polling. On a `SINGLE_ISSUER` ring, another thread or process sees the CQ as it stands, and a wait it can't satisfy yet fails with `EEXIST`, as before. The wait:
+Any process holding a ring set up without `SINGLE_ISSUER` (and so without `DEFER_TASKRUN`, which needs it) may wait on it with `IORING_ENTER_GETEVENTS`, unless the ring is `IOPOLL`, whose waits drive the polling. On a `SINGLE_ISSUER` ring another thread or process may wait the same way, as on Linux, unless the ring is `DEFER_TASKRUN`, whose completions only the owner runs (`EEXIST`), or an `IOPOLL` wait the CQ can't already satisfy (`EEXIST`; phase 15). The wait:
 
 - sleeps until the CQ holds `min_complete` entries or has overflowed, or a `TIMEOUT` request completes, or its timeout or a signal ends it, with the same arguments as the owner's wait (`EXT_ARG`, registered waits, signal mask, `min_wait_usec`);
 - registers as a CQ sleeper, so the batched wake-ups the owner's completions make reach it;

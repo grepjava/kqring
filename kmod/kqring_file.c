@@ -698,6 +698,147 @@ kqring_pipe_rw_nowait(struct file *fp, struct uio *uio, bool is_write,
  * With local, *punt is set, with op unchanged, unless the file is a regular
  * file on a local filesystem (kqring_exec_file_read_local()).
  */
+/*
+ * Whether fp is a regular file whose filesystem copies to and from user
+ * memory while it holds the file's pages: tmpfs busies the page it copies
+ * (uiomove_object()), and a filesystem on the buffer cache locks the
+ * buffer.  If the user memory is mapped from that very page, the copy's
+ * fault waits for the page or buffer, which is ours, and the thread hangs
+ * for good: read(2) does on tmpfs (FreeBSD bug 300734).  vn_io_fault()
+ * prevents it by holding the user's pages first, but only on a filesystem
+ * that sets MNTK_NO_IOPF (UFS, ZFS); tmpfs doesn't.
+ */
+static bool
+kqring_vn_iopf(const struct file *fp)
+{
+	struct vnode *vp = fp->f_vnode;
+	struct mount *mp;
+
+	if (fp->f_type != DTYPE_VNODE || vp == NULL || vp->v_type != VREG)
+		return (false);
+	mp = atomic_load_ptr(&vp->v_mount);
+	return (mp != NULL && (mp->mnt_kern_flag & MNTK_NO_IOPF) == 0);
+}
+
+#define	KQRING_HELD_RW_PAGES	256	/* 1 MiB of user memory at a time */
+
+/*
+ * fo_read() / fo_write() of uio's user memory, held first: up to
+ * KQRING_HELD_RW_PAGES of its pages at a time are held (faulted in, and
+ * for a read made writable and marked dirty), and the filesystem copies
+ * through their direct-map addresses, which can't fault.  uio advances
+ * over what was transferred, as uiomove() would advance it.  A buffer that
+ * can't be held fails with EFAULT, unless part was transferred already;
+ * one held page outside the direct map (device memory) leaves the rest to
+ * a plain fo_read() / fo_write().
+ */
+static int
+kqring_vn_rw_held(struct file *fp, struct uio *uio, bool is_write, int flags,
+    struct thread *td)
+{
+	vm_map_t map = &td->td_proc->p_vmspace->vm_map;
+	vm_prot_t prot = is_write ? VM_PROT_READ :
+	    VM_PROT_READ | VM_PROT_WRITE;
+	vm_page_t *pages;
+	struct iovec *kiov;
+	struct uio kuio;
+	ssize_t moved = 0;
+	int error = 0;
+
+	if (!PMAP_HAS_DMAP)
+		return (is_write ? fo_write(fp, uio, td->td_ucred, flags, td) :
+		    fo_read(fp, uio, td->td_ucred, flags, td));
+	pages = malloc(KQRING_HELD_RW_PAGES * sizeof(*pages), M_KQRING,
+	    M_WAITOK);
+	kiov = malloc(KQRING_HELD_RW_PAGES * sizeof(*kiov), M_KQRING,
+	    M_WAITOK);
+	while (uio->uio_resid > 0) {
+		ssize_t chunk = 0, done;
+		int npages = 0, nkiov = 0, i;
+		bool dmap = true;
+
+		/* Hold the next pieces of the user's iovecs, page by page. */
+		for (i = 0; i < uio->uio_iovcnt &&
+		    npages < KQRING_HELD_RW_PAGES; i++) {
+			vm_offset_t va =
+			    (vm_offset_t)uio->uio_iov[i].iov_base;
+			size_t len = uio->uio_iov[i].iov_len, n, want;
+			int held, p;
+
+			if (len == 0)
+				continue;
+			/* Whole pages of it that still fit. */
+			n = want = MIN(len, ptoa(KQRING_HELD_RW_PAGES -
+			    npages) - (va & PAGE_MASK));
+			held = vm_fault_quick_hold_pages(map, va, n, prot,
+			    &pages[npages], KQRING_HELD_RW_PAGES - npages);
+			if (held < 0)
+				break;
+			for (p = 0; p < held; p++) {
+				vm_paddr_t pa = VM_PAGE_TO_PHYS(pages[npages + p]);
+				size_t off = p == 0 ? va & PAGE_MASK : 0;
+				size_t plen = MIN(PAGE_SIZE - off, n);
+
+				if (!PHYS_IN_DMAP(pa))
+					dmap = false;
+				kiov[nkiov].iov_base =
+				    (void *)(PHYS_TO_DMAP(pa) + off);
+				kiov[nkiov].iov_len = plen;
+				nkiov++;
+				n -= plen;
+				chunk += plen;
+			}
+			npages += held;
+			/* The iovec goes on past what fits: stop with it. */
+			if (want < len)
+				break;
+		}
+		if (npages == 0 || !dmap) {
+			vm_page_unhold_pages(pages, npages);
+			if (npages == 0 && moved == 0)
+				error = EFAULT;
+			else if (!dmap)
+				error = is_write ? fo_write(fp, uio,
+				    td->td_ucred, flags, td) : fo_read(fp, uio,
+				    td->td_ucred, flags, td);
+			break;
+		}
+		kuio.uio_iov = kiov;
+		kuio.uio_iovcnt = nkiov;
+		kuio.uio_offset = uio->uio_offset;
+		kuio.uio_resid = chunk;
+		kuio.uio_segflg = UIO_SYSSPACE;
+		kuio.uio_rw = uio->uio_rw;
+		kuio.uio_td = td;
+		error = is_write ? fo_write(fp, &kuio, td->td_ucred, flags, td) :
+		    fo_read(fp, &kuio, td->td_ucred, flags, td);
+		vm_page_unhold_pages(pages, npages);
+		done = chunk - kuio.uio_resid;
+		uio->uio_offset = kuio.uio_offset;
+		/* Advance the user's iovecs over done, as uiomove() does. */
+		moved += done;
+		uio->uio_resid -= done;
+		while (done > 0) {
+			size_t step = MIN((size_t)done, uio->uio_iov->iov_len);
+
+			uio->uio_iov->iov_base =
+			    (char *)uio->uio_iov->iov_base + step;
+			uio->uio_iov->iov_len -= step;
+			done -= step;
+			if (uio->uio_iov->iov_len == 0 && uio->uio_iovcnt > 1) {
+				uio->uio_iov++;
+				uio->uio_iovcnt--;
+			}
+		}
+		/* An error, end of file, or a short write. */
+		if (error != 0 || kuio.uio_resid > 0)
+			break;
+	}
+	free(kiov, M_KQRING);
+	free(pages, M_KQRING);
+	return (error);
+}
+
 static int
 kqring_file_rw(struct kqring_ctx *ctx, struct kqring_op *op, bool is_write,
     bool nowait, bool local, bool *punt)
@@ -858,8 +999,13 @@ retry:
 	} else {
 		if (kqring_pipe_will_block(fp, is_write, (size_t)want))
 			kqring_wq_mark_blocking(ctx, op);
-		error = is_write ? fo_write(fp, &auio, td->td_ucred, flags,
-		    td) : fo_read(fp, &auio, td->td_ucred, flags, td);
+		if (auio.uio_segflg == UIO_USERSPACE && kqring_vn_iopf(fp))
+			error = kqring_vn_rw_held(fp, &auio, is_write, flags,
+			    td);
+		else
+			error = is_write ? fo_write(fp, &auio, td->td_ucred,
+			    flags, td) : fo_read(fp, &auio, td->td_ucred,
+			    flags, td);
 	}
 read_busy:
 	if (!nowait) {
@@ -1890,6 +2036,408 @@ kqring_open_caps(struct thread *td, int dirfd, struct filecaps *caps)
 	kqring_caps_all(caps);
 }
 
+/*
+ * OPENAT2's RESOLVE_IN_ROOT, RESOLVE_NO_XDEV and RESOLVE_NO_SYMLINKS, and
+ * RESOLVE_BENEATH with any of them, as Linux's path walk (fs/namei.c)
+ * defines them.  FreeBSD's namei() takes its root from the process, and
+ * can't refuse a symlink or a mount point along the way, so the path is
+ * walked here a component at a time: each is looked up with namei() from
+ * the directory reached so far, without following it; a symlink is read,
+ * and its target goes in front of what is left of the path; ".." goes back
+ * to the directory the walk came from (a stack of them), and only past the
+ * start to the real parent.  The last component is opened from its
+ * directory with vn_open_cred(), as openat(2) would open it.
+ *
+ * A scoped walk (IN_ROOT, BENEATH) never leaves its root: ".." only goes
+ * back the way the walk came, and an absolute symlink starts again at the
+ * root.  Linux takes the real parent for "..", and fails with EAGAIN if a
+ * rename meanwhile might have moved it above the root; here a directory
+ * renamed meanwhile is left by the way the walk came.  In capability mode
+ * a walk that isn't scoped is held beneath its start as namei() would
+ * hold it, with ENOTCAPABLE.
+ */
+#define	KQRING_WALK_LINKS	40	/* Linux's MAXSYMLINKS */
+#define	KQRING_WALK_DEPTH	(MAXPATHLEN / 2)
+
+struct kqring_walk {
+	struct thread	*td;
+	uint64_t	resolve;
+	bool		strict;		/* capability mode, unscoped */
+	struct vnode	*root;		/* where "/" and ".." stop */
+	struct vnode	*cur;
+	struct vnode	**up;		/* the directories cur came through */
+	int		depth;
+};
+
+static void
+kqring_walk_free(struct kqring_walk *w)
+{
+	while (w->depth > 0)
+		vrele(w->up[--w->depth]);
+	if (w->cur != NULL)
+		vrele(w->cur);
+	if (w->root != NULL)
+		vrele(w->root);
+	free(w->up, M_TEMP);
+}
+
+/* Linux's may_lookup(): search permission on the directory. */
+static int
+kqring_walk_access(struct kqring_walk *w)
+{
+	int error;
+
+	vn_lock(w->cur, LK_SHARED | LK_RETRY);
+	error = VOP_ACCESS(w->cur, VEXEC, w->td->td_ucred, w->td);
+	VOP_UNLOCK(w->cur);
+	return (error);
+}
+
+/* One component from w->cur, not followed: *vpp referenced, unlocked. */
+static int
+kqring_walk_lookup(struct kqring_walk *w, const char *name,
+    struct vnode **vpp)
+{
+	struct nameidata nd;
+	int error;
+
+	vrefact(w->cur);	/* namei() consumes it */
+	NDINIT_ATVP(&nd, LOOKUP, NOFOLLOW | NOCAPCHECK, UIO_SYSSPACE, name,
+	    w->cur);
+	error = namei(&nd);
+	if (error != 0)
+		return (error);
+	NDFREE_PNBUF(&nd);
+	*vpp = nd.ni_vp;
+	return (0);
+}
+
+/* ".." from w->cur. */
+static int
+kqring_walk_dotdot(struct kqring_walk *w)
+{
+	struct vnode *vp;
+	int error;
+
+	if ((error = kqring_walk_access(w)) != 0)
+		return (error);
+	if (w->cur == w->root) {
+		if ((w->resolve & RESOLVE_BENEATH) != 0)
+			return (EXDEV);
+		if (w->strict)
+			return (ENOTCAPABLE);
+		return (0);			/* IN_ROOT, or the process's */
+	}
+	if (w->depth > 0) {
+		vp = w->up[--w->depth];
+	} else {
+		/* Past the start of a walk that isn't scoped. */
+		if (w->strict)
+			return (ENOTCAPABLE);
+		if ((error = kqring_walk_lookup(w, "..", &vp)) != 0)
+			return (error);
+	}
+	if ((w->resolve & RESOLVE_NO_XDEV) != 0 &&
+	    vp->v_mount != w->cur->v_mount) {
+		vrele(vp);
+		return (EXDEV);
+	}
+	vrele(w->cur);
+	w->cur = vp;
+	return (0);
+}
+
+/* An absolute path or symlink: back to the root. */
+static int
+kqring_walk_jump_root(struct kqring_walk *w, bool start)
+{
+	if ((w->resolve & RESOLVE_BENEATH) != 0)
+		return (EXDEV);
+	if (w->strict)
+		return (ENOTCAPABLE);
+	/* As Linux, a path may start at "/" on another mount. */
+	if (!start && (w->resolve & RESOLVE_NO_XDEV) != 0 &&
+	    w->cur->v_mount != w->root->v_mount)
+		return (EXDEV);
+	while (w->depth > 0)
+		vrele(w->up[--w->depth]);
+	vref(w->root);
+	vrele(w->cur);
+	w->cur = w->root;
+	return (0);
+}
+
+/* vp's target, NUL-terminated, into buf (MAXPATHLEN). */
+static int
+kqring_walk_readlink(struct kqring_walk *w, struct vnode *vp, char *buf,
+    size_t *lenp)
+{
+	struct iovec aiov;
+	struct uio auio;
+	int error;
+
+	if ((vp->v_mount->mnt_flag & MNT_NOSYMFOLLOW) != 0)
+		return (EACCES);
+	aiov.iov_base = buf;
+	aiov.iov_len = MAXPATHLEN;
+	auio.uio_iov = &aiov;
+	auio.uio_iovcnt = 1;
+	auio.uio_offset = 0;
+	auio.uio_rw = UIO_READ;
+	auio.uio_segflg = UIO_SYSSPACE;
+	auio.uio_td = w->td;
+	auio.uio_resid = MAXPATHLEN;
+	vn_lock(vp, LK_SHARED | LK_RETRY);
+#ifdef MAC
+	error = mac_vnode_check_readlink(w->td->td_ucred, vp);
+	if (error == 0)
+#endif
+		error = VOP_READLINK(vp, &auio, w->td->td_ucred);
+	VOP_UNLOCK(vp);
+	if (error != 0)
+		return (error);
+	*lenp = MAXPATHLEN - auio.uio_resid;
+	if (*lenp == MAXPATHLEN)
+		return (ENAMETOOLONG);
+	if (*lenp == 0)
+		return (ENOENT);
+	buf[*lenp] = '\0';
+	return (0);
+}
+
+/*
+ * openat(2) of name in dvp (referenced, kept), into an uninstalled file:
+ * openatfp() from a directory vnode rather than a descriptor.  The walk
+ * has followed every symlink it should, so name is opened without
+ * following one (a symlink put there meanwhile fails it).
+ */
+static int
+kqring_open_vp(struct thread *td, struct vnode *dvp, const char *name,
+    int flags, int mode, struct file **fpp)
+{
+	struct nameidata nd;
+	struct file *fp;
+	struct vnode *vp;
+	int cmode, error;
+
+	/* openflags() */
+	if ((flags & O_PATH) != 0)
+		flags &= ~O_ACCMODE;
+	else if ((flags & O_EXEC) != 0) {
+		if ((flags & O_ACCMODE) != 0)
+			return (EINVAL);
+	} else if ((flags & O_ACCMODE) == O_ACCMODE)
+		return (EINVAL);
+	else
+		flags = FFLAGS(flags);
+	flags |= O_NOFOLLOW;
+
+	error = falloc_noinstall(td, &fp);
+	if (error != 0)
+		return (error);
+	fp->f_flag = flags & FMASK;
+	cmode = ((mode & ~td->td_proc->p_pd->pd_cmask) & ALLPERMS) & ~S_ISTXT;
+	vrefact(dvp);		/* namei() consumes it */
+	NDINIT_ATVP(&nd, LOOKUP, NOCAPCHECK, UIO_SYSSPACE, name, dvp);
+	error = vn_open_cred(&nd, &flags, cmode, VN_OPEN_NOCAPCHECK,
+	    td->td_ucred, fp);
+	if (error != 0) {
+		/* devfs replaced the file's methods: it is open. */
+		if (error == ENXIO && fp->f_ops != &badfileops) {
+			*fpp = fp;
+			return (0);
+		}
+		falloc_abort(td, fp);
+		return (error);
+	}
+	NDFREE_PNBUF(&nd);
+	vp = nd.ni_vp;
+	/* finit_open() */
+	fp->f_vnode = vp;
+	if (fp->f_ops == &badfileops) {
+		if ((flags & O_PATH) != 0)
+			finit(fp, (flags & FMASK) | (fp->f_flag & FKQALLOWED),
+			    DTYPE_VNODE, NULL, &path_fileops);
+		else
+			finit_vnode(fp, flags, NULL, &vnops);
+	}
+	VOP_UNLOCK(vp);
+	if ((flags & O_TRUNC) != 0) {
+		error = fo_truncate(fp, 0, td->td_ucred, td);
+		if (error != 0) {
+			falloc_abort(td, fp);
+			return (error);
+		}
+	}
+	*fpp = fp;
+	return (0);
+}
+
+static int
+kqring_open_walk(struct thread *td, int dirfd, const char *path,
+    const struct open_how *how, struct file **fpp)
+{
+	struct kqring_walk w = { .td = td, .resolve = how->resolve };
+	struct vnode *start, *vp;
+	struct pwd *pwd;
+	char *buf, *link, *p, *comp;
+	size_t len, rest;
+	int flags = (int)how->flags, links = 0, error;
+	bool scoped = (how->resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT)) != 0;
+	bool last, slash, follow;
+
+	if (path[0] == '\0')
+		return (ENOENT);
+	/* Where the walk starts: dirfd, which must be a directory. */
+	if (dirfd == AT_FDCWD) {
+		if (IN_CAPABILITY_MODE(td))
+			return (ECAPMODE);
+		pwd = pwd_hold(td);
+		start = pwd->pwd_cdir;
+		vref(start);
+		pwd_drop(pwd);
+	} else {
+		struct file *dfp;
+		cap_rights_t rights;
+
+		error = fget_cap(td, dirfd, cap_rights_init_one(&rights,
+		    CAP_LOOKUP), NULL, &dfp, NULL);
+		if (error != 0)
+			return (error);
+		start = dfp->f_vnode;
+		if (dfp->f_type != DTYPE_VNODE || start == NULL ||
+		    start->v_type != VDIR) {
+			fdrop(dfp, td);
+			return (ENOTDIR);
+		}
+		vref(start);
+		fdrop(dfp, td);
+	}
+	w.strict = !scoped && IN_CAPABILITY_MODE(td);
+	if (scoped || w.strict) {
+		w.root = start;
+		vref(start);
+	} else {
+		pwd = pwd_hold(td);
+		w.root = pwd->pwd_rdir;
+		vref(w.root);
+		pwd_drop(pwd);
+	}
+	w.cur = start;
+	w.up = malloc(KQRING_WALK_DEPTH * sizeof(*w.up), M_TEMP, M_WAITOK);
+	buf = malloc(2 * MAXPATHLEN, M_TEMP, M_WAITOK);
+	link = buf + MAXPATHLEN;
+	strlcpy(buf, path, MAXPATHLEN);
+
+	error = 0;
+	p = buf;
+	if (*p == '/' && (how->resolve & RESOLVE_IN_ROOT) == 0)
+		error = kqring_walk_jump_root(&w, true);
+	while (error == 0) {
+		while (*p == '/')
+			p++;
+		if (*p == '\0') {
+			/* The path ends at a directory: "/", or with "/". */
+			error = kqring_walk_access(&w);
+			if (error == 0)
+				error = kqring_open_vp(td, w.cur, ".", flags,
+				    (int)how->mode, fpp);
+			break;
+		}
+		comp = p;
+		while (*p != '/' && *p != '\0')
+			p++;
+		slash = *p == '/';
+		if (slash)
+			*p++ = '\0';
+		while (*p == '/')
+			p++;
+		last = *p == '\0';
+		if (strlen(comp) > NAME_MAX) {
+			error = ENAMETOOLONG;
+			break;
+		}
+		if (strcmp(comp, ".") == 0 || strcmp(comp, "..") == 0) {
+			error = comp[1] == '.' ? kqring_walk_dotdot(&w) :
+			    kqring_walk_access(&w);
+			if (error == 0 && last)
+				error = kqring_open_vp(td, w.cur, ".", flags,
+				    (int)how->mode, fpp);
+			if (last)
+				break;
+			continue;
+		}
+		error = kqring_walk_lookup(&w, comp, &vp);
+		if (last && error == ENOENT && (flags & O_CREAT) != 0) {
+			/* Created by the open, if the directory allows. */
+			error = 0;
+			vp = NULL;
+		}
+		if (error != 0)
+			break;
+		/* A trailing "/" follows, as on Linux. */
+		follow = !last || slash || ((flags & O_NOFOLLOW) == 0 &&
+		    (flags & (O_CREAT | O_EXCL)) != (O_CREAT | O_EXCL));
+		if (vp != NULL && vp->v_type == VLNK && follow) {
+			if ((how->resolve & RESOLVE_NO_SYMLINKS) != 0)
+				error = ELOOP;
+			else if (++links > KQRING_WALK_LINKS)
+				error = ELOOP;
+			else
+				error = kqring_walk_readlink(&w, vp, link,
+				    &len);
+			vrele(vp);
+			if (error != 0)
+				break;
+			/* The target, then what was left (with its "/"). */
+			rest = strlen(p);
+			if (len + (slash ? 1 : 0) + rest >= MAXPATHLEN) {
+				error = ENAMETOOLONG;
+				break;
+			}
+			if (slash)
+				link[len++] = '/';
+			memcpy(link + len, p, rest + 1);
+			memcpy(buf, link, len + rest + 1);
+			p = buf;
+			if (*p == '/')
+				error = kqring_walk_jump_root(&w, false);
+			continue;
+		}
+		if (vp != NULL && (how->resolve & RESOLVE_NO_XDEV) != 0 &&
+		    vp->v_mount != w.cur->v_mount) {
+			vrele(vp);
+			error = EXDEV;
+			break;
+		}
+		if (last) {
+			if (vp != NULL)
+				vrele(vp);
+			/* Its name, with the "/" that requires a directory. */
+			if (slash)
+				comp[strlen(comp)] = '/';
+			error = kqring_open_vp(td, w.cur, comp, flags,
+			    (int)how->mode, fpp);
+			break;
+		}
+		if (vp->v_type != VDIR) {
+			vrele(vp);
+			error = ENOTDIR;
+			break;
+		}
+		if (w.depth == KQRING_WALK_DEPTH) {
+			vrele(vp);
+			error = ENAMETOOLONG;
+			break;
+		}
+		w.up[w.depth++] = w.cur;
+		w.cur = vp;
+	}
+	free(buf, M_TEMP);
+	kqring_walk_free(&w);
+	return (error);
+}
+
 /* OPENAT / OPENAT2: openat(2), or with file_index into the fixed table. */
 int32_t
 kqring_exec_openat(struct kqring_ctx *ctx, struct kqring_op *op)
@@ -1899,20 +2447,53 @@ kqring_exec_openat(struct kqring_ctx *ctx, struct kqring_op *op)
 	struct thread *td = curthread;
 	struct filecaps caps;
 	struct file *fp;
-	int error;
+	int error, fd;
+	bool walk = (pa->how.resolve & (RESOLVE_IN_ROOT | RESOLVE_NO_XDEV |
+	    RESOLVE_NO_SYMLINKS)) != 0;
 
-	if (sqe->file_index == 0) {
+	if (sqe->file_index == 0 && !walk) {
 		error = kern_openat(td, sqe->fd, pa->path, UIO_SYSSPACE,
 		    (int)pa->how.flags, (int)pa->how.mode);
+		/* RESOLVE_BENEATH (O_RESOLVE_BENEATH): Linux's error. */
+		if (error == ENOTCAPABLE &&
+		    (pa->how.resolve & RESOLVE_BENEATH) != 0 &&
+		    !IN_CAPABILITY_MODE(td))
+			error = EXDEV;
 		return (error == 0 ? (int32_t)td->td_retval[0] :
 		    kqring_errno(error));
 	}
 	kqring_open_caps(td, sqe->fd, &caps);
-	error = kern_openatfp(td, sqe->fd, pa->path, UIO_SYSSPACE,
+	error = walk ? kqring_open_walk(td, sqe->fd, pa->path, &pa->how, &fp) :
+	    kern_openatfp(td, sqe->fd, pa->path, UIO_SYSSPACE,
 	    (int)pa->how.flags, (int)pa->how.mode, &fp);
+	if (error == ENOTCAPABLE && !walk &&
+	    (pa->how.resolve & RESOLVE_BENEATH) != 0 && !IN_CAPABILITY_MODE(td))
+		error = EXDEV;
 	if (error != 0) {
 		filecaps_free(&caps);
 		return (kqring_errno(error));
+	}
+	if (sqe->file_index == 0) {
+		cap_rights_t all;
+
+		/* The directory's rights if they are limited, as openat(2). */
+		CAP_ALL(&all);
+		if (cap_rights_contains(&caps.fc_rights, &all)) {
+			filecaps_free(&caps);
+			error = finstall_refed(td, fp, &fd, (int)pa->how.flags,
+			    NULL);
+		} else {
+			/* finstall_refed() consumes the caps on success. */
+			error = finstall_refed(td, fp, &fd, (int)pa->how.flags,
+			    &caps);
+			if (error != 0)
+				filecaps_free(&caps);
+		}
+		if (error != 0) {
+			fdrop(fp, td);
+			return (kqring_errno(error));
+		}
+		return (fd);
 	}
 	if (op->wq_running) {
 		if (kqring_fp_is_ring(fp)) {

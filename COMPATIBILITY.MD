@@ -29,7 +29,7 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 
 | Capability | Status | Contract | Source | Tests |
 |---|---|---|---|---|
-| `IORING_OP_NOP` | Partial | Only `IORING_NOP_INJECT_RESULT` is accepted; see [Subflags](#subflags). | `kqring_exec_sync` | `test_probe`, `liburing/nop`, `fuzz` |
+| `IORING_OP_NOP` | Equivalent | All of Linux 7.3's flags; see [Subflags](#subflags). | `kqring_exec_sync` | `test_probe`, `test_nop_flags`, `liburing/nop`, `diff/nop_flags`, `fuzz` |
 | `IORING_OP_READV` | Equivalent | One iovec can take a provided buffer. | `kqring_exec_file_rw` | `test_vectored_io`, `test_disk_bio`, `liburing/read-write`, `fuzz` |
 | `IORING_OP_WRITEV` | Equivalent | | `kqring_exec_file_rw` | `test_vectored_io`, `liburing/read-write`, `fuzz` |
 | `IORING_OP_FSYNC` | Equivalent | | `kqring_exec_fsync` | `test_file_rw`, `liburing/fsync`, `fuzz` |
@@ -57,7 +57,7 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_OP_MADVISE` | Equivalent | | `kqring_exec_sync` | `test_path_ops`, `liburing/madvise`, `fuzz` |
 | `IORING_OP_SEND` | Equivalent | Takes provided buffers, bundles and a destination address. `SIGPIPE` is never raised. | `kqring_exec_send` | `test_send_armed`, `liburing/send_recv`, `liburing/recvsend_bundle`, `fuzz` |
 | `IORING_OP_RECV` | Equivalent | A read at end of file consumes no provided buffer. | `kqring_exec_recv` | `test_multishot_and_eof`, `test_waitall`, `test_short_links`, `liburing/send_recv`, `liburing/recv-multishot`, `fuzz` |
-| `IORING_OP_OPENAT2` | Partial | `RESOLVE_BENEATH`, `RESOLVE_NO_MAGICLINKS` and `RESOLVE_CACHED`; `RESOLVE_IN_ROOT`, `RESOLVE_NO_XDEV` and `RESOLVE_NO_SYMLINKS` fail with `EINVAL`. **Platform:** FreeBSD's lookup can't take a directory as its root. | `kqring_exec_openat` | `test_path_ops`, `liburing/openat2`, `fuzz` |
+| `IORING_OP_OPENAT2` | Different | Every `RESOLVE_*` flag. `RESOLVE_IN_ROOT`, `RESOLVE_NO_XDEV` and `RESOLVE_NO_SYMLINKS` walk the path a component at a time, since FreeBSD's lookup takes its root from the process; in a walk scoped by `RESOLVE_IN_ROOT` or `RESOLVE_BENEATH`, `..` goes back the way the walk came, so a directory renamed meanwhile can't take it above the root, where Linux fails with `EAGAIN` ([docs/openat2-resolve.md](docs/openat2-resolve.md)). FreeBSD has no magic links, so `RESOLVE_NO_MAGICLINKS` changes nothing. | `kqring_exec_openat`, `kqring_open_walk` | `test_path_ops`, `test_openat2_resolve`, `liburing/openat2`, `diff/openat2_resolve`, `fuzz` |
 | `IORING_OP_EPOLL_CTL` | Unsupported | `-EOPNOTSUPP`. **Platform:** FreeBSD has no epoll. | `kqring_req_prep` | `test_phase2_validation`, `liburing/poll-v-poll` |
 | `IORING_OP_SPLICE` | Partial | One side must be a pipe. **Platform:** large pipe writes block until read, which stops `liburing/splice` early. | `kqring_exec_splice` | `test_splice_and_tee`, `liburing/splice`, `fuzz` |
 | `IORING_OP_PROVIDE_BUFFERS` | Partial | At most 2^18 buffers per ring. | `kqring_provide_buffers` | `test_buffer_groups`, `test_worker_buffer_reservation` |
@@ -111,12 +111,12 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 | `IORING_SETUP_TASKRUN_FLAG` | Equivalent | | `kqring_kp_kick` | `test_taskrun_on_wakeup`, `fuzz` |
 | `IORING_SETUP_SQE128` | Equivalent | | `kqring_ioc_setup` | `test_sqe128_cqe32_attach_wq`, `fuzz` |
 | `IORING_SETUP_CQE32` | Equivalent | | `kqring_ioc_setup` | `test_sqe128_cqe32_attach_wq`, `fuzz` |
-| `IORING_SETUP_SINGLE_ISSUER` | Partial | Another thread's wait fails with `EEXIST` unless the CQ can already satisfy it, where Linux waits: the ring's state is the owner's, without locks. | `kqring_is_owner` | `test_single_issuer`, `test_single_issuer_wait`, `liburing/single-issuer`, `fuzz` |
-| `IORING_SETUP_DEFER_TASKRUN` | Equivalent | | `kqring_ioc_setup` | `test_setup_errors`, `liburing/defer-taskrun`, `fuzz` |
+| `IORING_SETUP_SINGLE_ISSUER` | Partial | Another thread or process may wait, as on Linux, except on a `DEFER_TASKRUN` ring (`EEXIST`, as Linux). On an `IOPOLL` ring, another thread's wait that the CQ can't already satisfy fails with `EEXIST`, where Linux polls for it: the polling state is the owner's, without locks. | `kqring_is_owner`, `kqring_ioc_enter` | `test_single_issuer`, `test_single_issuer_wait`, `liburing/single-issuer`, `diff/single_issuer_wait`, `fuzz` |
+| `IORING_SETUP_DEFER_TASKRUN` | Equivalent | Completions wait for an enter with `IORING_ENTER_GETEVENTS`, as Linux's local work. | `kqring_ioc_setup`, `kqring_ioc_enter` | `test_setup_errors`, `test_nop_flags`, `liburing/defer-taskrun`, `diff/nop_flags`, `fuzz` |
 | `IORING_SETUP_NO_MMAP` | Equivalent | `fork(2)` shares these rings rather than copying them. | `kqring_ioc_setup` | `test_no_mmap`, `liburing/no-mmap-inval`, `fuzz` |
 | `IORING_SETUP_REGISTERED_FD_ONLY` | Equivalent | | `kqring_ioc_setup` | `test_no_mmap`, `liburing/reg-fd-only`, `fuzz` |
 | `IORING_SETUP_NO_SQARRAY` | Equivalent | | `kqring_ioc_setup` | `test_no_mmap`, `fuzz` |
-| `IORING_SETUP_HYBRID_IOPOLL` | Unsupported | `EINVAL`. | `kqring_ioc_setup` | `test_compat_contracts` |
+| `IORING_SETUP_HYBRID_IOPOLL` | Equivalent | With `IORING_SETUP_IOPOLL`, else `EINVAL`. It sets how long Linux sleeps before polling; kqring's polled waits sleep until a request completes anyway. | `kqring_ioc_setup` | `test_setup_errors`, `test_compat_contracts`, `diff/setup_flags` |
 | `IORING_SETUP_CQE_MIXED` | Different | Not with `CQE32`. A CQE with extra words (`IORING_NOP_CQE32`, kevent and kqueue-bridge CQEs) takes two slots and has `IORING_CQE_F_32`; one that would wrap has an `IORING_CQE_F_SKIP` entry before it, also out of the overflow list and after a resize. kqring clears those two flags from the flags a `MSG_RING` passes, so only the kernel sets them. | `kqring_cq_push_mixed`, `kqring_resize_rings` | `test_mixed_sizes`, `liburing/nop32`, `liburing/nop32-overflow`, `liburing/cq-peek-batch-mixed`, `liburing/large-resize`, `fuzz` |
 | `IORING_SETUP_SQE_MIXED` | Equivalent | Not with `SQE128`. `NOP128` and `URING_CMD128` take two slots; in the last slot, before or after the SQ array maps it, or when `to_submit` ends after the first, one fails with `-EINVAL` and takes one. | `kqring_submit_sqes` | `test_mixed_sizes`, `liburing/sqe-mixed-nop`, `liburing/sqe-mixed-bad-wrap`, `liburing/sqe-mixed-boundary`, `fuzz` |
 | `IORING_SETUP_SQ_REWIND` | Equivalent | Needs `NO_SQARRAY`, not with `SQPOLL`. Each enter reads `to_submit` SQEs from slot 0 and leaves the head at 0. | `kqring_submit_sqes` | `test_mixed_sizes`, `liburing/sqe-mixed-nop`, `fuzz` |
@@ -139,7 +139,7 @@ Platform and filesystem limits are marked **Platform** in the contract, because 
 
 | Capability | Status | Contract | Source | Tests |
 |---|---|---|---|---|
-| `IOSQE_FIXED_FILE` | Equivalent | A slot keeps the Capsicum rights its descriptor had. | `kqring_op_fget` | `test_fixed_files`, `test_compat_contracts`, `liburing/file-register`, `fuzz` |
+| `IOSQE_FIXED_FILE` | Equivalent | A slot keeps the Capsicum rights its descriptor had. On an opcode that takes no file it is ignored, except that a path opcode fails with `EBADF`, as Linux. | `kqring_op_fget`, `kqring_req_prep` | `test_fixed_files`, `test_sqe_validation`, `test_compat_contracts`, `liburing/file-register`, `diff/fixed_flag`, `fuzz` |
 | `IOSQE_IO_DRAIN` | Equivalent | | `kqring_submit_sqes` | `test_drain`, `liburing/link_drain`, `fuzz` |
 | `IOSQE_IO_LINK` | Equivalent | A short read or write breaks the link, and so does `SPLICE`, `TEE` or a socket opcode with `MSG_WAITALL`. | `kqring_submit_sqes` | `test_links`, `test_short_links`, `liburing/link`, `fuzz` |
 | `IOSQE_IO_HARDLINK` | Equivalent | | `kqring_submit_sqes` | `test_links`, `liburing/link`, `fuzz` |
@@ -224,7 +224,9 @@ These are the `IORING_FEAT_*` bits setup returns.
 |---|---|---|---|---|
 | `IORING_NOP_INJECT_RESULT` | Equivalent | | `kqring_exec_sync` | `test_trigger_concurrent` |
 | `IORING_NOP_CQE32` | Equivalent | On a `CQE32` or `CQE_MIXED` ring, else `-EINVAL`: `big_cqe` holds `sqe->off` and `sqe->addr`. | `kqring_req_prep`, `kqring_exec_sync` | `test_mixed_sizes`, `test_compat_contracts`, `liburing/nop32` |
-| `IORING_NOP_FILE` | Unsupported | `-EINVAL`, as are `IORING_NOP_FIXED_FILE`, `IORING_NOP_FIXED_BUFFER` and `IORING_NOP_TW`. | `kqring_req_prep` | `test_compat_contracts` |
+| `IORING_NOP_FILE` | Equivalent | `-EBADF` unless `sqe->fd` is open, or with `IORING_NOP_FIXED_FILE` or `IOSQE_FIXED_FILE` its fixed slot is filled. | `kqring_nop_resources` | `test_nop_flags`, `diff/nop_flags` |
+| `IORING_NOP_FIXED_BUFFER` | Equivalent | `-EFAULT` unless registered buffer `sqe->buf_index` exists. | `kqring_nop_resources` | `test_nop_flags`, `diff/nop_flags` |
+| `IORING_NOP_TW` | Equivalent | The CQE is posted from taskwork: on a `DEFER_TASKRUN` ring, in the next enter that asks for events. | `kqring_req_issue_cred` | `test_nop_flags`, `diff/nop_flags` |
 | `IORING_FSYNC_DATASYNC` | Equivalent | | `kqring_exec_fsync` | `liburing/fsync` |
 | `IORING_TIMEOUT_ABS` | Equivalent | | `kqring_timeout_rel` | `test_timeouts` |
 | `IORING_TIMEOUT_BOOTTIME` | Partial | Measured on the uptime clock, as the default is. | `kqring_timeout_rel` | `test_timeouts` |

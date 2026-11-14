@@ -521,6 +521,50 @@ kqring_op_unarm_locked(struct kqring_ctx *ctx, struct kqring_op *op)
 }
 
 
+static bool	kqring_op_takes_file(uint8_t opcode);
+
+/*
+ * NOP's IORING_NOP_FILE and IORING_NOP_FIXED_BUFFER, as Linux's io_nop():
+ * the descriptor (a fixed slot with IORING_NOP_FIXED_FILE or
+ * IOSQE_FIXED_FILE) must be open, else -EBADF, and then the registered
+ * buffer sqe->buf_index must exist, else -EFAULT.  A failure is the
+ * result, in place of IORING_NOP_INJECT_RESULT's, kept in op->args for
+ * kqring_exec_sync(); a NOP has no other arguments.
+ */
+static int
+kqring_nop_resources(struct kqring_ctx *ctx, struct kqring_op *op)
+{
+	const struct io_uring_sqe *sqe = &op->sqe;
+	struct thread *td = curthread;
+	struct file *fp;
+	int32_t *resp, res = 0;
+	int error;
+
+	if ((sqe->nop_flags & IORING_NOP_FILE) != 0) {
+		if ((sqe->nop_flags & IORING_NOP_FIXED_FILE) != 0 ||
+		    (sqe->flags & IOSQE_FIXED_FILE) != 0) {
+			if (ctx->files == NULL || (uint32_t)sqe->fd >=
+			    ctx->nfiles || ctx->files[(uint32_t)sqe->fd] == NULL)
+				res = -EBADF;
+		} else if (fget(td, sqe->fd, &cap_no_rights, &fp) != 0) {
+			res = -EBADF;
+		} else {
+			fdrop(fp, td);
+		}
+	}
+	if (res == 0 && (sqe->nop_flags & IORING_NOP_FIXED_BUFFER) != 0 &&
+	    (ctx->bufs == NULL || sqe->buf_index >= ctx->nbufs ||
+	    ctx->bufs[sqe->buf_index] == NULL))
+		res = -EFAULT;
+	if (res == 0 || op->args != NULL)
+		return (0);
+	resp = kqring_args_alloc(op, sizeof(*resp), &error);
+	if (resp == NULL)
+		return (error);
+	*resp = res;
+	return (0);
+}
+
 /*
  * Take the fixed file and registered buffer a request names.  As in
  * io_uring this happens at issue, so that a linked request sees slots its
@@ -537,7 +581,10 @@ kqring_req_resources(struct kqring_ctx *ctx, struct kqring_op *op)
 	uint32_t idx = sqe->buf_index;
 	int error;
 
-	if ((sqe->flags & IOSQE_FIXED_FILE) != 0 && op->ffile == NULL) {
+	if (__predict_false(sqe->opcode == IORING_OP_NOP))
+		return (kqring_nop_resources(ctx, op));
+	if ((sqe->flags & IOSQE_FIXED_FILE) != 0 && op->ffile == NULL &&
+	    kqring_op_takes_file(sqe->opcode)) {
 		error = kqring_fixed_get(ctx, (uint32_t)sqe->fd, &op->ffile);
 		if (error != 0)
 			return (error);
@@ -762,6 +809,9 @@ kqring_exec_sync(struct kqring_ctx *ctx, struct kqring_op *op)
 	case IORING_OP_NOP:
 		res = (sqe->nop_flags & IORING_NOP_INJECT_RESULT) != 0 ?
 		    (int32_t)sqe->len : 0;
+		/* What kqring_nop_resources() found wrong. */
+		if (__predict_false(op->args != NULL))
+			res = *(const int32_t *)op->args;
 		if ((sqe->nop_flags & IORING_NOP_CQE32) != 0) {
 			op->cqe_has_extra = true;
 			op->cqe_extra[0] = sqe->off;
@@ -1217,11 +1267,23 @@ kqring_prep_openat2(struct kqring_op *op)
 	/*
 	 * FreeBSD has no magic links, and RESOLVE_CACHED only asks to fail
 	 * rather than block, so both are honored by a normal lookup.
+	 * RESOLVE_IN_ROOT, NO_XDEV and NO_SYMLINKS walk the path in
+	 * kqring_open_walk(), and RESOLVE_BENEATH with them; alone, it is
+	 * FreeBSD's O_RESOLVE_BENEATH.
 	 */
-	if ((how.resolve & ~(uint64_t)(RESOLVE_BENEATH |
-	    RESOLVE_NO_MAGICLINKS | RESOLVE_CACHED)) != 0)
+	if ((how.resolve & ~(uint64_t)(RESOLVE_NO_XDEV |
+	    RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH |
+	    RESOLVE_IN_ROOT | RESOLVE_CACHED)) != 0)
 		return (EINVAL);
-	if ((how.resolve & RESOLVE_BENEATH) != 0)
+	if ((how.resolve & RESOLVE_BENEATH) != 0 &&
+	    (how.resolve & RESOLVE_IN_ROOT) != 0)
+		return (EINVAL);
+	/* As Linux: a cached lookup won't create or truncate. */
+	if ((how.resolve & RESOLVE_CACHED) != 0 &&
+	    (how.flags & (O_TRUNC | O_CREAT)) != 0)
+		return (EAGAIN);
+	if ((how.resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT |
+	    RESOLVE_NO_XDEV | RESOLVE_NO_SYMLINKS)) == RESOLVE_BENEATH)
 		how.flags |= O_RESOLVE_BENEATH;
 
 	error = kqring_prep_paths(op, false);
@@ -1432,6 +1494,28 @@ kqring_op_takes_file(uint8_t opcode)
 }
 
 
+/* Opcodes that name a path, which a fixed slot can't stand for. */
+static bool
+kqring_op_path(uint8_t opcode)
+{
+	switch (opcode) {
+	case IORING_OP_OPENAT:
+	case IORING_OP_OPENAT2:
+	case IORING_OP_CLOSE:
+	case IORING_OP_STATX:
+	case IORING_OP_RENAMEAT:
+	case IORING_OP_UNLINKAT:
+	case IORING_OP_MKDIRAT:
+	case IORING_OP_SYMLINKAT:
+	case IORING_OP_LINKAT:
+	case IORING_OP_SETXATTR:
+	case IORING_OP_GETXATTR:
+		return (true);
+	default:
+		return (false);
+	}
+}
+
 /* IORING_REGISTER_RESTRICTIONS: whether the SQE may be submitted. */
 static bool
 kqring_restriction_ok(const struct kqring_ctx *ctx,
@@ -1551,9 +1635,15 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 	if ((ctx->flags & IORING_SETUP_IOPOLL) != 0 &&
 	    !kqring_iopoll_op_ok(sqe->opcode))
 		return (EINVAL);
+	/*
+	 * IOSQE_FIXED_FILE on an opcode that takes no file: as Linux, a path
+	 * opcode fails with EBADF, and the others ignore it (a NOP takes it
+	 * as IORING_NOP_FIXED_FILE).
+	 */
 	if ((sqe->flags & IOSQE_FIXED_FILE) != 0 &&
-	    !kqring_op_takes_file(sqe->opcode))
-		return (EINVAL);
+	    !kqring_op_takes_file(sqe->opcode) &&
+	    kqring_op_path(sqe->opcode))
+		return (EBADF);
 	if (sqe->personality != 0) {
 		LIST_FOREACH(kc, &ctx->creds, link) {
 			if (kc->id == sqe->personality)
@@ -1720,6 +1810,8 @@ kqring_req_prep(struct kqring_op *op, const struct kqring_op *prev)
 		break;
 	case IORING_OP_NOP:
 		if ((sqe->nop_flags & ~(IORING_NOP_INJECT_RESULT |
+		    IORING_NOP_FILE | IORING_NOP_FIXED_FILE |
+		    IORING_NOP_FIXED_BUFFER | IORING_NOP_TW |
 		    IORING_NOP_CQE32)) != 0)
 			return (EINVAL);
 		if ((sqe->nop_flags & IORING_NOP_CQE32) != 0 &&
@@ -2510,6 +2602,15 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 			break;
 		}
 		kqring_exec_sync(ctx, op);
+		/* IORING_NOP_TW: posted from taskwork, as Linux's task work. */
+		if (__predict_false(sqe->opcode == IORING_OP_NOP &&
+		    (sqe->nop_flags & IORING_NOP_TW) != 0)) {
+			mtx_lock(&ctx->mtx);
+			kqring_op_arm_locked(ctx, op);
+			kqring_taskwork_add_locked(ctx, op);
+			mtx_unlock(&ctx->mtx);
+			return;
+		}
 		kqring_req_complete(ctx, op, op->res, op->cflags);
 		return;
 	}
@@ -2691,6 +2792,13 @@ kqring_taskwork_run_one(struct kqring_ctx *ctx, struct kqring_op *op)
 	case IORING_OP_TIMEOUT:
 	case IORING_OP_LINK_TIMEOUT:
 		kqring_timeout_fire(ctx, op);
+		return;
+	case IORING_OP_NOP:
+		/* IORING_NOP_TW, done already (kqring_req_issue_cred()). */
+		mtx_lock(&ctx->mtx);
+		kqring_op_unarm_locked(ctx, op);
+		mtx_unlock(&ctx->mtx);
+		kqring_req_complete(ctx, op, op->res, op->cflags);
 		return;
 	case IORING_OP_FUTEX_WAIT:
 	case IORING_OP_FUTEX_WAITV:

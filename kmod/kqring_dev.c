@@ -1515,6 +1515,14 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	    (p.flags & (IORING_SETUP_COOP_TASKRUN |
 	    IORING_SETUP_DEFER_TASKRUN)) == 0)
 		return (EINVAL);
+	/*
+	 * HYBRID_IOPOLL sleeps for part of a request's expected time before
+	 * polling it.  kqring's IOPOLL waits sleep until a disk request
+	 * completes anyway (kqring_wait_cqes()), so it changes nothing.
+	 */
+	if ((p.flags & IORING_SETUP_HYBRID_IOPOLL) != 0 &&
+	    (p.flags & IORING_SETUP_IOPOLL) == 0)
+		return (EINVAL);
 	/* One CQE size or both, one SQE size or both. */
 	if ((p.flags & IORING_SETUP_CQE32) != 0 &&
 	    (p.flags & IORING_SETUP_CQE_MIXED) != 0)
@@ -1966,21 +1974,27 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	if (!owner) {
 		if (!ctx->shared) {
 			/*
-			 * SINGLE_ISSUER: another thread sees the CQ as it
-			 * stands, and a wait it can't satisfy yet fails.
+			 * SINGLE_ISSUER: another thread or process may wait,
+			 * as on Linux, but not with DEFER_TASKRUN, whose
+			 * completions only the owner runs
+			 * (io_allowed_run_tw()).  Its wait is foreign: it runs
+			 * nothing of the owner's, which the kthread, the
+			 * owner, or COOP_TASKRUN's return to user space posts.
+			 * Not on an IOPOLL ring, whose waits poll.
 			 */
 			if (ea->to_submit > 0 ||
 			    ((ea->flags & IORING_ENTER_GETEVENTS) != 0 &&
 			    (ctx->flags & IORING_SETUP_DEFER_TASKRUN) != 0) ||
-			    (wait && (iopoll ||
-			    atomic_load_acq_32(&shm->cq_tail) -
+			    (wait && iopoll && atomic_load_acq_32(&shm->cq_tail) -
 			    atomic_load_acq_32(&shm->cq_head) <
-			    ea->min_complete)))
+			    ea->min_complete))
 				return (EEXIST);
-			ea->SUBMITTED_out = 0;
-			return (0);
-		}
-		if (ea->to_submit > 0) {
+			if (!wait) {
+				ea->SUBMITTED_out = 0;
+				return (0);
+			}
+			foreign = true;
+		} else if (ea->to_submit > 0) {
 			struct kqring_tctx *t;
 
 			if ((error = kqring_tctx_attach(ctx, td, &t)) != 0)
@@ -2134,8 +2148,15 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 		ea->SUBMITTED_out = 0;
 	}
 
-	/* 3. Run pending DEFER_TASKRUN completions, futex and timeout checks */
-	kqring_run_taskwork(ctx);
+	/*
+	 * 3. Run pending taskwork, futex and timeout checks.  A
+	 * DEFER_TASKRUN ring's taskwork runs only in an enter that asks for
+	 * events, as Linux runs its local work only with GETEVENTS: a
+	 * submit-only enter leaves its completions where they are.
+	 */
+	if ((ctx->flags & IORING_SETUP_DEFER_TASKRUN) == 0 ||
+	    (ea->flags & IORING_ENTER_GETEVENTS) != 0)
+		kqring_run_taskwork(ctx);
 	kqring_run_checks(ctx);
 	kqring_flush_overflow(ctx);
 	/*
