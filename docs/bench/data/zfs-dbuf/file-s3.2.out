@@ -1,6 +1,6 @@
-# file_4k start: ZFS dbuf cache target 131 MiB, ARC target 1052 MiB, file 64 MiB
-ROW file_4k pread 1308.2
-ROW file_4k kqring_read 2095.9
-ROW file_4k kqring_read_fixed 2081.2
-ROW file_4k kqring_read_batch32 794.1
-# file_4k end: ZFS dbuf cache target 131 MiB, ARC target 1052 MiB, file 64 MiB
+# file_4k start: ZFS dbuf cache target 138 MiB, ARC target 1111 MiB, file 64 MiB
+ROW file_4k pread 1281.7
+ROW file_4k kqring_read 2102.0
+ROW file_4k kqring_read_fixed 2057.0
+ROW file_4k kqring_read_batch32 780.4
+# file_4k end: ZFS dbuf cache target 138 MiB, ARC target 1111 MiB, file 64 MiB

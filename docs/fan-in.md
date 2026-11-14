@@ -2,7 +2,7 @@
 
 Status: done, November 2026. Roadmap phase 12.
 
-[BENCHMARK.MD](../BENCHMARK.MD#fan-in-many-connections-each-get-one-message-and-all-of-them-are-collected) has kqring's fan-in, many connections each getting one message and all of them collected, 26–66% slower than kqueue on the Ryzen, where a system call is cheap. This note measures where the time goes.
+[BENCHMARK.MD](../BENCHMARK.MD#fan-in-many-connections-each-get-one-message-and-all-of-them-are-collected) had kqring's fan-in, many connections each getting one message and all of them collected, 26–66% slower than kqueue on the Ryzen, where a system call is cheap. This note measures where the time went. Since phase 13, when `kqring_bench` stopped handing kqring's receives a 16 MiB pool of buffers, BENCHMARK.MD has it level with kqueue.
 
 ## How it is measured
 

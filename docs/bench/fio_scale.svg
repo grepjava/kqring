@@ -45,15 +45,15 @@
 <text x="313.0" y="358" class="tick" text-anchor="middle">2</text>
 <text x="570.0" y="358" class="tick" text-anchor="middle">4</text>
 <text x="313.0" y="374" class="tick" text-anchor="middle">jobs</text>
-<polyline points="56.0,265.5 313.0,235.9 570.0,275.3" fill="none" stroke="var(--kqueue)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<circle cx="56.0" cy="265.5" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>aio: 704k k IOPS</title></circle>
+<polyline points="56.0,265.6 313.0,235.9 570.0,275.3" fill="none" stroke="var(--kqueue)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="56.0" cy="265.6" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>aio: 703k k IOPS</title></circle>
 <circle cx="313.0" cy="235.9" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>aio: 1,018k k IOPS</title></circle>
 <circle cx="570.0" cy="275.3" r="4" fill="var(--kqueue)" stroke="var(--surface)" stroke-width="2"><title>aio: 601k k IOPS</title></circle>
-<polyline points="56.0,266.9 313.0,216.0 570.0,141.2" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<circle cx="56.0" cy="266.9" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring: 690k k IOPS</title></circle>
-<circle cx="313.0" cy="216.0" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring: 1,229k k IOPS</title></circle>
-<circle cx="570.0" cy="141.2" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring: 2,021k k IOPS</title></circle>
-<text x="580.0" y="145.2" class="val">kqring 2,021k</text>
+<polyline points="56.0,267.1 313.0,215.0 570.0,141.9" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="56.0" cy="267.1" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring: 687k k IOPS</title></circle>
+<circle cx="313.0" cy="215.0" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring: 1,239k k IOPS</title></circle>
+<circle cx="570.0" cy="141.9" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>kqring: 2,014k k IOPS</title></circle>
+<text x="580.0" y="145.9" class="val">kqring 2,014k</text>
 <text x="580.0" y="279.3" class="val">aio 601k</text>
 <text x="740" y="75" class="tick" text-anchor="end">k IOPS</text>
 </svg>

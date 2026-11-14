@@ -1,5 +1,5 @@
 # system FreeBSD 15.1-RELEASE amd64
-# memlock 65536
+# memlock 8388608
 # compiler FreeBSD Clang 19.1.7 (https://github.com/llvm/llvm-project.git llvmorg-19.1.7-0-gcd708029e0b2)
 nop/enter 1
 nop/cqe ud=1 res=0 flags=-
@@ -112,8 +112,8 @@ setup_flags/defer+sqpoll -EINVAL
 setup_flags/defer+coop 0
 setup_flags/defer+flag 0
 setup_flags/defer+iopoll 0
-newer/sqe_mixed -EINVAL
-newer/sq_rewind -EINVAL
+newer/sqe_mixed 0
+newer/sq_rewind 0
 newer/nop128 ud=1 res=-EINVAL flags=-
 newer/uring_cmd128 ud=2 res=-EINVAL flags=-
 newer/timeout_immediate ud=3 res=-EINVAL flags=-
@@ -196,10 +196,26 @@ provided_buffers/first ud=2 res=3 flags=B
 provided_buffers/eof ud=3 res=0 flags=-
 provided_buffers/left ud=4 res=1 flags=-
 provided_buffers/empty ud=5 res=-ENOBUFS flags=-
+recv_mshot_drained/provide ud=1 res=0 flags=-
+recv_mshot_drained/first ud=2 res=1 flags=BM
+recv_mshot_drained/last_buffer ud=2 res=1 flags=BM
+recv_mshot_drained/idle none
+recv_mshot_drained/provide_more ud=3 res=0 flags=-
+recv_mshot_drained/after_provide ud=2 res=1 flags=BM
+recv_mshot_drained/no_buffer ud=2 res=-ENOBUFS flags=-
 buffer_lifetime/remapped ud=1 res=6 flags=-
 buffer_lifetime/remapped_data after!
-buffer_lifetime/unmapped ud=2 res=-EFAULT flags=-
+buffer_lifetime/unmapped ud=2 res=6 flags=-
 buffer_lifetime/too_long ud=3 res=-EFAULT flags=-
+buffer_fork/child_read 8 parent0!
+buffer_fork/parent_sees filedata
+buffer_fork/parent_write ud=2 res=8 flags=-
+buffer_fork/written parentB!
+buffer_backing/file_shared -EFAULT
+buffer_backing/file_private 0
+buffer_backing/memfd_shared 0
+buffer_backing/anon_shared 0
+buffer_backing/anon_readonly -EFAULT
 cq_overflow/enter 8
 cq_overflow/enter 8
 cq_overflow/enter 8
@@ -233,10 +249,25 @@ sockets/dontwait ud=2 res=-EAGAIN flags=-
 sockets/eof ud=3 res=0 flags=-
 sockets/closed_peer ud=4 res=-EPIPE flags=-
 sockets/not_a_socket ud=5 res=-ENOTSOCK flags=-
-fork/child_enter -EEXIST
-fork/parent_cq none
+fork/child_enter 1
+fork/parent_cq ud=1 res=0 flags=-
 fork/parent_after ud=2 res=0 flags=-
-exec/enter_after -EBADF
+fork_inflight/parent_submit 1
+fork_inflight/child_submit 2
+fork_inflight/child_poll ud=2 res=IN flags=-
+fork_inflight/child_exit ud=4 res=-ETIME flags=-
+fork_inflight/parent_poll ud=1 res=IN flags=-
+fork_inflight/parent_after ud=5 res=0 flags=-
+exit_armed/parent_submit 1
+exit_armed/child_submit 3
+exit_armed/child_poll ud=2 res=IN flags=-
+exit_armed/child_exit ud=3 res=-ECANCELED flags=-
+exit_armed/child_exit ud=4 res=-ETIME flags=-
+exit_armed/child_read_late none
+exit_armed/parent_poll ud=1 res=IN flags=-
+exit_armed/parent_after ud=5 res=0 flags=-
+exec/enter_after 0
+exec/cq_after ud=1 res=-ECANCELED flags=-
 exec/status 0
 threads/enter_errors 0
 threads/enter_errors 0

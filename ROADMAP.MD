@@ -20,7 +20,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 10 | The cost of an enter | Done |
 | 11 | Cached file reads | Done |
 | 12 | Fan-in against kqueue | Done |
-| 13 | Refresh the evidence | In progress |
+| 13 | Refresh the evidence | Done |
 
 ## Where kqring stands
 
@@ -246,6 +246,11 @@ Acceptance: BENCHMARK.MD names one build for every figure and its raw runs are k
 Progress (14 November 2026):
 
 - Step 1: on the Ryzen, with the same module, the kqueue rows didn't move, and kqring's multishot fan-in went from 510–614 to 379–471 ns per message, now ahead of kqueue at 16 and 256 connections and level at 1,024; multishot ping-pong at 64 B went from 622–629 to 535–540, level with kqueue's 537–544.
+- Step 2: every `kqring_bench` group (5 runs, the module reloaded before each), its disk group on md(4), its file group on UFS, its stream group, `kqring_mt_bench`, `kqring_diskbench` and fio's `bench.sh` and `scale.sh`, from `28e67b2` on the Ryzen ([`system.txt`](docs/bench/data/system.txt)). The ZFS file table was run again after fio: run early, with the ARC target at 241 MiB, the file fit neither dbuf cache size, and `zfs-dbuf/run.sh` now fails when that happens. 75 of the 100 rows the old set shares with the new moved less than 4%; the rest are the buffer change, and ZFS writes in fio, which vary between runs. `kqring_diskbench -V` passed on the md disk and a ZFS file.
+- Step 3: `kqring_diff` three times on Linux 7.3.0-10 (i5) and on kqring (Ryzen), each identical across runs; of 30 cases 25 match and 5 differ on purpose.
+- BENCHMARK.MD's generator now fails if its summary's claims about fan-in and ping-pong stop holding. Its comparison with the i5 leaves out the laptop's fan-in, measured with the old buffer pool, and the README marks those rows. The claim that an enter costs kqring 250 ns more than io_uring, from before phase 10, is corrected in the README and docs/linux-comparison.md.
+
+Phase 13 is done: BENCHMARK.MD names one build for every figure, with its raw runs; on the Ryzen kqring is now level with kqueue on sockets, ahead on fan-in up to 256 connections, and behind on a single request per enter.
 
 ## Research
 

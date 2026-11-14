@@ -33,7 +33,7 @@ Phase 6 of the [roadmap](../ROADMAP.MD#phase-6-performance-evidence) asks for Li
 | AF_UNIX: `write(2)` then `RECV` | 1,145 | 2,432 |
 | — `RECV` above `recv(2)` | +419 | +248 |
 
-**An enter costs kqring about 250 ns more than io_uring**, above each system's own floor. That's the fixed cost per call the [cached-read profile](worker-wakeups.md#where-the-rest-of-the-gap-is-and-batching) found spread over the enter, the SQE, the request and the CQE. **Per operation in a batch, kqring is cheaper**: 75 ns per `NOP` at 32 per enter, against 94.
+**An enter cost kqring about 250 ns more than io_uring** in these runs, above each system's own floor. Phase 10 removed that gap: on the same laptop on 12 November 2026, one `NOP` per enter cost kqring 165 ns above FreeBSD's floor and io_uring 173 above Linux's ([per-request-cost.md](per-request-cost.md#on-the-machine-that-runs-both)). The gap here was the fixed cost per call the [cached-read profile](worker-wakeups.md#where-the-rest-of-the-gap-is-and-batching) found spread over the enter, the SQE, the request and the CQE. **Per operation in a batch, kqring is cheaper**: 75 ns per `NOP` at 32 per enter, against 94.
 
 ## fio
 
@@ -76,7 +76,7 @@ Within each system, kqring's direct bio path gets three times `psync`'s IOPS fro
 ## What it shows
 
 - kqring matches or beats io_uring where the device sets the pace, and does it with less CPU.
-- Its fixed cost per enter is about 250 ns above io_uring's. Batching hides it, and per batched operation kqring is the cheaper of the two.
+- Its fixed cost per enter was about 250 ns above io_uring's; since phase 10 it is level (165 ns against 173 above each floor). Per batched operation kqring is the cheaper of the two.
 - Cached file reads from several threads were where io_uring was ahead, because Linux tries a read without blocking and kqring sent tmpfs reads to workers. Since phase 11 kqring reads cached tmpfs pages in the enter and is ahead there too ([cached-reads.md](cached-reads.md)); on ZFS that would need the change described in [async-zfs-reads.md](async-zfs-reads.md).
 
 ## Not covered

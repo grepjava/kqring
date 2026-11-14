@@ -39,28 +39,28 @@
 <text x="690.0" y="354" class="tick" text-anchor="middle">4,000</text>
 <text x="740" y="354" class="tick" text-anchor="end">ns</text>
 <text x="224.0" y="89.0" class="lab" text-anchor="end">NOP, 32 per enter</text>
-<path d="M234.0,78.0 H238.7 Q242.7,78.0 242.7,82.0 V88.0 Q242.7,92.0 238.7,92.0 H234.0 Z" fill="var(--s1)"><title>NOP, 32 per enter — ns: 76 ns</title></path>
-<text x="247.7" y="89" class="val">76</text>
+<path d="M234.0,78.0 H238.1 Q242.1,78.0 242.1,82.0 V88.0 Q242.1,92.0 238.1,92.0 H234.0 Z" fill="var(--s1)"><title>NOP, 32 per enter — ns: 71 ns</title></path>
+<text x="247.1" y="89" class="val">71</text>
 <text x="224.0" y="121.0" class="lab" text-anchor="end">NOP, one per enter</text>
-<path d="M234.0,110.0 H251.4 Q255.4,110.0 255.4,114.0 V120.0 Q255.4,124.0 251.4,124.0 H234.0 Z" fill="var(--s1)"><title>NOP, one per enter — ns: 187 ns</title></path>
-<text x="260.4" y="121" class="val">187</text>
+<path d="M234.0,110.0 H250.8 Q254.8,110.0 254.8,114.0 V120.0 Q254.8,124.0 250.8,124.0 H234.0 Z" fill="var(--s1)"><title>NOP, one per enter — ns: 182 ns</title></path>
+<text x="259.8" y="121" class="val">182</text>
 <text x="224.0" y="153.0" class="lab" text-anchor="end">Pipe READ, inline</text>
-<path d="M234.0,142.0 H284.5 Q288.5,142.0 288.5,146.0 V152.0 Q288.5,156.0 284.5,156.0 H234.0 Z" fill="var(--s1)"><title>Pipe READ, inline — ns: 478 ns</title></path>
-<text x="293.5" y="153" class="val">478</text>
+<path d="M234.0,142.0 H284.2 Q288.2,142.0 288.2,146.0 V152.0 Q288.2,156.0 284.2,156.0 H234.0 Z" fill="var(--s1)"><title>Pipe READ, inline — ns: 476 ns</title></path>
+<text x="293.2" y="153" class="val">476</text>
 <text x="224.0" y="185.0" class="lab" text-anchor="end">RECV, reused buffer</text>
-<path d="M234.0,174.0 H293.0 Q297.0,174.0 297.0,178.0 V184.0 Q297.0,188.0 293.0,188.0 H234.0 Z" fill="var(--s1)"><title>RECV, reused buffer — ns: 552 ns</title></path>
-<text x="302.0" y="185" class="val">552</text>
+<path d="M234.0,174.0 H291.9 Q295.9,174.0 295.9,178.0 V184.0 Q295.9,188.0 291.9,188.0 H234.0 Z" fill="var(--s1)"><title>RECV, reused buffer — ns: 543 ns</title></path>
+<text x="300.9" y="185" class="val">543</text>
 <text x="224.0" y="217.0" class="lab" text-anchor="end">NOP through a worker</text>
-<path d="M234.0,206.0 H313.6 Q317.6,206.0 317.6,210.0 V216.0 Q317.6,220.0 313.6,220.0 H234.0 Z" fill="var(--s1)"><title>NOP through a worker — ns: 733 ns</title></path>
-<text x="322.6" y="217" class="val">733</text>
+<path d="M234.0,206.0 H315.5 Q319.5,206.0 319.5,210.0 V216.0 Q319.5,220.0 315.5,220.0 H234.0 Z" fill="var(--s1)"><title>NOP through a worker — ns: 750 ns</title></path>
+<text x="324.5" y="217" class="val">750</text>
 <text x="224.0" y="249.0" class="lab" text-anchor="end">UFS READ, inline</text>
-<path d="M234.0,238.0 H339.7 Q343.7,238.0 343.7,242.0 V248.0 Q343.7,252.0 339.7,252.0 H234.0 Z" fill="var(--s1)"><title>UFS READ, inline — ns: 962 ns</title></path>
-<text x="348.7" y="249" class="val">962</text>
+<path d="M234.0,238.0 H335.4 Q339.4,238.0 339.4,242.0 V248.0 Q339.4,252.0 335.4,252.0 H234.0 Z" fill="var(--s1)"><title>UFS READ, inline — ns: 925 ns</title></path>
+<text x="344.4" y="249" class="val">925</text>
 <text x="224.0" y="281.0" class="lab" text-anchor="end">RECV armed, then woken by an upcall</text>
-<path d="M234.0,270.0 H343.1 Q347.1,270.0 347.1,274.0 V280.0 Q347.1,284.0 343.1,284.0 H234.0 Z" fill="var(--s1)"><title>RECV armed, then woken by an upcall — ns: 992 ns</title></path>
-<text x="352.1" y="281" class="val">992</text>
+<path d="M234.0,270.0 H333.7 Q337.7,270.0 337.7,274.0 V280.0 Q337.7,284.0 333.7,284.0 H234.0 Z" fill="var(--s1)"><title>RECV armed, then woken by an upcall — ns: 910 ns</title></path>
+<text x="342.7" y="281" class="val">910</text>
 <text x="224.0" y="313.0" class="lab" text-anchor="end">Disk READ, bio to md(4)</text>
-<path d="M234.0,302.0 H660.0 Q664.0,302.0 664.0,306.0 V312.0 Q664.0,316.0 660.0,316.0 H234.0 Z" fill="var(--s1)"><title>Disk READ, bio to md(4) — ns: 3,772 ns</title></path>
-<text x="669.0" y="313" class="val">3,772</text>
+<path d="M234.0,302.0 H662.6 Q666.6,302.0 666.6,306.0 V312.0 Q666.6,316.0 662.6,316.0 H234.0 Z" fill="var(--s1)"><title>Disk READ, bio to md(4) — ns: 3,794 ns</title></path>
+<text x="671.6" y="313" class="val">3,794</text>
 <line x1="234.0" y1="72" x2="234.0" y2="338" class="axis"/>
 </svg>

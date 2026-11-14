@@ -53,9 +53,9 @@
 <path d="M114.0,164.0 H311.6 Q315.6,164.0 315.6,168.0 V174.0 Q315.6,178.0 311.6,178.0 H114.0 Z" fill="var(--s1)"><title>ZFS file reads — kqring: 14% % CPU</title></path>
 <text x="320.6" y="175" class="val">14%</text>
 <text x="104.0" y="215.0" class="lab" text-anchor="end">ZFS file writes</text>
-<path d="M114.0,196.0 H153.2 Q157.2,196.0 157.2,200.0 V206.0 Q157.2,210.0 153.2,210.0 H114.0 Z" fill="var(--kqueue)"><title>ZFS file writes — aio: 3% % CPU</title></path>
-<text x="162.2" y="207" class="val">3%</text>
-<path d="M114.0,212.0 H138.8 Q142.8,212.0 142.8,216.0 V222.0 Q142.8,226.0 138.8,226.0 H114.0 Z" fill="var(--s1)"><title>ZFS file writes — kqring: 2% % CPU</title></path>
-<text x="147.8" y="223" class="val">2%</text>
+<path d="M114.0,196.0 H167.6 Q171.6,196.0 171.6,200.0 V206.0 Q171.6,210.0 167.6,210.0 H114.0 Z" fill="var(--kqueue)"><title>ZFS file writes — aio: 4% % CPU</title></path>
+<text x="176.6" y="207" class="val">4%</text>
+<path d="M114.0,212.0 H153.2 Q157.2,212.0 157.2,216.0 V222.0 Q157.2,226.0 153.2,226.0 H114.0 Z" fill="var(--s1)"><title>ZFS file writes — kqring: 3% % CPU</title></path>
+<text x="162.2" y="223" class="val">3%</text>
 <line x1="114.0" y1="94" x2="114.0" y2="248" class="axis"/>
 </svg>

@@ -1,441 +1,441 @@
 md_psync_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 268432, 1048.6 MiB/s, latency (us) p50 3.6, p99 4.5, p99.9 6.1, max 43.7
-ROW diskbench md_psync_1 read 268432 1048.6 3.6 4.5 6.1
+  read  IOPS 269919, 1054.4 MiB/s, latency (us) p50 3.6, p99 4.2, p99.9 6.1, max 85.5
+ROW diskbench md_psync_1 read 269919 1054.4 3.6 4.2 6.1
 md_aio_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 254594, 994.5 MiB/s, latency (us) p50 3.9, p99 4.6, p99.9 5.1, max 18.1
-ROW diskbench md_aio_1 read 254594 994.5 3.9 4.6 5.1
+  read  IOPS 254640, 994.7 MiB/s, latency (us) p50 3.9, p99 4.5, p99.9 5.1, max 18.8
+ROW diskbench md_aio_1 read 254640 994.7 3.9 4.5 5.1
 md_kqring_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 254723, 995.0 MiB/s, latency (us) p50 3.9, p99 4.5, p99.9 5.1, max 17.8
-ROW diskbench md_kqring_1 read 254723 995.0 3.9 4.5 5.1
+  read  IOPS 255358, 997.5 MiB/s, latency (us) p50 3.9, p99 4.5, p99.9 5.2, max 17.5
+ROW diskbench md_kqring_1 read 255358 997.5 3.9 4.5 5.2
 md_kqringFB_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 255627, 998.5 MiB/s, latency (us) p50 3.9, p99 4.5, p99.9 5.2, max 17.3
-ROW diskbench md_kqringFB_1 read 255627 998.5 3.9 4.5 5.2
+  read  IOPS 259908, 1015.3 MiB/s, latency (us) p50 3.8, p99 4.5, p99.9 5.0, max 17.0
+ROW diskbench md_kqringFB_1 read 259908 1015.3 3.8 4.5 5.0
 md_kqringP_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 188992, 738.2 MiB/s, latency (us) p50 5.2, p99 6.4, p99.9 6.9, max 550.8
-ROW diskbench md_kqringP_1 read 188992 738.2 5.2 6.4 6.9
+  read  IOPS 190258, 743.2 MiB/s, latency (us) p50 5.2, p99 6.4, p99.9 6.9, max 22.5
+ROW diskbench md_kqringP_1 read 190258 743.2 5.2 6.4 6.9
 md_kqringI_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 254544, 994.3 MiB/s, latency (us) p50 3.9, p99 4.6, p99.9 5.2, max 17.4
-ROW diskbench md_kqringI_1 read 254544 994.3 3.9 4.6 5.2
-md_psync_32: /dev/md11 randread bs=4096 qd=1 jobs=32 area=1024 MiB
-  read  IOPS 643551, 2513.9 MiB/s, latency (us) p50 50.2, p99 54.3, p99.9 64.5, max 110.7
-ROW diskbench md_psync_32 read 643551 2513.9 50.2 54.3 64.5
+  read  IOPS 254978, 996.0 MiB/s, latency (us) p50 3.9, p99 4.6, p99.9 5.2, max 18.8
+ROW diskbench md_kqringI_1 read 254978 996.0 3.9 4.6 5.2
+md_psync_32: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
+  read  IOPS 271716, 1061.4 MiB/s, latency (us) p50 3.6, p99 4.2, p99.9 4.7, max 16.9
+ROW diskbench md_psync_32 read 271716 1061.4 3.6 4.2 4.7
 md_aio_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 645851, 2522.9 MiB/s, latency (us) p50 50.2, p99 110.6, p99.9 129.0, max 176.5
-ROW diskbench md_aio_32 read 645851 2522.9 50.2 110.6 129.0
+  read  IOPS 650330, 2540.3 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 175.5
+ROW diskbench md_aio_32 read 650330 2540.3 49.2 110.6 127.0
 md_kqring_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 651377, 2544.4 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 181.6
-ROW diskbench md_kqring_32 read 651377 2544.4 49.2 110.6 127.0
+  read  IOPS 651764, 2546.0 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 181.4
+ROW diskbench md_kqring_32 read 651764 2546.0 49.2 110.6 127.0
 md_kqringFB_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 655738, 2561.5 MiB/s, latency (us) p50 49.2, p99 108.5, p99.9 127.0, max 194.2
-ROW diskbench md_kqringFB_32 read 655738 2561.5 49.2 108.5 127.0
+  read  IOPS 666491, 2603.5 MiB/s, latency (us) p50 48.1, p99 106.5, p99.9 124.9, max 170.6
+ROW diskbench md_kqringFB_32 read 666491 2603.5 48.1 106.5 124.9
 md_kqringP_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 690177, 2696.0 MiB/s, latency (us) p50 47.1, p99 102.4, p99.9 116.7, max 177.4
-ROW diskbench md_kqringP_32 read 690177 2696.0 47.1 102.4 116.7
+  read  IOPS 683202, 2668.8 MiB/s, latency (us) p50 47.1, p99 102.4, p99.9 118.8, max 154.2
+ROW diskbench md_kqringP_32 read 683202 2668.8 47.1 102.4 118.8
 md_kqringI_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 653588, 2553.1 MiB/s, latency (us) p50 49.2, p99 108.5, p99.9 127.0, max 172.7
-ROW diskbench md_kqringI_32 read 653588 2553.1 49.2 108.5 127.0
+  read  IOPS 652584, 2549.2 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 171.8
+ROW diskbench md_kqringI_32 read 652584 2549.2 49.2 110.6 127.0
 wait_1: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 651435, 2544.7 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 171.3
-ROW diskbench wait_1 read 651435 2544.7 49.2 110.6 127.0
+  read  IOPS 651107, 2543.4 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 169.8
+ROW diskbench wait_1 read 651107 2543.4 49.2 110.6 127.0
 wait_16: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 697841, 2725.9 MiB/s, latency (us) p50 48.1, p99 86.0, p99.9 98.3, max 129.8
-ROW diskbench wait_16 read 697841 2725.9 48.1 86.0 98.3
+  read  IOPS 702010, 2742.2 MiB/s, latency (us) p50 48.1, p99 81.9, p99.9 98.3, max 144.2
+ROW diskbench wait_16 read 702010 2742.2 48.1 81.9 98.3
 md_psync_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 254197, 993.0 MiB/s, latency (us) p50 3.9, p99 4.5, p99.9 5.6, max 18.4
-ROW diskbench md_psync_1 write 254197 993.0 3.9 4.5 5.6
+  write IOPS 255416, 997.7 MiB/s, latency (us) p50 3.8, p99 4.5, p99.9 5.4, max 17.9
+ROW diskbench md_psync_1 write 255416 997.7 3.8 4.5 5.4
 md_aio_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 242859, 948.7 MiB/s, latency (us) p50 4.1, p99 4.7, p99.9 5.8, max 19.8
-ROW diskbench md_aio_1 write 242859 948.7 4.1 4.7 5.8
+  write IOPS 245912, 960.6 MiB/s, latency (us) p50 4.1, p99 4.7, p99.9 5.8, max 23.4
+ROW diskbench md_aio_1 write 245912 960.6 4.1 4.7 5.8
 md_kqring_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 243957, 953.0 MiB/s, latency (us) p50 4.1, p99 4.7, p99.9 5.9, max 20.4
-ROW diskbench md_kqring_1 write 243957 953.0 4.1 4.7 5.9
+  write IOPS 246160, 961.6 MiB/s, latency (us) p50 4.0, p99 4.7, p99.9 5.9, max 18.6
+ROW diskbench md_kqring_1 write 246160 961.6 4.0 4.7 5.9
 md_kqringFB_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 244129, 953.6 MiB/s, latency (us) p50 4.1, p99 4.7, p99.9 5.8, max 18.2
-ROW diskbench md_kqringFB_1 write 244129 953.6 4.1 4.7 5.8
+  write IOPS 252844, 987.7 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.6, max 24.6
+ROW diskbench md_kqringFB_1 write 252844 987.7 4.0 4.6 5.6
 md_kqringP_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 182974, 714.7 MiB/s, latency (us) p50 5.2, p99 6.5, p99.9 7.7, max 25.7
-ROW diskbench md_kqringP_1 write 182974 714.7 5.2 6.5 7.7
+  write IOPS 185465, 724.5 MiB/s, latency (us) p50 5.2, p99 6.4, p99.9 7.3, max 19.4
+ROW diskbench md_kqringP_1 write 185465 724.5 5.2 6.4 7.3
 md_kqringI_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 243919, 952.8 MiB/s, latency (us) p50 4.1, p99 4.7, p99.9 5.9, max 19.6
-ROW diskbench md_kqringI_1 write 243919 952.8 4.1 4.7 5.9
-md_psync_32: /dev/md11 randwrite bs=4096 qd=1 jobs=32 area=1024 MiB
-  write IOPS 564546, 2205.3 MiB/s, latency (us) p50 57.3, p99 63.5, p99.9 73.7, max 121.7
-ROW diskbench md_psync_32 write 564546 2205.3 57.3 63.5 73.7
+  write IOPS 245940, 960.7 MiB/s, latency (us) p50 4.0, p99 4.7, p99.9 5.9, max 21.9
+ROW diskbench md_kqringI_1 write 245940 960.7 4.0 4.7 5.9
+md_psync_32: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
+  write IOPS 254916, 995.8 MiB/s, latency (us) p50 3.9, p99 4.5, p99.9 5.5, max 19.2
+ROW diskbench md_psync_32 write 254916 995.8 3.9 4.5 5.5
 md_aio_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 557753, 2178.7 MiB/s, latency (us) p50 57.3, p99 129.0, p99.9 151.6, max 199.5
-ROW diskbench md_aio_32 write 557753 2178.7 57.3 129.0 151.6
+  write IOPS 573020, 2238.4 MiB/s, latency (us) p50 56.3, p99 124.9, p99.9 147.5, max 191.5
+ROW diskbench md_aio_32 write 573020 2238.4 56.3 124.9 147.5
 md_kqring_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 553094, 2160.5 MiB/s, latency (us) p50 58.4, p99 129.0, p99.9 151.6, max 242.5
-ROW diskbench md_kqring_32 write 553094 2160.5 58.4 129.0 151.6
+  write IOPS 571596, 2232.8 MiB/s, latency (us) p50 56.3, p99 124.9, p99.9 147.5, max 223.6
+ROW diskbench md_kqring_32 write 571596 2232.8 56.3 124.9 147.5
 md_kqringFB_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 556087, 2172.2 MiB/s, latency (us) p50 58.4, p99 129.0, p99.9 151.6, max 292.0
-ROW diskbench md_kqringFB_32 write 556087 2172.2 58.4 129.0 151.6
+  write IOPS 581158, 2270.1 MiB/s, latency (us) p50 55.3, p99 122.9, p99.9 143.4, max 221.5
+ROW diskbench md_kqringFB_32 write 581158 2270.1 55.3 122.9 143.4
 md_kqringP_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 581884, 2273.0 MiB/s, latency (us) p50 55.3, p99 120.8, p99.9 143.4, max 211.8
-ROW diskbench md_kqringP_32 write 581884 2273.0 55.3 120.8 143.4
+  write IOPS 600002, 2343.8 MiB/s, latency (us) p50 53.2, p99 118.8, p99.9 139.3, max 233.6
+ROW diskbench md_kqringP_32 write 600002 2343.8 53.2 118.8 139.3
 md_kqringI_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 554275, 2165.1 MiB/s, latency (us) p50 58.4, p99 129.0, p99.9 151.6, max 212.7
-ROW diskbench md_kqringI_32 write 554275 2165.1 58.4 129.0 151.6
+  write IOPS 575328, 2247.4 MiB/s, latency (us) p50 56.3, p99 124.9, p99.9 147.5, max 292.0
+ROW diskbench md_kqringI_32 write 575328 2247.4 56.3 124.9 147.5
 wait_1: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 555797, 2171.1 MiB/s, latency (us) p50 58.4, p99 129.0, p99.9 151.6, max 227.4
-ROW diskbench wait_1 write 555797 2171.1 58.4 129.0 151.6
+  write IOPS 566558, 2213.1 MiB/s, latency (us) p50 56.3, p99 127.0, p99.9 147.5, max 204.3
+ROW diskbench wait_1 write 566558 2213.1 56.3 127.0 147.5
 wait_16: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 592364, 2313.9 MiB/s, latency (us) p50 54.3, p99 108.5, p99.9 112.6, max 167.9
-ROW diskbench wait_16 write 592364 2313.9 54.3 108.5 112.6
+  write IOPS 607347, 2372.4 MiB/s, latency (us) p50 54.3, p99 106.5, p99.9 112.6, max 178.5
+ROW diskbench wait_16 write 607347 2372.4 54.3 106.5 112.6
 sq_plain_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 252698, 987.1 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.2, max 16.9
-ROW diskbench sq_plain_1 read 252698 987.1 4.0 4.6 5.2
+  read  IOPS 254507, 994.2 MiB/s, latency (us) p50 4.0, p99 4.5, p99.9 5.1, max 18.3
+ROW diskbench sq_plain_1 read 254507 994.2 4.0 4.5 5.1
 sq_P_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 189990, 742.1 MiB/s, latency (us) p50 5.2, p99 6.4, p99.9 6.9, max 18.9
-ROW diskbench sq_P_1 read 189990 742.1 5.2 6.4 6.9
+  read  IOPS 190873, 745.6 MiB/s, latency (us) p50 5.2, p99 6.3, p99.9 6.9, max 18.5
+ROW diskbench sq_P_1 read 190873 745.6 5.2 6.3 6.9
 sq_PC_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 258118, 1008.3 MiB/s, latency (us) p50 3.8, p99 5.0, p99.9 5.5, max 45.9
-ROW diskbench sq_PC_1 read 258118 1008.3 3.8 5.0 5.5
+  read  IOPS 338753, 1323.3 MiB/s, latency (us) p50 2.9, p99 4.0, p99.9 5.0, max 42.6
+ROW diskbench sq_PC_1 read 338753 1323.3 2.9 4.0 5.0
 sq_plain_4: /dev/md11 randread bs=4096 qd=4 jobs=1 area=1024 MiB
-  read  IOPS 650827, 2542.3 MiB/s, latency (us) p50 6.0, p99 12.0, p99.9 15.4, max 31.3
-ROW diskbench sq_plain_4 read 650827 2542.3 6.0 12.0 15.4
+  read  IOPS 657143, 2567.0 MiB/s, latency (us) p50 6.0, p99 12.0, p99.9 15.4, max 30.1
+ROW diskbench sq_plain_4 read 657143 2567.0 6.0 12.0 15.4
 sq_P_4: /dev/md11 randread bs=4096 qd=4 jobs=1 area=1024 MiB
-  read  IOPS 674535, 2634.9 MiB/s, latency (us) p50 5.6, p99 10.5, p99.9 13.6, max 28.0
-ROW diskbench sq_P_4 read 674535 2634.9 5.6 10.5 13.6
+  read  IOPS 674584, 2635.1 MiB/s, latency (us) p50 5.9, p99 10.5, p99.9 13.3, max 28.0
+ROW diskbench sq_P_4 read 674584 2635.1 5.9 10.5 13.3
 sq_PC_4: /dev/md11 randread bs=4096 qd=4 jobs=1 area=1024 MiB
-  read  IOPS 707457, 2763.5 MiB/s, latency (us) p50 5.5, p99 10.2, p99.9 13.1, max 28.7
-ROW diskbench sq_PC_4 read 707457 2763.5 5.5 10.2 13.1
+  read  IOPS 705970, 2757.7 MiB/s, latency (us) p50 5.5, p99 10.5, p99.9 13.3, max 56.3
+ROW diskbench sq_PC_4 read 705970 2757.7 5.5 10.5 13.3
 sq_plain_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 651055, 2543.2 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 163.8
-ROW diskbench sq_plain_32 read 651055 2543.2 49.2 110.6 127.0
+  read  IOPS 652684, 2549.5 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 172.2
+ROW diskbench sq_plain_32 read 652684 2549.5 49.2 110.6 127.0
 sq_P_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 682407, 2665.7 MiB/s, latency (us) p50 47.1, p99 102.4, p99.9 118.8, max 169.2
-ROW diskbench sq_P_32 read 682407 2665.7 47.1 102.4 118.8
+  read  IOPS 678207, 2649.2 MiB/s, latency (us) p50 47.1, p99 104.4, p99.9 120.8, max 154.8
+ROW diskbench sq_P_32 read 678207 2649.2 47.1 104.4 120.8
 sq_PC_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 694117, 2711.4 MiB/s, latency (us) p50 46.1, p99 102.4, p99.9 118.8, max 159.0
-ROW diskbench sq_PC_32 read 694117 2711.4 46.1 102.4 118.8
+  read  IOPS 697335, 2724.0 MiB/s, latency (us) p50 46.1, p99 102.4, p99.9 118.8, max 155.2
+ROW diskbench sq_PC_32 read 697335 2724.0 46.1 102.4 118.8
 zfs_psync_1: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
-  read  IOPS 85270, 333.1 MiB/s, latency (us) p50 12.8, p99 23.0, p99.9 26.6, max 42.5
-ROW diskbench zfs_psync_1 read 85270 333.1 12.8 23.0 26.6
+  read  IOPS 80629, 315.0 MiB/s, latency (us) p50 12.5, p99 23.0, p99.9 27.6, max 50.8
+ROW diskbench zfs_psync_1 read 80629 315.0 12.5 23.0 27.6
 zfs_aio_1: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
-  read  IOPS 73074, 285.4 MiB/s, latency (us) p50 15.1, p99 25.6, p99.9 29.2, max 82.8
-ROW diskbench zfs_aio_1 read 73074 285.4 15.1 25.6 29.2
+  read  IOPS 67629, 264.2 MiB/s, latency (us) p50 15.1, p99 25.6, p99.9 30.2, max 62.2
+ROW diskbench zfs_aio_1 read 67629 264.2 15.1 25.6 30.2
 zfs_kqring_1: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
-  read  IOPS 84029, 328.2 MiB/s, latency (us) p50 13.3, p99 23.6, p99.9 27.6, max 73.1
-ROW diskbench zfs_kqring_1 read 84029 328.2 13.3 23.6 27.6
-zfs_psync_4: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=4 area=256 MiB
-  read  IOPS 118638, 463.4 MiB/s, latency (us) p50 36.9, p99 69.6, p99.9 84.0, max 204.6
-ROW diskbench zfs_psync_4 read 118638 463.4 36.9 69.6 84.0
+  read  IOPS 75965, 296.7 MiB/s, latency (us) p50 13.6, p99 24.1, p99.9 28.2, max 43.4
+ROW diskbench zfs_kqring_1 read 75965 296.7 13.6 24.1 28.2
+zfs_psync_4: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
+  read  IOPS 80734, 315.4 MiB/s, latency (us) p50 12.5, p99 23.0, p99.9 27.6, max 56.1
+ROW diskbench zfs_psync_4 read 80734 315.4 12.5 23.0 27.6
 zfs_aio_4: /home/grepjava/dbench.dat randread bs=4096 qd=4 jobs=1 area=256 MiB
-  read  IOPS 122590, 478.9 MiB/s, latency (us) p50 33.8, p99 65.5, p99.9 84.0, max 169.0
-ROW diskbench zfs_aio_4 read 122590 478.9 33.8 65.5 84.0
+  read  IOPS 111106, 434.0 MiB/s, latency (us) p50 35.8, p99 67.6, p99.9 88.1, max 171.5
+ROW diskbench zfs_aio_4 read 111106 434.0 35.8 67.6 88.1
 zfs_kqring_4: /home/grepjava/dbench.dat randread bs=4096 qd=4 jobs=1 area=256 MiB
-  read  IOPS 123351, 481.8 MiB/s, latency (us) p50 33.8, p99 67.6, p99.9 81.9, max 167.9
-ROW diskbench zfs_kqring_4 read 123351 481.8 33.8 67.6 81.9
-zfs_psync_16: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=16 area=256 MiB
-  read  IOPS 116359, 454.5 MiB/s, latency (us) p50 77.8, p99 114.7, p99.9 26738.7, max 141836.2
-ROW diskbench zfs_psync_16 read 116359 454.5 77.8 114.7 26738.7
+  read  IOPS 111819, 436.8 MiB/s, latency (us) p50 35.8, p99 67.6, p99.9 84.0, max 197.3
+ROW diskbench zfs_kqring_4 read 111819 436.8 35.8 67.6 84.0
+zfs_psync_16: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
+  read  IOPS 81072, 316.7 MiB/s, latency (us) p50 12.5, p99 23.0, p99.9 27.6, max 42.6
+ROW diskbench zfs_psync_16 read 81072 316.7 12.5 23.0 27.6
 zfs_aio_16: /home/grepjava/dbench.dat randread bs=4096 qd=16 jobs=1 area=256 MiB
-  read  IOPS 119523, 466.9 MiB/s, latency (us) p50 143.4, p99 192.5, p99.9 221.2, max 331.0
-ROW diskbench zfs_aio_16 read 119523 466.9 143.4 192.5 221.2
+  read  IOPS 108257, 422.9 MiB/s, latency (us) p50 151.6, p99 200.7, p99.9 229.4, max 358.4
+ROW diskbench zfs_aio_16 read 108257 422.9 151.6 200.7 229.4
 zfs_kqring_16: /home/grepjava/dbench.dat randread bs=4096 qd=16 jobs=1 area=256 MiB
-  read  IOPS 124250, 485.4 MiB/s, latency (us) p50 131.1, p99 180.2, p99.9 208.9, max 322.4
-ROW diskbench zfs_kqring_16 read 124250 485.4 131.1 180.2 208.9
-zfs_psync_64: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=64 area=256 MiB
-  read  IOPS 115319, 450.5 MiB/s, latency (us) p50 75.8, p99 147.5, p99.9 88080.4, max 212271.7
-ROW diskbench zfs_psync_64 read 115319 450.5 75.8 147.5 88080.4
+  read  IOPS 112844, 440.8 MiB/s, latency (us) p50 143.4, p99 188.4, p99.9 217.1, max 389.7
+ROW diskbench zfs_kqring_16 read 112844 440.8 143.4 188.4 217.1
+zfs_psync_64: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
+  read  IOPS 80866, 315.9 MiB/s, latency (us) p50 12.5, p99 23.0, p99.9 27.6, max 43.3
+ROW diskbench zfs_psync_64 read 80866 315.9 12.5 23.0 27.6
 zfs_aio_64: /home/grepjava/dbench.dat randread bs=4096 qd=64 jobs=1 area=256 MiB
-  read  IOPS 119256, 465.8 MiB/s, latency (us) p50 540.7, p99 639.0, p99.9 688.1, max 891.8
-ROW diskbench zfs_aio_64 read 119256 465.8 540.7 639.0 688.1
+  read  IOPS 107677, 420.6 MiB/s, latency (us) p50 606.2, p99 688.1, p99.9 753.7, max 988.2
+ROW diskbench zfs_aio_64 read 107677 420.6 606.2 688.1 753.7
 zfs_kqring_64: /home/grepjava/dbench.dat randread bs=4096 qd=64 jobs=1 area=256 MiB
-  read  IOPS 123732, 483.3 MiB/s, latency (us) p50 524.3, p99 622.6, p99.9 671.7, max 1019.2
-ROW diskbench zfs_kqring_64 read 123732 483.3 524.3 622.6 671.7
+  read  IOPS 112149, 438.1 MiB/s, latency (us) p50 573.4, p99 655.4, p99.9 720.9, max 1253.8
+ROW diskbench zfs_kqring_64 read 112149 438.1 573.4 655.4 720.9
 md_psync_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 270297, 1055.8 MiB/s, latency (us) p50 3.6, p99 4.2, p99.9 4.9, max 17.8
-ROW diskbench md_psync_1 read 270297 1055.8 3.6 4.2 4.9
+  read  IOPS 271462, 1060.4 MiB/s, latency (us) p50 3.6, p99 4.2, p99.9 4.7, max 16.3
+ROW diskbench md_psync_1 read 271462 1060.4 3.6 4.2 4.7
 md_aio_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 253639, 990.8 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.2, max 28.9
-ROW diskbench md_aio_1 read 253639 990.8 4.0 4.6 5.2
+  read  IOPS 253524, 990.3 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.2, max 19.2
+ROW diskbench md_aio_1 read 253524 990.3 4.0 4.6 5.2
 md_kqring_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 253792, 991.4 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.2, max 100.0
-ROW diskbench md_kqring_1 read 253792 991.4 4.0 4.6 5.2
+  read  IOPS 253769, 991.3 MiB/s, latency (us) p50 4.0, p99 4.5, p99.9 5.2, max 17.5
+ROW diskbench md_kqring_1 read 253769 991.3 4.0 4.5 5.2
 md_kqringFB_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 252615, 986.8 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.2, max 30.4
-ROW diskbench md_kqringFB_1 read 252615 986.8 4.0 4.6 5.2
+  read  IOPS 260012, 1015.7 MiB/s, latency (us) p50 3.8, p99 4.5, p99.9 5.1, max 20.0
+ROW diskbench md_kqringFB_1 read 260012 1015.7 3.8 4.5 5.1
 md_kqringP_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 189917, 741.9 MiB/s, latency (us) p50 5.2, p99 6.4, p99.9 6.9, max 30.0
-ROW diskbench md_kqringP_1 read 189917 741.9 5.2 6.4 6.9
+  read  IOPS 190975, 746.0 MiB/s, latency (us) p50 5.2, p99 6.3, p99.9 6.9, max 18.9
+ROW diskbench md_kqringP_1 read 190975 746.0 5.2 6.3 6.9
 md_kqringI_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 252267, 985.4 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.2, max 17.4
-ROW diskbench md_kqringI_1 read 252267 985.4 4.0 4.6 5.2
-md_psync_32: /dev/md11 randread bs=4096 qd=1 jobs=32 area=1024 MiB
-  read  IOPS 645234, 2520.4 MiB/s, latency (us) p50 50.2, p99 53.2, p99.9 63.5, max 84.8
-ROW diskbench md_psync_32 read 645234 2520.4 50.2 53.2 63.5
+  read  IOPS 254068, 992.5 MiB/s, latency (us) p50 4.0, p99 4.5, p99.9 5.1, max 49.7
+ROW diskbench md_kqringI_1 read 254068 992.5 4.0 4.5 5.1
+md_psync_32: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
+  read  IOPS 271004, 1058.6 MiB/s, latency (us) p50 3.6, p99 4.2, p99.9 4.9, max 16.9
+ROW diskbench md_psync_32 read 271004 1058.6 3.6 4.2 4.9
 md_aio_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 646520, 2525.5 MiB/s, latency (us) p50 50.2, p99 110.6, p99.9 129.0, max 191.0
-ROW diskbench md_aio_32 read 646520 2525.5 50.2 110.6 129.0
+  read  IOPS 649718, 2538.0 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 172.0
+ROW diskbench md_aio_32 read 649718 2538.0 49.2 110.6 127.0
 md_kqring_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 647378, 2528.8 MiB/s, latency (us) p50 50.2, p99 110.6, p99.9 127.0, max 168.5
-ROW diskbench md_kqring_32 read 647378 2528.8 50.2 110.6 127.0
+  read  IOPS 649998, 2539.1 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 179.9
+ROW diskbench md_kqring_32 read 649998 2539.1 49.2 110.6 127.0
 md_kqringFB_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 652808, 2550.0 MiB/s, latency (us) p50 49.2, p99 108.5, p99.9 127.0, max 183.3
-ROW diskbench md_kqringFB_32 read 652808 2550.0 49.2 108.5 127.0
+  read  IOPS 662780, 2589.0 MiB/s, latency (us) p50 48.1, p99 108.5, p99.9 124.9, max 184.7
+ROW diskbench md_kqringFB_32 read 662780 2589.0 48.1 108.5 124.9
 md_kqringP_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 687143, 2684.2 MiB/s, latency (us) p50 47.1, p99 102.4, p99.9 118.8, max 162.2
-ROW diskbench md_kqringP_32 read 687143 2684.2 47.1 102.4 118.8
+  read  IOPS 679546, 2654.5 MiB/s, latency (us) p50 47.1, p99 104.4, p99.9 120.8, max 158.0
+ROW diskbench md_kqringP_32 read 679546 2654.5 47.1 104.4 120.8
 md_kqringI_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 650347, 2540.4 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 193.2
-ROW diskbench md_kqringI_32 read 650347 2540.4 49.2 110.6 127.0
+  read  IOPS 650759, 2542.0 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 192.4
+ROW diskbench md_kqringI_32 read 650759 2542.0 49.2 110.6 127.0
 wait_1: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 649074, 2535.4 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 176.8
-ROW diskbench wait_1 read 649074 2535.4 49.2 110.6 127.0
+  read  IOPS 650817, 2542.3 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 184.8
+ROW diskbench wait_1 read 650817 2542.3 49.2 110.6 127.0
 wait_16: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 694694, 2713.6 MiB/s, latency (us) p50 48.1, p99 86.0, p99.9 98.3, max 136.7
-ROW diskbench wait_16 read 694694 2713.6 48.1 86.0 98.3
+  read  IOPS 703045, 2746.3 MiB/s, latency (us) p50 48.1, p99 79.9, p99.9 98.3, max 133.4
+ROW diskbench wait_16 read 703045 2746.3 48.1 79.9 98.3
 md_psync_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 254058, 992.4 MiB/s, latency (us) p50 3.9, p99 4.5, p99.9 5.6, max 17.9
-ROW diskbench md_psync_1 write 254058 992.4 3.9 4.5 5.6
+  write IOPS 255270, 997.1 MiB/s, latency (us) p50 3.8, p99 4.5, p99.9 5.5, max 18.0
+ROW diskbench md_psync_1 write 255270 997.1 3.8 4.5 5.5
 md_aio_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 242814, 948.5 MiB/s, latency (us) p50 4.1, p99 4.9, p99.9 5.9, max 27.0
-ROW diskbench md_aio_1 write 242814 948.5 4.1 4.9 5.9
+  write IOPS 245869, 960.4 MiB/s, latency (us) p50 4.1, p99 4.7, p99.9 5.9, max 18.6
+ROW diskbench md_aio_1 write 245869 960.4 4.1 4.7 5.9
 md_kqring_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 243668, 951.8 MiB/s, latency (us) p50 4.1, p99 4.9, p99.9 5.9, max 20.1
-ROW diskbench md_kqring_1 write 243668 951.8 4.1 4.9 5.9
+  write IOPS 246388, 962.5 MiB/s, latency (us) p50 4.0, p99 4.7, p99.9 5.8, max 18.2
+ROW diskbench md_kqring_1 write 246388 962.5 4.0 4.7 5.8
 md_kqringFB_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 244240, 954.1 MiB/s, latency (us) p50 4.1, p99 4.7, p99.9 5.9, max 18.1
-ROW diskbench md_kqringFB_1 write 244240 954.1 4.1 4.7 5.9
+  write IOPS 253429, 990.0 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.6, max 25.5
+ROW diskbench md_kqringFB_1 write 253429 990.0 4.0 4.6 5.6
 md_kqringP_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 182791, 714.0 MiB/s, latency (us) p50 5.2, p99 6.5, p99.9 7.7, max 44.8
-ROW diskbench md_kqringP_1 write 182791 714.0 5.2 6.5 7.7
+  write IOPS 185935, 726.3 MiB/s, latency (us) p50 5.2, p99 6.4, p99.9 7.3, max 103.4
+ROW diskbench md_kqringP_1 write 185935 726.3 5.2 6.4 7.3
 md_kqringI_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 243941, 952.9 MiB/s, latency (us) p50 4.1, p99 4.7, p99.9 5.9, max 22.2
-ROW diskbench md_kqringI_1 write 243941 952.9 4.1 4.7 5.9
-md_psync_32: /dev/md11 randwrite bs=4096 qd=1 jobs=32 area=1024 MiB
-  write IOPS 563471, 2201.1 MiB/s, latency (us) p50 57.3, p99 61.4, p99.9 73.7, max 136.7
-ROW diskbench md_psync_32 write 563471 2201.1 57.3 61.4 73.7
+  write IOPS 247313, 966.1 MiB/s, latency (us) p50 4.0, p99 4.7, p99.9 5.8, max 21.7
+ROW diskbench md_kqringI_1 write 247313 966.1 4.0 4.7 5.8
+md_psync_32: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
+  write IOPS 256133, 1000.5 MiB/s, latency (us) p50 3.8, p99 4.5, p99.9 5.5, max 17.7
+ROW diskbench md_psync_32 write 256133 1000.5 3.8 4.5 5.5
 md_aio_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 555290, 2169.1 MiB/s, latency (us) p50 58.4, p99 129.0, p99.9 151.6, max 209.6
-ROW diskbench md_aio_32 write 555290 2169.1 58.4 129.0 151.6
+  write IOPS 570828, 2229.8 MiB/s, latency (us) p50 56.3, p99 124.9, p99.9 147.5, max 211.9
+ROW diskbench md_aio_32 write 570828 2229.8 56.3 124.9 147.5
 md_kqring_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 554390, 2165.6 MiB/s, latency (us) p50 58.4, p99 129.0, p99.9 151.6, max 272.6
-ROW diskbench md_kqring_32 write 554390 2165.6 58.4 129.0 151.6
+  write IOPS 571683, 2233.1 MiB/s, latency (us) p50 56.3, p99 124.9, p99.9 147.5, max 295.8
+ROW diskbench md_kqring_32 write 571683 2233.1 56.3 124.9 147.5
 md_kqringFB_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 558908, 2183.2 MiB/s, latency (us) p50 57.3, p99 129.0, p99.9 151.6, max 215.4
-ROW diskbench md_kqringFB_32 write 558908 2183.2 57.3 129.0 151.6
+  write IOPS 583790, 2280.4 MiB/s, latency (us) p50 55.3, p99 122.9, p99.9 143.4, max 233.1
+ROW diskbench md_kqringFB_32 write 583790 2280.4 55.3 122.9 143.4
 md_kqringP_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 583458, 2279.1 MiB/s, latency (us) p50 55.3, p99 120.8, p99.9 143.4, max 214.4
-ROW diskbench md_kqringP_32 write 583458 2279.1 55.3 120.8 143.4
+  write IOPS 604062, 2359.6 MiB/s, latency (us) p50 53.2, p99 116.7, p99.9 135.2, max 195.0
+ROW diskbench md_kqringP_32 write 604062 2359.6 53.2 116.7 135.2
 md_kqringI_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 551820, 2155.5 MiB/s, latency (us) p50 58.4, p99 129.0, p99.9 151.6, max 228.1
-ROW diskbench md_kqringI_32 write 551820 2155.5 58.4 129.0 151.6
+  write IOPS 573140, 2238.8 MiB/s, latency (us) p50 56.3, p99 124.9, p99.9 147.5, max 242.1
+ROW diskbench md_kqringI_32 write 573140 2238.8 56.3 124.9 147.5
 wait_1: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 555195, 2168.7 MiB/s, latency (us) p50 58.4, p99 129.0, p99.9 151.6, max 214.1
-ROW diskbench wait_1 write 555195 2168.7 58.4 129.0 151.6
+  write IOPS 571976, 2234.3 MiB/s, latency (us) p50 56.3, p99 124.9, p99.9 147.5, max 234.8
+ROW diskbench wait_1 write 571976 2234.3 56.3 124.9 147.5
 wait_16: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 592109, 2312.9 MiB/s, latency (us) p50 54.3, p99 108.5, p99.9 112.6, max 192.3
-ROW diskbench wait_16 write 592109 2312.9 54.3 108.5 112.6
+  write IOPS 606382, 2368.7 MiB/s, latency (us) p50 54.3, p99 106.5, p99.9 112.6, max 164.8
+ROW diskbench wait_16 write 606382 2368.7 54.3 106.5 112.6
 sq_plain_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 253199, 989.1 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.2, max 22.2
-ROW diskbench sq_plain_1 read 253199 989.1 4.0 4.6 5.2
+  read  IOPS 254376, 993.7 MiB/s, latency (us) p50 4.0, p99 4.5, p99.9 5.1, max 18.4
+ROW diskbench sq_plain_1 read 254376 993.7 4.0 4.5 5.1
 sq_P_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 190004, 742.2 MiB/s, latency (us) p50 5.2, p99 6.4, p99.9 6.9, max 20.6
-ROW diskbench sq_P_1 read 190004 742.2 5.2 6.4 6.9
+  read  IOPS 191614, 748.5 MiB/s, latency (us) p50 5.2, p99 6.3, p99.9 6.8, max 18.5
+ROW diskbench sq_P_1 read 191614 748.5 5.2 6.3 6.8
 sq_PC_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 267087, 1043.3 MiB/s, latency (us) p50 3.8, p99 5.0, p99.9 5.4, max 33.2
-ROW diskbench sq_PC_1 read 267087 1043.3 3.8 5.0 5.4
+  read  IOPS 264601, 1033.6 MiB/s, latency (us) p50 3.8, p99 5.0, p99.9 5.4, max 85.8
+ROW diskbench sq_PC_1 read 264601 1033.6 3.8 5.0 5.4
 sq_plain_4: /dev/md11 randread bs=4096 qd=4 jobs=1 area=1024 MiB
-  read  IOPS 654234, 2555.6 MiB/s, latency (us) p50 6.0, p99 12.0, p99.9 15.4, max 29.1
-ROW diskbench sq_plain_4 read 654234 2555.6 6.0 12.0 15.4
+  read  IOPS 653882, 2554.2 MiB/s, latency (us) p50 6.0, p99 12.0, p99.9 15.4, max 29.7
+ROW diskbench sq_plain_4 read 653882 2554.2 6.0 12.0 15.4
 sq_P_4: /dev/md11 randread bs=4096 qd=4 jobs=1 area=1024 MiB
-  read  IOPS 673718, 2631.7 MiB/s, latency (us) p50 5.9, p99 10.2, p99.9 13.3, max 27.9
-ROW diskbench sq_P_4 read 673718 2631.7 5.9 10.2 13.3
+  read  IOPS 677062, 2644.8 MiB/s, latency (us) p50 5.9, p99 10.5, p99.9 13.6, max 27.2
+ROW diskbench sq_P_4 read 677062 2644.8 5.9 10.5 13.6
 sq_PC_4: /dev/md11 randread bs=4096 qd=4 jobs=1 area=1024 MiB
-  read  IOPS 700725, 2737.2 MiB/s, latency (us) p50 5.5, p99 10.5, p99.9 13.3, max 56.8
-ROW diskbench sq_PC_4 read 700725 2737.2 5.5 10.5 13.3
+  read  IOPS 705209, 2754.7 MiB/s, latency (us) p50 5.5, p99 10.5, p99.9 13.3, max 29.1
+ROW diskbench sq_PC_4 read 705209 2754.7 5.5 10.5 13.3
 sq_plain_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 648462, 2533.1 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 170.5
-ROW diskbench sq_plain_32 read 648462 2533.1 49.2 110.6 127.0
+  read  IOPS 651008, 2543.0 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 188.3
+ROW diskbench sq_plain_32 read 651008 2543.0 49.2 110.6 127.0
 sq_P_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 673971, 2632.7 MiB/s, latency (us) p50 48.1, p99 104.4, p99.9 120.8, max 172.5
-ROW diskbench sq_P_32 read 673971 2632.7 48.1 104.4 120.8
+  read  IOPS 680533, 2658.3 MiB/s, latency (us) p50 47.1, p99 104.4, p99.9 118.8, max 156.7
+ROW diskbench sq_P_32 read 680533 2658.3 47.1 104.4 118.8
 sq_PC_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 696121, 2719.2 MiB/s, latency (us) p50 46.1, p99 102.4, p99.9 118.8, max 165.3
-ROW diskbench sq_PC_32 read 696121 2719.2 46.1 102.4 118.8
+  read  IOPS 693319, 2708.3 MiB/s, latency (us) p50 46.1, p99 102.4, p99.9 118.8, max 157.6
+ROW diskbench sq_PC_32 read 693319 2708.3 46.1 102.4 118.8
 zfs_psync_1: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
-  read  IOPS 84360, 329.5 MiB/s, latency (us) p50 12.8, p99 23.0, p99.9 27.1, max 42.6
-ROW diskbench zfs_psync_1 read 84360 329.5 12.8 23.0 27.1
+  read  IOPS 80540, 314.6 MiB/s, latency (us) p50 12.5, p99 23.0, p99.9 27.6, max 50.7
+ROW diskbench zfs_psync_1 read 80540 314.6 12.5 23.0 27.6
 zfs_aio_1: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
-  read  IOPS 73072, 285.4 MiB/s, latency (us) p50 15.1, p99 25.6, p99.9 29.2, max 59.1
-ROW diskbench zfs_aio_1 read 73072 285.4 15.1 25.6 29.2
+  read  IOPS 67818, 264.9 MiB/s, latency (us) p50 15.1, p99 25.6, p99.9 30.2, max 68.5
+ROW diskbench zfs_aio_1 read 67818 264.9 15.1 25.6 30.2
 zfs_kqring_1: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
-  read  IOPS 83772, 327.2 MiB/s, latency (us) p50 13.3, p99 23.6, p99.9 27.6, max 47.8
-ROW diskbench zfs_kqring_1 read 83772 327.2 13.3 23.6 27.6
-zfs_psync_4: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=4 area=256 MiB
-  read  IOPS 118742, 463.8 MiB/s, latency (us) p50 36.9, p99 69.6, p99.9 84.0, max 187.4
-ROW diskbench zfs_psync_4 read 118742 463.8 36.9 69.6 84.0
+  read  IOPS 75747, 295.9 MiB/s, latency (us) p50 13.6, p99 24.1, p99.9 28.2, max 44.6
+ROW diskbench zfs_kqring_1 read 75747 295.9 13.6 24.1 28.2
+zfs_psync_4: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
+  read  IOPS 80661, 315.1 MiB/s, latency (us) p50 12.5, p99 23.0, p99.9 27.6, max 52.9
+ROW diskbench zfs_psync_4 read 80661 315.1 12.5 23.0 27.6
 zfs_aio_4: /home/grepjava/dbench.dat randread bs=4096 qd=4 jobs=1 area=256 MiB
-  read  IOPS 122535, 478.7 MiB/s, latency (us) p50 33.8, p99 65.5, p99.9 84.0, max 176.5
-ROW diskbench zfs_aio_4 read 122535 478.7 33.8 65.5 84.0
+  read  IOPS 111122, 434.1 MiB/s, latency (us) p50 34.8, p99 67.6, p99.9 88.1, max 162.1
+ROW diskbench zfs_aio_4 read 111122 434.1 34.8 67.6 88.1
 zfs_kqring_4: /home/grepjava/dbench.dat randread bs=4096 qd=4 jobs=1 area=256 MiB
-  read  IOPS 123377, 481.9 MiB/s, latency (us) p50 33.8, p99 67.6, p99.9 81.9, max 212.1
-ROW diskbench zfs_kqring_4 read 123377 481.9 33.8 67.6 81.9
-zfs_psync_16: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=16 area=256 MiB
-  read  IOPS 115713, 452.0 MiB/s, latency (us) p50 77.8, p99 114.7, p99.9 28311.6, max 126061.9
-ROW diskbench zfs_psync_16 read 115713 452.0 77.8 114.7 28311.6
+  read  IOPS 111747, 436.5 MiB/s, latency (us) p50 35.8, p99 67.6, p99.9 84.0, max 173.6
+ROW diskbench zfs_kqring_4 read 111747 436.5 35.8 67.6 84.0
+zfs_psync_16: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
+  read  IOPS 80202, 313.3 MiB/s, latency (us) p50 12.8, p99 23.0, p99.9 27.6, max 50.6
+ROW diskbench zfs_psync_16 read 80202 313.3 12.8 23.0 27.6
 zfs_aio_16: /home/grepjava/dbench.dat randread bs=4096 qd=16 jobs=1 area=256 MiB
-  read  IOPS 119505, 466.8 MiB/s, latency (us) p50 143.4, p99 192.5, p99.9 225.3, max 425.6
-ROW diskbench zfs_aio_16 read 119505 466.8 143.4 192.5 225.3
+  read  IOPS 108381, 423.4 MiB/s, latency (us) p50 151.6, p99 196.6, p99.9 229.4, max 339.9
+ROW diskbench zfs_aio_16 read 108381 423.4 151.6 196.6 229.4
 zfs_kqring_16: /home/grepjava/dbench.dat randread bs=4096 qd=16 jobs=1 area=256 MiB
-  read  IOPS 124302, 485.6 MiB/s, latency (us) p50 131.1, p99 180.2, p99.9 204.8, max 349.3
-ROW diskbench zfs_kqring_16 read 124302 485.6 131.1 180.2 204.8
-zfs_psync_64: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=64 area=256 MiB
-  read  IOPS 115544, 451.3 MiB/s, latency (us) p50 75.8, p99 147.5, p99.9 88080.4, max 191878.2
-ROW diskbench zfs_psync_64 read 115544 451.3 75.8 147.5 88080.4
+  read  IOPS 112628, 440.0 MiB/s, latency (us) p50 143.4, p99 188.4, p99.9 217.1, max 365.8
+ROW diskbench zfs_kqring_16 read 112628 440.0 143.4 188.4 217.1
+zfs_psync_64: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
+  read  IOPS 80535, 314.6 MiB/s, latency (us) p50 12.5, p99 23.0, p99.9 27.6, max 50.7
+ROW diskbench zfs_psync_64 read 80535 314.6 12.5 23.0 27.6
 zfs_aio_64: /home/grepjava/dbench.dat randread bs=4096 qd=64 jobs=1 area=256 MiB
-  read  IOPS 119289, 466.0 MiB/s, latency (us) p50 540.7, p99 639.0, p99.9 688.1, max 1052.7
-ROW diskbench zfs_aio_64 read 119289 466.0 540.7 639.0 688.1
+  read  IOPS 107809, 421.1 MiB/s, latency (us) p50 606.2, p99 688.1, p99.9 737.3, max 968.3
+ROW diskbench zfs_aio_64 read 107809 421.1 606.2 688.1 737.3
 zfs_kqring_64: /home/grepjava/dbench.dat randread bs=4096 qd=64 jobs=1 area=256 MiB
-  read  IOPS 123796, 483.6 MiB/s, latency (us) p50 524.3, p99 622.6, p99.9 671.7, max 1110.9
-ROW diskbench zfs_kqring_64 read 123796 483.6 524.3 622.6 671.7
+  read  IOPS 112013, 437.6 MiB/s, latency (us) p50 573.4, p99 671.7, p99.9 737.3, max 1260.3
+ROW diskbench zfs_kqring_64 read 112013 437.6 573.4 671.7 737.3
 md_psync_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 269726, 1053.6 MiB/s, latency (us) p50 3.6, p99 4.2, p99.9 4.9, max 20.6
-ROW diskbench md_psync_1 read 269726 1053.6 3.6 4.2 4.9
+  read  IOPS 271856, 1061.9 MiB/s, latency (us) p50 3.6, p99 4.2, p99.9 4.7, max 16.5
+ROW diskbench md_psync_1 read 271856 1061.9 3.6 4.2 4.7
 md_aio_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 253388, 989.8 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.2, max 18.1
-ROW diskbench md_aio_1 read 253388 989.8 4.0 4.6 5.2
+  read  IOPS 253431, 990.0 MiB/s, latency (us) p50 4.0, p99 4.5, p99.9 5.1, max 83.7
+ROW diskbench md_aio_1 read 253431 990.0 4.0 4.5 5.1
 md_kqring_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 253359, 989.7 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.2, max 17.4
-ROW diskbench md_kqring_1 read 253359 989.7 4.0 4.6 5.2
+  read  IOPS 254221, 993.0 MiB/s, latency (us) p50 4.0, p99 4.5, p99.9 5.2, max 17.1
+ROW diskbench md_kqring_1 read 254221 993.0 4.0 4.5 5.2
 md_kqringFB_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 253262, 989.3 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.2, max 17.9
-ROW diskbench md_kqringFB_1 read 253262 989.3 4.0 4.6 5.2
+  read  IOPS 259550, 1013.9 MiB/s, latency (us) p50 3.9, p99 4.5, p99.9 5.0, max 17.1
+ROW diskbench md_kqringFB_1 read 259550 1013.9 3.9 4.5 5.0
 md_kqringP_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 190053, 742.4 MiB/s, latency (us) p50 5.2, p99 6.4, p99.9 6.9, max 19.2
-ROW diskbench md_kqringP_1 read 190053 742.4 5.2 6.4 6.9
+  read  IOPS 190891, 745.7 MiB/s, latency (us) p50 5.2, p99 6.3, p99.9 6.9, max 19.0
+ROW diskbench md_kqringP_1 read 190891 745.7 5.2 6.3 6.9
 md_kqringI_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 253117, 988.7 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.2, max 18.0
-ROW diskbench md_kqringI_1 read 253117 988.7 4.0 4.6 5.2
-md_psync_32: /dev/md11 randread bs=4096 qd=1 jobs=32 area=1024 MiB
-  read  IOPS 643802, 2514.9 MiB/s, latency (us) p50 50.2, p99 54.3, p99.9 63.5, max 111.7
-ROW diskbench md_psync_32 read 643802 2514.9 50.2 54.3 63.5
+  read  IOPS 252529, 986.4 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.2, max 16.8
+ROW diskbench md_kqringI_1 read 252529 986.4 4.0 4.6 5.2
+md_psync_32: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
+  read  IOPS 272529, 1064.6 MiB/s, latency (us) p50 3.6, p99 4.2, p99.9 4.7, max 16.9
+ROW diskbench md_psync_32 read 272529 1064.6 3.6 4.2 4.7
 md_aio_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 649097, 2535.5 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 164.5
-ROW diskbench md_aio_32 read 649097 2535.5 49.2 110.6 127.0
+  read  IOPS 649401, 2536.7 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 176.5
+ROW diskbench md_aio_32 read 649401 2536.7 49.2 110.6 127.0
 md_kqring_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 649078, 2535.5 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 170.7
-ROW diskbench md_kqring_32 read 649078 2535.5 49.2 110.6 127.0
+  read  IOPS 648857, 2534.6 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 171.6
+ROW diskbench md_kqring_32 read 648857 2534.6 49.2 110.6 127.0
 md_kqringFB_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 651151, 2543.6 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 191.2
-ROW diskbench md_kqringFB_32 read 651151 2543.6 49.2 110.6 127.0
+  read  IOPS 662635, 2588.4 MiB/s, latency (us) p50 48.1, p99 108.5, p99.9 124.9, max 171.6
+ROW diskbench md_kqringFB_32 read 662635 2588.4 48.1 108.5 124.9
 md_kqringP_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 684722, 2674.7 MiB/s, latency (us) p50 47.1, p99 102.4, p99.9 118.8, max 175.6
-ROW diskbench md_kqringP_32 read 684722 2674.7 47.1 102.4 118.8
+  read  IOPS 681586, 2662.4 MiB/s, latency (us) p50 47.1, p99 102.4, p99.9 118.8, max 159.9
+ROW diskbench md_kqringP_32 read 681586 2662.4 47.1 102.4 118.8
 md_kqringI_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 648758, 2534.2 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 173.9
-ROW diskbench md_kqringI_32 read 648758 2534.2 49.2 110.6 127.0
+  read  IOPS 649069, 2535.4 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 162.4
+ROW diskbench md_kqringI_32 read 649069 2535.4 49.2 110.6 127.0
 wait_1: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 647981, 2531.2 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 180.8
-ROW diskbench wait_1 read 647981 2531.2 49.2 110.6 127.0
+  read  IOPS 649427, 2536.8 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 177.8
+ROW diskbench wait_1 read 649427 2536.8 49.2 110.6 127.0
 wait_16: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 699867, 2733.9 MiB/s, latency (us) p50 48.1, p99 84.0, p99.9 98.3, max 150.8
-ROW diskbench wait_16 read 699867 2733.9 48.1 84.0 98.3
+  read  IOPS 699055, 2730.7 MiB/s, latency (us) p50 48.1, p99 84.0, p99.9 98.3, max 137.3
+ROW diskbench wait_16 read 699055 2730.7 48.1 84.0 98.3
 md_psync_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 253938, 991.9 MiB/s, latency (us) p50 3.9, p99 4.5, p99.9 5.6, max 20.4
-ROW diskbench md_psync_1 write 253938 991.9 3.9 4.5 5.6
+  write IOPS 255137, 996.6 MiB/s, latency (us) p50 3.8, p99 4.5, p99.9 5.5, max 17.1
+ROW diskbench md_psync_1 write 255137 996.6 3.8 4.5 5.5
 md_aio_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 243423, 950.9 MiB/s, latency (us) p50 4.1, p99 4.7, p99.9 5.8, max 18.3
-ROW diskbench md_aio_1 write 243423 950.9 4.1 4.7 5.8
+  write IOPS 245118, 957.5 MiB/s, latency (us) p50 4.1, p99 4.7, p99.9 5.8, max 20.4
+ROW diskbench md_aio_1 write 245118 957.5 4.1 4.7 5.8
 md_kqring_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 242844, 948.6 MiB/s, latency (us) p50 4.1, p99 4.9, p99.9 5.9, max 18.4
-ROW diskbench md_kqring_1 write 242844 948.6 4.1 4.9 5.9
+  write IOPS 246911, 964.5 MiB/s, latency (us) p50 4.0, p99 4.7, p99.9 5.9, max 23.3
+ROW diskbench md_kqring_1 write 246911 964.5 4.0 4.7 5.9
 md_kqringFB_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 244086, 953.5 MiB/s, latency (us) p50 4.1, p99 4.7, p99.9 5.9, max 18.7
-ROW diskbench md_kqringFB_1 write 244086 953.5 4.1 4.7 5.9
+  write IOPS 252094, 984.7 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.6, max 18.4
+ROW diskbench md_kqringFB_1 write 252094 984.7 4.0 4.6 5.6
 md_kqringP_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 182813, 714.1 MiB/s, latency (us) p50 5.2, p99 6.5, p99.9 7.7, max 27.1
-ROW diskbench md_kqringP_1 write 182813 714.1 5.2 6.5 7.7
+  write IOPS 185618, 725.1 MiB/s, latency (us) p50 5.2, p99 6.4, p99.9 7.4, max 22.6
+ROW diskbench md_kqringP_1 write 185618 725.1 5.2 6.4 7.4
 md_kqringI_1: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
-  write IOPS 244689, 955.8 MiB/s, latency (us) p50 4.1, p99 4.7, p99.9 5.9, max 19.8
-ROW diskbench md_kqringI_1 write 244689 955.8 4.1 4.7 5.9
-md_psync_32: /dev/md11 randwrite bs=4096 qd=1 jobs=32 area=1024 MiB
-  write IOPS 566391, 2212.5 MiB/s, latency (us) p50 56.3, p99 61.4, p99.9 73.7, max 147.7
-ROW diskbench md_psync_32 write 566391 2212.5 56.3 61.4 73.7
+  write IOPS 246822, 964.1 MiB/s, latency (us) p50 4.0, p99 4.7, p99.9 5.8, max 19.9
+ROW diskbench md_kqringI_1 write 246822 964.1 4.0 4.7 5.8
+md_psync_32: /dev/md11 randwrite bs=4096 qd=1 jobs=1 area=1024 MiB
+  write IOPS 254065, 992.4 MiB/s, latency (us) p50 3.9, p99 4.5, p99.9 5.5, max 24.7
+ROW diskbench md_psync_32 write 254065 992.4 3.9 4.5 5.5
 md_aio_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 555760, 2170.9 MiB/s, latency (us) p50 58.4, p99 129.0, p99.9 151.6, max 204.5
-ROW diskbench md_aio_32 write 555760 2170.9 58.4 129.0 151.6
+  write IOPS 569532, 2224.7 MiB/s, latency (us) p50 56.3, p99 124.9, p99.9 147.5, max 216.6
+ROW diskbench md_aio_32 write 569532 2224.7 56.3 124.9 147.5
 md_kqring_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 555639, 2170.5 MiB/s, latency (us) p50 58.4, p99 129.0, p99.9 151.6, max 229.6
-ROW diskbench md_kqring_32 write 555639 2170.5 58.4 129.0 151.6
+  write IOPS 567874, 2218.3 MiB/s, latency (us) p50 56.3, p99 127.0, p99.9 147.5, max 203.8
+ROW diskbench md_kqring_32 write 567874 2218.3 56.3 127.0 147.5
 md_kqringFB_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 553106, 2160.6 MiB/s, latency (us) p50 58.4, p99 129.0, p99.9 151.6, max 210.8
-ROW diskbench md_kqringFB_32 write 553106 2160.6 58.4 129.0 151.6
+  write IOPS 577436, 2255.6 MiB/s, latency (us) p50 55.3, p99 124.9, p99.9 143.4, max 212.9
+ROW diskbench md_kqringFB_32 write 577436 2255.6 55.3 124.9 143.4
 md_kqringP_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 582006, 2273.5 MiB/s, latency (us) p50 55.3, p99 120.8, p99.9 143.4, max 237.6
-ROW diskbench md_kqringP_32 write 582006 2273.5 55.3 120.8 143.4
+  write IOPS 598328, 2337.2 MiB/s, latency (us) p50 54.3, p99 118.8, p99.9 139.3, max 251.6
+ROW diskbench md_kqringP_32 write 598328 2337.2 54.3 118.8 139.3
 md_kqringI_32: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 552122, 2156.7 MiB/s, latency (us) p50 58.4, p99 129.0, p99.9 151.6, max 217.9
-ROW diskbench md_kqringI_32 write 552122 2156.7 58.4 129.0 151.6
+  write IOPS 571371, 2231.9 MiB/s, latency (us) p50 56.3, p99 124.9, p99.9 147.5, max 228.1
+ROW diskbench md_kqringI_32 write 571371 2231.9 56.3 124.9 147.5
 wait_1: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 554537, 2166.2 MiB/s, latency (us) p50 58.4, p99 129.0, p99.9 151.6, max 202.2
-ROW diskbench wait_1 write 554537 2166.2 58.4 129.0 151.6
+  write IOPS 570296, 2227.7 MiB/s, latency (us) p50 56.3, p99 124.9, p99.9 147.5, max 193.1
+ROW diskbench wait_1 write 570296 2227.7 56.3 124.9 147.5
 wait_16: /dev/md11 randwrite bs=4096 qd=32 jobs=1 area=1024 MiB
-  write IOPS 587987, 2296.8 MiB/s, latency (us) p50 55.3, p99 108.5, p99.9 112.6, max 166.0
-ROW diskbench wait_16 write 587987 2296.8 55.3 108.5 112.6
+  write IOPS 606669, 2369.8 MiB/s, latency (us) p50 54.3, p99 106.5, p99.9 112.6, max 207.9
+ROW diskbench wait_16 write 606669 2369.8 54.3 106.5 112.6
 sq_plain_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 253272, 989.3 MiB/s, latency (us) p50 4.0, p99 4.6, p99.9 5.2, max 17.7
-ROW diskbench sq_plain_1 read 253272 989.3 4.0 4.6 5.2
+  read  IOPS 254118, 992.6 MiB/s, latency (us) p50 4.0, p99 4.5, p99.9 5.1, max 16.9
+ROW diskbench sq_plain_1 read 254118 992.6 4.0 4.5 5.1
 sq_P_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 190315, 743.4 MiB/s, latency (us) p50 5.2, p99 6.4, p99.9 6.9, max 23.7
-ROW diskbench sq_P_1 read 190315 743.4 5.2 6.4 6.9
+  read  IOPS 190635, 744.7 MiB/s, latency (us) p50 5.2, p99 6.3, p99.9 6.9, max 18.9
+ROW diskbench sq_P_1 read 190635 744.7 5.2 6.3 6.9
 sq_PC_1: /dev/md11 randread bs=4096 qd=1 jobs=1 area=1024 MiB
-  read  IOPS 258200, 1008.6 MiB/s, latency (us) p50 3.8, p99 5.0, p99.9 5.5, max 34.0
-ROW diskbench sq_PC_1 read 258200 1008.6 3.8 5.0 5.5
+  read  IOPS 258232, 1008.7 MiB/s, latency (us) p50 3.8, p99 5.0, p99.9 5.5, max 64.8
+ROW diskbench sq_PC_1 read 258232 1008.7 3.8 5.0 5.5
 sq_plain_4: /dev/md11 randread bs=4096 qd=4 jobs=1 area=1024 MiB
-  read  IOPS 652597, 2549.2 MiB/s, latency (us) p50 6.0, p99 12.0, p99.9 15.4, max 30.0
-ROW diskbench sq_plain_4 read 652597 2549.2 6.0 12.0 15.4
+  read  IOPS 656666, 2565.1 MiB/s, latency (us) p50 6.0, p99 12.0, p99.9 15.4, max 30.8
+ROW diskbench sq_plain_4 read 656666 2565.1 6.0 12.0 15.4
 sq_P_4: /dev/md11 randread bs=4096 qd=4 jobs=1 area=1024 MiB
-  read  IOPS 674776, 2635.8 MiB/s, latency (us) p50 5.8, p99 10.5, p99.9 13.6, max 26.3
-ROW diskbench sq_P_4 read 674776 2635.8 5.8 10.5 13.6
+  read  IOPS 675346, 2638.1 MiB/s, latency (us) p50 5.9, p99 10.5, p99.9 13.3, max 26.2
+ROW diskbench sq_P_4 read 675346 2638.1 5.9 10.5 13.3
 sq_PC_4: /dev/md11 randread bs=4096 qd=4 jobs=1 area=1024 MiB
-  read  IOPS 701932, 2741.9 MiB/s, latency (us) p50 5.5, p99 10.5, p99.9 13.1, max 26.4
-ROW diskbench sq_PC_4 read 701932 2741.9 5.5 10.5 13.1
+  read  IOPS 702252, 2743.2 MiB/s, latency (us) p50 5.5, p99 10.2, p99.9 13.1, max 28.6
+ROW diskbench sq_PC_4 read 702252 2743.2 5.5 10.2 13.1
 sq_plain_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 647669, 2530.0 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 177.3
-ROW diskbench sq_plain_32 read 647669 2530.0 49.2 110.6 127.0
+  read  IOPS 649261, 2536.2 MiB/s, latency (us) p50 49.2, p99 110.6, p99.9 127.0, max 186.4
+ROW diskbench sq_plain_32 read 649261 2536.2 49.2 110.6 127.0
 sq_P_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 676915, 2644.2 MiB/s, latency (us) p50 47.1, p99 104.4, p99.9 120.8, max 173.4
-ROW diskbench sq_P_32 read 676915 2644.2 47.1 104.4 120.8
+  read  IOPS 689265, 2692.4 MiB/s, latency (us) p50 47.1, p99 102.4, p99.9 118.8, max 151.6
+ROW diskbench sq_P_32 read 689265 2692.4 47.1 102.4 118.8
 sq_PC_32: /dev/md11 randread bs=4096 qd=32 jobs=1 area=1024 MiB
-  read  IOPS 694652, 2713.5 MiB/s, latency (us) p50 46.1, p99 102.4, p99.9 118.8, max 157.8
-ROW diskbench sq_PC_32 read 694652 2713.5 46.1 102.4 118.8
+  read  IOPS 690399, 2696.9 MiB/s, latency (us) p50 47.1, p99 102.4, p99.9 118.8, max 162.3
+ROW diskbench sq_PC_32 read 690399 2696.9 47.1 102.4 118.8
 zfs_psync_1: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
-  read  IOPS 84897, 331.6 MiB/s, latency (us) p50 12.8, p99 23.0, p99.9 27.1, max 91.7
-ROW diskbench zfs_psync_1 read 84897 331.6 12.8 23.0 27.1
+  read  IOPS 81170, 317.1 MiB/s, latency (us) p50 12.5, p99 23.0, p99.9 27.6, max 44.9
+ROW diskbench zfs_psync_1 read 81170 317.1 12.5 23.0 27.6
 zfs_aio_1: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
-  read  IOPS 71193, 278.1 MiB/s, latency (us) p50 15.4, p99 26.1, p99.9 30.7, max 137.9
-ROW diskbench zfs_aio_1 read 71193 278.1 15.4 26.1 30.7
+  read  IOPS 67605, 264.1 MiB/s, latency (us) p50 15.1, p99 25.6, p99.9 30.2, max 76.8
+ROW diskbench zfs_aio_1 read 67605 264.1 15.1 25.6 30.2
 zfs_kqring_1: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
-  read  IOPS 83801, 327.3 MiB/s, latency (us) p50 13.3, p99 23.6, p99.9 27.6, max 67.3
-ROW diskbench zfs_kqring_1 read 83801 327.3 13.3 23.6 27.6
-zfs_psync_4: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=4 area=256 MiB
-  read  IOPS 118670, 463.6 MiB/s, latency (us) p50 36.9, p99 69.6, p99.9 81.9, max 203.4
-ROW diskbench zfs_psync_4 read 118670 463.6 36.9 69.6 81.9
+  read  IOPS 76248, 297.8 MiB/s, latency (us) p50 13.3, p99 24.1, p99.9 28.2, max 48.0
+ROW diskbench zfs_kqring_1 read 76248 297.8 13.3 24.1 28.2
+zfs_psync_4: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
+  read  IOPS 81024, 316.5 MiB/s, latency (us) p50 12.5, p99 23.0, p99.9 27.6, max 42.5
+ROW diskbench zfs_psync_4 read 81024 316.5 12.5 23.0 27.6
 zfs_aio_4: /home/grepjava/dbench.dat randread bs=4096 qd=4 jobs=1 area=256 MiB
-  read  IOPS 122562, 478.8 MiB/s, latency (us) p50 33.8, p99 65.5, p99.9 84.0, max 166.0
-ROW diskbench zfs_aio_4 read 122562 478.8 33.8 65.5 84.0
+  read  IOPS 111060, 433.8 MiB/s, latency (us) p50 35.8, p99 67.6, p99.9 88.1, max 179.2
+ROW diskbench zfs_aio_4 read 111060 433.8 35.8 67.6 88.1
 zfs_kqring_4: /home/grepjava/dbench.dat randread bs=4096 qd=4 jobs=1 area=256 MiB
-  read  IOPS 123351, 481.8 MiB/s, latency (us) p50 33.8, p99 67.6, p99.9 81.9, max 175.2
-ROW diskbench zfs_kqring_4 read 123351 481.8 33.8 67.6 81.9
-zfs_psync_16: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=16 area=256 MiB
-  read  IOPS 116276, 454.2 MiB/s, latency (us) p50 77.8, p99 114.7, p99.9 28311.6, max 115050.6
-ROW diskbench zfs_psync_16 read 116276 454.2 77.8 114.7 28311.6
+  read  IOPS 111817, 436.8 MiB/s, latency (us) p50 35.8, p99 67.6, p99.9 84.0, max 172.4
+ROW diskbench zfs_kqring_4 read 111817 436.8 35.8 67.6 84.0
+zfs_psync_16: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
+  read  IOPS 81263, 317.4 MiB/s, latency (us) p50 12.5, p99 23.0, p99.9 27.6, max 58.8
+ROW diskbench zfs_psync_16 read 81263 317.4 12.5 23.0 27.6
 zfs_aio_16: /home/grepjava/dbench.dat randread bs=4096 qd=16 jobs=1 area=256 MiB
-  read  IOPS 119526, 466.9 MiB/s, latency (us) p50 143.4, p99 188.4, p99.9 221.2, max 319.5
-ROW diskbench zfs_aio_16 read 119526 466.9 143.4 188.4 221.2
+  read  IOPS 108404, 423.5 MiB/s, latency (us) p50 151.6, p99 196.6, p99.9 229.4, max 338.4
+ROW diskbench zfs_aio_16 read 108404 423.5 151.6 196.6 229.4
 zfs_kqring_16: /home/grepjava/dbench.dat randread bs=4096 qd=16 jobs=1 area=256 MiB
-  read  IOPS 124276, 485.5 MiB/s, latency (us) p50 131.1, p99 180.2, p99.9 204.8, max 358.8
-ROW diskbench zfs_kqring_16 read 124276 485.5 131.1 180.2 204.8
-zfs_psync_64: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=64 area=256 MiB
-  read  IOPS 115583, 451.5 MiB/s, latency (us) p50 75.8, p99 147.5, p99.9 88080.4, max 182705.7
-ROW diskbench zfs_psync_64 read 115583 451.5 75.8 147.5 88080.4
+  read  IOPS 112771, 440.5 MiB/s, latency (us) p50 143.4, p99 188.4, p99.9 213.0, max 401.1
+ROW diskbench zfs_kqring_16 read 112771 440.5 143.4 188.4 213.0
+zfs_psync_64: /home/grepjava/dbench.dat randread bs=4096 qd=1 jobs=1 area=256 MiB
+  read  IOPS 81100, 316.8 MiB/s, latency (us) p50 12.5, p99 23.0, p99.9 27.6, max 44.5
+ROW diskbench zfs_psync_64 read 81100 316.8 12.5 23.0 27.6
 zfs_aio_64: /home/grepjava/dbench.dat randread bs=4096 qd=64 jobs=1 area=256 MiB
-  read  IOPS 119228, 465.7 MiB/s, latency (us) p50 540.7, p99 639.0, p99.9 688.1, max 810.2
-ROW diskbench zfs_aio_64 read 119228 465.7 540.7 639.0 688.1
+  read  IOPS 107801, 421.1 MiB/s, latency (us) p50 606.2, p99 688.1, p99.9 737.3, max 1024.8
+ROW diskbench zfs_aio_64 read 107801 421.1 606.2 688.1 737.3
 zfs_kqring_64: /home/grepjava/dbench.dat randread bs=4096 qd=64 jobs=1 area=256 MiB
-  read  IOPS 123875, 483.9 MiB/s, latency (us) p50 516.1, p99 606.2, p99.9 655.4, max 1100.3
-ROW diskbench zfs_kqring_64 read 123875 483.9 516.1 606.2 655.4
+  read  IOPS 112083, 437.8 MiB/s, latency (us) p50 573.4, p99 655.4, p99.9 704.5, max 1285.9
+ROW diskbench zfs_kqring_64 read 112083 437.8 573.4 655.4 704.5

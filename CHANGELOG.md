@@ -71,9 +71,11 @@
 
 ### Testing
 
+- `kqring_bench`'s ping-pong and fan-in give kqring's receives as many provided buffers as are in flight (16 of 4 KiB, or one 64-byte buffer per connection) instead of 4,096 of 4 KiB in turn, out of cache, where kqueue read into one buffer. On the Ryzen, fan-in went from 26–66% slower than kqueue to between 5% faster and 4% slower.
+- `docs/bench/data/zfs-dbuf/run.sh` fails when the file doesn't fit the larger dbuf cache, which happens when the ARC target is small.
 - The leak check of `kqring_stress` and `kqring_fuzz` counts the requests in use from the `kqring_op` zone along with kqring's `malloc(9)` memory.
 - `tests/kqring_test.c`'s `test_default_ring_waiter_handoff`: on a ring without `DEFER_TASKRUN`, a waiter runs the taskwork it was woken for; an interrupted waiter, a request cancelled while its worker runs, and a `MSG_RING` leave theirs to the kernel thread; on a `COOP_TASKRUN` ring the CQE is there when the `write(2)` that completes it returns. `tests/kqring_xbench.c` gains a ping-pong with a peer process (`xp_kevent`, `xp_ring_armed`) and `XBENCH_COOP=1`.
-- Linux 7.3 and kqring now match in 19 of the 25 cases of `tests/kqring_diff.c`, and the other 6 differ on purpose. The results are in `docs/conformance/`.
+- Linux 7.3 and kqring now match in 25 of the 30 cases of `tests/kqring_diff.c`, and the other 5 differ on purpose. The results are in `docs/conformance/`.
 - `tests/kqring_diff.c` runs the same cases on Linux and on kqring, and `tests/diff_compare.py` fails on a difference that isn't listed with its reason.
 - `tests/kqring_test.c` now covers `WRITEV_FIXED`, level-triggered polls, `ACCEPT_POLL_FIRST`, `IORING_OFF_CQ_RING`, how a failed SQE ends a batch, the flags kqring refuses, `SIGPIPE`, hole punching and the Capsicum rights of fixed files.
 - `tests/kqring_fuzz.c` now unmaps each ring's SQE array. It left them all mapped, a few thousand more every 10 s, and with tens of thousands each `fork(2)` and page fault slowed until a run could stop making progress.
@@ -94,6 +96,7 @@
 
 ### Documentation
 
+- BENCHMARK.MD, the README's performance figures and `docs/conformance/` are measured again from one build, `28e67b2`, on the Ryzen; see ROADMAP phase 13.
 - `COMPATIBILITY.MD` lists every io_uring capability against Linux 7.3 and liburing 2.9, with its contract, source and tests, and `tests/compat_check.py` checks it against the source.
 - `README.md` now explains what kqring is and why it exists, and `ARCHITECTURE.MD` covers kernel threads, where a request goes, disk I/O, read ordering, the extensions and testing, and no longer describes names the code has dropped. Its description of the ring header was wrong: all the indices share one 64-byte cache line.
 - Every table in `BENCHMARK.MD` is re-measured on `v0.3.0`, with the raw runs in `docs/bench/data/`, and the charts are redrawn. md(4) disks are now filled first. Reads of unwritten blocks are far cheaper, so 32 reads per enter are about 2.9× `pread(2)`, not 4.5×. `tests/bench_doc.py` writes the document from those runs.
