@@ -1490,9 +1490,10 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	 * silently different ring.  Completions always run as DEFER_TASKRUN
 	 * describes, in an enter.  Without SINGLE_ISSUER, any thread of the process may submit
 	 * and wait (ctx->shared); DEFER_TASKRUN needs SINGLE_ISSUER, as in
-	 * io_uring.  Without DEFER_TASKRUN, COOP_TASKRUN lets a thread of
-	 * the process that completes a request run it as it returns to user
-	 * space, rather than the ring's kthread (kqring_ast_try());
+	 * io_uring.  Without DEFER_TASKRUN, a thread of the process that
+	 * completes a request runs it as it returns to user space, rather
+	 * than the ring's kthread (kqring_ast_try()), with COOP_TASKRUN or
+	 * without;
 	 * IORING_SQ_TASKRUN is up while there is work to run: on a
 	 * DEFER_TASKRUN ring only with TASKRUN_FLAG, as on Linux, and on
 	 * others always (kqring_taskrun_flag()).  Without
@@ -2113,6 +2114,36 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 		return (kqring_enter_wait_sig(ctx, ea->min_complete,
 		    has_timeout, sbt, min_sbt, false, usig, sigsz,
 		    (ea->flags & IORING_ENTER_ABS_TIMER) != 0, false));
+	}
+
+	/*
+	 * Nothing to submit, nothing queued to run, and the CQ already holds
+	 * what the wait asks for: return without sq_sx, as io_uring_enter(2)
+	 * takes its ring lock only to submit.  This is the enter after a
+	 * write(2) whose return ran the completion (kqring_ast_try()).  Not
+	 * on a DEFER_TASKRUN ring, whose completions only an enter runs, nor
+	 * an IOPOLL one, whose waits poll, nor with a signal mask to apply,
+	 * nor for an enter that doesn't wait: one made on seeing
+	 * IORING_SQ_TASKRUN takes the taskwork pass, which clears it.  The
+	 * reads are unlocked: work queued after them goes to the ring's
+	 * kthread or a thread's return, as it would while this enter waited.
+	 */
+	if (wait && ea->to_submit == 0 && usig == NULL &&
+	    (ctx->flags & (IORING_SETUP_DEFER_TASKRUN |
+	    IORING_SETUP_IOPOLL)) == 0 &&
+	    atomic_load_int(&ctx->ntaskwork) == 0 &&
+	    KQRING_STQ_EMPTY_HINT(&ctx->rcq) &&
+	    KQRING_STQ_EMPTY_HINT(&ctx->ocq) &&
+	    atomic_load_int(&ctx->kp_kicks) == 0 &&
+	    ctx->nfutex == 0 && ctx->nwaitid == 0 && ctx->nseqto == 0 &&
+	    ctx->npolled == 0 && !ctx->cq_dropped &&
+	    TAILQ_EMPTY(&ctx->ready_q) && TAILQ_EMPTY(&ctx->defer_q) &&
+	    atomic_load_ptr(&ctx->zb_retired) == NULL &&
+	    atomic_load_acq_32(&shm->cq_tail) -
+	    atomic_load_acq_32(&shm->cq_head) >= ea->min_complete) {
+		ea->SUBMITTED_out = 0;
+		kqring_evfd_flush(ctx);
+		return (0);
 	}
 
 	/*
@@ -3087,12 +3118,18 @@ again:
 
 /*
  * Taskwork run as the thread that queued it returns to user space, as
- * io_uring runs a ring's task_work in the submitting task: on a ring with
- * COOP_TASKRUN and no DEFER_TASKRUN, a socket upcall (or other completion)
- * that runs in a thread of the request's process, one that may enter the
- * ring, leaves the request to that thread's return instead of waking the
- * ring's kthread on another CPU (kqring_ast_try()).  As under Linux's
- * COOP_TASKRUN, the CQE then waits while that thread's system call blocks.
+ * io_uring runs a ring's task_work in the submitting task: on a ring
+ * without DEFER_TASKRUN, a socket upcall (or other completion) that runs
+ * in a thread of the request's process, one that may enter the ring,
+ * leaves the request to that thread's return instead of waking the ring's
+ * kthread on another CPU (kqring_ast_try()).
+ *
+ * That thread's system call may block before it returns: a write(2)
+ * larger than the socket's buffers waits for the RECV it completed to free
+ * their space.  Linux's task work interrupts the wait (TIF_NOTIFY_SIGNAL);
+ * a FreeBSD AST doesn't, so a watcher (kqring_ast_watch()), which runs
+ * while anything is queued, hands what has waited a full pass, one to two
+ * ticks, to the ring's kthread.
  *
  * Contexts queued for a thread hang off a bucket of kqring_astq (by
  * thread), each holding a reference to the context and its ring.  Its
@@ -3112,6 +3149,10 @@ static struct kqring_astq {
 
 bool kqring_ast_on;		/* under every bucket's mtx to change */
 static u_int kqring_ast_active;		/* threads in kqring_ast() */
+static u_int kqring_ast_gen;		/* the watcher's passes */
+static u_int kqring_ast_watching;	/* its pass is scheduled */
+static struct timeout_task kqring_ast_watch_task;
+static void kqring_ast_watch_arm(void);
 
 static struct kqring_astq *
 kqring_astq_of(const struct thread *td)
@@ -3145,11 +3186,14 @@ kqring_ast_queue(struct kqring_ctx *ctx, struct kqring_tctx *t,
 		return (false);
 	}
 	t->ast_td = td;
+	t->ast_gen = atomic_load_int(&kqring_ast_gen);
 	refcount_acquire(&t->refs);
 	refcount_acquire(&ctx->refs);
 	TAILQ_INSERT_TAIL(&q->q, t, ast_link);
 	mtx_unlock(&q->mtx);
 	ast_sched(td, KQRING_TDA);
+	if (atomic_load_int(&kqring_ast_watching) == 0)
+		kqring_ast_watch_arm();
 	return (true);
 }
 
@@ -3252,6 +3296,62 @@ kqring_ast_purge(struct proc *p)
 	}
 }
 
+/*
+ * Schedule the watcher's next pass, unless it is.  Called with ctx->mtx
+ * held (from a socket upcall, under a sockbuf's): the taskqueue's mutex
+ * and the callout's are taken under them, and never the other way.  On
+ * taskqueue_thread, not kqteardown, whose tasks may wait on rings.
+ */
+static void
+kqring_ast_watch_arm(void)
+{
+	if (atomic_cmpset_int(&kqring_ast_watching, 0, 1))
+		taskqueue_enqueue_timeout(taskqueue_thread,
+		    &kqring_ast_watch_task, 1);
+}
+
+/*
+ * The watcher's pass: hand to its kthread each context queued before the
+ * pass before this one, whose thread hasn't returned to user space for a
+ * tick or more, so its system call blocks or runs long.  Then pass again
+ * a tick later while anything is queued.
+ */
+static void
+kqring_ast_watch(void *arg __unused, int pending __unused)
+{
+	struct kqring_tctx *t;
+	u_int gen = atomic_fetchadd_int(&kqring_ast_gen, 1);
+	bool left = false;
+
+	for (int i = 0; i < KQRING_AST_HASH; i++) {
+		struct kqring_astq *q = &kqring_astq[i];
+
+		for (;;) {
+			mtx_lock(&q->mtx);
+			TAILQ_FOREACH(t, &q->q, ast_link) {
+				if (t->ast_gen != gen)
+					break;
+				left = true;
+			}
+			if (t != NULL)
+				kqring_ast_unlink(q, t);
+			mtx_unlock(&q->mtx);
+			if (t == NULL)
+				break;
+			kqring_ast_run(t, curthread, false);
+		}
+	}
+	atomic_store_int(&kqring_ast_watching, 0);
+	atomic_thread_fence_seq_cst();
+	/* Queued since (kqring_ast_queue() saw it watching), or left. */
+	if (!left) {
+		for (int i = 0; i < KQRING_AST_HASH && !left; i++)
+			left = !TAILQ_EMPTY(&kqring_astq[i].q);
+	}
+	if (left && kqring_ast_on)
+		kqring_ast_watch_arm();
+}
+
 static void
 kqring_ast_set_on(bool on)
 {
@@ -3281,6 +3381,12 @@ kqring_ast_unregister(void)
 	int ticks_left;
 
 	kqring_ast_set_on(false);
+	/* No pass arms another now; one may be running or scheduled. */
+	while (taskqueue_cancel_timeout(taskqueue_thread,
+	    &kqring_ast_watch_task, NULL) != 0)
+		taskqueue_drain_timeout(taskqueue_thread,
+		    &kqring_ast_watch_task);
+	atomic_store_int(&kqring_ast_watching, 0);
 	kqring_ast_purge(NULL);
 	ast_deregister(KQRING_TDA);
 	for (ticks_left = 10 * hz; atomic_load_int(&kqring_ast_active) != 0 &&
@@ -3461,6 +3567,8 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 		    M_WAITOK, taskqueue_thread_enqueue, &kqring_teardown_tq);
 		taskqueue_start_threads(&kqring_teardown_tq, 1, PWAIT,
 		    "kqteardown");
+		TIMEOUT_TASK_INIT(taskqueue_thread, &kqring_ast_watch_task,
+		    0, kqring_ast_watch, NULL);
 		kqring_exit_tag = EVENTHANDLER_REGISTER(process_exit,
 		    kqring_proc_exit, NULL, EVENTHANDLER_PRI_ANY);
 		kqring_exec_tag = EVENTHANDLER_REGISTER(process_exec,

@@ -12926,6 +12926,116 @@ tw_coop_writer(void *arg)
 	return (NULL);
 }
 
+struct tw_block_arg {
+	int		fd;
+	_Atomic int	done;
+};
+
+static void *
+tw_block_writer(void *arg)
+{
+	struct tw_block_arg *a = arg;
+	static char big[1 << 20];
+	size_t off = 0;
+
+	while (off < sizeof(big)) {
+		ssize_t n = write(a->fd, big + off, sizeof(big) - off);
+
+		assert(n > 0);
+		off += (size_t)n;
+	}
+	atomic_store(&a->done, 1);
+	return (NULL);
+}
+
+/*
+ * A completion left to a thread's return to user space (a COOP_TASKRUN
+ * ring, or a default one) must not wait for ever when that thread's call
+ * blocks: here a write(2) larger than the socket's buffers, whose space
+ * only the RECV it completes would free.  Linux's task work interrupts the
+ * wait; kqring hands the request to the ring's kthread.  If the CQE never
+ * comes, read the socket here to let the writer go, and fail.
+ */
+static void
+test_tw_blocking_writer(void)
+{
+	int f0 = failures;
+
+	for (int kind = 0; kind < 2; kind++) {
+		struct io_uring_params p;
+		struct io_uring_sqe *sqe;
+		struct io_uring_cqe c;
+		struct test_ring t;
+		struct tw_block_arg a;
+		pthread_t th;
+		static char rbuf[4096], drain[65536];
+		int sv[2];
+
+		memset(&p, 0, sizeof(p));
+		p.flags = IORING_SETUP_CQSIZE | IORING_SETUP_SUBMIT_ALL |
+		    (kind == 0 ? IORING_SETUP_COOP_TASKRUN : 0);
+		p.cq_entries = CQ_ENTRIES;
+		memset(&t, 0, sizeof(t));
+		t.fd = (int)kqring_setup(SQ_ENTRIES, &p);
+		assert(t.fd >= 0);
+		ring_map(&t, &p);
+		assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+		for (int round = 0; round < 5; round++) {
+			sqe = ring_prep(&t, IORING_OP_RECV, sv[0], 79000 + round);
+			sqe->addr = (uint64_t)(uintptr_t)rbuf;
+			sqe->len = sizeof(rbuf);
+			ring_push_sqe(&t);
+			ring_submit(&t);
+			assert(ring_cq_ready(&t) == 0);
+			a = (struct tw_block_arg){ .fd = sv[1] };
+			assert(pthread_create(&th, NULL, tw_block_writer,
+			    &a) == 0);
+			uint64_t deadline = now_ns() + 2000000000ULL;
+			bool posted = true;
+			while (ring_cq_ready(&t) == 0) {
+				if (now_ns() >= deadline) {
+					posted = false;
+					break;
+				}
+				usleep(100);
+			}
+			/* Let the writer finish either way. */
+			while (atomic_load(&a.done) == 0 || ({
+			    int nb = 0; ioctl(sv[0], FIONREAD, &nb); nb > 0; })) {
+				ssize_t n = recv(sv[0], drain, sizeof(drain),
+				    MSG_DONTWAIT);
+
+				if (n < 0 && errno != EAGAIN)
+					break;
+				if (n <= 0)
+					usleep(100);
+			}
+			assert(pthread_join(th, NULL) == 0);
+			if (!posted) {
+				printf("[FAIL] %s ring: RECV not posted while "
+				    "its writer blocked\n",
+				    kind == 0 ? "COOP_TASKRUN" : "default");
+				failures++;
+				/* The armed RECV ends once data comes. */
+				assert(write(sv[1], "x", 1) == 1);
+				while (ring_cq_ready(&t) == 0)
+					usleep(100);
+				(void)ring_pop_cqe(&t);
+				break;
+			}
+			c = ring_pop_cqe(&t);
+			assert(c.user_data == 79000 + (uint64_t)round &&
+			    c.res > 0);
+		}
+		close(sv[0]);
+		close(sv[1]);
+		close(t.fd);
+	}
+	if (failures == f0)
+		printf("[PASS] A completion left to a blocked writer's "
+		    "return reaches the kthread\n");
+}
+
 struct tw_handoff_arg {
 	int		fd;
 	_Atomic int	asleep;
@@ -15816,6 +15926,13 @@ main(int argc, char **argv)
 		printf("[OK]: %d failure(s)\n", failures);
 		return (failures != 0);
 	}
+	/* "p18": the tests of roadmap phase 18 only. */
+	if (argc >= 2 && strcmp(argv[1], "p18") == 0) {
+		test_default_ring_waiter_handoff();
+		test_tw_blocking_writer();
+		printf("[OK]: %d failure(s)\n", failures);
+		return (failures != 0);
+	}
 	/* "trig": only the event-driven chain tests. */
 	if (argc >= 2 && strcmp(argv[1], "trig") == 0) {
 		test_triggers(&r);
@@ -15974,6 +16091,7 @@ main(int argc, char **argv)
 		test_sqpoll_and_iopoll();
 		test_stop_during_close();
 		test_default_ring_waiter_handoff();
+		test_tw_blocking_writer();
 		test_bpf_process();
 		test_phase5_security_audit();
 		printf("%s: %d failure(s)\n", failures ? "[FAIL]" : "[OK]",

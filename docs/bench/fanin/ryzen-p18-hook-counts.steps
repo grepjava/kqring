@@ -1,0 +1,13 @@
+15:52:03 loaded kqp17e e3333c26 vmcores=8
+15:52:15 kqp17e ms256.def 341.3 ns; calls: kqring_run_taskwork/100391=9435 kqring_run_taskwork/512965=14085 wakeup/100391=1276720 kqring_taskwork_add_locked/100391=2415382 
+15:52:28 kqp17e pp.def 1113.6 ns; calls: wakeup/848749=442075 kqring_run_taskwork/512967=884355 kqring_taskwork_add_locked/848749=884913 kqring_run_taskwork/848749=1769825 
+15:52:40 kqp17e pp.defer 840.8 ns; calls: kqring_run_taskwork/241173=1676504 kqring_taskwork_add_locked/241173=1676505 
+15:52:40 loaded kqp18c b4191264 vmcores=8
+15:52:52 kqp18c ms256.def 381.6 ns; calls: kqring_ast_watch/0=3974 kqring_run_taskwork/512972=17852 kqring_ast/848749=19203 kqring_ast_queue/848749=19203 kqring_run_taskwork/848749=29086 wakeup/848749=801205 kqring_taskwork_add_locked/848749=2532462 
+15:53:05 kqp18c pp.def 978.4 ns; calls: kqring_run_taskwork/512974=259 kqring_ast_watch/0=3976 kqring_ast/100370=763332 kqring_ast_queue/100370=763332 kqring_taskwork_add_locked/100370=763505 kqring_run_taskwork/100370=2290164 
+15:53:17 kqp18c pp.defer 849.1 ns; calls: kqring_run_taskwork/100365=1688381 kqring_taskwork_add_locked/100365=1688381 
+15:53:17 loaded kqp18d 6a98df0c vmcores=8
+15:53:29 kqp18d ms256.def 355.2 ns; calls: kqring_ast_watch/0=3975 kqring_ast/1086423=8996 kqring_ast_queue/1086423=8996 kqring_run_taskwork/512979=13639 kqring_run_taskwork/1086423=18069 wakeup/1086423=1326911 kqring_taskwork_add_locked/1086423=2324056 
+15:53:41 kqp18d pp.def 977.7 ns; calls: kqring_run_taskwork/512981=800 kqring_ast_watch/0=3976 kqring_ast_queue/1086426=765929 kqring_ast/1086426=765930 kqring_taskwork_add_locked/1086426=766230 kqring_run_taskwork/1086426=2297880 
+15:53:54 kqp18d pp.defer 833.9 ns; calls: kqring_run_taskwork/1086425=1694465 kqring_taskwork_add_locked/1086425=1694465 
+15:53:54 ALLDONE vmcores=8

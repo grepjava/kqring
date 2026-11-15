@@ -1,0 +1,5 @@
+15:36:21 loaded kqp17e e3333c26 vmcores=8
+15:36:23 kqp17e rc=0 1 FAIL lines: [FAIL] COOP_TASKRUN ring: RECV not posted while its writer blocked  last: Assertion failed: (ring_cq_ready(&t) == 0), function test_tw_blocking_writer, file kqring_test.c, line 12987.
+15:36:23 loaded kqp18c b4191264 vmcores=8
+15:36:23 kqp18c rc=0 0 FAIL lines:  last: [OK]: 0 failure(s)
+15:36:23 ALLDONE vmcores=8

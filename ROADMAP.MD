@@ -25,6 +25,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 15 | A worker that can't hang, and small gaps | Done |
 | 16 | Fan-in at a thousand connections | Done |
 | 17 | A receive that waits | Done |
+| 18 | A default ring's kernel thread | Done |
 
 ## Where kqring stands
 
@@ -337,6 +338,27 @@ Progress (15 November 2026), on the Ryzen ([docs/fan-in.md](docs/fan-in.md#phase
 - What is left is spread over the second enter (its system call about 35 ns beyond `getppid`, its own work 36), arming 31, the taskwork 28, the ring's mutex 20, the descriptors 15, the end-of-file knote 9 and disarming 8.
 
 Phase 17 is done on its second clause: 209 ns, not 150, and what stops it measured and written down.
+
+## Phase 18: A default ring's kernel thread
+
+A ring without `DEFER_TASKRUN` posts its completions from a kernel thread, so that they appear with nobody in an enter. When nobody waits in an enter, every completion a socket upcall queues wakes that thread on another CPU. In ping-pong with a `RECV` armed first, on the Ryzen, a default ring takes 1,083–1,119 ns per message against 809–835 for a `DEFER_TASKRUN` ring and 944–955 with `COOP_TASKRUN` ([docs/fan-in.md](docs/fan-in.md#the-default-rings-kernel-thread)). The profile puts about 110 ns of the difference in the writer's `wakeup()`, and most of the rest in the woken thread and the enter after the `write(2)` fighting over the ring's locks; the enter usually runs the receive itself.
+
+Order of work:
+
+1. Measure the build from phase 17 on the Ryzen: ping-pong on the three kinds of ring, the peer-process loop, fan-in on a default ring at 16 to 1,024 connections, and a profile per thread, the kernel thread's included.
+2. Try what saves the wake-up, each measured against the build before, with the CPU time it costs: the kernel thread polling a while after it worked before it sleeps; the completion left to the queueing thread's return to user space, as io_uring runs a default ring's task work, with a bound on how long it can wait when that thread's call blocks.
+3. Keep what helps, and check what it might slow: one `NOP` per enter, a `RECV` that finds its data, fan-in at 16 to 1,024 connections on both kinds of ring, the single-shot batch.
+
+Acceptance: on the Ryzen, ping-pong with an armed `RECV` on a default ring at most 100 ns slower than on a `DEFER_TASKRUN` ring (from about 275), with the CPU time it takes written down, or what stops it measured and written down; nothing else in `kqring_xbench` more than 2% slower; the unit tests, the cross-process test, `kqring_diff`, liburing, stress and the fuzzer pass as before.
+
+Progress (15 November 2026), on the Ryzen ([docs/fan-in.md](docs/fan-in.md#phase-18)):
+
+- Measured from phase 17's build: 260–275 ns over, the kernel thread's wake-up in the `write(2)` (about 110 ns) and the fight that followed for the ring's locks; the process at 1.38 CPUs.
+- Kept: a completion queued by a thread of the ring's process runs as that thread returns to user space, on default rings as on `COOP_TASKRUN` ones, unless the thread writes on without reaping; a watcher hands to the kernel thread what a blocked call holds back; an enter that waits for CQEs already there, with nothing to submit or run, returns without `sq_sx`. The watcher fixes a `COOP_TASKRUN` ring that never posted a `RECV` whose completing thread then blocked in `write(2)` (`test_tw_blocking_writer`).
+- Dropped: the kernel thread polling after it worked (about 990 ns, at two CPUs); the enter also checking `IORING_SQ_TASKRUN`, and the thread's pattern read from the CQ's head alone, both of which moved rows they don't run by 3–8%, from where the code lay.
+- Result: 87 ns over (919.8 against 832.7), at one CPU; multishot fan-in on a `COOP_TASKRUN` ring 24–32% faster; nothing else slower by more than multishot fan-in on a `DEFER_TASKRUN` ring at 16 connections, 2.1%. The unit tests (152), the cross-process test, `kqring_diff` (38 cases), liburing (223 of 245, the same five failures), stress and the fuzzer pass.
+
+Phase 18 is done: a default ring's ping-pong within 100 ns of a `DEFER_TASKRUN` ring's.
 
 ## Research
 

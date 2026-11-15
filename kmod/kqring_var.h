@@ -892,6 +892,19 @@ struct kqring_tctx {
 	 */
 	struct thread		*ast_td;
 	TAILQ_ENTRY(kqring_tctx) ast_link;
+	/* The watcher's pass it was queued in (kqring_ast_watch()). */
+	u_int			ast_gen;
+	/*
+	 * For kqring_ast_try(): the CQ's head when it last looked (with the
+	 * kthread asleep), the requests queued since (counted on every
+	 * queueing, kqring_taskwork_add_common(), so that the head's line,
+	 * which the CQ's tail shares, is read only then), and whether more
+	 * than one came between the two reaps before (a thread writing on
+	 * without reaping, as fan-in does).  Under ctx->mtx.
+	 */
+	uint32_t		ast_head;
+	u_int			ast_adds;
+	bool			ast_burst;
 };
 
 /*
@@ -1512,17 +1525,36 @@ bool	kqring_ast_queue(struct kqring_ctx *ctx, struct kqring_tctx *t,
 
 /*
  * Taskwork the ring's kthread would run: leave it to curthread's return
- * to user space instead (kqring_ast_queue()) when the ring has
- * COOP_TASKRUN and curthread is a user thread of the request's process
- * that may enter the ring, and isn't exiting or exec'ing.
+ * to user space instead (kqring_ast_queue()), as io_uring runs a ring's
+ * task_work in the task, when curthread is a user thread of the
+ * request's process that may enter the ring, and isn't exiting or
+ * exec'ing.  Only for the first request queued after a reap of the CQ:
+ * a thread that writes on without reaping (fan-in) has the kthread run
+ * the rest on another CPU, many to a wake-up, where its own returns would
+ * run them one at a time.  On a default ring, not even the first if the
+ * thread queued more than one between its last two reaps; a COOP_TASKRUN
+ * ring, which asks for its completions in the task, always has the first
+ * there as the write(2) that completed it returns.
  */
 static inline bool
 kqring_ast_try(struct kqring_ctx *ctx, struct kqring_tctx *t)
 {
 	struct thread *td = curthread;
+	uint32_t head;
 
-	if ((ctx->flags & IORING_SETUP_COOP_TASKRUN) == 0 ||
-	    !ctx->taskrun_only || td->td_proc != t->proc || t->dead ||
+	if (!ctx->taskrun_only || ctx->shm == NULL)
+		return (false);
+	/* ast_adds counts this request too (kqring_taskwork_add_common()). */
+	head = atomic_load_32(&ctx->shm->cq_head);
+	if (head != t->ast_head) {
+		t->ast_burst = t->ast_adds - 1 > 1;
+		t->ast_head = head;
+		t->ast_adds = 1;
+	}
+	if (t->ast_adds > 1 || (t->ast_burst &&
+	    (ctx->flags & IORING_SETUP_COOP_TASKRUN) == 0))
+		return (false);
+	if (td->td_proc != t->proc || t->dead ||
 	    (td->td_pflags & TDP_KTHREAD) != 0 ||
 	    (td->td_proc->p_flag & (P_WEXIT | P_INEXEC)) != 0 ||
 	    (!ctx->shared && !kqring_is_owner(ctx, td)))
@@ -1567,6 +1599,8 @@ kqring_taskwork_add_common(struct kqring_ctx *ctx, struct kqring_op *op,
 	    (!ctx->evfd_async || !ctx->submitting))
 		kqring_evfd_signal_common(ctx, false);
 	kqring_tw_insert_locked(ctx, op);
+	if (ctx->taskrun_only)
+		op->tctx->ast_adds++;
 	kqring_taskrun_flag(ctx);
 	/*
 	 * ctx->sleeping is only changed under ctx->mtx, and the owner

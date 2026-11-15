@@ -264,7 +264,7 @@ Programs that use liburing build against the port in [`liburing/`](liburing/), w
 ### Requirements
 
 - **Rings shared by processes.** Without `IORING_SETUP_SINGLE_ISSUER`, any thread of any process that holds the ring, such as a forked child, may submit, wait and register, whatever the others have in flight. Each process's requests run in that process, with its descriptors, memory and credentials, as PostgreSQL's `io_method=io_uring` needs ([docs/concurrent-submitters.md](docs/concurrent-submitters.md)). With `SINGLE_ISSUER`, only the creating thread may submit (`EEXIST` otherwise); another thread's enter that submits nothing is allowed, as on Linux, but it can't wait for completions that haven't been posted yet (see [Differences from Linux](#differences-from-linux)).
-- **`IORING_SETUP_DEFER_TASKRUN` is the fastest mode.** It requires `SINGLE_ISSUER`, as on Linux, and completions are posted when the owner enters the ring. Without it, a kernel thread in the process posts completions as they happen, which costs a thread switch per batch.
+- **`IORING_SETUP_DEFER_TASKRUN` is the fastest mode.** It requires `SINGLE_ISSUER`, as on Linux, and completions are posted when the owner enters the ring. Without it, a completion queued by a thread of the process, as a `write(2)` completes a `RECV`, runs as that thread returns to user space, as on Linux, and other completions are posted by a kernel thread in the process, which costs a thread switch per batch.
 - **Raise `RLIMIT_MEMLOCK` to register buffers.** Registered buffers' pages are held and charged to the user's locked-memory limit, which FreeBSD sets to only 64 KiB by default (Linux uses 8 MiB). Set `memorylocked` in `login.conf(5)`, or use `ulimit -l`.
 
 ---
