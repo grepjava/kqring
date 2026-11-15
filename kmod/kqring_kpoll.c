@@ -551,14 +551,18 @@ kqring_kp_thread(void *arg)
 	}
 
 	/*
-	 * The process is exiting or exec'ing, not the ring closing.  The
-	 * kqueue is on the process's descriptor table, which exit frees once
-	 * this thread is gone and which the ring can outlive (its descriptor
-	 * passed to another process), so close it now.  The process's
-	 * requests are cancelled (kqring_tctx_exit_task()).
+	 * Close the kqueue here, in a thread of its process, whatever ended
+	 * the loop: the process exiting or exec'ing, or the ring closing.
+	 * kqueue_close() takes the descriptor table the kqueue was made on,
+	 * and holds no reference to it; exit frees the table once this
+	 * thread is gone, and the ring can outlive it (its descriptor passed
+	 * to another process).  Left to the ring's teardown, on its own
+	 * thread, the close could come after the table was freed: a ring
+	 * that began closing just before its process exited did that.  The
+	 * process's requests are cancelled by kqring_tctx_exit_task(), or by
+	 * the ring's teardown.
 	 */
-	if (!ctx->closing)
-		kqring_kpoll_close(t);
+	kqring_kpoll_close(t);
 
 	mtx_lock(&ctx->mtx);
 	t->kp_running = false;
@@ -626,8 +630,17 @@ kqring_kp_start(struct kqring_tctx *t)
 
 	mtx_lock(&ctx->mtx);
 	if (t->kp_running || kqring_kp_done(t) || t->kp_fp == NULL) {
+		bool orphan = !t->kp_running && t->kp_fp != NULL;
+
 		error = t->kp_running ? 0 : EBADF;
 		mtx_unlock(&ctx->mtx);
+		/*
+		 * The ring began closing (or the process exiting) after the
+		 * kqueue was made: no poller will close it, so close it here,
+		 * in its process, as the poller would (kqring_kp_thread()).
+		 */
+		if (orphan)
+			kqring_kpoll_close(t);
 		return (error);
 	}
 	t->kp_running = true;

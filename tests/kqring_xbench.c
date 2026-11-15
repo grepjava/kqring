@@ -13,6 +13,8 @@
  *
  * Naming a case runs only that one, which gives a profiler a steady loop.
  * The fan-in cases use XBENCH_FANIN_N connections (default 256).
+ * The file cases read the file XBENCH_FILE names, and are skipped in a
+ * full run without it.
  * XBENCH_DEFER=1 sets the rings up with SINGLE_ISSUER | DEFER_TASKRUN.
  * XBENCH_FANIN_OWNBUF=1 makes fanin_kevent read each connection into a
  * buffer of its own, as the ring's cases receive, rather than into one.
@@ -26,6 +28,7 @@
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #if defined(__linux__)
 #include <sys/epoll.h>
@@ -35,6 +38,7 @@
 #include <sys/utsname.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -204,6 +208,58 @@ op_pipe_read_ring(void)
 	s->addr = (uint64_t)(uintptr_t)buf;
 	s->len = sizeof(buf);
 	s->off = (uint64_t)-1;
+	submit_wait(&R, 1);
+	return (1);
+}
+
+/*
+ * Cached file reads: 4 KiB at a pseudo-random 4 KiB-aligned offset of the
+ * file XBENCH_FILE names (at least 4 KiB; a tmpfs file reads as the page
+ * cache does), as fio's randread with bs=4k.
+ */
+static int ffd = -1;
+static uint64_t fblocks, fseed = 88172645463325252ULL;
+static char fbuf[4096] __attribute__((aligned(4096)));
+
+static off_t
+file_next(void)
+{
+	struct stat st;
+
+	if (ffd < 0) {
+		const char *path = getenv("XBENCH_FILE");
+
+		CHECK(path != NULL);
+		CHECK((ffd = open(path, O_RDONLY)) >= 0);
+		CHECK(fstat(ffd, &st) == 0);
+		fblocks = (uint64_t)st.st_size / sizeof(fbuf);
+		CHECK(fblocks > 0);
+	}
+	fseed ^= fseed << 13;
+	fseed ^= fseed >> 7;
+	fseed ^= fseed << 17;
+	return ((off_t)((fseed % fblocks) * sizeof(fbuf)));
+}
+
+static unsigned
+op_file_pread_syscall(void)
+{
+	off_t off = file_next();
+
+	CHECK(pread(ffd, fbuf, sizeof(fbuf), off) == sizeof(fbuf));
+	return (1);
+}
+
+static unsigned
+op_file_read_ring(void)
+{
+	off_t off = file_next();
+	struct io_uring_sqe *s;
+
+	s = prep(&R, IORING_OP_READ, ffd);
+	s->addr = (uint64_t)(uintptr_t)fbuf;
+	s->len = sizeof(fbuf);
+	s->off = (uint64_t)off;
 	submit_wait(&R, 1);
 	return (1);
 }
@@ -600,6 +656,10 @@ static const struct bcase {
 	{ "getppid", op_getppid, "getppid(2): the system call floor" },
 	{ "nop1", op_nop1, "1 NOP per enter, waited for" },
 	{ "nop32", op_nop32, "32 NOPs per enter, waited for, per NOP" },
+	{ "file_pread_syscall", op_file_pread_syscall,
+	    "pread(2) 4 KiB at a random offset of XBENCH_FILE (cached)" },
+	{ "file_read_ring", op_file_read_ring,
+	    "READ 4 KiB at a random offset of XBENCH_FILE, 1 per enter" },
 	{ "pipe_read_syscall", op_pipe_read_syscall,
 	    "write(2) 64 B then read(2) it from a pipe" },
 	{ "pipe_read_ring", op_pipe_read_ring,
@@ -665,6 +725,10 @@ main(int argc, char **argv)
 		if (only != NULL && strcmp(only, cases[c].name) != 0)
 			continue;
 		found = 1;
+		/* The file cases need a file: skipped in a full run without. */
+		if (only == NULL && strncmp(cases[c].name, "file_", 5) == 0 &&
+		    getenv("XBENCH_FILE") == NULL)
+			continue;
 		(void)run(cases[c].op, 200000000ULL);
 		for (int i = 0; i < reps; i++)
 			v[i] = run(cases[c].op, 1000000000ULL);

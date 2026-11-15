@@ -26,6 +26,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 16 | Fan-in at a thousand connections | Done |
 | 17 | A receive that waits | Done |
 | 18 | A default ring's kernel thread | Done |
+| 19 | A cached read in the enter | Done |
 
 ## Where kqring stands
 
@@ -359,6 +360,29 @@ Progress (15 November 2026), on the Ryzen ([docs/fan-in.md](docs/fan-in.md#phase
 - Result: 87 ns over (919.8 against 832.7), at one CPU; multishot fan-in on a `COOP_TASKRUN` ring 24–32% faster; nothing else slower by more than multishot fan-in on a `DEFER_TASKRUN` ring at 16 connections, 2.1%. The unit tests (152), the cross-process test, `kqring_diff` (38 cases), liburing (223 of 245, the same five failures), stress and the fuzzer pass.
 
 Phase 18 is done: a default ring's ping-pong within 100 ns of a `DEFER_TASKRUN` ring's.
+
+## Phase 19: A cached read in the enter
+
+A `READ` of a page in the page cache runs in the enter that submits it, without a worker, since phase 11; it still costs more than `pread(2)`. On the i5-8250U under FreeBSD 15.1 (the Ryzen was taken by other work), 4 KiB at a random offset of a 256 MiB tmpfs file takes 1,380 ns with one `READ` per enter against 1,194 for `pread(2)`, and fio's one job reaches 0.85 of `psync`, four jobs 0.80 ([docs/cached-reads.md](docs/cached-reads.md#phase-19)). Both spend the same on the copy (495 ns) and on finding the page; kqring's 186 ns more are its own functions: the request's allocation and freeing (51), the enter (about 67), submitting, preparing, issuing and completing the request (about 86), the read in the enter (about 72), the CQE (15), less what `pread(2)`'s own system call path takes.
+
+Order of work:
+
+1. Measure the build from phase 18: `pread(2)` against a `READ` per enter in `kqring_xbench` (new cases `file_pread_syscall` and `file_read_ring`), fio's random reads at one and four jobs, and a profile per function.
+2. Take each piece in turn, each measured against the build before: requests that complete in the enter taken from a cache of the ring's own rather than the zone; the work a request does around a read that completes at once (its lists, preparing and issuing it); the read's own path (the descriptor taken twice, the range lock and the object held).
+3. Keep what helps, and check what it might slow: one `NOP` per enter, a `RECV` that finds its data, pipes, fan-in, the single-shot batch.
+
+Acceptance: on the i5, a cached `READ` at most 100 ns over `pread(2)` (from 186), or what stops it measured and written down; fio's one job at least 0.90 of `psync`; nothing else in `kqring_xbench` more than 2% slower; the unit tests, the cross-process test, `kqring_diff`, liburing, stress and the fuzzer pass as before.
+
+Progress (16 November 2026), on the i5 ([docs/cached-reads.md](docs/cached-reads.md#phase-19)):
+
+- Measured from phase 18's build, alternated with it and a padded control in each run: a `READ` 196 ns over `pread(2)` on a default ring, 184 on a `DEFER_TASKRUN` one (186 in the first run; `pread(2)` itself moves up to 20 ns with the file).
+- Kept: the tmpfs read takes the vnode lock shared, without waiting, as `read(2)` does on tmpfs, instead of the range lock, an SMR section and a hold on the object. It also fixes a torn read: tmpfs writes don't take the range lock, and on the build before 5,995 of 20,000 `READ`s of a file being rewritten held parts of two writes (`test_inline_read_atomic`). And an enter whose submissions already filled the CQ to `min_complete` doesn't enter the wait. A `READ` is now 180 ns over `pread(2)` on a default ring and 174 on a `DEFER_TASKRUN` one, fio's 4 jobs 32 deep read 5.8% more (9.4% in an earlier run), one `NOP` per enter is 2.6–3.7% faster, and no other row of `kqring_xbench` is more than 1.3% slower.
+- Dropped: the worker pool's process kept in the context for the enter's lock check (no change); clearing fewer of a reused request's fields, which made a `NOP` 16 ns faster and a `READ` no faster.
+- What is left is the request's own machinery, a few ns at a time, most of it first touches of cache lines the 4 KiB copy evicts: clearing a reused request 23 ns, the file's and the ring's references 15, the SQE's copy 8, the free list 7, the enter's lock check 7–9. fio's one job stays at 0.85 of `psync`.
+- Found by the fuzzer while validating, and fixed: a ring that began closing with non-socket polls armed, its process then exiting, panicked in `kqueue_close()`, on a descriptor table exit had freed; the poller now closes its kqueue in the process whatever stops it (`test_kpoll_close_exit`).
+- Validated on the i5 with the final module: the unit tests (155 pass, 3 skip, on tmpfs and UFS too), the cross-process test (20 rounds), `kqring_diff` (38 cases, 0 problems), liburing (223 pass, 17 skip, the same 5 fail), stress and the fuzzer (30 minutes) pass.
+
+Phase 19 is done on its second clause: 174–180 ns, not 100, and what stops it measured and written down; fio's one job did not reach 0.90.
 
 ## Research
 

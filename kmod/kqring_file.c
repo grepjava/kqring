@@ -407,12 +407,12 @@ kqring_vp_is_tmpfs(const struct vnode *vp)
  * default), and even then pages a swapped-out page back in, which sleeps.
  * This is vn_read_from_obj() for tmpfs: the node's swap object is the
  * vnode's, but its size is the node's (tn_size), not the vnode pager's.
- * The node is read under SMR, as tmpfs_read_pgcache() does; vm_objects are
- * type-stable, so holding the object (vm_object_pip_add()) after leaving
- * SMR is safe, and OBJ_DEAD is checked once it is held.  Pages are taken
- * one at a time, never created or waited for, and copied with
- * uiomove_fromphys(); the caller holds the range read-locked, so the file
- * can't be truncated under the copy, and has page faults disabled.
+ * The caller holds the vnode locked shared, as read(2) does on tmpfs
+ * (tmpfs doesn't set MNTK_NO_IOPF, so vn_read() takes no range lock): the
+ * vnode can't be reclaimed nor the file truncated or written under the
+ * copy, so the node and its object stay.  Pages are taken one at a time,
+ * never created or waited for, and copied with uiomove_fromphys(), with
+ * page faults disabled by the caller.
  *
  * Returns 0 when uio was filled or the file ended (a short read at end of
  * file), or EJUSTRETURN when a page wasn't resident and valid, with uio
@@ -430,22 +430,13 @@ kqring_tmpfs_read(struct vnode *vp, struct uio *uio)
 	int error;
 	u_int off;
 
-	vfs_smr_enter();
-	node = VP_TO_TMPFS_NODE_SMR(vp);
+	ASSERT_VOP_LOCKED(vp, "kqring_tmpfs_read");
+	node = VP_TO_TMPFS_NODE(vp);
 	if (node == NULL || VN_IS_DOOMED(vp) || node->tn_type != VREG ||
-	    (obj = node->tn_reg.tn_aobj) == NULL) {
-		vfs_smr_exit();
+	    (obj = node->tn_reg.tn_aobj) == NULL)
 		return (EJUSTRETURN);
-	}
 	size = node->tn_size;
 	tmpfs_set_accessed(node->tn_reg.tn_tmp, node);
-	vfs_smr_exit();
-
-	vm_object_pip_add(obj, 1);
-	if ((obj->flags & OBJ_DEAD) != 0) {
-		vm_object_pip_wakeup(obj);
-		return (EJUSTRETURN);
-	}
 	error = 0;
 	while (uio->uio_resid > 0 && uio->uio_offset < size) {
 		off = uio->uio_offset & PAGE_MASK;
@@ -458,11 +449,7 @@ kqring_tmpfs_read(struct vnode *vp, struct uio *uio)
 			error = EJUSTRETURN;
 			break;
 		}
-		/*
-		 * A busied page keeps vgonel() from terminating the object
-		 * past it, so the vnode is checked again after.
-		 */
-		if (!vm_page_all_valid(m) || VN_IS_DOOMED(vp)) {
+		if (!vm_page_all_valid(m)) {
 			vm_page_sunbusy(m);
 			error = EJUSTRETURN;
 			break;
@@ -473,7 +460,6 @@ kqring_tmpfs_read(struct vnode *vp, struct uio *uio)
 		if (error != 0)
 			break;
 	}
-	vm_object_pip_wakeup(obj);
 	return (error);
 }
 
@@ -591,24 +577,38 @@ kqring_file_rw_inline(struct kqring_ctx *ctx, struct kqring_op *op,
 		return (KQRING_RW_PUNT);
 	}
 	/*
-	 * As vn_io_fault() does for read(2): hold the range against writers
-	 * (but never wait for it), and copy out with page faults disabled.  A
+	 * As read(2) does: on tmpfs the vnode lock, shared, elsewhere the
+	 * range as vn_io_fault() holds it, against writers (but never wait
+	 * for either); and copy out with page faults disabled.  A
 	 * fault on the destination while file pages are busied could need
 	 * those very pages (a buffer mapped from the same file); a copy that
 	 * would fault fails with EFAULT and goes to the worker instead, whose
 	 * fo_read() faults the buffer in safely.
 	 */
-	rl = vn_rangelock_tryrlock(vp, auio.uio_offset, auio.uio_offset + want);
-	if (rl == NULL) {
-		free(hiov, M_KQRING);
-		fdrop(fp, td);
-		return (KQRING_RW_PUNT);
+	if (tmpfs) {
+		rl = NULL;
+		if (vn_lock(vp, LK_SHARED | LK_NOWAIT) != 0) {
+			free(hiov, M_KQRING);
+			fdrop(fp, td);
+			return (KQRING_RW_PUNT);
+		}
+	} else {
+		rl = vn_rangelock_tryrlock(vp, auio.uio_offset,
+		    auio.uio_offset + want);
+		if (rl == NULL) {
+			free(hiov, M_KQRING);
+			fdrop(fp, td);
+			return (KQRING_RW_PUNT);
+		}
 	}
 	save = vm_fault_disable_pagefaults();
 	error = tmpfs ? kqring_tmpfs_read(vp, &auio) :
 	    VOP_READ_PGCACHE(vp, &auio, 0, fp->f_cred);
 	vm_fault_enable_pagefaults(save);
-	vn_rangelock_unlock(vp, rl);
+	if (tmpfs)
+		VOP_UNLOCK(vp);
+	else
+		vn_rangelock_unlock(vp, rl);
 	free(hiov, M_KQRING);
 	done = (size_t)(want - auio.uio_resid);
 	if (error == EFAULT) {

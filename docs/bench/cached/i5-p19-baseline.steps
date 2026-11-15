@@ -1,0 +1,38 @@
+20:19:12 loaded 723a072d tmpfs on /mnt/p19t (tmpfs, local) vmcores=7
+20:19:17 1.getppid 192.8
+20:19:22 1.pread 1190.8
+20:19:27 1.read.def 1381.0
+20:19:32 1.read.defer 1365.0
+20:19:38 1.nop1.def 358.8
+20:19:43 1.nop1.defer 348.0
+20:19:56 1.fio.psync.qd1.j1 iops=675546
+20:20:09 1.fio.io_uring.qd1.j1 iops=572041
+20:20:22 1.fio.io_uring.qd32.j1 iops=567507
+20:20:35 1.fio.psync.qd1.j4 iops=2305226
+20:20:48 1.fio.io_uring.qd32.j4 iops=1785880
+20:20:53 2.getppid 192.3
+20:20:59 2.pread 1199.0
+20:21:04 2.read.def 1384.1
+20:21:09 2.read.defer 1365.4
+20:21:14 2.nop1.def 357.0
+20:21:19 2.nop1.defer 348.4
+20:21:32 2.fio.psync.qd1.j1 iops=674867
+20:21:45 2.fio.io_uring.qd1.j1 iops=573013
+20:21:58 2.fio.io_uring.qd32.j1 iops=572236
+20:22:12 2.fio.psync.qd1.j4 iops=2200911
+20:22:25 2.fio.io_uring.qd32.j4 iops=1839994
+20:22:30 3.getppid 192.5
+20:22:35 3.pread 1193.7
+20:22:40 3.read.def 1380.1
+20:22:46 3.read.defer 1367.3
+20:22:51 3.nop1.def 358.5
+20:22:56 3.nop1.defer 345.5
+20:23:09 3.fio.psync.qd1.j1 iops=677698
+20:23:22 3.fio.io_uring.qd1.j1 iops=575300
+20:23:35 3.fio.io_uring.qd32.j1 iops=570498
+20:23:48 3.fio.psync.qd1.j4 iops=2263353
+20:24:01 3.fio.io_uring.qd32.j4 iops=1852277
+20:24:16 profile pread TOTAL 100471 39929  USER 100471 4998  1195.4 ns
+20:24:30 profile read.defer TOTAL 100344 39932  USER 100344 4113  1400.0 ns
+20:24:44 profile read.def TOTAL 100456 39932  USER 100456 4463  1397.6 ns
+20:24:44 ALLDONE vmcores=7

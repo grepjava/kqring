@@ -2219,11 +2219,18 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	 * 4. Wait.  As with io_uring_enter(2), once SQEs have been consumed
 	 * the call reports success (the submitted count) even if the wait
 	 * then times out or is interrupted: an ioctl error would make
-	 * sys_ioctl() skip copying SUBMITTED_out back to userspace.
+	 * sys_ioctl() skip copying SUBMITTED_out back to userspace.  A CQ
+	 * that already holds min_complete (the requests just submitted
+	 * completed here) ends it at once, as kqring_wait_cqes() would
+	 * before anything else, and without the signal mask's checks.
 	 */
-	error = kqring_enter_wait_sig(ctx, ea->min_complete, has_timeout, sbt,
-	    min_sbt, lock, usig, sigsz,
-	    (ea->flags & IORING_ENTER_ABS_TIMER) != 0, false);
+	if (atomic_load_acq_32(&shm->cq_tail) -
+	    atomic_load_acq_32(&shm->cq_head) >= ea->min_complete)
+		error = 0;
+	else
+		error = kqring_enter_wait_sig(ctx, ea->min_complete,
+		    has_timeout, sbt, min_sbt, lock, usig, sigsz,
+		    (ea->flags & IORING_ENTER_ABS_TIMER) != 0, false);
 	kqring_evfd_flush(ctx);
 	if (error != 0 && submitted > 0)
 		error = 0;

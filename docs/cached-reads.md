@@ -27,7 +27,7 @@ Read in the enter, 4 jobs went from 53% of `psync` to 87%. One job 32 deep is th
 
 `kqring_tmpfs_read()` is `vn_read_from_obj()` for tmpfs, and needs no mount option:
 
-- The node, its swap object and its size (`tn_size`) are read under SMR, as `tmpfs_read_pgcache()` reads them. vm_objects are type-stable, so the object is held (`vm_object_pip_add()`) after leaving SMR and checked for `OBJ_DEAD` once held.
+- The node, its swap object and its size (`tn_size`) are read under SMR, as `tmpfs_read_pgcache()` reads them. vm_objects are type-stable, so the object is held (`vm_object_pip_add()`) after leaving SMR and checked for `OBJ_DEAD` once held. (Since phase 19 the read takes the vnode lock instead, which `read(2)` takes and tmpfs writes respect; see [below](#what-changed).)
 - Pages are grabbed one at a time with `VM_ALLOC_NOCREAT | VM_ALLOC_NOWAIT`, shared-busied, and copied with `uiomove_fromphys()`; a page that isn't resident and valid ends the copy, and the read goes to a worker, which redoes it whole. A busied page keeps `vgonel()` from terminating the object past it, so the vnode is checked for doom after each grab.
 - The range lock the enter already takes keeps the file from being truncated under the copy, and the copy runs with page faults disabled, as before: a destination that isn't mapped goes to the worker.
 
@@ -76,6 +76,54 @@ kqring's own functions take 190 ns of each read, the whole of the difference in 
 `read(2)` of a tmpfs file into a writable `MAP_SHARED` mapping of the same page never returns, on FreeBSD 15.1 without kqring. tmpfs doesn't set `MNTK_NO_IOPF`, so `vn_io_fault()` doesn't hold the destination's pages first; `tmpfs_read()` busies the file's page, and the copy faults on its mapping, which waits for the page to be unbusied: by itself. The wait can't be interrupted, and the machine can't finish a shutdown. ZFS and UFS hold the pages first and return. kqring's read in the enter gives up with `EFAULT` (faults are disabled), and the worker it goes to used to read as `read(2)` does, and hang as it does. Reported as [FreeBSD bug 300734](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=300734).
 
 Since phase 15 a worker's read or write of a regular file on a filesystem without `MNTK_NO_IOPF` (tmpfs, and nullfs over it) holds the user's pages first, up to 1 MiB at a time, as `vn_io_fault()` does for UFS and ZFS, and the filesystem copies through their direct-map addresses, which can't fault (`kqring_vn_rw_held()`). The unit test reads and writes a self-mapped tmpfs file, as it does on ZFS and UFS. `read(2)` itself still hangs until FreeBSD fixes it.
+
+## Phase 19
+
+A `READ` of a cached page, one per enter, against `pread(2)` of the same page: how much of the difference is kqring's own, and how much of that can go.
+
+### How it is measured
+
+On the i5-8250U under FreeBSD 15.1 (the Ryzen was taken by other work). `kqring_xbench` gained two cases, `file_pread_syscall` and `file_read_ring`, which read 4 KiB at a random page-aligned offset of the file named by `XBENCH_FILE`, here a 256 MiB file on a fresh tmpfs mount. Each comparison alternates the builds in one run, five rounds, with each round's order rotated, and includes a control: the base build with 48 bytes of padding at the start of `kqring_wq.c`'s code, which moves everything after it. `pread(2)` itself moves by up to 20 ns from one run's file to the next, so a read's cost is given as its distance above `pread(2)` in the same round. The step logs are `bench/cached/i5-p19-*.steps`.
+
+### Where the 186 ns went
+
+A kernel profile (`profile-4999`, full stacks, 8 seconds of one thread) of each, in ns per read, before any change:
+
+| ns per read | `pread(2)` | `READ`, `DEFER_TASKRUN` ring |
+|---|---:|---:|
+| all | 1,202 | 1,402 |
+| the copy (`copyout`) | 525 | 464 |
+| finding the page (`pctrie`) | 187 | 152 |
+| taking and dropping the file | 32 | 55 |
+| locking the file for the copy | 21 (vnode lock) | 30 (range lock) + 18 (object held) + 10 (SMR) |
+| kqring's own functions (allocating, preparing, issuing, completing and freeing the request, the enter, the CQE) | | about 250 |
+
+The copy and the lookup cost the same or less; the difference is the request's own path. A profile per instruction showed it spread thin: most of it on the first touch of a cache line (the request's 14 lines, the ring's, the SQE and CQE, a context's) that the 4 KiB copy has evicted, with no single function above 35 ns.
+
+### What changed
+
+- **The tmpfs read takes the vnode lock**, shared and without waiting (`LK_NOWAIT`; a busy lock sends the read to a worker), as `read(2)` does on tmpfs, in place of the range lock, the SMR section and the hold on the file's object. A held vnode lock already keeps the node from being reclaimed, truncated or written, so the object needs no hold and the per-page check for a dead vnode goes. This also fixes a torn read: a write to tmpfs takes the vnode lock but not the range lock (tmpfs doesn't set `MNTK_NO_IOPF`, so `vn_write()` doesn't take it), so a `READ` holding only the range lock could see part of a concurrent `write(2)`, which `pread(2)` never does. `test_inline_read_atomic` reads a four-page file while another thread rewrites it with one of two patterns, `pread(2)` first as the control, then `READ`. On tmpfs, with the build before, 5,995 of 20,000 `READ`s, all completed in the enter, held parts of both patterns, the first change at byte 9,087, inside a page; with the new one none of 20,000 do (19,950 in the enter), as none of the `pread(2)`s do. On UFS both pass; on ZFS the writer leaves too few reads in the test's 3 seconds to judge, and it skips. Other filesystems keep `VOP_READ_PGCACHE` under the range lock, which their writes take too.
+- **An enter whose submissions already filled the CQ to `min_complete` doesn't enter the wait.** `kqring_wait_cqes()` returned at its first check in that case, through three calls; the result is the same.
+
+Tried and dropped: keeping the worker pool's process in the context, so that the enter's check for taking the ring's lock reads one line less (no measurable change); clearing fewer of a request's fields when it is reused. A build that cleared only the six a `READ` or `NOP` writes, for measurement only, made a `NOP` per enter 16 ns faster and a `READ` no faster: with the copy evicting the request's lines anyway, the clearing's stores only moved the misses to the next touch.
+
+### Results
+
+The final comparison, five rounds, of the build before the poll-teardown fix that validation found (it changes only how a poller ends); in brackets against the build before:
+
+| i5-8250U | HEAD (6da505b) | phase 19 | phase 19, padded |
+|---|---:|---:|---:|
+| `READ` above `pread(2)`, default ring | 196 ns | 180 ns | 180 ns |
+| `READ` above `pread(2)`, `DEFER_TASKRUN` | 184 ns | 174 ns | 171 ns |
+| one `NOP` per enter, default / `DEFER_TASKRUN` | 358 / 347 ns | 349 / 334 ns (−2.6 / −3.7%) | 348 / 332 ns |
+| fio, 1 job, 1 deep, against `psync` | 0.849 | 0.852 | 0.854 |
+| fio, 4 jobs, 32 deep, IOPS | 1,798,470 | 1,903,650 (+5.8%) | 1,932,740 (+7.5%) |
+
+In earlier runs of the same builds, with other files, the tmpfs lock alone took the `READ` from 180 to 154 ns above `pread(2)` on a default ring and from 163 to 145 on a `DEFER_TASKRUN` one, and fio's 4 jobs from 1.81 to 1.98 million (+9.4%). Every other `kqring_xbench` row, on both kinds of ring, is within 1.3% of before, most of them faster.
+
+### What stops 100 ns
+
+The acceptance asked for at most 100 ns above `pread(2)`, or what stops it measured; it stays at 170–180 ns. What is left is a request's machinery, which `pread(2)` doesn't have, spread over its path a few ns at a time, and the cache lines it touches. In a profile per source line of the phase 19 build, the largest pieces are: clearing a reused request, 23 ns (12 in a `NOP` loop, where no copy evicts its lines); the references to the file and to the ring's own descriptor, taken and dropped once per read and once per enter, 15; copying the SQE, 8; taking the request off the free list, 7; the enter's check for taking the ring's lock, 7–9 (a chase through three structures). Each is a line or two of the request or the ring that the copy pushed out. The ring's descriptor is one Linux avoids: its `fdget()` takes no reference in a single-threaded process, and a registered ring takes none at all, where kqring's registered rings still do, because the table is per process and another thread may unregister. fio's one job stays at 0.85 of `psync`, against the 0.90 asked: it enters once per read too, and pays the same.
 
 ## Acceptance
 

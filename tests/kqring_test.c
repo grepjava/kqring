@@ -7704,6 +7704,132 @@ expect_cancel_pair(struct test_ring *r, uint64_t target, uint64_t cancel)
 	    a.user_data == cancel && a.res == 0));
 }
 
+struct read_atomic_arg {
+	int		fd;
+	size_t		len;
+	const char	*pat[2];
+	atomic_bool	stop;
+	unsigned long	writes;
+};
+
+static void *
+read_atomic_writer(void *p)
+{
+	struct read_atomic_arg *a = p;
+
+	while (!atomic_load(&a->stop)) {
+		assert(pwrite(a->fd, a->pat[a->writes & 1], a->len, 0) ==
+		    (ssize_t)a->len);
+		a->writes++;
+	}
+	return (NULL);
+}
+
+/* Whether all of buf is one byte; else its first differing offset + 1. */
+static size_t
+read_atomic_torn(const char *buf, size_t len)
+{
+	for (size_t i = 1; i < len; i++)
+		if (buf[i] != buf[0])
+			return (i);
+	return (0);
+}
+
+/*
+ * A READ that completes in the enter is atomic against a write(2) of the
+ * same range, as pread(2) is: it sees the file before the write or after
+ * it, never a mix.  A write to tmpfs takes the vnode lock, not the range
+ * lock (tmpfs doesn't set MNTK_NO_IOPF, so vn_write() doesn't take it), so
+ * a READ that held only the range lock could copy one page before a write
+ * and the next after it.  pread(2) runs first under the same writer, as
+ * the control: if it tears, the premise is wrong, and the test says so.
+ */
+static void
+test_inline_read_atomic(const char *dir)
+{
+	enum { LEN = 4 * 4096, ROUNDS = 20000, SECS = 3, ENOUGH = 100 };
+	static char pa[LEN], pb[LEN], buf[LEN];
+	struct read_atomic_arg a = { .len = LEN, .pat = { pa, pb } };
+	char path[PATH_MAX];
+	struct test_ring t;
+	pthread_t th;
+	unsigned long ptorn = 0, rtorn = 0, rinline = 0;
+	unsigned long preads = 0, rreads = 0;
+	struct timespec t0, now;
+	size_t at = 0;
+
+	memset(pa, 'A', LEN);
+	memset(pb, 'B', LEN);
+	snprintf(path, sizeof(path), "%s/kqring_atomic.XXXXXX", dir);
+	a.fd = mkstemp(path);
+	assert(a.fd >= 0);
+	unlink(path);
+	assert(pwrite(a.fd, pa, LEN, 0) == LEN);
+	ring_init(&t);
+	assert(pthread_create(&th, NULL, read_atomic_writer, &a) == 0);
+	/*
+	 * Each half stops after SECS: a writer in a tight loop can keep a
+	 * reader waiting for the range most of the time (ZFS).
+	 */
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (int i = 0; i < ROUNDS; i++) {
+		assert(pread(a.fd, buf, LEN, 0) == LEN);
+		preads++;
+		if (read_atomic_torn(buf, LEN) != 0)
+			ptorn++;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (now.tv_sec - t0.tv_sec >= SECS)
+			break;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (int i = 0; i < ROUNDS; i++) {
+		size_t torn;
+
+		prep_pread(&t, a.fd, buf, LEN, 0, 62100);
+		ring_submit(&t);
+		if (ring_cq_ready(&t) == 1)
+			rinline++;
+		else
+			(void)ring_wait(&t, 1, 10000);
+		assert(ring_cq_ready(&t) == 1);
+		expect_cqe(&t, 62100, LEN);
+		rreads++;
+		if ((torn = read_atomic_torn(buf, LEN)) != 0) {
+			rtorn++;
+			at = torn - 1;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (now.tv_sec - t0.tv_sec >= SECS)
+			break;
+	}
+	atomic_store(&a.stop, true);
+	assert(pthread_join(th, NULL) == 0);
+	close(a.fd);
+	close(t.fd);
+	if (ptorn != 0) {
+		printf("[SKIP] Inline READ atomic (%s): pread(2) itself tore "
+		    "%lu of %lu reads\n", dir, ptorn, preads);
+		return;
+	}
+	if (rtorn != 0) {
+		printf("[FAIL] Inline READ atomic (%s): %lu of %lu READs saw "
+		    "a write in part (first change at byte %zu; %lu "
+		    "inline, %lu writes)\n", dir, rtorn, rreads, at, rinline,
+		    a.writes);
+		failures++;
+		return;
+	}
+	if (rreads < ENOUGH) {
+		printf("[SKIP] Inline READ atomic (%s): only %lu READs in %d s "
+		    "under the writer (%lu pread(2)s)\n", dir, rreads, SECS,
+		    preads);
+		return;
+	}
+	printf("[PASS] Inline READ atomic (%s): %lu READs (%lu in the "
+	    "enter) and %lu pread(2)s under %lu writes, none torn\n", dir,
+	    rreads, rinline, preads, a.writes);
+}
+
 /* A pty blocks in fo_read after selection, unlike the pipe pre-wait. */
 static void
 test_worker_buffer_reservation(void)
@@ -8306,6 +8432,58 @@ test_nonsock_poll(void)
 	close(t.fd);
 	printf("[PASS] Non-socket POLL_ADD: pipe and eventfd single/multishot, "
 	    "FIXED_FILE, POLL_REMOVE, POLLHUP\n");
+}
+
+/*
+ * A ring that closes while its process's poller runs, the process then
+ * exiting at once.  The poll kqueue sits on the process's descriptor
+ * table, which exit frees; the ring's teardown runs later, on its own
+ * thread, so the kqueue must be closed by the poller, in the process,
+ * whatever stopped it.  Closed by the teardown instead, it took the freed
+ * table's lock (a panic in kqueue_close(), found by kqring_fuzz).  Each
+ * child arms a POLL_ADD on a pipe (a knote, and the poller with it),
+ * closes its only descriptor of the ring, and exits.
+ */
+static void
+test_kpoll_close_exit(void)
+{
+	enum { ROUNDS = 200 };
+
+	for (int i = 0; i < ROUNDS; i++) {
+		pid_t pid = fork();
+		int st;
+
+		assert(pid >= 0);
+		if (pid == 0) {
+			struct io_uring_sqe *sqe;
+			struct test_ring t;
+			int pfd[2];
+
+			ring_init(&t);
+			if (pipe(pfd) != 0)
+				_exit(1);
+			sqe = ring_prep(&t, IORING_OP_POLL_ADD, pfd[0], 91200);
+			sqe->poll32_events = POLLIN;
+			ring_push_sqe(&t);
+			if (kqring_enter(t.fd, 1, 0, 0, NULL, 0) != 1)
+				_exit(2);
+			if (i % 2 != 0)
+				usleep(1000);	/* the poller started */
+			close(t.fd);
+			_exit(0);
+		}
+		assert(waitpid(pid, &st, 0) == pid);
+		if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+			printf("[FAIL] POLL_ADD ring closed by an exiting "
+			    "process: child %d status %#x\n", i, st);
+			failures++;
+			return;
+		}
+	}
+	/* The teardowns run on their own thread: let them finish. */
+	usleep(200000);
+	printf("[PASS] POLL_ADD ring closed by a process that exits at once: "
+	    "%d rounds\n", ROUNDS);
 }
 
 #define KPOLL_NPIPES	100
@@ -15926,6 +16104,25 @@ main(int argc, char **argv)
 		printf("[OK]: %d failure(s)\n", failures);
 		return (failures != 0);
 	}
+	/*
+	 * "kpexit": rings closed by processes that exit at once.  Not on a
+	 * module before phase 19, which it panics.
+	 */
+	if (argc >= 2 && strcmp(argv[1], "kpexit") == 0) {
+		test_kpoll_close_exit();
+		printf("[OK]: %d failure(s)\n", failures);
+		return (failures != 0);
+	}
+	/* "p19": the tests of roadmap phase 19 only (safe on any module). */
+	if (argc >= 2 && strcmp(argv[1], "p19") == 0) {
+		test_inline_read_atomic("/tmp");
+		if (getenv("KQRING_TEST_TMPFS") != NULL)
+			test_inline_read_atomic(getenv("KQRING_TEST_TMPFS"));
+		if (getenv("KQRING_TEST_UFS") != NULL)
+			test_inline_read_atomic(getenv("KQRING_TEST_UFS"));
+		printf("[OK]: %d failure(s)\n", failures);
+		return (failures != 0);
+	}
 	/* "p18": the tests of roadmap phase 18 only. */
 	if (argc >= 2 && strcmp(argv[1], "p18") == 0) {
 		test_default_ring_waiter_handoff();
@@ -16042,6 +16239,11 @@ main(int argc, char **argv)
 			test_inline_file_pipe(getenv("KQRING_TEST_TMPFS"));
 		if (getenv("KQRING_TEST_UFS") != NULL)
 			test_inline_file_pipe(getenv("KQRING_TEST_UFS"));
+		test_inline_read_atomic("/tmp");
+		if (getenv("KQRING_TEST_TMPFS") != NULL)
+			test_inline_read_atomic(getenv("KQRING_TEST_TMPFS"));
+		if (getenv("KQRING_TEST_UFS") != NULL)
+			test_inline_read_atomic(getenv("KQRING_TEST_UFS"));
 		test_disk_bio();
 		test_napi_busy_poll();
 		test_worker_buffer_reservation();
@@ -16051,6 +16253,7 @@ main(int argc, char **argv)
 		test_splice_and_tee();
 		test_nonsock_poll();
 		test_kpoll();
+		test_kpoll_close_exit();
 		test_pipe_nowait();
 		test_pipe_nonblock_drained();
 		test_pipe_multishot_drained();
