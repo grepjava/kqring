@@ -1530,6 +1530,25 @@ kqring_ast_try(struct kqring_ctx *ctx, struct kqring_tctx *t)
 	return (kqring_ast_queue(ctx, t, td));
 }
 
+/*
+ * Tell the ring's user that it has work to run, with IORING_SQ_TASKRUN.
+ * On a DEFER_TASKRUN ring, only with IORING_SETUP_TASKRUN_FLAG, as
+ * io_uring: its completions wait for an enter in any case, and the flag
+ * is a locked operation on a line the user's CPU reads.  On other rings
+ * always: Linux runs their completions as the submitter returns to user
+ * space, so they are there when it looks, where kqring's kernel thread
+ * runs them later; the flag has liburing's peek enter for them (and for
+ * the CQ's overflow, test poll-mshot-overflow).
+ */
+static inline void
+kqring_taskrun_flag(struct kqring_ctx *ctx)
+{
+	if (ctx->shm != NULL &&
+	    (ctx->flags & (IORING_SETUP_DEFER_TASKRUN |
+	    IORING_SETUP_TASKRUN_FLAG)) != IORING_SETUP_DEFER_TASKRUN)
+		atomic_set_32(&ctx->shm->sq_flags, IORING_SQ_TASKRUN);
+}
+
 /* Returns true if it left the sleeper asleep (a deferred lazy wake-up). */
 static inline bool
 kqring_taskwork_add_common(struct kqring_ctx *ctx, struct kqring_op *op,
@@ -1548,8 +1567,7 @@ kqring_taskwork_add_common(struct kqring_ctx *ctx, struct kqring_op *op,
 	    (!ctx->evfd_async || !ctx->submitting))
 		kqring_evfd_signal_common(ctx, false);
 	kqring_tw_insert_locked(ctx, op);
-	if (ctx->shm != NULL)
-		atomic_set_32(&ctx->shm->sq_flags, IORING_SQ_TASKRUN);
+	kqring_taskrun_flag(ctx);
 	/*
 	 * ctx->sleeping is only changed under ctx->mtx, and the owner
 	 * re-checks its taskwork under ctx->mtx before sleeping, so

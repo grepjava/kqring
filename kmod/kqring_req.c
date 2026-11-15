@@ -2618,7 +2618,8 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 		kqring_req_complete(ctx, op, op->res, op->cflags);
 		return;
 	}
-	if (armed)
+	/* A LINK_TIMEOUT follows it (op->link), checked here without a call. */
+	if (armed && op->link != NULL)
 		kqring_ltimeout_arm(ctx, op);
 }
 
@@ -2944,6 +2945,18 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 				}
 				mtx_unlock(&ctx->mtx);
 				kqring_taskwork_run_one(ctx, op);
+				/*
+				 * Nothing more queued, as the fast path above
+				 * reads it, and no IORING_SQ_TASKRUN to clear:
+				 * done without taking ctx->mtx again.
+				 */
+				if (TAILQ_EMPTY(tw) &&
+				    (KQRING_STQ_EMPTY_HINT(&ctx->rcq) ||
+				    ctx->nocq >= KQRING_OCQ_BUSY) &&
+				    (ctx->shm == NULL ||
+				    (atomic_load_32(&ctx->shm->sq_flags) &
+				    IORING_SQ_TASKRUN) == 0))
+					goto flush;
 				mtx_lock(&ctx->mtx);
 				continue;
 			}
@@ -2962,6 +2975,7 @@ kqring_run_taskwork(struct kqring_ctx *ctx)
 		    IORING_SQ_TASKRUN) != 0)
 			atomic_clear_32(&ctx->shm->sq_flags, IORING_SQ_TASKRUN);
 		mtx_unlock(&ctx->mtx);
+flush:
 		kqring_flush_ready(ctx);
 		if (TAILQ_EMPTY(tw) &&
 		    (KQRING_STQ_EMPTY_HINT(&ctx->rcq) || ctx->nocq >= KQRING_OCQ_BUSY))

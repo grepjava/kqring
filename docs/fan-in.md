@@ -122,6 +122,38 @@ Where the Ryzen's 300 ns or so between the armed `RECV` and the one that finds i
 
 The CPU's counters agree: about 6,000 instructions per message against 4,100, at the same rate (1.69 instructions per cycle against 1.74), and no more lines from memory. The time is in instructions and atomic operations, spread over the path; nothing in it is waiting or repeated. What could go without changing how it works is about 20 ns: the two locked increments of the per-CPU count of enters, which unload uses, and the ring's mutex taken again after the last taskwork item only to clear `IORING_SQ_TASKRUN`. That is under 3%, and neither change was made.
 
+### Phase 17
+
+Roadmap phase 17 took the armed `RECV` up again, from 832 ns against 552 for the `RECV` that finds its data and 53 for `getppid`, 227 ns over on a `DEFER_TASKRUN` ring ([bench/fanin/ryzen-p17-baseline.steps](bench/fanin/ryzen-p17-baseline.steps)). Each change was alternated three times with the build before it, after that build's unit tests:
+
+| Change | armed `RECV`, `DEFER_TASKRUN` | Kept |
+|---|---:|---|
+| No count of the enters in progress: two locked operations on each enter | −1.9% (default ring −2.8%) | yes |
+| `IORING_SQ_TASKRUN` on a `DEFER_TASKRUN` ring only with `IORING_SETUP_TASKRUN_FLAG`; the taskwork loop done without taking the ring's mutex a second time; the MAC check after the check that the socket is empty | −2.5% | not the MAC check |
+| Calls that usually find nothing to do (`kqring_flush_ready()`, `kqring_run_checks()`, `kqring_evfd_flush()`, `kqring_op_dirs()`) checked inline | −0.5%, one `NOP` per enter +4.7% | no |
+
+- **The count of enters** was kqring's own, kept on a word of each CPU so that unload could wait for the calls in progress. Unload doesn't need it: it waits until every ring is closed, a thread only stays in `kqring_enter(2)` on a ring it holds, and the threads whose current call is enter are waited for in any case until they return to user space.
+- **`IORING_SQ_TASKRUN`** is a locked operation on a line the program's CPU reads, for each request that becomes ready. Linux sets it only with `IORING_SETUP_TASKRUN_FLAG`, and a `DEFER_TASKRUN` ring's completions wait for an enter whatever the flag says. On other rings kqring still sets it always: there Linux runs completions as the submitter returns to user space, so they are in the CQ when it looks, where kqring's kernel thread runs them later; liburing's `poll-mshot-overflow` failed with the flag gone there ([ryzen-p17-taskrun-all-rings-ab.steps](bench/fanin/ryzen-p17-taskrun-all-rings-ab.steps) is that build).
+- **The MAC check after the empty check** did no less work for a receive that finds data, yet the single-shot batch at 1,024 connections was 6.5% slower with it, over five rounds, and level without it ([ryzen-p17-mac-order.steps](bench/fanin/ryzen-p17-mac-order.steps), [ryzen-p17-batch-bisect.steps](bench/fanin/ryzen-p17-batch-bisect.steps)): with a thousand sockets out of cache, which of their lines a receive touches first matters.
+
+Against phase 16's build ([ryzen-p17-final-ab.steps](bench/fanin/ryzen-p17-final-ab.steps)), the armed `RECV` is 1.7% faster on a `DEFER_TASKRUN` ring and 2.1% with `COOP_TASKRUN`, and nothing else moved more than kqueue's own rows did in the same runs (2.4%). In the profiled runs ([ryzen-p17-final-profile.steps](bench/fanin/ryzen-p17-final-profile.steps)) the armed `RECV` takes 820 ns, against 558 and 53: 209 ns over, from 227.
+
+What is in the 262 ns between the armed `RECV` and the one that finds its data, from the same DTrace profile:
+
+| ns per message | |
+|---|---:|
+| the second enter's system call: user mode, entry, `amd64_syscall()`, its six arguments (53 of it is `getppid`'s) | ~88 |
+| the enter's own work with nothing to submit | ~36 |
+| arming: `kqring_arm_socket_op()`, `kqring_sb_arm()`, `soupcall_set()` | ~31 |
+| the upcall, queueing and running the taskwork | ~28 |
+| the ring's mutex, three times: arming, the upcall, taking the taskwork | ~20 |
+| looking up the descriptors (`fget`) | ~15 |
+| the end-of-file knote on AF_UNIX sockets | ~9 |
+| disarming | ~8 |
+| the rest, spread thinly | ~22 |
+
+So what stops it at 150 ns is the shape of the wait more than any one piece: a second system call with its arguments and descriptor, the socket armed and disarmed with its lock and the ring's, and the request queued and taken off again, each a few tens of nanoseconds of instructions and locked operations. Closing the rest would take a different path, such as the upcall finishing a lone waiter's receive itself, which only a ring that runs completions outside an enter could do.
+
 ## The default ring's kernel thread
 
 A ring without `DEFER_TASKRUN` or `SQPOLL` has a kernel thread that posts its completions, so that they appear with nobody in an enter. The thread slept on the same channel as the enters waiting for CQEs, and new taskwork woke both: a thread asleep in an enter, which runs its process's taskwork when woken, and the kernel thread, which then fought it for `sq_sx`, the lock that serialises a ring's submissions and completions. The kernel thread now sleeps on a channel of its own. Taskwork wakes it only when no thread of the request's process is asleep in an enter (`tw_waiters`); every other wake-up still wakes both. A waiter that leaves without running the taskwork (interrupted by a signal, or `sq_sx` not taken) wakes the kernel thread itself. `test_default_ring_waiter_handoff` covers both: a waiter interrupted 20 times leaves the receive to the kernel thread, and a sleeping waiter runs it itself.

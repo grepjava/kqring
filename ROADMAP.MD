@@ -24,6 +24,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 14 | liburing's remaining failures and skips | Done |
 | 15 | A worker that can't hang, and small gaps | Done |
 | 16 | Fan-in at a thousand connections | Done |
+| 17 | A receive that waits | Done |
 
 ## Where kqring stands
 
@@ -315,6 +316,27 @@ Progress (14 November 2026), on the Ryzen ([docs/fan-in.md](docs/fan-in.md#a-tho
 - Moving the module's code alone changes fan-in at 2,048 by up to 5% and the single-shot batch by 4%; layouts without the lone waiter gave less, or cost the batch.
 
 Phase 16 is done: within 5% of kqueue at 1,024 connections, and what stops it at 2,048 measured and written down.
+
+## Phase 17: A receive that waits
+
+A `RECV` submitted before its data, as a server waits, costs about 250 ns more on a `DEFER_TASKRUN` ring than one that finds its data, less the extra system call, on both test machines ([docs/fan-in.md](docs/fan-in.md#a-receive-that-waits)). On the Ryzen, where a system call costs 53 ns, ping-pong with an armed `RECV` takes 847 ns against kqueue's 531. The profile spreads the difference over the second enter (its system call, about 90 ns, and its own work with nothing to submit, about 70), arming the socket (33), the ring's mutex taken four times (32), the upcall, the taskwork and the disarm (25), and on AF_UNIX the end-of-file knote (9); nothing in it waits or repeats.
+
+Order of work:
+
+1. Measure the build from phase 16 on the Ryzen: `pp_ring_armed` against `pp_kevent`, `unix_recv_ring` and `getppid`, on both kinds of ring, with a profile per function, and the code-placement control from phase 16 to know what is noise.
+2. Take each piece in turn, each measured on its own against the build before: an enter that only waits, without the work of one that submits; the upcall queueing taskwork without the ring's mutex; the mutex taken again only to clear `IORING_SQ_TASKRUN`; the locked counts of enters; arming a socket a request has armed before.
+3. Keep what helps, and check what it might slow: one `NOP` per enter, fan-in at 16 to 2,048, the single-shot batch, a `RECV` that finds its data.
+
+Acceptance: on the Ryzen, an armed `RECV` on a `DEFER_TASKRUN` ring at most 150 ns above one that finds its data less a system call (from about 250), or what stops it measured and written down; nothing else in `kqring_xbench` more than 2% slower; the unit tests, the cross-process test, `kqring_diff`, liburing, stress and the fuzzer pass as before.
+
+Progress (15 November 2026), on the Ryzen ([docs/fan-in.md](docs/fan-in.md#phase-17)):
+
+- Measured from phase 16's build: 227 ns over (832 against 552 and 53).
+- Kept: no count of enters in progress (unload waits for the rings to close and for threads in the call anyway); `IORING_SQ_TASKRUN` on a `DEFER_TASKRUN` ring only with `IORING_SETUP_TASKRUN_FLAG`, as Linux; the taskwork loop without a second take of the ring's mutex. The armed `RECV` is 1.7% faster, 209 ns over; nothing else moved more than kqueue's own rows.
+- Dropped: the MAC check after the empty check, which slowed the single-shot batch at 1,024 connections by 6.5% with no more work; inline checks for calls that find nothing to do, which gained nothing; `IORING_SQ_TASKRUN` dropped on rings without `DEFER_TASKRUN`, which failed liburing's `poll-mshot-overflow`.
+- What is left is spread over the second enter (its system call about 35 ns beyond `getppid`, its own work 36), arming 31, the taskwork 28, the ring's mutex 20, the descriptors 15, the end-of-file knote 9 and disarming 8.
+
+Phase 17 is done on its second clause: 209 ns, not 150, and what stops it measured and written down.
 
 ## Research
 

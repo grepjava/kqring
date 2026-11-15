@@ -23,6 +23,8 @@
 
 ### Changed
 
+- A `RECV` that waits for its data costs 1–2% less, about 20 ns on the Ryzen: an enter no longer counts itself on a locked word of its CPU, the taskwork loop takes the ring's mutex once per request, and a `DEFER_TASKRUN` ring no longer raises `IORING_SQ_TASKRUN` (below). See [docs/fan-in.md](docs/fan-in.md#phase-17).
+- A `DEFER_TASKRUN` ring raises `IORING_SQ_TASKRUN` only if it was set up with `IORING_SETUP_TASKRUN_FLAG`, as on Linux; its completions wait for an enter with `IORING_ENTER_GETEVENTS` either way. Other rings still raise it whenever there is work to run, since kqring's kernel thread, not the submitter's return to user space, runs their completions.
 - Multishot receives at a thousand connections are 6–8% faster: a request's fields that an upcall and a receive touch now sit together, the upcall's in a line of their own, and a socket's only waiter is the upcall's argument, with no waiter list. At 1,024 AF_UNIX connections on the Ryzen, multishot fan-in on a `DEFER_TASKRUN` ring is 2% behind kqueue, from 11%, and 8% at 2,048, from 16%; a default ring is level at 1,024 and 9% ahead at 2,048. See [docs/fan-in.md](docs/fan-in.md#a-thousand-connections-again).
 - On a `SINGLE_ISSUER` ring another thread or process may now wait for completions, as on Linux, rather than fail with `EEXIST` when the CQ can't satisfy it yet; not on a `DEFER_TASKRUN` ring, as on Linux, nor in a polled wait on an `IOPOLL` ring.
 - A `DEFER_TASKRUN` ring's completions now wait for an enter with `IORING_ENTER_GETEVENTS`, as Linux runs its local work only then; an enter that only submitted used to post them. A `MSG_RING` to its own ring without `DEFER_TASKRUN` posts its CQE at once, before the request's own, as Linux.

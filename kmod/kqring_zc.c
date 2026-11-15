@@ -288,7 +288,7 @@ kqring_zc_rele(struct kqring_zc_notif *zc, bool in_issuer)
 				kqring_evfd_signal_locked(ctx);
 			STAILQ_INSERT_TAIL(&ctx->rcq, rcqe, link);
 			ctx->nrcq++;
-			atomic_set_32(&ctx->shm->sq_flags, IORING_SQ_TASKRUN);
+			kqring_taskrun_flag(ctx);
 			if (ctx->sleeping)
 				kqring_wakeup_locked(ctx);
 			if (ctx->sqpoll_waiting)

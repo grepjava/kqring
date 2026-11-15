@@ -1488,13 +1488,14 @@ kqring_setup_rings(struct kqring_ctx *ctx, struct kqring_setup_arg *uarg,
 	 * Reject every flag kqring does not implement, as io_uring_setup(2)
 	 * does, so that callers probing for a feature see EINVAL rather than a
 	 * silently different ring.  Completions always run as DEFER_TASKRUN
-	 * describes, in an enter (liburing enters when IORING_SQ_TASKRUN is
-	 * set).  Without SINGLE_ISSUER, any thread of the process may submit
+	 * describes, in an enter.  Without SINGLE_ISSUER, any thread of the process may submit
 	 * and wait (ctx->shared); DEFER_TASKRUN needs SINGLE_ISSUER, as in
 	 * io_uring.  Without DEFER_TASKRUN, COOP_TASKRUN lets a thread of
 	 * the process that completes a request run it as it returns to user
 	 * space, rather than the ring's kthread (kqring_ast_try());
-	 * TASKRUN_FLAG describes what kqring always does.  Without
+	 * IORING_SQ_TASKRUN is up while there is work to run: on a
+	 * DEFER_TASKRUN ring only with TASKRUN_FLAG, as on Linux, and on
+	 * others always (kqring_taskrun_flag()).  Without
 	 * SUBMIT_ALL, submission stops at an SQE that fails its checks
 	 * (kqring_submit_sqes()).
 	 */
@@ -2857,15 +2858,16 @@ kqring_sys_setup(struct thread *td, struct kqring_setup_args *uap)
 }
 
 /*
- * kqring_enter(2) calls in progress, by the CPU each started on.  A
- * module's system calls are counted in their sysent entry (sy_thrcnt) so
- * that unload can wait for them, but that is one atomic word every CPU
+ * A module's system calls are counted in their sysent entry (sy_thrcnt)
+ * so that unload can wait for them, but that is one atomic word every CPU
  * updates twice per call, and enter is the call threads make in a loop:
  * it stopped enter scaling past one thread.  So the enter entry is marked
- * SY_THR_STATIC while loaded, and counted here instead, on a word of the
- * CPU's own.
+ * SY_THR_STATIC while loaded, and not counted at all.  Unload doesn't
+ * need it: it waits for every open ring to close first, and a thread can
+ * only stay in kqring_sys_enter() on a ring it holds; one without a ring
+ * leaves at once, and kqring_sys_drain_threads() waits for each thread
+ * whose current system call is enter to return to user space.
  */
-DPCPU_DEFINE_STATIC(u_int, kqring_sys_busy);
 
 static int
 kqring_sys_enter(struct thread *td, struct kqring_enter_args *uap)
@@ -2878,12 +2880,10 @@ kqring_sys_enter(struct thread *td, struct kqring_enter_args *uap)
 		.argsz = uap->argsz,
 		.ring_fd = uap->fd,
 	};
-	u_int *busy = DPCPU_ID_PTR(PCPU_GET(cpuid), kqring_sys_busy);
 	struct kqring_ctx *ctx;
 	struct file *fp;
 	int error;
 
-	atomic_add_acq_int(busy, 1);
 	error = kqring_sys_ring(td, uap->fd,
 	    (uap->flags & IORING_ENTER_REGISTERED_RING) != 0, true, &fp, &ctx);
 	if (error == 0) {
@@ -2892,7 +2892,6 @@ kqring_sys_enter(struct thread *td, struct kqring_enter_args *uap)
 		/* SQE ops' kern_*() calls leave their results in td_retval. */
 		td->td_retval[0] = error == 0 ? ea.SUBMITTED_out : 0;
 	}
-	atomic_subtract_rel_int(busy, 1);
 	return (error);
 }
 
@@ -2965,11 +2964,11 @@ kqring_sys_register_all(void)
 {
 	for (int i = 0; i < KQRING_NSYS; i++) {
 		/*
-		 * Enter counts itself (kqring_sys_busy), so it is registered
-		 * SY_THR_STATIC: the slot goes from absent to static in one
-		 * store, and the kernel never counts a call to it.  (A
-		 * counted call can't be made static later: a thread may have
-		 * read it as counted and not yet counted itself.)
+		 * Enter isn't counted (see kqring_sys_enter()), so it is
+		 * registered SY_THR_STATIC: the slot goes from absent to
+		 * static in one store, and the kernel never counts a call to
+		 * it.  (A counted call can't be made static later: a thread
+		 * may have read it as counted and not yet counted itself.)
 		 */
 		kqring_sysnum[i] = NO_SYSCALL;
 		if (kern_syscall_register(sysent, &kqring_sysnum[i],
@@ -2983,8 +2982,8 @@ kqring_sys_register_all(void)
 
 /*
  * After deregistration a thread that took one of these calls' sysent
- * entries before can still be about to enter kqring's code, or just
- * leaving it, a few instructions outside kqring_sys_busy.  Such a thread's
+ * entries before can still be about to enter kqring's code, in it, or
+ * just leaving it, where enter isn't counted.  Such a thread's
  * current system call (td_sa.code) is that call until it next returns to
  * user space, through ast(), which clears td_ast.  So mark each thread
  * whose current call is one of ours with an AST (TDA_AST, which only makes
@@ -3303,7 +3302,6 @@ static int
 kqring_sys_deregister_all(void)
 {
 	int nums[KQRING_NSYS];
-	u_int cpu, n;
 
 	/*
 	 * Count enter calls in the sysent entry again, so that
@@ -3320,21 +3318,8 @@ kqring_sys_deregister_all(void)
 		kqring_sysnum[i] = NO_SYSCALL;
 	}
 	/*
-	 * Then wait out those that started uncounted.  No new one starts,
-	 * so each CPU's count only falls: one pass reading all zero means
-	 * none is left.
-	 */
-	do {
-		n = 0;
-		CPU_FOREACH(cpu)
-			n += atomic_load_acq_int(DPCPU_ID_PTR(cpu,
-			    kqring_sys_busy));
-		if (n != 0)
-			pause("kqsysdr", 1);
-	} while (n != 0);
-	/*
-	 * And for any thread between the sysent dispatch and its count, or
-	 * between the count and its return.
+	 * Then for those that started uncounted: no ring is open, so none
+	 * stays in enter (see kqring_sys_enter()).
 	 */
 	return (kqring_sys_drain_threads(nums));
 }

@@ -270,7 +270,7 @@ kqring_rcqe_queue(struct kqring_ctx *tctx, struct kqring_rcqe *rc)
 			kqring_evfd_signal_locked(tctx);
 		STAILQ_INSERT_TAIL(&tctx->rcq, rc, link);
 		tctx->nrcq++;
-		atomic_set_32(&tctx->shm->sq_flags, IORING_SQ_TASKRUN);
+		kqring_taskrun_flag(tctx);
 		/* The kthread posts it on a ring without DEFER_TASKRUN. */
 		if (tctx->sleeping)
 			kqring_wakeup_locked(tctx);

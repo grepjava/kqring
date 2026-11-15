@@ -717,9 +717,7 @@ kqring_wq_thread(void *arg)
 					op->in_taskwork = true;
 					kqring_tw_insert_locked(ctx, op);
 				}
-				if (ctx->shm != NULL)
-					atomic_set_32(&ctx->shm->sq_flags,
-					    IORING_SQ_TASKRUN);
+				kqring_taskrun_flag(ctx);
 				kqring_evfd_signal_locked(ctx);
 			} else if (!op->cancelled && !ctx->closing &&
 			    (op->wq_blocking || op->wq_wait_ready)) {

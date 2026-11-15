@@ -1,0 +1,35 @@
+08:13:47 loaded e3333c26 vmcores=8
+08:13:52 1.getppid 53.5
+08:13:57 1.nop1.defer 185.9
+08:14:03 1.recv.defer 557.7
+08:14:08 1.recv.def 571.7
+08:14:13 1.recvsys 349.0
+08:14:18 1.ppkq 539.8
+08:14:23 1.pp.defer 819.9
+08:14:29 1.pp.def 1084.4
+08:14:34 1.pp.coop 944.7
+08:14:39 2.getppid 53.5
+08:14:44 2.nop1.defer 182.1
+08:14:49 2.recv.defer 560.1
+08:14:55 2.recv.def 564.9
+08:15:00 2.recvsys 344.3
+08:15:05 2.ppkq 527.9
+08:15:10 2.pp.defer 833.0
+08:15:15 2.pp.def 1077.6
+08:15:21 2.pp.coop 949.7
+08:15:26 3.getppid 53.2
+08:15:31 3.nop1.defer 183.2
+08:15:36 3.recv.defer 548.7
+08:15:41 3.recv.def 571.6
+08:15:47 3.recvsys 348.5
+08:15:52 3.ppkq 536.9
+08:15:57 3.pp.defer 808.7
+08:16:02 3.pp.def 1091.6
+08:16:07 3.pp.coop 940.5
+08:16:11 pmc pp_kevent 530.5 ns; instr cyc:  24609698092 13081005283 
+08:16:14 pmc pp_ring_armed 808.0 ns; instr cyc:  23203670257 13086957415 
+08:16:17 pmc unix_recv_ring 553.6 ns; instr cyc:  23735569097 13078230991 
+08:16:31 profile pp_kevent TOTAL 39871 USER 7191 540.4 ns
+08:16:46 profile pp_ring_armed TOTAL 39871 USER 4840 821.9 ns
+08:17:00 profile unix_recv_ring TOTAL 39871 USER 4902 560.1 ns
+08:17:00 ALLDONE vmcores=8
