@@ -82,6 +82,7 @@
 #include <sys/refcount.h>
 #include <sys/resourcevar.h>
 #include <sys/signal.h>
+#include <sys/signalvar.h>
 #include <sys/stat.h>
 #include <sys/taskqueue.h>
 #include <sys/syscallsubr.h>
@@ -905,6 +906,13 @@ struct kqring_tctx {
 	uint32_t		ast_head;
 	u_int			ast_adds;
 	bool			ast_burst;
+	/*
+	 * The thread of its process that last submitted (enter, under
+	 * sq_sx): on a ring without SINGLE_ISSUER, only its return runs a
+	 * completion (kqring_ast_try(), under ctx->mtx: atomic loads and
+	 * stores).  Compared, never dereferenced.
+	 */
+	const struct thread	*submit_td;
 };
 
 /*
@@ -1526,9 +1534,15 @@ bool	kqring_ast_queue(struct kqring_ctx *ctx, struct kqring_tctx *t,
 /*
  * Taskwork the ring's kthread would run: leave it to curthread's return
  * to user space instead (kqring_ast_queue()), as io_uring runs a ring's
- * task_work in the task, when curthread is a user thread of the
- * request's process that may enter the ring, and isn't exiting or
- * exec'ing.  Only for the first request queued after a reap of the CQ:
+ * task_work in the task, when curthread is the thread of the request's
+ * process that submits to the ring (the owner of a SINGLE_ISSUER ring, or
+ * the last to submit, t->submit_td), and isn't exiting or exec'ing.
+ * io_uring runs task_work in the submitting task, interrupting it; a
+ * FreeBSD AST runs only when its own thread returns, and another thread
+ * that completed a request (by writing to its socket) may block in that
+ * write(2) after, for as long as the reader takes, with the CQE behind it:
+ * that thread's completions go to the kthread, which posts them at once.
+ * Only for the first request queued after a reap of the CQ:
  * a thread that writes on without reaping (fan-in) has the kthread run
  * the rest on another CPU, many to a wake-up, where its own returns would
  * run them one at a time.  On a default ring, not even the first if the
@@ -1557,7 +1571,8 @@ kqring_ast_try(struct kqring_ctx *ctx, struct kqring_tctx *t)
 	if (td->td_proc != t->proc || t->dead ||
 	    (td->td_pflags & TDP_KTHREAD) != 0 ||
 	    (td->td_proc->p_flag & (P_WEXIT | P_INEXEC)) != 0 ||
-	    (!ctx->shared && !kqring_is_owner(ctx, td)))
+	    (ctx->shared ? td != atomic_load_ptr(&t->submit_td) :
+	    !kqring_is_owner(ctx, td)))
 		return (false);
 	return (kqring_ast_queue(ctx, t, td));
 }
@@ -1607,8 +1622,18 @@ kqring_taskwork_add_common(struct kqring_ctx *ctx, struct kqring_op *op,
 	 * re-checks its taskwork under ctx->mtx before sleeping, so
 	 * skipping wakeup() (sleepq lookup) here cannot lose a wakeup.
 	 */
-	if (ctx->sleeping == 0)
+	if (ctx->sleeping == 0) {
+		/*
+		 * Nobody asleep: the ring's kthread is running and takes this
+		 * in its loop.  The submitting thread's return still runs
+		 * what is left (kqring_ast_try()), under sq_sx, so after the
+		 * kthread if it has begun: its CQE is posted by the time its
+		 * call returns, as io_uring runs task_work before the task
+		 * goes back to user space, whichever of the two gets it.
+		 */
+		(void)kqring_ast_try(ctx, op->tctx);
 		return (false);
+	}
 	/*
 	 * A thread of op's process asleep in an enter runs its taskwork when
 	 * woken, as io_uring runs a default ring's task_work in the task:
@@ -1633,8 +1658,9 @@ kqring_taskwork_add_common(struct kqring_ctx *ctx, struct kqring_op *op,
 		return (true);
 	if (ctx->sleeping != ctx->task_sleeping)
 		wakeup(&ctx->wakeup_chan);
-	if (ctx->task_sleeping != 0 && !runner &&
-	    !kqring_ast_try(ctx, op->tctx))
+	/* As above when the kthread is awake: the return runs what is left. */
+	if (!runner && !kqring_ast_try(ctx, op->tctx) &&
+	    ctx->task_sleeping != 0)
 		wakeup(&ctx->task_chan);
 	return (false);
 }

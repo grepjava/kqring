@@ -1,0 +1,42 @@
+09:17:57 loaded a59491ce vmcores=8
+09:17:57 1 twlat default ring, spin, 200 rounds, 1048576-byte writes: CQE after 10.8 us (p90 11.7, p99 22.0, max 24.9); writes full 200, short 0, failed 0
+09:17:57 1 twlat default ring, poll, 200 rounds, 1048576-byte writes: CQE after 9.4 us (p90 12.2, p99 20.2, max 23.4); writes full 200, short 0, failed 0
+09:17:57 1 twlat default ring, enter, 200 rounds, 1048576-byte writes: CQE after 8.3 us (p90 8.7, p99 17.8, max 20.4); writes full 200, short 0, failed 0
+09:17:57 1 twlat coop ring, spin, 200 rounds, 1048576-byte writes: CQE after 7.9 us (p90 10.2, p99 21.0, max 26.6); writes full 200, short 0, failed 0
+09:17:57 1 twlat coop ring, poll, 200 rounds, 1048576-byte writes: CQE after 11.0 us (p90 12.1, p99 31.5, max 40.1); writes full 200, short 0, failed 0
+09:17:57 1 twlat coop ring, enter, 200 rounds, 1048576-byte writes: CQE after 8.4 us (p90 8.8, p99 16.4, max 18.7); writes full 200, short 0, failed 0
+09:17:57 1 twlat defer ring, enter, 200 rounds, 1048576-byte writes: CQE after 8.2 us (p90 8.9, p99 19.9, max 23.3); writes full 200, short 0, failed 0
+09:17:57 1 twlat default ring, self-spin, 200 rounds, 1048576-byte writes: CQE after 8.6 us (p90 11.7, p99 24.7, max 36.0); writes full 0, short 200, failed 0
+09:17:57 1 twlat default ring, self-poll, 200 rounds, 1048576-byte writes: CQE after 11.6 us (p90 14.6, p99 30.3, max 32.8); writes full 0, short 200, failed 0
+09:17:57 1 twlat default ring, self-enter, 200 rounds, 1048576-byte writes: CQE after 8.1 us (p90 8.5, p99 19.2, max 20.8); writes full 200, short 0, failed 0
+09:17:57 1 twlat coop ring, self-spin, 200 rounds, 1048576-byte writes: CQE after 8.6 us (p90 11.8, p99 28.0, max 30.8); writes full 0, short 200, failed 0
+09:17:57 1 twlat coop ring, self-poll, 200 rounds, 1048576-byte writes: CQE after 11.8 us (p90 14.9, p99 32.7, max 34.0); writes full 0, short 200, failed 0
+09:17:57 1 twlat coop ring, self-enter, 200 rounds, 1048576-byte writes: CQE after 8.0 us (p90 8.6, p99 17.7, max 19.3); writes full 200, short 0, failed 0
+09:17:57 2 twlat default ring, spin, 200 rounds, 1048576-byte writes: CQE after 8.0 us (p90 11.0, p99 19.8, max 32.6); writes full 200, short 0, failed 0
+09:17:57 2 twlat default ring, poll, 200 rounds, 1048576-byte writes: CQE after 8.6 us (p90 11.4, p99 20.2, max 24.2); writes full 200, short 0, failed 0
+09:17:57 2 twlat default ring, enter, 200 rounds, 1048576-byte writes: CQE after 8.3 us (p90 8.7, p99 17.5, max 18.6); writes full 200, short 0, failed 0
+09:17:57 2 twlat coop ring, spin, 200 rounds, 1048576-byte writes: CQE after 7.4 us (p90 10.0, p99 17.4, max 31.2); writes full 200, short 0, failed 0
+09:17:57 2 twlat coop ring, poll, 200 rounds, 1048576-byte writes: CQE after 8.6 us (p90 11.3, p99 22.1, max 23.5); writes full 200, short 0, failed 0
+09:17:57 2 twlat coop ring, enter, 200 rounds, 1048576-byte writes: CQE after 8.3 us (p90 9.0, p99 19.0, max 19.6); writes full 200, short 0, failed 0
+09:17:57 2 twlat defer ring, enter, 200 rounds, 1048576-byte writes: CQE after 8.2 us (p90 8.7, p99 16.6, max 19.4); writes full 200, short 0, failed 0
+09:17:57 2 twlat default ring, self-spin, 200 rounds, 1048576-byte writes: CQE after 8.6 us (p90 11.9, p99 29.6, max 32.5); writes full 0, short 200, failed 0
+09:17:57 2 twlat default ring, self-poll, 200 rounds, 1048576-byte writes: CQE after 11.8 us (p90 17.3, p99 28.5, max 29.3); writes full 0, short 200, failed 0
+09:17:57 2 twlat default ring, self-enter, 200 rounds, 1048576-byte writes: CQE after 8.0 us (p90 9.0, p99 17.7, max 19.2); writes full 200, short 0, failed 0
+09:17:57 2 twlat coop ring, self-spin, 200 rounds, 1048576-byte writes: CQE after 8.5 us (p90 11.8, p99 25.4, max 35.7); writes full 0, short 200, failed 0
+09:17:57 2 twlat coop ring, self-poll, 200 rounds, 1048576-byte writes: CQE after 12.1 us (p90 15.0, p99 29.2, max 31.7); writes full 0, short 200, failed 0
+09:17:57 2 twlat coop ring, self-enter, 200 rounds, 1048576-byte writes: CQE after 8.0 us (p90 9.4, p99 18.5, max 18.6); writes full 200, short 0, failed 0
+09:17:58 3 twlat default ring, spin, 200 rounds, 1048576-byte writes: CQE after 7.8 us (p90 9.0, p99 20.5, max 34.0); writes full 200, short 0, failed 0
+09:17:58 3 twlat default ring, poll, 200 rounds, 1048576-byte writes: CQE after 9.0 us (p90 13.0, p99 26.8, max 29.1); writes full 200, short 0, failed 0
+09:17:58 3 twlat default ring, enter, 200 rounds, 1048576-byte writes: CQE after 8.3 us (p90 8.8, p99 19.9, max 22.1); writes full 200, short 0, failed 0
+09:17:58 3 twlat coop ring, spin, 200 rounds, 1048576-byte writes: CQE after 7.4 us (p90 7.7, p99 14.7, max 18.8); writes full 200, short 0, failed 0
+09:17:58 3 twlat coop ring, poll, 200 rounds, 1048576-byte writes: CQE after 8.7 us (p90 10.9, p99 22.3, max 23.3); writes full 200, short 0, failed 0
+09:17:58 3 twlat coop ring, enter, 200 rounds, 1048576-byte writes: CQE after 8.3 us (p90 9.2, p99 23.0, max 28.4); writes full 200, short 0, failed 0
+09:17:58 3 twlat defer ring, enter, 200 rounds, 1048576-byte writes: CQE after 8.1 us (p90 8.6, p99 17.1, max 19.2); writes full 200, short 0, failed 0
+09:17:58 3 twlat default ring, self-spin, 200 rounds, 1048576-byte writes: CQE after 8.6 us (p90 11.8, p99 24.5, max 26.4); writes full 0, short 200, failed 0
+09:17:58 3 twlat default ring, self-poll, 200 rounds, 1048576-byte writes: CQE after 11.5 us (p90 14.8, p99 36.5, max 38.3); writes full 0, short 200, failed 0
+09:17:58 3 twlat default ring, self-enter, 200 rounds, 1048576-byte writes: CQE after 8.1 us (p90 8.7, p99 18.6, max 19.6); writes full 200, short 0, failed 0
+09:17:58 3 twlat coop ring, self-spin, 200 rounds, 1048576-byte writes: CQE after 8.5 us (p90 11.4, p99 27.6, max 33.2); writes full 0, short 200, failed 0
+09:17:58 3 twlat coop ring, self-poll, 200 rounds, 1048576-byte writes: CQE after 11.7 us (p90 14.8, p99 28.4, max 29.4); writes full 0, short 200, failed 0
+09:17:58 3 twlat coop ring, self-enter, 200 rounds, 1048576-byte writes: CQE after 8.1 us (p90 8.5, p99 14.2, max 18.6); writes full 200, short 0, failed 0
+09:17:58 p18 rc=0 [PASS] default ring: a waiter runs its taskwork; one interrupted, a cancelled worker and M|[PASS] A completion left to a blocked writer's return reaches the kthread| [OK]: 0 failure(s)
+09:17:58 ALLDONE vmcores=8

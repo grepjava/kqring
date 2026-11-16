@@ -41,6 +41,8 @@
  *  - a CQ ring that holds more entries than it has room for;
  *  - SIGBUS or SIGSEGV in the fuzzer, which says where and dies;
  *  - its log descriptors no longer being its log, which would hide the rest;
+ *  - its counters going back, which means its own memory changed (with
+ *    KQFUZZ_STOP_ON_RESET set it stops itself there, to be looked at);
  *  - writes to a file out of order: each thread appends bursts of numbered
  *    records to a file of its own (not on IOPOLL rings, not behind a link,
  *    not on rings whose SQ array it scrambles),
@@ -2742,7 +2744,7 @@ main(int argc, char **argv)
 	pthread_t tw;
 	struct sigaction sa;
 	long socks0, wired0, mem0, inline0;
-	uint64_t t0, last = 0;
+	uint64_t t0, last = 0, seen_sqes = 0, seen_forks = 0;
 	char cmd[128];
 	int ch, rc = 0;
 
@@ -2867,6 +2869,30 @@ main(int argc, char **argv)
 			    (uintmax_t)st_regs, (uintmax_t)st_cqes,
 			    (uintmax_t)st_chaos, (uintmax_t)st_forks,
 			    (uintmax_t)st_kicks);
+			/*
+			 * The counters only grow.  Going back means their
+			 * page of .bss changed under us (it was found zeroed
+			 * once, mid-run, in runs over 1000 s): fail here
+			 * rather than run on with ring_fds and fzs[] gone.
+			 * KQFUZZ_STOP_ON_RESET stops the process instead, to
+			 * be looked at.
+			 */
+			if (st_sqes < seen_sqes || st_forks < seen_forks) {
+				dprintf(ERR_FD, "kqring_fuzz: FAIL: counters "
+				    "went back (sqes %ju to %ju, forks %ju to "
+				    "%ju): this process's memory changed "
+				    "(seed %ju)\n", (uintmax_t)seen_sqes,
+				    (uintmax_t)st_sqes, (uintmax_t)seen_forks,
+				    (uintmax_t)st_forks, (uintmax_t)seed);
+				snprintf(cmd, sizeof(cmd), "procstat -v %d >&%d",
+				    getpid(), ERR_FD);
+				(void)system(cmd);
+				if (getenv("KQFUZZ_STOP_ON_RESET") != NULL)
+					(void)kill(getpid(), SIGSTOP);
+				_exit(5);
+			}
+			seen_sqes = st_sqes;
+			seen_forks = st_forks;
 			last = now;
 		}
 		usleep(100000);

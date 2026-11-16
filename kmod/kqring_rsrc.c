@@ -402,6 +402,22 @@ kqring_rsrc_file(struct file *fp, struct filecaps *caps, uint64_t tag)
  * ============================================================================
  */
 
+/*
+ * Files a fixed table refuses (EBADF).  A ring: one held in a ring's table
+ * (its own, or in a cycle) would never be closed, as io_uring found.  A
+ * kqueue: FreeBSD keeps one to its process (it can't be passed over a
+ * socket, nor is it inherited on fork), since kqueue_close() takes the
+ * descriptor table it was made on, which it holds no reference to.  A
+ * ring's table can outlive that process, held by another process or torn
+ * down after exit freed the table, and the kqueue closed from it would
+ * take a freed table's lock (a panic kqring_fuzz found).
+ */
+static bool
+kqring_fixed_refused(const struct file *fp)
+{
+	return (kqring_fp_is_ring(fp) || fp->f_type == DTYPE_KQUEUE);
+}
+
 
 
 /* A free slot for IORING_FILE_INDEX_ALLOC, searched from the hint. */
@@ -443,11 +459,8 @@ kqring_fixed_install(struct kqring_ctx *ctx, struct file *fp,
 		res = file_index == IORING_FILE_INDEX_ALLOC ? -ENFILE : -ENXIO;
 		goto fail;
 	}
-	/*
-	 * A ring held in a ring's table (its own, or in a cycle) would never
-	 * be closed, as io_uring found; nothing is gained by allowing it.
-	 */
-	if (kqring_fp_is_ring(fp)) {
+	/* Rings and kqueues: see kqring_fixed_refused(). */
+	if (kqring_fixed_refused(fp)) {
 		res = -EBADF;
 		goto fail;
 	}
@@ -500,7 +513,7 @@ kqring_files_set(struct kqring_ctx *ctx, uint32_t slot, int fd,
 		return (0);
 	if (fget_cap(td, fd, &cap_no_rights, NULL, &fp, &caps) != 0)
 		return (EBADF);
-	if (kqring_fp_is_ring(fp)) {
+	if (kqring_fixed_refused(fp)) {
 		filecaps_free(&caps);
 		fdrop(fp, td);
 		return (EBADF);

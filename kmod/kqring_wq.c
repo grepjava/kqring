@@ -1359,6 +1359,7 @@ kqring_sqpoll_thread(void *arg)
 	}
 
 	last_active = getsbinuptime();
+	sbintime_t busy_since = 0;	/* busy without a break since; 0: idle */
 	for (;;) {
 		if (kqring_kthread_check_suspend(ctx))
 			break;
@@ -1392,6 +1393,29 @@ kqring_sqpoll_thread(void *arg)
 		    ctx->nocq != ocq_before;
 		sx_xunlock(&ctx->sq_sx);
 
+		/*
+		 * Passes without a sleep for over a tick: step aside for 50 us
+		 * before taking sq_sx again, so that the ring's other users get
+		 * it (an enter, a registration, fork(2)'s re-hold of registered
+		 * buffers).  This loop releases it after every pass, but takes
+		 * it back at once, and an sx lock doesn't queue the threads that
+		 * spin for it: with work that never stops (a trigger whose event
+		 * its chain never consumes, posting a CQE or not) they spun for
+		 * good and the whole process stopped (kqring_fuzz).  As
+		 * io_uring's SQPOLL thread lets go of its lock when asked to
+		 * park.  Only a sleep or an idle spin below starts it over.
+		 */
+		{
+			sbintime_t now = getsbinuptime();
+
+			if (busy_since == 0) {
+				busy_since = now;
+			} else if (now - busy_since > tick_sbt) {
+				pause_sbt("kqbusy", 50 * SBT_1US, 0, C_PREL(1));
+				busy_since = getsbinuptime();
+			}
+		}
+
 		if (did_work) {
 			last_active = getsbinuptime();
 			if (ctx->sqpoll_waiting) {
@@ -1424,11 +1448,14 @@ kqring_sqpoll_thread(void *arg)
 			(void)kqring_wq_abort_retired_locked(ctx);
 		if ((!taskrun && atomic_load_acq_32(&shm->sq_tail) !=
 		    shm->sq_head) || !TAILQ_EMPTY(tw) ||
-		    !KQRING_STQ_EMPTY_HINT(&ctx->rcq)) {
+		    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) ||
+		    !TAILQ_EMPTY(&ctx->trig_work)) {
 			mtx_unlock(&ctx->mtx);
 			continue;
 		}
 
+		/* Nothing pending: what follows idles or sleeps. */
+		busy_since = 0;
 		sbintime_t now = getsbinuptime();
 		sbintime_t elapsed = now - last_active;
 		if (elapsed < ctx->sqpoll_idle_sbt && !taskrun) {
@@ -1446,6 +1473,7 @@ kqring_sqpoll_thread(void *arg)
 				if (atomic_load_acq_32(&shm->sq_tail) !=
 				    shm->sq_head ||
 				    !TAILQ_EMPTY(tw) ||
+				    !TAILQ_EMPTY(&ctx->trig_work) ||
 				    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) || ctx->closing ||
 				    tctx->dead || kqring_wq_suspend_pending())
 					break;
@@ -1469,7 +1497,7 @@ kqring_sqpoll_thread(void *arg)
 		if (!taskrun) {
 			atomic_set_32(&shm->sq_flags, IORING_SQ_NEED_WAKEUP);
 			if (atomic_load_acq_32(&shm->sq_tail) != shm->sq_head ||
-			    !TAILQ_EMPTY(tw) ||
+			    !TAILQ_EMPTY(tw) || !TAILQ_EMPTY(&ctx->trig_work) ||
 			    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) || ctx->closing ||
 			    tctx->dead) {
 				atomic_clear_32(&shm->sq_flags,

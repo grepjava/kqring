@@ -5387,6 +5387,24 @@ test_fixed_files(void)
 	up = (struct io_uring_files_update){ .offset = 3,
 	    .fds = (uint64_t)(uintptr_t)one };
 	assert(reg(&t, IORING_REGISTER_FILES_UPDATE, &up, 1) == -EBADF);
+	/*
+	 * Nor can a kqueue: FreeBSD keeps one to its process, and a table
+	 * can outlive it (closing the kqueue from it then would take its
+	 * process's freed descriptor table).
+	 */
+	int kqfd = kqueue();
+	assert(kqfd >= 0);
+	one[0] = kqfd;
+	assert(reg(&t, IORING_REGISTER_FILES_UPDATE, &up, 1) == -EBADF);
+	{
+		struct test_ring tk;
+		int kfds[2] = { sv[0], kqfd };
+
+		ring_init(&tk);
+		assert(reg(&tk, IORING_REGISTER_FILES, kfds, 2) == -EBADF);
+		close(tk.fd);
+	}
+	close(kqfd);
 	/* Update: empty slot 0, leave slot 1, put sv[1] in slot 3. */
 	int ufds[4] = { -1, IORING_REGISTER_FILES_SKIP,
 	    IORING_REGISTER_FILES_SKIP, sv[1] };
@@ -13214,6 +13232,201 @@ test_tw_blocking_writer(void)
 		    "return reaches the kthread\n");
 }
 
+struct tw_wake_arg {
+	struct test_ring	*t;
+	int			sv[2], pfd[2];
+	bool			self;	/* submit the RECV, then write */
+	size_t			len;
+	_Atomic uint64_t	t0;
+	_Atomic int		done;
+	ssize_t			ret;
+	int			err;
+};
+
+static char tw_wake_rbuf[64];
+
+static int
+cmp_u64(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return (x < y ? -1 : x > y);
+}
+
+static void *
+tw_wake_writer(void *arg)
+{
+	struct tw_wake_arg *a = arg;
+	static char big[1 << 20];
+	struct io_uring_sqe *sqe;
+
+	if (a->self) {
+		sqe = ring_prep(a->t, IORING_OP_RECV, a->sv[0], 79100);
+		sqe->addr = (uint64_t)(uintptr_t)tw_wake_rbuf;
+		sqe->len = sizeof(tw_wake_rbuf);
+		ring_push_sqe(a->t);
+		ring_submit(a->t);
+	}
+	atomic_store(&a->t0, now_ns());
+	a->ret = write(a->sv[1], big, a->len);
+	a->err = a->ret < 0 ? errno : 0;
+	if (a->pfd[0] >= 0 && a->ret > 0) {
+		char c;
+
+		/* Its next blocking call must not be interrupted. */
+		a->ret = read(a->pfd[0], &c, 1);
+		a->err = a->ret < 0 ? errno : 0;
+	}
+	atomic_store(&a->done, 1);
+	return (NULL);
+}
+
+/*
+ * How soon a completion made by a thread whose call then blocks reaches a
+ * thread spinning on the CQ, as io_uring's task work (which goes to the
+ * submitting task, interrupting it) has it there in microseconds:
+ *  - another thread completes the RECV: its completion goes to the ring's
+ *    kthread, and its 1 MiB write(2) completes whole;
+ *  - the thread that submitted the RECV writes: its write is interrupted
+ *    and returns short, as on Linux, and its return posts the CQE;
+ *  - the submitting thread completes the RECV with a write(2) that doesn't
+ *    block: the interruption, unused, is cleared as the write returns, and
+ *    its next blocking call, a read(2) that waits 30 ms, gets its byte,
+ *    not EINTR.
+ * Before, all but the last took the watcher's one or two ticks (about 2
+ * ms at hz=1000).  The medians are bounded at 500 us, far above the ~10 us
+ * expected and far below 2 ms.  Default and COOP_TASKRUN rings.
+ */
+static void
+test_tw_wake(void)
+{
+	enum { ROUNDS = 30 };
+	int f0 = failures;
+
+	for (int kind = 0; kind < 2; kind++) {
+		for (int mode = 0; mode < 3; mode++) {
+			const char *what = mode == 0 ? "another thread's" :
+			    mode == 1 ? "the submitter's" :
+			    "the submitter's unblocked";
+			struct io_uring_params p;
+			struct io_uring_sqe *sqe;
+			struct io_uring_cqe c;
+			struct test_ring t;
+			uint64_t lat[ROUNDS];
+			static char drain[65536];
+			int nshort = 0;
+
+			memset(&p, 0, sizeof(p));
+			p.flags = IORING_SETUP_CQSIZE |
+			    (kind == 1 ? IORING_SETUP_COOP_TASKRUN : 0);
+			p.cq_entries = CQ_ENTRIES;
+			memset(&t, 0, sizeof(t));
+			t.fd = (int)kqring_setup(SQ_ENTRIES, &p);
+			assert(t.fd >= 0);
+			ring_map(&t, &p);
+			for (int i = 0; i < ROUNDS; i++) {
+				struct tw_wake_arg a = { .t = &t,
+				    .self = mode != 0,
+				    .len = mode == 2 ? 64 : 1 << 20,
+				    .pfd = { -1, -1 } };
+				pthread_t th;
+				size_t got = 0;
+				uint64_t deadline;
+
+				assert(socketpair(AF_UNIX, SOCK_STREAM, 0,
+				    a.sv) == 0);
+				if (mode == 2)
+					assert(pipe(a.pfd) == 0);
+				if (mode == 0) {
+					sqe = ring_prep(&t, IORING_OP_RECV,
+					    a.sv[0], 79100);
+					sqe->addr =
+					    (uint64_t)(uintptr_t)tw_wake_rbuf;
+					sqe->len = sizeof(tw_wake_rbuf);
+					ring_push_sqe(&t);
+					ring_submit(&t);
+				}
+				assert(pthread_create(&th, NULL,
+				    tw_wake_writer, &a) == 0);
+				deadline = now_ns() + 2000000000ULL;
+				while (ring_cq_ready(&t) == 0 &&
+				    now_ns() < deadline)
+					;
+				lat[i] = now_ns() - atomic_load(&a.t0);
+				assert(ring_cq_ready(&t) == 1);
+				c = ring_pop_cqe(&t);
+				assert(c.user_data == 79100 &&
+				    c.res == (int)sizeof(tw_wake_rbuf));
+				if (mode == 2) {
+					usleep(30000);
+					assert(write(a.pfd[1], "p", 1) == 1);
+				}
+				/* Read the rest, so that the write ends. */
+				while (!atomic_load(&a.done) || got +
+				    sizeof(tw_wake_rbuf) < (size_t)(mode == 2 ?
+				    64 : (a.ret > 0 ? a.ret : 0))) {
+					ssize_t n = recv(a.sv[0], drain,
+					    sizeof(drain), MSG_DONTWAIT);
+
+					if (n > 0)
+						got += (size_t)n;
+					else
+						assert(n < 0 &&
+						    errno == EAGAIN);
+					if (atomic_load(&a.done) &&
+					    mode == 1 && a.ret > 0 &&
+					    got + sizeof(tw_wake_rbuf) >=
+					    (size_t)a.ret)
+						break;
+				}
+				assert(pthread_join(th, NULL) == 0);
+				if (mode == 2 && a.ret != 1) {
+					printf("[FAIL] %s ring: read(2) after "
+					    "an unblocked write: %zd (%s)\n",
+					    kind ? "COOP" : "default", a.ret,
+					    strerror(a.err));
+					failures++;
+				}
+				if (mode == 0 && a.ret != 1 << 20) {
+					printf("[FAIL] %s ring: another "
+					    "thread's write returned %zd\n",
+					    kind ? "COOP" : "default", a.ret);
+					failures++;
+				}
+				if (mode == 1) {
+					assert(a.ret > 0);
+					nshort += a.ret < (1 << 20);
+				}
+				close(a.sv[0]);
+				close(a.sv[1]);
+				if (mode == 2) {
+					close(a.pfd[0]);
+					close(a.pfd[1]);
+				}
+			}
+			close(t.fd);
+			qsort(lat, ROUNDS, sizeof(lat[0]), cmp_u64);
+			if (mode != 2 && lat[ROUNDS / 2] > 500000) {
+				printf("[FAIL] %s ring: %s blocked write "
+				    "left its CQE %ju us (median)\n",
+				    kind ? "COOP" : "default", what,
+				    (uintmax_t)(lat[ROUNDS / 2] / 1000));
+				failures++;
+			}
+			if (mode == 1 && nshort == 0) {
+				printf("[FAIL] %s ring: the submitter's "
+				    "write was never interrupted\n",
+				    kind ? "COOP" : "default");
+				failures++;
+			}
+		}
+	}
+	if (failures == f0)
+		printf("[PASS] A blocked completer's CQE in microseconds: "
+		    "another thread's via the kthread, the submitter's by "
+		    "interrupting its write; no stray EINTR\n");
+}
+
 struct tw_handoff_arg {
 	int		fd;
 	_Atomic int	asleep;
@@ -13362,10 +13575,13 @@ test_default_ring_waiter_handoff(void)
 	close(t2.fd);
 
 	/*
-	 * 4. COOP_TASKRUN (t has it): a write(2) by a thread of the process
+	 * 4. COOP_TASKRUN (t has it): a write(2) by the thread that submits
 	 * runs the receive it completes as it returns, as io_uring's
-	 * task_work does, so the CQE is there when write(2) returns; from
-	 * another thread of the process, when that thread's has.
+	 * task_work does, so the CQE is there when write(2) returns.  From
+	 * another thread of the process, the ring's kthread posts it, at
+	 * once but not necessarily before that thread has been joined (since
+	 * phase 20: io_uring gives it to the submitting task, and that
+	 * thread's call may block after it).
 	 */
 	for (int round = 0; round < 100; round++) {
 		pthread_t wt;
@@ -13382,8 +13598,23 @@ test_default_ring_waiter_handoff(void)
 			assert(pthread_create(&wt, NULL, tw_coop_writer,
 			    &sv[1]) == 0);
 			assert(pthread_join(wt, NULL) == 0);
+			deadline = now_ns() + 100000000ULL;
+			while (ring_cq_ready(&t) == 0)
+				assert(now_ns() < deadline);
 		}
-		assert(ring_cq_ready(&t) == 1);
+		if (ring_cq_ready(&t) != 1) {
+			unsigned nr = ring_cq_ready(&t);
+
+			fprintf(stderr, "waiter_handoff part 4 round %d: %u "
+			    "CQEs:", round, nr);
+			for (unsigned k = 0; k < nr; k++) {
+				c = ring_pop_cqe(&t);
+				fprintf(stderr, " (%ju, %d)",
+				    (uintmax_t)c.user_data, c.res);
+			}
+			fprintf(stderr, "\n");
+			abort();
+		}
 		c = ring_pop_cqe(&t);
 		assert(c.user_data == 78400 + (uint64_t)round && c.res == 4);
 	}
@@ -13564,6 +13795,208 @@ test_trigger_optin(struct test_ring *plain)
 	close(r.fd);
 	printf("[PASS] EXT_SETUP: opt-in once, never an io_uring opcode; "
 	    "escape opcode unknown without it\n");
+}
+
+struct busy_reap_arg {
+	struct test_ring	*r;
+	_Atomic int		stop;
+};
+
+/* Enter and reap, as a busy thread would: the CQ never fills. */
+static void *
+busy_reaper(void *arg)
+{
+	struct busy_reap_arg *a = arg;
+
+	while (!atomic_load(&a->stop)) {
+		(void)kqring_enter(a->r->fd, 0, 0, IORING_ENTER_GETEVENTS,
+		    NULL, 0);
+		while (ring_cq_ready(a->r) > 0)
+			(void)ring_pop_cqe(a->r);
+	}
+	return (NULL);
+}
+
+/*
+ * A trigger whose event its chain never consumes fires for good (a pipe
+ * left readable, its chain a NOP; a thread entering the ring and reaping
+ * its CQEs, so that the CQ never fills and ends it), keeping the ring's
+ * kernel thread busy.  The rest of the process must still get the ring: a
+ * registration and fork(2), which re-holds the ring's registered buffers,
+ * both take sq_sx.  The kernel thread let it go after each pass but took
+ * it back at once, and the threads spinning for it never won it (the
+ * whole of kqring_fuzz stopped).  Run in a child, which the parent kills
+ * if it stalls.
+ */
+static void
+test_trigger_busy_fair(void)
+{
+	pid_t pid = fork();
+	int st;
+
+	assert(pid >= 0);
+	if (pid == 0) {
+		struct kqring_trigger t = { .nsteps = 1 };
+		static char rbuf[4096];
+		struct iovec iov = { rbuf, sizeof(rbuf) };
+		struct test_ring r;
+		uint64_t t0, t1, t2;
+		int p[2];
+		pid_t gc;
+
+		trig_ring(&r);
+		if (pipe2(p, O_NONBLOCK) != 0 || write(p[1], "x", 1) != 1)
+			_exit(2);
+		if (kqring_register(r.fd, IORING_REGISTER_BUFFERS, &iov, 1) != 0)
+			_exit(3);
+		trig_prep(&r, p[0], POLLIN, 7100, &t);
+		ring_push_sqe(&r);
+		(void)ring_prep(&r, IORING_OP_NOP, -1, 7101);
+		ring_push_sqe(&r);
+		ring_submit(&r);
+		struct busy_reap_arg ra = { .r = &r };
+		pthread_t rt;
+		if (pthread_create(&rt, NULL, busy_reaper, &ra) != 0)
+			_exit(7);
+		struct rusage ru0, ru1;
+		assert(getrusage(RUSAGE_SELF, &ru0) == 0);
+		usleep(200000);		/* it fires all the while */
+		assert(getrusage(RUSAGE_SELF, &ru1) == 0);
+		fprintf(stderr, "busy trigger: %ld ms of system time in 200\n",
+		    (long)((ru1.ru_stime.tv_sec - ru0.ru_stime.tv_sec) * 1000 +
+		    (ru1.ru_stime.tv_usec - ru0.ru_stime.tv_usec) / 1000));
+		t0 = now_ns();
+		if (kqring_register(r.fd, IORING_REGISTER_PROBE, NULL, 0) ==
+		    -1 && errno != EINVAL && errno != EFAULT)
+			_exit(4);
+		t1 = now_ns();
+		if ((gc = fork()) == 0)
+			_exit(0);
+		if (gc < 0 || waitpid(gc, &st, 0) != gc)
+			_exit(5);
+		t2 = now_ns();
+		fprintf(stderr, "busy trigger: register %ju us, fork %ju us\n",
+		    (uintmax_t)((t1 - t0) / 1000), (uintmax_t)((t2 - t1) / 1000));
+		if (t1 - t0 > 500000000ULL || t2 - t1 > 500000000ULL)
+			_exit(6);
+		atomic_store(&ra.stop, 1);
+		(void)pthread_join(rt, NULL);
+		trig_cancel(&r, 7100);
+		close(r.fd);
+		_exit(0);
+	}
+	for (int ms = 0; ms < 10000; ms += 10) {
+		if (waitpid(pid, &st, WNOHANG) == pid) {
+			if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+				printf("[PASS] A trigger that never stops leaves "
+				    "the ring to its process: registration and "
+				    "fork(2) take it within 500 ms\n");
+				return;
+			}
+			printf("[FAIL] busy trigger: child status %#x\n", st);
+			failures++;
+			return;
+		}
+		usleep(10000);
+	}
+	(void)kill(pid, SIGKILL);
+	printf("[FAIL] busy trigger: the process stalled for 10 s\n");
+	failures++;
+}
+
+static void
+trig_sig_noop(int sig)
+{
+	(void)sig;
+}
+
+/*
+ * A trigger whose event stays pending and whose chain posts nothing (a
+ * NOP with IOSQE_CQE_SKIP_SUCCESS on a readable socket) gives a wait for a
+ * CQE work to drain every round and never a reason to sleep.  The wait
+ * must still end on a signal: it looked for one only in a sleep, and the
+ * thread spun in the kernel, deaf even to SIGKILL (kqring_fuzz, one CPU
+ * for good and a reboot).  For the suite's two kinds of ring, in a child
+ * the parent gives 10 s.
+ */
+static void
+test_trigger_wait_signal(void)
+{
+	for (int shared = 0; shared < 2; shared++) {
+		pid_t pid = fork();
+		int st;
+
+		assert(pid >= 0);
+		if (pid == 0) {
+			struct kqring_trigger t = { .nsteps = 1 };
+			struct sigaction sa = { .sa_handler = trig_sig_noop };
+			struct itimerval it = { .it_value = { 0, 200000 } };
+			struct test_ring r;
+			uint64_t t0;
+			int p[2], rc;
+			/*
+			 * Not the test's output: a child stuck in the kernel
+			 * would hold it open, and a pipeline reading it would
+			 * never end.  The exit status tells the parent.
+			 */
+			int dn = open("/dev/null", O_WRONLY);
+
+			if (dn < 0 || dup2(dn, 1) < 0 || dup2(dn, 2) < 0)
+				_exit(9);
+			ring_setup_shared = shared != 0;
+			trig_ring(&r);
+			/*
+			 * A socket: already readable, even the IOSQE_ASYNC
+			 * re-arm of every KQRING_TRIG_BURST-th run completes
+			 * through the owner's taskwork, never a sleep (a
+			 * pipe's goes through the poller, and the wait slept).
+			 */
+			if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0,
+			    p) != 0 || write(p[1], "x", 1) != 1)
+				_exit(2);
+			trig_prep(&r, p[0], POLLIN, 7200, &t);
+			ring_push_sqe(&r);
+			ring_prep(&r, IORING_OP_NOP, -1, 7201)->flags =
+			    IOSQE_CQE_SKIP_SUCCESS;
+			ring_push_sqe(&r);
+			ring_submit(&r);
+			sigemptyset(&sa.sa_mask);
+			if (sigaction(SIGALRM, &sa, NULL) != 0 ||
+			    setitimer(ITIMER_REAL, &it, NULL) != 0)
+				_exit(3);
+			t0 = now_ns();
+			rc = kqring_enter(r.fd, 0, 1, IORING_ENTER_GETEVENTS,
+			    NULL, 0);
+			if (rc != -1 || errno != EINTR)
+				_exit(4);
+			if (now_ns() - t0 > 2000000000ULL)
+				_exit(5);
+			trig_cancel(&r, 7200);
+			close(r.fd);
+			_exit(0);
+		}
+		for (int ms = 0;; ms += 10) {
+			if (waitpid(pid, &st, WNOHANG) == pid) {
+				if (WIFEXITED(st) && WEXITSTATUS(st) == 0)
+					break;
+				printf("[FAIL] trigger wait (%s ring): child "
+				    "status %#x\n", shared ? "shared" : "DEFER",
+				    st);
+				failures++;
+				return;
+			}
+			if (ms >= 10000) {
+				(void)kill(pid, SIGKILL);
+				printf("[FAIL] trigger wait (%s ring): no EINTR "
+				    "in 10 s\n", shared ? "shared" : "DEFER");
+				failures++;
+				return;
+			}
+			usleep(10000);
+		}
+	}
+	printf("[PASS] A wait that drains a trigger which never stops still "
+	    "ends on a signal (DEFER_TASKRUN and shared rings)\n");
 }
 
 /* SERIAL: each message runs RECV then SEND, in order; cancel ends it. */
@@ -15898,6 +16331,8 @@ test_triggers(struct test_ring *plain)
 {
 	test_trigger_optin(plain);
 	test_trigger_serial();
+	test_trigger_busy_fair();
+	test_trigger_wait_signal();
 	test_trigger_pending_event();
 	test_trigger_concurrent();
 	test_trigger_hangup();
@@ -16113,6 +16548,16 @@ main(int argc, char **argv)
 		printf("[OK]: %d failure(s)\n", failures);
 		return (failures != 0);
 	}
+	/* "p20": the tests of roadmap phase 20 only. */
+	if (argc >= 2 && strcmp(argv[1], "p20") == 0) {
+		test_tw_blocking_writer();
+		test_tw_wake();
+		test_default_ring_waiter_handoff();
+		test_trigger_busy_fair();
+		test_trigger_wait_signal();
+		printf("[OK]: %d failure(s)\n", failures);
+		return (failures != 0);
+	}
 	/* "p19": the tests of roadmap phase 19 only (safe on any module). */
 	if (argc >= 2 && strcmp(argv[1], "p19") == 0) {
 		test_inline_read_atomic("/tmp");
@@ -16295,6 +16740,7 @@ main(int argc, char **argv)
 		test_stop_during_close();
 		test_default_ring_waiter_handoff();
 		test_tw_blocking_writer();
+		test_tw_wake();
 		test_bpf_process();
 		test_phase5_security_audit();
 		printf("%s: %d failure(s)\n", failures ? "[FAIL]" : "[OK]",

@@ -27,6 +27,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 17 | A receive that waits | Done |
 | 18 | A default ring's kernel thread | Done |
 | 19 | A cached read in the enter | Done |
+| 20 | A completion whose thread then blocks | Done |
 
 ## Where kqring stands
 
@@ -383,6 +384,30 @@ Progress (16 November 2026), on the i5 ([docs/cached-reads.md](docs/cached-reads
 - Validated on the i5 with the final module: the unit tests (155 pass, 3 skip, on tmpfs and UFS too), the cross-process test (20 rounds), `kqring_diff` (38 cases, 0 problems), liburing (223 pass, 17 skip, the same 5 fail), stress and the fuzzer (30 minutes) pass.
 
 Phase 19 is done on its second clause: 174–180 ns, not 100, and what stops it measured and written down; fio's one job did not reach 0.90.
+
+## Phase 20: A completion whose thread then blocks
+
+On a ring without `DEFER_TASKRUN`, a completion made in a thread of the ring's process runs as that thread returns to user space (phase 18). When the thread's system call blocks after making it, as a `write(2)` larger than the socket's buffers blocks after its first bytes complete a waiting `RECV`, a watcher hands it to the ring's kernel thread after one to two ticks: on the i5 at `hz=1000`, a thread spinning on the CQ or in `poll(2)` on the ring sees the CQE about 1.9 ms after the write began, where Linux 7.3 shows it in 8–35 µs ([docs/task-work-latency.md](docs/task-work-latency.md#phase-20)). A waiter in an enter already runs it itself (8 µs).
+
+Order of work:
+
+1. Measure kqring and Linux on the i5 with a tool that builds on both (`tests/kqring_twlat.c`): another thread or the submitter writing, a waiter spinning, in `poll(2)` or in an enter, default and `COOP_TASKRUN` rings; and what the blocked `write(2)` returns.
+2. Make the completion reach a waiter in tens of microseconds, keeping what Linux does with the blocked call.
+3. Check what it might slow: ping-pong, fan-in, the cross-process ping-pong, fio.
+
+Acceptance: on the i5, the CQE within 50 µs (median) in every case where Linux's is; the blocked call's result as on Linux, with any difference written down; nothing in `kqring_xbench` more than 2% slower; the unit tests, the cross-process test, `kqring_diff`, liburing, stress and the fuzzer pass as before.
+
+Progress (16 November 2026), on the i5 ([docs/task-work-latency.md](docs/task-work-latency.md#phase-20)):
+
+- Measured from phase 19's build, both systems: with a thread spinning on the CQ or in `poll(2)` on the ring, kqring posted the CQE 1,890–1,925 µs after the write began, on default and `COOP_TASKRUN` rings, whoever wrote; Linux 7.3 in 8–35 µs, except 0.6–0.7 ms on a `COOP_TASKRUN` ring when spinning. Linux's task work goes to the submitting task, and when that task is the writer, Linux interrupts its `write(2)`, which returns short (200 of 200).
+- Kept: only the submitting thread's return runs a completion (on a ring without `SINGLE_ISSUER`, the process's last thread to submit); others' go to the kernel thread at once. The submitting thread's next interruptible sleep in that call returns at once (`TDP_WAKEUP`), as Linux's task work interrupts it, and the flag is cleared at its return if no sleep took it. The CQE now comes in 7.4–12.1 µs (median) in every case, and the submitter's writes return short, as on Linux; no row of `kqring_xbench` is 2% slower (worst: the cross-process ping-pong on a default ring +1.7%, its padded control +1.3%; a `NOP` per enter on a `DEFER_TASKRUN` ring +1.4%).
+- Found and fixed on the way: the phase 18 watcher could hand on a context queued during its own pass, microseconds old, and a completion queued while the kernel thread ran was left to it: the submitter's CQE then came a few microseconds after its call returned (about one round in a thousand of `test_default_ring_waiter_handoff`; 60 of 60 runs pass now).
+- Found by the fuzzer while validating, and fixed: a kqueue registered as a fixed file, closed from the table after the process that made it had exited, panicked in `kqueue_close()` on that process's freed descriptor table (the same class as phase 19's poller fix). A fixed-file table now refuses kqueues, as it refuses rings.
+- Found by the fuzzer while validating, and fixed (on the build before as well, seed 2020): a trigger whose event stays pending and whose runs complete at once kept `kqring_flush_ready()` looping with the ring's lock held, and the rest of the process, its enters, registrations and `fork(2)`, spun for it until the fuzzer's watchdog failed the run. A pass now does at most 64 rounds of trigger work and leaves the rest to the next (which it wakes), and the kernel thread steps aside for 50 µs after a tick of unbroken work. `test_trigger_busy_fair` checks a registration and `fork(2)` under a busy trigger; a single trigger didn't stall the build before, so the fuzzer's seed is the check that it is gone.
+- Found by the fuzzer while validating, and fixed (older than this phase): an enter waiting for CQEs while the ring's work kept queueing more (a trigger on a readable socket whose runs post nothing) never slept, and saw signals only in a sleep, so the thread spun in the kernel deaf even to `SIGKILL`, and the i5 had to be rebooted. The wait checks for a signal after each round of work and yields when its slice is spent, as `io_cqring_wait()` does; `IORING_REGISTER_SYNC_CANCEL`'s wait had the same loop and the same fix. `test_trigger_wait_signal` hangs on the build before and passes now.
+- Validated on the final build (16 November 2026): the unit tests (158 pass, 3 skipped), the cross-process test (20 rounds), `kqring_diff` against Linux 7.3 (38 cases, no problems), liburing (223 pass, the same 5 failures as before), stress, and the fuzzer for 1,800 s with seed 2020, twice; no panic.
+- Open, older than this phase: in every fuzzer run over about 1,000 s on earlier builds (phase 19's too), the page of the fuzzer's own memory that holds its counters, its ring list and its futex words was found zeroed mid-run, and one such run died with `SIGSEGV`. The two runs on the final build didn't show it, and what zeroed it is not known; the fuzzer now fails as soon as its counters go back (see TODO).
+- Differences left, written down: a call interrupted before it moved anything fails with `EINTR` where Linux restarts it; with a thread waiting in an enter, that thread posts the completion and the writer's call isn't interrupted, where Linux interrupts it anyway; a sleep that can't be interrupted, or a call that runs long, still waits for the watcher.
 
 ## Research
 

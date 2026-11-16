@@ -807,8 +807,18 @@ kqring_cancel_wait(struct kqring_ctx *ctx, const struct io_uring_sqe *sqe,
 				mtx_unlock(&ctx->mtx);
 				return (EINTR);
 			}
+			mtx_unlock(&ctx->mtx);
+			continue;
 		}
 		mtx_unlock(&ctx->mtx);
+		/*
+		 * Taskwork left (more queued as it ran): round again without
+		 * sleeping, so a signal is looked for here, as the sleep would
+		 * have, and the CPU given up when the slice is spent.
+		 */
+		if (sig_intr() != 0)
+			return (EINTR);
+		maybe_yield();
 	}
 }
 

@@ -2623,6 +2623,24 @@ kqring_req_issue_cred(struct kqring_ctx *ctx, struct kqring_op *op)
 		kqring_ltimeout_arm(ctx, op);
 }
 
+/* Rounds of trigger work one kqring_flush_ready() does at most. */
+#define	KQRING_TRIG_ROUNDS	64U
+
+/*
+ * Trigger work left for the next pass: wake whoever makes it, the ring's
+ * kthread or an enter waiting for CQEs (kqring_wait_cqes() drains it).
+ */
+static void
+kqring_trig_later(struct kqring_ctx *ctx)
+{
+	mtx_lock(&ctx->mtx);
+	if (ctx->task_sleeping != 0)
+		wakeup(&ctx->task_chan);
+	if (ctx->sleeping != ctx->task_sleeping)
+		wakeup(&ctx->wakeup_chan);
+	mtx_unlock(&ctx->mtx);
+}
+
 /*
  * Issue queued link successors, then deferred chains whose IOSQE_IO_DRAIN
  * barrier has cleared: a drained chain starts once nothing else is in
@@ -2632,6 +2650,7 @@ void
 kqring_flush_ready(struct kqring_ctx *ctx)
 {
 	struct kqring_op *op;
+	u_int trig_rounds = 0;
 
 	if (TAILQ_EMPTY(&ctx->ready_q) && TAILQ_EMPTY(&ctx->defer_q) &&
 	    TAILQ_EMPTY(&ctx->trig_work))
@@ -2645,8 +2664,21 @@ kqring_flush_ready(struct kqring_ctx *ctx)
 				kqring_req_issue(ctx, op);
 			continue;
 		}
-		/* Triggers to re-arm or run: they queue on ready_q. */
+		/*
+		 * Triggers to re-arm or run: they queue on ready_q.  A
+		 * trigger whose runs complete at once and whose event stays
+		 * pending queues more work every round, and this loop held
+		 * sq_sx for good (the rest of the process, its enters,
+		 * registrations and fork(2), spun for it: kqring_fuzz).  So
+		 * at most KQRING_TRIG_ROUNDS here; the rest is left for the
+		 * next pass, of the ring's kthread or an enter
+		 * (kqring_run_checks()), which kqring_trig_later() wakes.
+		 */
 		if (!TAILQ_EMPTY(&ctx->trig_work)) {
+			if (++trig_rounds > KQRING_TRIG_ROUNDS) {
+				kqring_trig_later(ctx);
+				return;
+			}
 			kqring_trig_work(ctx);
 			continue;
 		}

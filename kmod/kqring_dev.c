@@ -8,6 +8,7 @@
 
 #include <sys/imgact.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/sysent.h>
 
 MALLOC_DEFINE(M_KQRING, "kqring", "FreeBSD kqring I/O ring state");
@@ -1744,7 +1745,8 @@ kqring_run_checks(struct kqring_ctx *ctx)
 		kqring_check_waitids(ctx);
 	if (ctx->nseqto != 0)
 		kqring_check_timeouts(ctx);
-	if (!TAILQ_EMPTY(&ctx->ready_q) || !TAILQ_EMPTY(&ctx->defer_q))
+	if (!TAILQ_EMPTY(&ctx->ready_q) || !TAILQ_EMPTY(&ctx->defer_q) ||
+	    !TAILQ_EMPTY(&ctx->trig_work))
 		kqring_flush_ready(ctx);
 }
 
@@ -2138,6 +2140,7 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	    ctx->nfutex == 0 && ctx->nwaitid == 0 && ctx->nseqto == 0 &&
 	    ctx->npolled == 0 && !ctx->cq_dropped &&
 	    TAILQ_EMPTY(&ctx->ready_q) && TAILQ_EMPTY(&ctx->defer_q) &&
+	    TAILQ_EMPTY(&ctx->trig_work) &&
 	    atomic_load_ptr(&ctx->zb_retired) == NULL &&
 	    atomic_load_acq_32(&shm->cq_tail) -
 	    atomic_load_acq_32(&shm->cq_head) >= ea->min_complete) {
@@ -2167,6 +2170,15 @@ kqring_ioc_enter_body(struct kqring_ctx *ctx, struct kqring_enter_arg *ea,
 	}
 	kqring_bufs_retired_drain(ctx);
 	if (ea->to_submit > 0) {
+		struct kqring_tctx *st = kqring_tctx_cur(ctx);
+
+		/*
+		 * The submitting thread, whose return runs completions
+		 * (kqring_ast_try()); stored only when it changes, so that
+		 * threads taking turns don't write the line each time.
+		 */
+		if (st != NULL && atomic_load_ptr(&st->submit_td) != td)
+			atomic_store_ptr(&st->submit_td, td);
 		/*
 		 * Cached file reads may run here (kqring_wq_try_inline()),
 		 * decided at the first.
@@ -2257,7 +2269,7 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 	struct kqring_op_list *tw = NULL;
 	bool tw_known = foreign;
 	bool iopoll = (ctx->flags & IORING_SETUP_IOPOLL) != 0;
-	bool may_poll = !foreign, deadline_set = false;
+	bool may_poll = !foreign, deadline_set = false, drained = false;
 	sbintime_t spin = foreign ? 0 : ctx->busy_poll_sbt, deadline = 0;
 	uint32_t timeouts = atomic_load_acq_32(&ctx->cq_timeouts);
 	int error;
@@ -2273,6 +2285,25 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 		if (cq_count >= min_complete || !KQRING_STQ_EMPTY_HINT(&ctx->ocq) ||
 		    atomic_load_acq_32(&ctx->cq_timeouts) != timeouts)
 			return (0);
+
+		/*
+		 * Work that queues more work as it runs (taskwork that
+		 * requeues itself, a trigger whose event stays pending and
+		 * whose runs post nothing) keeps this loop from ever sleeping,
+		 * and kqring_enter_lock() sees a signal only when it sleeps:
+		 * the thread spun here, deaf even to SIGKILL (kqring_fuzz).
+		 * As io_cqring_wait() checks signal_pending() after its
+		 * task_work, a signal ends the wait after each drain, and the
+		 * CPU is given up when the thread's slice is spent.
+		 */
+		if (drained) {
+			drained = false;
+			if (sig_intr() != 0) {
+				kqring_tw_handoff(ctx, mine);
+				return (EINTR);
+			}
+			maybe_yield();
+		}
 
 		if (!tw_known) {
 			mine = ctx->shared ? kqring_tctx_cur_unlocked(ctx) :
@@ -2342,6 +2373,7 @@ kqring_wait_cqes(struct kqring_ctx *ctx, uint32_t min_complete,
 			(void)kqring_wq_abort_retired_locked(ctx);
 		if (!foreign && ((tw != NULL && !TAILQ_EMPTY(tw)) ||
 		    !KQRING_STQ_EMPTY_HINT(&ctx->rcq) ||
+		    !TAILQ_EMPTY(&ctx->trig_work) ||
 		    (mine != NULL &&
 		    atomic_load_acq_int(&mine->kp_kick) != 0))) {
 			mtx_unlock(&ctx->mtx);
@@ -2446,6 +2478,7 @@ drain:
 		kqring_run_checks(ctx);
 		kqring_flush_overflow(ctx);
 		kqring_enter_unlock(ctx, lock);
+		drained = true;
 	}
 }
 
@@ -3131,12 +3164,16 @@ again:
  * leaves the request to that thread's return instead of waking the ring's
  * kthread on another CPU (kqring_ast_try()).
  *
- * That thread's system call may block before it returns: a write(2)
- * larger than the socket's buffers waits for the RECV it completed to free
- * their space.  Linux's task work interrupts the wait (TIF_NOTIFY_SIGNAL);
- * a FreeBSD AST doesn't, so a watcher (kqring_ast_watch()), which runs
- * while anything is queued, hands what has waited a full pass, one to two
- * ticks, to the ring's kthread.
+ * That thread is the one that submits to the ring (kqring_ast_try()), as
+ * Linux gives task work to the submitting task; another thread's
+ * completions go to the kthread.  Its system call may block before it
+ * returns: a write(2) larger than the socket's buffers waits for the RECV
+ * it completed to free their space.  Linux's task work interrupts the
+ * wait (TIF_NOTIFY_SIGNAL), and so does kqring, with TDP_WAKEUP
+ * (kqring_ast_wake_set()).  A wait that can't be interrupted, or a call
+ * that runs long without sleeping, is left to a watcher
+ * (kqring_ast_watch()), which runs while anything is queued and hands what
+ * has waited a full pass, one to two ticks, to the ring's kthread.
  *
  * Contexts queued for a thread hang off a bucket of kqring_astq (by
  * thread), each holding a reference to the context and its ring.  Its
@@ -3152,6 +3189,16 @@ again:
 static struct kqring_astq {
 	struct mtx		mtx;
 	TAILQ_HEAD(, kqring_tctx) q;
+	/*
+	 * Threads of this bucket that kqring_ast_wake_set() gave TDP_WAKEUP,
+	 * for kqring_ast() to clear as each returns; with their processes,
+	 * for kqring_ast_purge(), which never dereferences a thread.
+	 */
+	u_int			nwake;
+	struct {
+		struct thread	*td;
+		struct proc	*p;
+	}			wake[4];
 } __aligned(CACHE_LINE_SIZE) kqring_astq[KQRING_AST_HASH];
 
 bool kqring_ast_on;		/* under every bucket's mtx to change */
@@ -3165,6 +3212,66 @@ static struct kqring_astq *
 kqring_astq_of(const struct thread *td)
 {
 	return (&kqring_astq[((uintptr_t)td >> 10) % KQRING_AST_HASH]);
+}
+
+/*
+ * As io_uring's task work interrupts the submitting task's wait
+ * (TIF_NOTIFY_SIGNAL, on default and COOP_TASKRUN rings alike): td's next
+ * interruptible sleep in this system call returns at once, with EINTR
+ * (TDP_WAKEUP, the flag thr_wake(2) sets).  A call that blocks after
+ * completing a request, a write(2) larger than the socket's buffers,
+ * returns then, short as on Linux, and its return to user space runs the
+ * completion, rather than leaving it to the watcher a tick or two later.
+ * Not in kqring's own calls (an enter runs its taskwork itself, and its
+ * wait would only fail), nor when TDP_WAKEUP is set already (by
+ * thr_wake(2), or by this and not yet taken), nor without a slot to
+ * remember td in (the watcher hands the request on, as before).
+ * kqring_ast() clears it if no sleep took it.  td is curthread, whose
+ * td_pflags only it changes; with its bucket's mtx.
+ */
+static void
+kqring_ast_wake_set(struct kqring_astq *q, struct thread *td)
+{
+	u_int code = td->td_sa.code;
+	u_int i;
+
+	mtx_assert(&q->mtx, MA_OWNED);
+	MPASS(td == curthread);
+	if ((td->td_pflags & TDP_WAKEUP) != 0 || code == SYS_ioctl)
+		return;
+	for (i = 0; i < KQRING_NSYS; i++) {
+		if (kqring_sysnum[i] != NO_SYSCALL &&
+		    code == (u_int)kqring_sysnum[i])
+			return;
+	}
+	for (i = 0; i < q->nwake; i++) {
+		if (q->wake[i].td == td)
+			break;
+	}
+	if (i == q->nwake) {
+		/* Not one of ours yet: remember it, if there is room. */
+		if (q->nwake == nitems(q->wake))
+			return;
+		q->wake[i].td = td;
+		q->wake[i].p = td->td_proc;
+		atomic_store_int(&q->nwake, q->nwake + 1);
+	}
+	/* New, or ours and taken by a sleep since: interrupt the next. */
+	td->td_pflags |= TDP_WAKEUP;
+}
+
+/*
+ * Forget slot i of q (locked), and clear TDP_WAKEUP if its thread is
+ * curthread (no other thread's td_pflags may be changed).
+ */
+static void
+kqring_ast_wake_drop(struct kqring_astq *q, u_int i)
+{
+	mtx_assert(&q->mtx, MA_OWNED);
+	if (q->wake[i].td == curthread)
+		curthread->td_pflags &= ~TDP_WAKEUP;
+	q->wake[i] = q->wake[q->nwake - 1];
+	atomic_store_int(&q->nwake, q->nwake - 1);
 }
 
 /* Queue t for td's (curthread's) return to user space; false if not. */
@@ -3183,8 +3290,15 @@ kqring_ast_queue(struct kqring_ctx *ctx, struct kqring_tctx *t,
 	 */
 	mtx_assert(&ctx->mtx, MA_OWNED);
 	cur = (struct thread *)atomic_load_acq_ptr((uintptr_t *)&t->ast_td);
-	if (cur == td)
-		return (true);	/* td's return runs it, and what comes now */
+	if (cur == td) {
+		/* td's return runs it, and what comes now: don't let it wait. */
+		if ((td->td_pflags & TDP_WAKEUP) == 0) {
+			mtx_lock(&q->mtx);
+			kqring_ast_wake_set(q, td);
+			mtx_unlock(&q->mtx);
+		}
+		return (true);
+	}
 	if (cur != NULL)
 		return (false);	/* another's will, but it may be blocked */
 	mtx_lock(&q->mtx);
@@ -3197,6 +3311,7 @@ kqring_ast_queue(struct kqring_ctx *ctx, struct kqring_tctx *t,
 	refcount_acquire(&t->refs);
 	refcount_acquire(&ctx->refs);
 	TAILQ_INSERT_TAIL(&q->q, t, ast_link);
+	kqring_ast_wake_set(q, td);
 	mtx_unlock(&q->mtx);
 	ast_sched(td, KQRING_TDA);
 	if (atomic_load_int(&kqring_ast_watching) == 0)
@@ -3257,12 +3372,25 @@ kqring_ast(struct thread *td, int asts __unused)
 
 	/* Only td queues for td, so it sees what it queued. */
 	q = kqring_astq_of(td);
-	if (TAILQ_EMPTY(&q->q))
+	if (TAILQ_EMPTY(&q->q) && atomic_load_int(&q->nwake) == 0)
 		return;
 	atomic_add_int(&kqring_ast_active, 1);
 	do {
 		n = 0;
 		mtx_lock(&q->mtx);
+		/*
+		 * TDP_WAKEUP that no sleep took goes first: left set, it
+		 * would end the next interruptible sleep td makes, sq_sx's in
+		 * kqring_ast_run() included, or a later system call's
+		 * (kqring_ast_wake_set()).  Also when the watcher handed td's
+		 * contexts on, and none is left below.
+		 */
+		for (u_int i = 0; i < q->nwake; i++) {
+			if (q->wake[i].td == td) {
+				kqring_ast_wake_drop(q, i);
+				break;
+			}
+		}
 		TAILQ_FOREACH_SAFE(t, &q->q, ast_link, tn) {
 			if (t->ast_td != td)
 				continue;
@@ -3287,6 +3415,20 @@ kqring_ast_purge(struct proc *p)
 	for (int i = 0; i < KQRING_AST_HASH; i++) {
 		struct kqring_astq *q = &kqring_astq[i];
 
+		/*
+		 * Threads killed in the kernel never return to clear their
+		 * TDP_WAKEUP: forget them (curthread's, an exec's, is cleared).
+		 */
+		if (atomic_load_int(&q->nwake) != 0) {
+			mtx_lock(&q->mtx);
+			for (u_int w = 0; w < q->nwake;) {
+				if (p == NULL || q->wake[w].p == p)
+					kqring_ast_wake_drop(q, w);
+				else
+					w++;
+			}
+			mtx_unlock(&q->mtx);
+		}
 		while (!TAILQ_EMPTY(&q->q)) {
 			mtx_lock(&q->mtx);
 			TAILQ_FOREACH(t, &q->q, ast_link) {
@@ -3335,8 +3477,15 @@ kqring_ast_watch(void *arg __unused, int pending __unused)
 
 		for (;;) {
 			mtx_lock(&q->mtx);
+			/*
+			 * Only what was queued before gen, by its age: one
+			 * queued during this pass has read gen + 1, and
+			 * "!= gen" took it at once, from under a thread about
+			 * to return (its hook found nothing, and its CQE came
+			 * after the call returned).
+			 */
 			TAILQ_FOREACH(t, &q->q, ast_link) {
-				if (t->ast_gen != gen)
+				if ((int)(t->ast_gen - gen) < 0)
 					break;
 				left = true;
 			}
