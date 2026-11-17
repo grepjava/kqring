@@ -13999,6 +13999,133 @@ test_trigger_wait_signal(void)
 	    "ends on a signal (DEFER_TASKRUN and shared rings)\n");
 }
 
+static _Atomic int swap_stop;
+static _Atomic uint64_t swap_progress;
+static _Atomic unsigned swap_blocked;
+static int swap_fd, swap_pipe, swap_sock, swap_peer;
+
+/* Put the pipe, then the socket, behind swap_fd, as fast as it goes. */
+static void *
+swap_dup2(void *arg)
+{
+	(void)arg;
+	while (!atomic_load(&swap_stop)) {
+		(void)dup2(swap_pipe, swap_fd);
+		(void)dup2(swap_sock, swap_fd);
+	}
+	return (NULL);
+}
+
+/* An enter stuck for a second: free it with a datagram, and count it. */
+static void *
+swap_watch(void *arg)
+{
+	(void)arg;
+	while (!atomic_load(&swap_stop)) {
+		usleep(100000);
+		if (now_ns() - atomic_load(&swap_progress) > 1000000000ULL) {
+			(void)send(swap_peer, "u", 1, 0);
+			atomic_store(&swap_progress, now_ns());
+		}
+	}
+	return (NULL);
+}
+
+/*
+ * A READ issued inline, of a pipe the issuer saw ready, looks the
+ * descriptor up again to read it.  When dup2(2) had put a blocking socket
+ * behind the number in between, the read ran as a blocking one in the
+ * issuer: an enter, or a ring's SQPOLL thread holding sq_sx, waited in
+ * the socket's receive (kqring_fuzz: fork(2) then waited for sq_sx and the
+ * whole process stopped).  It goes to a worker now.  Three seconds of
+ * READs while another thread swaps a ready pipe and an empty datagram
+ * socket behind one number; no enter may take a second.
+ */
+static void
+test_inline_read_fd_swap(void)
+{
+	pid_t pid = fork();
+	int st;
+
+	assert(pid >= 0);
+	if (pid == 0) {
+		static char rbuf[8];
+		struct test_ring r;
+		pthread_t sw, wd;
+		int p[2], s[2];
+		uint64_t end, n = 0, t0, ts, t1, max_enter = 0, max_round = 0;
+
+		if (pipe2(p, O_NONBLOCK) != 0 ||
+		    socketpair(AF_UNIX, SOCK_DGRAM, 0, s) != 0)
+			_exit(2);
+		/* The pipe's read end blocking, as the socket is. */
+		if (fcntl(p[0], F_SETFL, 0) != 0)
+			_exit(2);
+		swap_pipe = p[0];
+		swap_sock = s[0];
+		swap_peer = s[1];
+		swap_fd = dup(p[0]);
+		ring_init(&r);
+		atomic_store(&swap_progress, now_ns());
+		if (pthread_create(&sw, NULL, swap_dup2, NULL) != 0 ||
+		    pthread_create(&wd, NULL, swap_watch, NULL) != 0)
+			_exit(3);
+		end = now_ns() + 3000000000ULL;
+		while ((t0 = now_ns()) < end) {
+			struct io_uring_sqe *sqe;
+
+			(void)write(p[1], "x", 1);
+			sqe = ring_prep(&r, IORING_OP_READ, swap_fd, n);
+			sqe->addr = (uint64_t)(uintptr_t)rbuf;
+			sqe->len = 1;
+			sqe->off = (uint64_t)-1;
+			ring_push_sqe(&r);
+			ts = now_ns();
+			(void)kqring_enter(r.fd, 1, 0, 0, NULL, 0);
+			t1 = now_ns();
+			atomic_store(&swap_progress, t1);
+			if (t1 - ts > max_enter)
+				max_enter = t1 - ts;
+			/* Only an enter that waited counts, not this one's CPU. */
+			if (t1 - ts > 1000000000ULL)
+				atomic_fetch_add(&swap_blocked, 1);
+			while (ring_cq_ready(&r) > 0)
+				(void)ring_pop_cqe(&r);
+			if (now_ns() - t0 > max_round)
+				max_round = now_ns() - t0;
+			n++;
+		}
+		atomic_store(&swap_stop, 1);
+		(void)pthread_join(sw, NULL);
+		(void)pthread_join(wd, NULL);
+		fprintf(stderr, "fd swap: %ju READs, %u enters blocked; longest "
+		    "enter %ju us, round %ju us\n", (uintmax_t)n,
+		    atomic_load(&swap_blocked), (uintmax_t)(max_enter / 1000),
+		    (uintmax_t)(max_round / 1000));
+		/* Reads left on workers end with the ring. */
+		close(r.fd);
+		_exit(atomic_load(&swap_blocked) != 0 ? 4 : 0);
+	}
+	for (int ms = 0;; ms += 10) {
+		if (waitpid(pid, &st, WNOHANG) == pid)
+			break;
+		if (ms >= 30000) {
+			(void)kill(pid, SIGKILL);
+			(void)waitpid(pid, &st, 0);
+			break;
+		}
+		usleep(10000);
+	}
+	if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+		printf("[PASS] An inline READ whose descriptor turns into a "
+		    "blocking socket goes to a worker; no enter blocks\n");
+		return;
+	}
+	printf("[FAIL] inline READ, descriptor swapped: child status %#x "
+	    "(exit 4: an enter blocked in the socket)\n", st);
+	failures++;
+}
+
 /* SERIAL: each message runs RECV then SEND, in order; cancel ends it. */
 static void
 test_trigger_serial(void)
@@ -16548,6 +16675,15 @@ main(int argc, char **argv)
 		printf("[OK]: %d failure(s)\n", failures);
 		return (failures != 0);
 	}
+	/*
+	 * "p21": the tests of roadmap phase 21 only (safe on any module: an
+	 * enter that blocks is freed by the test).
+	 */
+	if (argc >= 2 && strcmp(argv[1], "p21") == 0) {
+		test_inline_read_fd_swap();
+		printf("[OK]: %d failure(s)\n", failures);
+		return (failures != 0);
+	}
 	/* "p20": the tests of roadmap phase 20 only. */
 	if (argc >= 2 && strcmp(argv[1], "p20") == 0) {
 		test_tw_blocking_writer();
@@ -16689,6 +16825,7 @@ main(int argc, char **argv)
 			test_inline_read_atomic(getenv("KQRING_TEST_TMPFS"));
 		if (getenv("KQRING_TEST_UFS") != NULL)
 			test_inline_read_atomic(getenv("KQRING_TEST_UFS"));
+		test_inline_read_fd_swap();
 		test_disk_bio();
 		test_napi_busy_poll();
 		test_worker_buffer_reservation();

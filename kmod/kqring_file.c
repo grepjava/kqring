@@ -862,9 +862,20 @@ kqring_file_rw(struct kqring_ctx *ctx, struct kqring_op *op, bool is_write,
 		return (kqring_done(op, -error, 0));
 	/*
 	 * O_NONBLOCK too: another reader can drain the pipe after the issuer
-	 * saw it ready, and the issuer must then punt rather than wait.
+	 * saw it ready, and the issuer must then punt rather than wait.  This
+	 * is a second lookup: since kqring_file_rw_inline() saw a ready pipe,
+	 * dup2(2) can have put another file behind the number.  That goes to
+	 * a worker.  It used to run here as a blocking read or write, in the
+	 * issuer: a ring's SQPOLL thread blocked in a socket's receive with
+	 * sq_sx held, and fork(2), which takes sq_sx to hold the ring's
+	 * buffers again, stopped the whole process (kqring_fuzz).  Pipes and
+	 * FIFOs both have pipeops.
 	 */
-	nowait = nowait && fp->f_ops == &pipeops;
+	if (nowait && fp->f_ops != &pipeops) {
+		fdrop(fp, td);
+		*punt = true;
+		return (0);
+	}
 	if (local) {
 		struct vnode *vp = fp->f_type == DTYPE_VNODE ?
 		    fp->f_vnode : NULL;

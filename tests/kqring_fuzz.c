@@ -1118,6 +1118,12 @@ sanitize(struct fz *f, struct io_uring_sqe *s)
 
 		s->addr = (uint64_t)(uintptr_t)f->arena + o;
 		s->len = (uint32_t)rn(f, ARENA_SIZE - o + 1);
+		/*
+		 * A non-zero off is the length, as in io_uring: left random
+		 * it sent madvise(2) up to 32 GB past the arena, over the
+		 * fuzzer's heap and thread stacks.
+		 */
+		s->off = chance(f, 50) ? 0 : rn(f, ARENA_SIZE - o + 1);
 		break;
 	}
 	}

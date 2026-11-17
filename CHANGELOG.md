@@ -48,6 +48,7 @@
 
 ### Fixed
 
+- A `READ` or `WRITE` the enter found ready on a pipe, whose descriptor `dup2(2)` then moved to a socket or file before the request ran, ran there as a blocking call in the submitting thread, or in a `SQPOLL` ring's kernel thread with the ring's submission lock held; a `fork(2)` then waited for that lock and the whole process stopped. It now goes to a worker (`test_inline_read_fd_swap`: enters blocked 1–5 s before, under 0.3 ms now).
 - An enter waiting for CQEs while its ring's work kept queueing more, such as a trigger on a readable socket whose runs post nothing, never slept, and looked for signals only in a sleep: the thread spun in the kernel for good, deaf even to `SIGKILL`, and only a reboot ended it. The wait now checks for a signal after each round of work and gives up the CPU when its time slice is spent, as `io_cqring_wait()` checks `signal_pending()` after running task work; so does `IORING_REGISTER_SYNC_CANCEL`'s wait, which looped the same way while taskwork was left. Found by `kqring_fuzz`; `test_trigger_wait_signal` covers both a `DEFER_TASKRUN` and a shared ring.
 - A trigger whose event stays pending and whose runs complete at once, its CQEs reaped as they come, could keep the ring's lock for good: issuing ready work looped as long as triggers queued more, and the rest of the process, its enters, registrations and `fork(2)` (which re-holds the ring's registered buffers), spun for the lock, so the whole process stopped. One pass now does at most 64 rounds of trigger work and leaves the rest to the next, of the ring's kernel thread or an enter, which it wakes; and a kernel thread busy without a break for a tick steps aside for 50 µs, since it takes the lock back at once after each pass and an sx lock doesn't queue the threads spinning for it, as io_uring's SQPOLL thread lets go of its lock when asked to park. Found by `kqring_fuzz`, whose process stopped after a few minutes with some seeds.
 - A kqueue descriptor registered as a fixed file could panic the kernel in `kqueue_close()` once the process that made it had exited and the ring's table was freed: a kqueue closes through the descriptor table it was made on, which FreeBSD frees with its process. A fixed-file table now refuses kqueues with `EBADF`, as it refuses rings. Found by `kqring_fuzz`.
@@ -95,6 +96,8 @@
 
 ### Testing
 
+- `kqring_fuzz`'s `MADVISE` requests keep their length in the arena: a non-zero `off` is the length, as in io_uring, and left random it sent `madvise(2)` up to 32 GB past the arena, over the fuzzer's heap and thread stacks.
+- `tests/kqring_pagecheck.c` forks while threads wait on futex words in its static data and checks that page never changes under it.
 - liburing's `iopoll-sync` compares a socket option as true or false, as `socket-getsetsock-cmd` does, and passes: 223 of 245 tests pass, 17 skip and 5 fail for reasons of the platform.
 - `kqring_bench`'s ping-pong and fan-in give kqring's receives as many provided buffers as are in flight (16 of 4 KiB, or one 64-byte buffer per connection) instead of 4,096 of 4 KiB in turn, out of cache, where kqueue read into one buffer. On the Ryzen, fan-in went from 26–66% slower than kqueue to between 5% faster and 4% slower.
 - `docs/bench/data/zfs-dbuf/run.sh` fails when the file doesn't fit the larger dbuf cache, which happens when the ARC target is small.
