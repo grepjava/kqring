@@ -28,6 +28,7 @@ See also [`TODO.MD`](TODO.MD) for individual open items, [Differences from Linux
 | 18 | A default ring's kernel thread | Done |
 | 19 | A cached read in the enter | Done |
 | 20 | A completion whose thread then blocks | Done |
+| 21 | The fuzzer's zeroed memory | In progress |
 
 ## Where kqring stands
 
@@ -408,6 +409,18 @@ Progress (16 November 2026), on the i5 ([docs/task-work-latency.md](docs/task-wo
 - Validated on the final build (16 November 2026): the unit tests (158 pass, 3 skipped), the cross-process test (20 rounds), `kqring_diff` against Linux 7.3 (38 cases, no problems), liburing (223 pass, the same 5 failures as before), stress, and the fuzzer for 1,800 s with seed 2020, twice; no panic.
 - Open, older than this phase: in every fuzzer run over about 1,000 s on earlier builds (phase 19's too), the page of the fuzzer's own memory that holds its counters, its ring list and its futex words was found zeroed mid-run, and one such run died with `SIGSEGV`. The two runs on the final build didn't show it, and what zeroed it is not known; the fuzzer now fails as soon as its counters go back (see TODO).
 - Differences left, written down: a call interrupted before it moved anything fails with `EINTR` where Linux restarts it; with a thread waiting in an enter, that thread posts the completion and the writer's call isn't interrupted, where Linux interrupts it anyway; a sleep that can't be interrupted, or a call that runs long, still waits for the watcher.
+
+## Phase 21: The fuzzer's zeroed memory
+
+In every `kqring_fuzz` run over about 1,000 s on builds before phase 20's last, one page of the fuzzer's `.bss` was found zeroed mid-run: its counters, its list of rings and the words its futex requests wait on (the only pointers into its own memory it gives the kernel). One such run died with `SIGSEGV`. Phase 20's final build ran 1,800 s twice without it, but nothing explains why, so it may only be hidden. A kernel that zeroes a process's memory is the worst kind of bug kqring could have.
+
+Order of work:
+
+1. Reproduce it on phase 20's build before last, with the fuzzer stopping itself when its counters go back (`KQFUZZ_STOP_ON_RESET`), the mapping and paging sampled, and DTrace on the page.
+2. Find what zeroes it, and whether kqring does (futex keys and reads, held-page buffers at `fork(2)`, the copy-outs) or FreeBSD does.
+3. Fix it, with a test that fails before the fix, and check every sibling path.
+
+Acceptance: the cause named and shown; fixed if it is kqring's, with a test; otherwise a minimal reproduction without kqring and a FreeBSD bug report; the fuzzer for 1,800 s, three seeds, without it.
 
 ## Research
 
