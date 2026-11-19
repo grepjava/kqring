@@ -3714,9 +3714,10 @@ kqring_modevent(module_t mod __unused, int type, void *data __unused)
 			TAILQ_INIT(&kqring_futex_hash[i]);
 		for (int i = 0; i < KQRING_PROC_HASH; i++)
 			LIST_INIT(&kqring_proc_hash[i]);
+		/* kqring_ast_set_on() holds them all at once. */
 		for (int i = 0; i < KQRING_AST_HASH; i++) {
 			mtx_init(&kqring_astq[i].mtx, "kqring ast", NULL,
-			    MTX_DEF);
+			    MTX_DEF | MTX_DUPOK);
 			TAILQ_INIT(&kqring_astq[i].q);
 		}
 		kqring_teardown_tq = taskqueue_create("kqring teardown",

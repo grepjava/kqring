@@ -298,6 +298,41 @@ chance(struct fz *f, unsigned pct)
 	return (rn(f, 100) < pct);
 }
 
+/*
+ * KQFUZZ_FUTEX_PAGE (phase 21): the shared futex words on a page of their
+ * own, private anonymous memory at a fixed address (so no static variable
+ * moves the .bss), filled with a pattern main() checks every 100 ms.  The
+ * .bss page found zeroed mid-run held those words, the only pointers into
+ * the fuzzer's own memory it gives the kernel: this tells whether that is
+ * why it was hit.
+ */
+#define	FUTEX_PAGE	((uint64_t *)(uintptr_t)0x7e0000000000ULL)
+#define	FUTEX_PAGE_W0	0x100		/* qwords 0x100-0x101: the words */
+#define	FUTEX_PAGE_WORDS ((uint32_t *)(void *)(FUTEX_PAGE + FUTEX_PAGE_W0))
+#define	FUTEX_PAGE_WANT(i) ((i) == FUTEX_PAGE_W0 || (i) == FUTEX_PAGE_W0 + 1 ? \
+	0 : 0xa5a5a5a55a5a5a5aULL ^ (uint64_t)(i))
+
+static void
+futex_page_init(void)
+{
+	if (mmap(FUTEX_PAGE, PAGE_SIZE, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON | MAP_FIXED | MAP_EXCL, -1, 0) !=
+	    (void *)FUTEX_PAGE)
+		die("futex page: %s", strerror(errno));
+	for (int i = 0; i < PAGE_SIZE / 8; i++)
+		FUTEX_PAGE[i] = FUTEX_PAGE_WANT(i);
+}
+
+/* The first qword of the futex page that isn't what was put there, or -1. */
+static int
+futex_page_bad(void)
+{
+	for (int i = 0; i < PAGE_SIZE / 8; i++)
+		if (FUTEX_PAGE[i] != FUTEX_PAGE_WANT(i))
+			return (i);
+	return (-1);
+}
+
 /* ------------------------------------------------------------------------
  * Values: pointers that are never the fuzzer's own, descriptors, sizes.
  * ------------------------------------------------------------------------
@@ -1655,7 +1690,9 @@ sqe_struct(struct fz *f, struct io_uring_sqe *s)
 
 		w = (uint32_t *)((uintptr_t)w & ~(uintptr_t)3);
 		if (chance(f, 80))
-			w = &words[rn(f, nitems(words))];
+			w = getenv("KQFUZZ_FUTEX_PAGE") != NULL ?
+			    &FUTEX_PAGE_WORDS[rn(f, 4)] :
+			    &words[rn(f, nitems(words))];
 		s->opcode = chance(f, 50) ? IORING_OP_FUTEX_WAIT :
 		    IORING_OP_FUTEX_WAKE;
 		s->addr = (uint64_t)(uintptr_t)w;
@@ -2332,7 +2369,15 @@ do_chaos(struct fz *f)
 		 * submitters.md), while the parent's are in flight: with the
 		 * SQ empty, and this thread waiting until they are in, so the
 		 * two never write it at once.
+		 *
+		 * Phase 21 bisection: KQFUZZ_NO_FORK makes this an arena
+		 * refill; KQFUZZ_CHILD_QUIET keeps the fork, and the child
+		 * exits at once.
 		 */
+		if (getenv("KQFUZZ_NO_FORK") != NULL) {
+			arena_fill(f);
+			break;
+		}
 		int sync[2];
 		bool own = f->sqes != NULL && f->sq_ktail != NULL &&
 		    (f->p.flags & (IORING_SETUP_SQPOLL |
@@ -2341,11 +2386,19 @@ do_chaos(struct fz *f)
 		    atomic_load(f->sq_khead) == f->sq_tail &&
 		    atomic_load(f->sq_ktail) == f->sq_tail && chance(f, 50) &&
 		    pipe(sync) == 0;
-		pid_t pid = fork();
+		pid_t pid;
 
+		if (own && getenv("KQFUZZ_CHILD_QUIET") != NULL) {
+			close(sync[0]);
+			close(sync[1]);
+			own = false;
+		}
+		pid = fork();
 		if (pid == 0) {
 			struct io_uring_params p;
 
+			if (getenv("KQFUZZ_CHILD_QUIET") != NULL)
+				_exit(0);
 			if (own) {
 				child_submit(f);
 				(void)write(sync[1], "x", 1);
@@ -2804,8 +2857,12 @@ main(int argc, char **argv)
 	mem0 = kqring_malloc_inuse();
 	inline0 = sysctl_num("kern.kqring.wq_inline");
 	names_init();
-	printf("kqring_fuzz: seed %ju, %d threads, %d s, in %s\n",
-	    (uintmax_t)seed, nthreads, run_secs, scratch);
+	if (getenv("KQFUZZ_FUTEX_PAGE") != NULL)
+		futex_page_init();
+	printf("kqring_fuzz: seed %ju, %d threads, %d s, in %s%s\n",
+	    (uintmax_t)seed, nthreads, run_secs, scratch,
+	    getenv("KQFUZZ_FUTEX_PAGE") != NULL ?
+	    ", futex words on their own page" : "");
 	stdio_hide();
 	if (fstat(OUT_FD, &out_st) != 0 || fstat(ERR_FD, &err_st) != 0)
 		die("fstat: %s", strerror(errno));
@@ -2900,6 +2957,25 @@ main(int argc, char **argv)
 			seen_sqes = st_sqes;
 			seen_forks = st_forks;
 			last = now;
+		}
+		if (getenv("KQFUZZ_FUTEX_PAGE") != NULL) {
+			int q = futex_page_bad();
+
+			if (q >= 0) {
+				dprintf(ERR_FD, "kqring_fuzz: FAIL: futex page "
+				    "went back: qword %#x is %#jx, not %#jx, at "
+				    "%ju s (seed %ju)\n", (unsigned)q,
+				    (uintmax_t)FUTEX_PAGE[q],
+				    (uintmax_t)FUTEX_PAGE_WANT(q),
+				    (uintmax_t)((now - t0) / 1000000000ULL),
+				    (uintmax_t)seed);
+				snprintf(cmd, sizeof(cmd), "procstat -v %d >&%d",
+				    getpid(), ERR_FD);
+				(void)system(cmd);
+				if (getenv("KQFUZZ_STOP_ON_RESET") != NULL)
+					(void)kill(getpid(), SIGSTOP);
+				_exit(5);
+			}
 		}
 		usleep(100000);
 	}
