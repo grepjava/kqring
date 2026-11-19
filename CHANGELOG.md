@@ -97,7 +97,7 @@
 ### Testing
 
 - `kqring_fuzz`'s `MADVISE` requests keep their length in the arena: a non-zero `off` is the length, as in io_uring, and left random it sent `madvise(2)` up to 32 GB past the arena, over the fuzzer's heap and thread stacks.
-- `tests/kqring_pagecheck.c` forks while threads wait on futex words in its static data and checks that page never changes under it.
+- `tests/kqring_pagecheck.c` forks while threads wait on futex words in its static data and checks that page never goes back: it holds counters that only grow, so a page put back to an older copy is caught, not only one zeroed. Up to 16 children at once do what `kqring_fuzz`'s do (wake the parent's futexes, fixed reads and writes on its registered buffers, a ring of their own, `exec`); `-F` waits on NOPs instead of futexes, to tell kqring's futex keys from FreeBSD. `kqring_pagecheck_last` puts the page last in a 40-page `.bss`, as in the fuzzer. Neither has reproduced the fuzzer's page.
 - liburing's `iopoll-sync` compares a socket option as true or false, as `socket-getsetsock-cmd` does, and passes: 223 of 245 tests pass, 17 skip and 5 fail for reasons of the platform.
 - `kqring_bench`'s ping-pong and fan-in give kqring's receives as many provided buffers as are in flight (16 of 4 KiB, or one 64-byte buffer per connection) instead of 4,096 of 4 KiB in turn, out of cache, where kqueue read into one buffer. On the Ryzen, fan-in went from 26–66% slower than kqueue to between 5% faster and 4% slower.
 - `docs/bench/data/zfs-dbuf/run.sh` fails when the file doesn't fit the larger dbuf cache, which happens when the ARC target is small.
