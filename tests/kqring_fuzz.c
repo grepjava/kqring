@@ -126,6 +126,7 @@ static _Atomic uint64_t	st_direct, st_buffered;
 static _Atomic uint64_t	st_ring_gone;
 static _Atomic uint64_t	st_dyn_reserved;	/* refused, see dyn_add() */
 static struct stat	out_st, err_st;		/* OUT_FD, ERR_FD at start */
+static struct stat	null_st;		/* /dev/null, on 0-2 while running */
 /* Reads in pipe bursts submitted; those that got data. */
 static _Atomic uint64_t	st_piperd, st_piperd_data;
 /* Reads in file runs submitted. */
@@ -244,6 +245,10 @@ stdio_hide(void)
 	    fcntl(STDERR_FILENO, F_DUPFD, ERR_FD) != ERR_FD ||
 	    (null = open("/dev/null", O_RDWR)) < 0) {
 		perror("kqring_fuzz: stdio");
+		exit(1);
+	}
+	if (fstat(null, &null_st) != 0) {
+		perror("kqring_fuzz: fstat /dev/null");
 		exit(1);
 	}
 	fflush(stdout);
@@ -2628,21 +2633,50 @@ prime_ring_table(void)
 	close(fd);
 }
 
-/* Drop rings left in the process's registered-ring table. */
+/* What unregister_rings() found wrong, printed once stdio is back. */
+static char unreg_msg[512];
+
+/*
+ * Drop rings left in the process's registered-ring table, through a new
+ * ring or, if none can be made, through a ring still in the table, and
+ * check that the table is empty: a ring left there is never closed before
+ * exit, and fails the leak check with nothing to say why.
+ */
 static void
 unregister_rings(void)
 {
 	struct io_uring_params p;
 	struct io_uring_rsrc_update u[REG_RINGS];
-	int fd;
+	size_t len = 0;
+	int fd, setup_errno = 0;
+	long rc = -1;
 
-	memset(&p, 0, sizeof(p));
-	if ((fd = (int)kqring_setup(4, &p)) < 0)
-		return;
 	for (unsigned i = 0; i < REG_RINGS; i++)
 		u[i] = (struct io_uring_rsrc_update){ .offset = i };
-	(void)kqring_register(fd, IORING_UNREGISTER_RING_FDS, u, REG_RINGS);
-	close(fd);
+	memset(&p, 0, sizeof(p));
+	if ((fd = (int)kqring_setup(4, &p)) >= 0) {
+		rc = kqring_register(fd, IORING_UNREGISTER_RING_FDS, u,
+		    REG_RINGS);
+		if (rc < 0)
+			len += (size_t)snprintf(unreg_msg + len,
+			    sizeof(unreg_msg) - len, " unregister: %s;",
+			    strerror(errno));
+		close(fd);
+	} else {
+		setup_errno = errno;
+		len += (size_t)snprintf(unreg_msg + len, sizeof(unreg_msg) - len,
+		    " setup: %s;", strerror(setup_errno));
+		for (unsigned i = 0; i < REG_RINGS && rc < 0; i++)
+			rc = kqring_register((int)i, IORING_UNREGISTER_RING_FDS |
+			    IORING_REGISTER_USE_REGISTERED_RING, u, REG_RINGS);
+	}
+	for (unsigned i = 0; i < REG_RINGS; i++) {
+		if (kqring_enter((int)i, 0, 0, IORING_ENTER_REGISTERED_RING,
+		    NULL, 0) >= 0 && len < sizeof(unreg_msg))
+			len += (size_t)snprintf(unreg_msg + len,
+			    sizeof(unreg_msg) - len, " slot %u still holds a ring;",
+			    i);
+	}
 }
 
 static const char *_Atomic teardown_at;	/* the step, NULL when done */
@@ -2996,6 +3030,34 @@ main(int argc, char **argv)
 	atomic_store(&teardown_at, NULL);
 	pthread_join(tw, NULL);
 	closefrom(3);
+	/*
+	 * closefrom(3) and stdio_restore() leave 0 alone.  A request that
+	 * closed it would have let a ring or socket opened after take it,
+	 * held through the leak check until exit: say so, and close it.
+	 */
+	{
+		struct stat st0;
+		bool open0 = fstat(STDIN_FILENO, &st0) == 0;
+
+		if (!open0 || st0.st_dev != null_st.st_dev ||
+		    st0.st_ino != null_st.st_ino) {
+			int null = open("/dev/null", O_RDWR);
+
+			if (open0)
+				printf("kqring_fuzz: descriptor 0 was no "
+				    "longer /dev/null at the end (mode %#o, "
+				    "rdev %#jx): closed\n",
+				    (unsigned)st0.st_mode,
+				    (uintmax_t)st0.st_rdev);
+			else
+				printf("kqring_fuzz: descriptor 0 was closed "
+				    "at the end\n");
+			if (null >= 0 && null != STDIN_FILENO) {
+				(void)dup2(null, STDIN_FILENO);
+				close(null);
+			}
+		}
+	}
 	printf("kqring_fuzz: rings %ju, sqes %ju, enters %ju, registers %ju, "
 	    "cqes %ju\n", (uintmax_t)st_rings, (uintmax_t)st_sqes,
 	    (uintmax_t)st_enters, (uintmax_t)st_regs, (uintmax_t)st_cqes);
@@ -3024,6 +3086,14 @@ main(int argc, char **argv)
 	if (atomic_load(&cq_bad)) {
 		fprintf(stderr, "kqring_fuzz: FAIL: a CQ ring overran\n");
 		rc = 1;
+	}
+	if (unreg_msg[0] != '\0') {
+		bool left = strstr(unreg_msg, "slot") != NULL;
+
+		fprintf(stderr, "kqring_fuzz: %sregistered rings at the end:%s\n",
+		    left ? "FAIL: " : "", unreg_msg);
+		if (left)
+			rc = 1;
 	}
 	if (check_leaks(socks0, wired0, mem0) != 0)
 		rc = 1;

@@ -187,8 +187,16 @@ check_leaks(long socks0, long wired0, long mem0)
 	    "kqring malloc + requests in use %ld -> %ld\n", socks0, socks, wired0, wired,
 	    mem0, mem);
 	if (socks > socks0 || wired > wired0 || mem > mem0) {
+		char cmd[256];
+
 		fprintf(stderr, "%s: FAIL: resources still held "
 		    "after everything was closed\n", getprogname());
+		/* What holds them goes with the process: show it now. */
+		fflush(stdout);
+		snprintf(cmd, sizeof(cmd), "procstat -f %d; procstat -kk %d; "
+		    "sysctl kern.kqring; vmstat -z | grep -i kq", (int)getpid(),
+		    (int)getpid());
+		(void)system(cmd);
 		return (1);
 	}
 	return (0);
