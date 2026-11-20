@@ -93,6 +93,7 @@
 - A multishot poll on the ring's own registered eventfd now ends when the ring's signal for posted CQEs wakes it, and that CQE, without `IORING_CQE_F_MORE`, is its last, as Linux does with `EPOLL_URING_WAKE`. A write by the program still gives a CQE with `F_MORE`. It used to fire on its own signal for ever. A first fix ended it one wakeup later, which posted a CQE too many when another request's CQE woke it; liburing's `evloop` failed on that in about 60% of runs.
 - `READ_MULTISHOT` of a file that can't be polled now completes with `EBADF`, where Linux has `EBADFD`, rather than `EOPNOTSUPP`, with or without `IOSQE_ASYNC`.
 - A wait that a signal ends now succeeds if there are CQEs to reap, as on Linux, rather than failing with `EINTR`.
+- `IORING_REGISTER_QUERY` fails with `E2BIG` for a header whose `size` is over a page, before writing anything, as io_uring does. It used to zero all of the caller's `size` past the answer, up to 4 GB from `query_data`, until it faulted: a header with a stray size wiped the caller's memory. This is what zeroed `kqring_fuzz`'s `.bss` mid-run (phase 21): its random query headers took a small integer in the range of its low, non-PIE `.bss` as `query_data`, and the zeroing ran up to the end of the mapping, over its counters.
 - Loading the module on a kernel with `WITNESS` no longer warns of a duplicate lock: turning the AST hook on or off holds every AST queue's mutex at once, and they are now made with `MTX_DUPOK`.
 
 ### Testing

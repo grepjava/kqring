@@ -12405,8 +12405,8 @@ query_hdr(uint32_t op, void *data, uint32_t size)
  * what kqring implements (the masks setup and enter check, setup's
  * features), cut to the caller's size and zeroed past it; -EOPNOTSUPP in
  * result for an unknown query or ZCRX; -EINVAL for reserved fields, a set
- * result or size 0; EFAULT for a bad header or buffer, ERANGE for a
- * chain that loops, EINVAL for nr_args.
+ * result or size 0; E2BIG for a size over a page; EFAULT for a bad header
+ * or buffer, ERANGE for a chain that loops, EINVAL for nr_args.
  */
 static void
 test_register_query(void)
@@ -12460,6 +12460,37 @@ test_register_query(void)
 	assert(memcmp(big, &op, sizeof(op)) == 0);
 	for (size_t i = sizeof(op); i < sizeof(big); i++)
 		assert(big[i] == 0);
+	/*
+	 * Zeroed up to a page at most: a size over that is E2BIG, before
+	 * anything is written, as in io_uring (whatever the query).  kqring
+	 * used to zero all of a stray size, up to 4 GB from query_data, which
+	 * wiped kqring_fuzz's .bss (phase 21).
+	 */
+	{
+		long pg = sysconf(_SC_PAGESIZE);
+		/* A guard page after: an old module's zeroing stops there. */
+		unsigned char *two = mmap(NULL, 3 * (size_t)pg, PROT_READ |
+		    PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+
+		assert(two != MAP_FAILED);
+		assert(mprotect(two + 2 * pg, (size_t)pg, PROT_NONE) == 0);
+		memset(two, 0xff, 2 * (size_t)pg);
+		h = query_hdr(IO_URING_QUERY_OPCODES, two, (uint32_t)pg);
+		assert(query(-1, &h, 0) == 0 && h.result == 0 &&
+		    h.size == sizeof(op));
+		for (long i = (long)sizeof(op); i < pg; i++)
+			assert(two[i] == 0);
+		assert(two[pg] == 0xff);
+		memset(two, 0xff, 2 * (size_t)pg);
+		h = query_hdr(IO_URING_QUERY_OPCODES, two, (uint32_t)pg + 1);
+		assert(query(-1, &h, 0) == E2BIG && h.result == 0 &&
+		    h.size == (uint32_t)pg + 1);
+		h = query_hdr(77, two, UINT32_MAX);
+		assert(query(-1, &h, 0) == E2BIG && h.result == 0);
+		for (long i = 0; i < 2 * pg; i++)
+			assert(two[i] == 0xff);
+		munmap(two, 3 * (size_t)pg);
+	}
 
 	/* The rings' header: where a NO_SQARRAY ring's CQEs start. */
 	h = query_hdr(IO_URING_QUERY_SCQ, &scq, sizeof(scq));
@@ -16681,6 +16712,7 @@ main(int argc, char **argv)
 	 */
 	if (argc >= 2 && strcmp(argv[1], "p21") == 0) {
 		test_inline_read_fd_swap();
+		test_register_query();
 		printf("[OK]: %d failure(s)\n", failures);
 		return (failures != 0);
 	}

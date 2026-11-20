@@ -1047,6 +1047,11 @@ kqring_register_op(struct kqring_ctx *ctx, const struct kqring_register_arg *ra,
  * reserved fields, a result already set or a size of 0, -EINVAL.  The
  * answer is cut to the caller's size, which is written back as the bytes
  * given; the rest of the caller's size is zeroed.  Faults fail the call.
+ * A size over a page fails it with E2BIG first, as io_uring's: what is
+ * zeroed stays within a page of query_data.  Without that, a header with
+ * a stray size (kqring_fuzz's random ones, up to 4 GB) zeroed the
+ * caller's memory from query_data on until it faulted: the fuzzer's .bss,
+ * counters and all, in phase 21.
  */
 static int
 kqring_query_entry(void *uhdr, uint64_t *next)
@@ -1064,6 +1069,8 @@ kqring_query_entry(void *uhdr, uint64_t *next)
 
 	if ((error = copyin(uhdr, &hdr, sizeof(hdr))) != 0)
 		return (error);
+	if (hdr.size > PAGE_SIZE)
+		return (E2BIG);
 	usize = hdr.size;
 	udata = (char *)(uintptr_t)hdr.query_data;
 	memset(&d, 0, sizeof(d));
