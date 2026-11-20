@@ -48,8 +48,10 @@
  *    not on rings whose SQ array it scrambles),
  *    and once every ring is gone, a ring's records must be whole and in the
  *    order it submitted them (cancelled ones may be missing);
+ *  - a slot of its registered-ring table still holding a ring at the end;
  *  - kqring memory, user-wired pages or sockets nothing refers to still
- *    held once everything is closed.
+ *    held once everything is closed (it then prints what the process
+ *    holds, which goes with it when it exits).
  *
  * The kernel is never given a pointer into the fuzzer's own memory: user
  * pointers point into a scratch arena, into a read-only table of names

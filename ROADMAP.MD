@@ -427,7 +427,7 @@ Result (20 November 2026):
 - The cause was kqring's. `IORING_REGISTER_QUERY` wrote its answer to the header's `query_data` and zeroed the rest of the header's `size`, a `u32`, with no limit, until it faulted. The fuzzer's random query headers took a small integer as `query_data`, which in its non-PIE build fell in its own `.bss`, and the zeroing ran to the end of the mapping, over its counters. A query now fails with `E2BIG` when `size` is over a page, before writing anything, as io_uring does. `test_register_query` puts a guard page after the buffer: a page-sized query succeeds, one byte more and `UINT32_MAX` fail with `E2BIG`, and both pages are intact.
 - Sibling paths checked: no other copy-out writes a length the caller chooses. The others write a fixed size, a count bounded by `IORING_OP_LAST` or the fixed tables, or the kernel's own data's length.
 - Validated on the fixed module with the fuzzer unchanged, 1,800 s runs: the i5, seed 7 eight times and seed 99 three times; the Ryzen, seed 2020 eleven times, ten of them passing. No page went back in those 22 runs, where it had once every 4 to 9 runs before.
-- Seen once while validating, on the Ryzen, and not explained (see TODO): a run whose leak check waited out its 3 minutes on a ring that was never closed.
+- Seen once while validating, on the Ryzen, and not explained (see TODO): a run whose leak check waited out its 3 minutes on a ring that was never closed. The fuzzer now checks its registered-ring table and descriptor 0 at the end of a run and prints what the process holds when its leak check fails; twelve more 1,800 s runs on the i5 (seed 7) passed without it recurring.
 
 ## Research
 
